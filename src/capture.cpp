@@ -1,0 +1,493 @@
+﻿#include "capture.h"
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfreadwrite.h>
+#include <mferror.h>
+#include <wrl/client.h>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <mutex>
+#include <new>
+
+namespace lapse {
+namespace {
+using Microsoft::WRL::ComPtr;
+using Clock = std::chrono::steady_clock;
+constexpr DWORD videoStream = static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM);
+constexpr DWORD allStreams = static_cast<DWORD>(MF_SOURCE_READER_ALL_STREAMS);
+
+std::wstring captureError(const wchar_t* context, HRESULT hr) {
+    return std::wstring(context) + L" " + errorText(hr);
+}
+
+struct ScreenDC {
+    HDC value = GetDC(nullptr);
+    ~ScreenDC() { if (value) ReleaseDC(nullptr, value); }
+};
+
+// Reuse one output-sized surface per capture thread; never allocate a full
+// desktop-sized intermediate image just to shrink it for the timelapse.
+struct DesktopSurface {
+    HDC dc = nullptr;
+    HBITMAP bitmap = nullptr;
+    HGDIOBJ previous = nullptr;
+    void* pixels = nullptr;
+    int width = 0, height = 0;
+    ~DesktopSurface() { clear(); }
+    void clear() {
+        if (dc && previous) SelectObject(dc, previous);
+        if (bitmap) DeleteObject(bitmap);
+        if (dc) DeleteDC(dc);
+        dc = nullptr; bitmap = nullptr; previous = nullptr; pixels = nullptr;
+        width = height = 0;
+    }
+    bool prepare(HDC screen, int w, int h) {
+        if (dc && width == w && height == h) return true;
+        clear();
+        dc = CreateCompatibleDC(screen);
+        if (!dc) return false;
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth = w; info.bmiHeader.biHeight = -h;
+        info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        bitmap = CreateDIBSection(screen, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
+        if (!bitmap) { clear(); return false; }
+        previous = SelectObject(dc, bitmap);
+        if (!previous || previous == HGDI_ERROR) { previous = nullptr; clear(); return false; }
+        width = w; height = h;
+        SetStretchBltMode(dc, HALFTONE);
+        SetBrushOrgEx(dc, 0, 0, nullptr);
+        return true;
+    }
+};
+
+void drawCursor(HDC dc, const RECT& bounds, int width, int height) {
+    CURSORINFO cursor{sizeof(CURSORINFO)};
+    if (!GetCursorInfo(&cursor) || !(cursor.flags & CURSOR_SHOWING)) return;
+    ICONINFO icon{};
+    if (!GetIconInfo(cursor.hCursor, &icon)) return;
+    BITMAP bitmap{};
+    int nativeWidth = GetSystemMetrics(SM_CXCURSOR), nativeHeight = GetSystemMetrics(SM_CYCURSOR);
+    if (GetObjectW(icon.hbmColor ? icon.hbmColor : icon.hbmMask, sizeof(bitmap), &bitmap)) {
+        nativeWidth = bitmap.bmWidth;
+        nativeHeight = icon.hbmColor ? bitmap.bmHeight : bitmap.bmHeight / 2;
+    }
+    const double sx = double(width) / (bounds.right - bounds.left);
+    const double sy = double(height) / (bounds.bottom - bounds.top);
+    const int x = int(std::lround((double(cursor.ptScreenPos.x) - bounds.left - icon.xHotspot) * sx));
+    const int y = int(std::lround((double(cursor.ptScreenPos.y) - bounds.top - icon.yHotspot) * sy));
+    DrawIconEx(dc, x, y, cursor.hCursor, std::max(1, int(std::lround(nativeWidth * sx))),
+               std::max(1, int(std::lround(nativeHeight * sy))), 0, nullptr, DI_NORMAL);
+    if (icon.hbmColor) DeleteObject(icon.hbmColor);
+    if (icon.hbmMask) DeleteObject(icon.hbmMask);
+}
+
+struct ActivationArray {
+    IMFActivate** values = nullptr;
+    UINT32 count = 0;
+    ~ActivationArray() {
+        for (UINT32 i = 0; i < count; ++i) if (values[i]) values[i]->Release();
+        CoTaskMemFree(values);
+    }
+};
+
+std::wstring attributeString(IMFAttributes* attributes, REFGUID key) {
+    UINT32 length = 0;
+    if (FAILED(attributes->GetStringLength(key, &length))) return {};
+    std::wstring result(size_t(length) + 1, L'\0');
+    if (FAILED(attributes->GetString(key, result.data(), length + 1, &length))) return {};
+    result.resize(length);
+    return result;
+}
+
+struct Format { UINT32 width = 0, height = 0; LONG stride = 0; };
+struct CameraState {
+    std::mutex mutex;
+    // Cleared under mutex before the owning reader reference is released.
+    IMFSourceReader* reader = nullptr;
+    bool running = false;
+    HRESULT failure = S_OK;
+    ComPtr<IMFSample> sample;
+    Format format;
+    Clock::time_point started{}, received{};
+    uint64_t receivedTick = 0;
+};
+
+HRESULT readFormat(IMFSourceReader* reader, Format& format) {
+    ComPtr<IMFMediaType> type;
+    HRESULT hr = reader->GetCurrentMediaType(videoStream, &type);
+    if (FAILED(hr)) return hr;
+    GUID subtype{};
+    hr = type->GetGUID(MF_MT_SUBTYPE, &subtype);
+    if (FAILED(hr) || subtype != MFVideoFormat_RGB32) return MF_E_INVALIDMEDIATYPE;
+    UINT32 width = 0, height = 0;
+    hr = MFGetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, &width, &height);
+    if (FAILED(hr) || !width || !height || width > 1280 || height > 720) return MF_E_INVALIDMEDIATYPE;
+    UINT32 stride = 0;
+    hr = type->GetUINT32(MF_MT_DEFAULT_STRIDE, &stride);
+    if (FAILED(hr)) {
+        LONG computed = 0;
+        hr = MFGetStrideForBitmapInfoHeader(subtype.Data1, width, &computed);
+        if (FAILED(hr)) return hr;
+        stride = UINT32(computed);
+    }
+    if (std::abs(int64_t(LONG(stride))) < int64_t(width) * 4) return MF_E_INVALIDMEDIATYPE;
+    format = {width, height, LONG(stride)};
+    return S_OK;
+}
+
+class BufferLock {
+public:
+    explicit BufferLock(IMFMediaBuffer* buffer) : buffer_(buffer) {}
+    ~BufferLock() {
+        if (locked2D_) surface_->Unlock2D();
+        else if (locked_) buffer_->Unlock();
+    }
+    HRESULT lock(LONG defaultStride, UINT32 height) {
+        ComPtr<IMF2DBuffer2> extended;
+        if (SUCCEEDED(buffer_.As(&extended))) {
+            const HRESULT hr = extended->Lock2DSize(MF2DBuffer_LockFlags_Read, &top, &stride, &base_, &length_);
+            if (SUCCEEDED(hr)) {
+                surface_ = extended; locked2D_ = bounded_ = true;
+                return S_OK;
+            }
+        }
+        if (SUCCEEDED(buffer_.As(&surface_))) {
+            const HRESULT hr = surface_->Lock2D(&top, &stride);
+            if (SUCCEEDED(hr)) { locked2D_ = true; return S_OK; }
+        }
+        DWORD maximum = 0;
+        HRESULT hr = buffer_->Lock(&base_, &maximum, &length_);
+        if (FAILED(hr)) return hr;
+        locked_ = bounded_ = true;
+        if (length_ > maximum) return E_UNEXPECTED;
+        stride = defaultStride; top = base_;
+        if (stride < 0) {
+            const uint64_t offset = uint64_t(-int64_t(stride)) * (height - 1);
+            if (offset >= length_) return MF_E_BUFFERTOOSMALL;
+            top += size_t(offset);
+        }
+        return S_OK;
+    }
+    bool containsRows(UINT32 width, UINT32 height) const {
+        if (!top || !height) return false;
+        const uint64_t pitch = uint64_t(std::abs(int64_t(stride)));
+        const uint64_t rowBytes = uint64_t(width) * 4;
+        if (pitch < rowBytes) return false;
+        if (!bounded_) return true;
+        const uint64_t offset = pitch * (height - 1);
+        const uintptr_t topAddress = reinterpret_cast<uintptr_t>(top);
+        const uintptr_t baseAddress = reinterpret_cast<uintptr_t>(base_);
+        if (stride < 0 && offset > topAddress) return false;
+        const uintptr_t first = stride < 0 ? topAddress - uintptr_t(offset) : topAddress;
+        if (first < baseAddress) return false;
+        const uint64_t prefix = first - baseAddress;
+        return prefix <= length_ && offset + rowBytes <= uint64_t(length_) - prefix;
+    }
+    BYTE* top = nullptr;
+    LONG stride = 0;
+private:
+    ComPtr<IMFMediaBuffer> buffer_;
+    ComPtr<IMF2DBuffer> surface_;
+    BYTE* base_ = nullptr;
+    DWORD length_ = 0;
+    bool bounded_ = false, locked_ = false, locked2D_ = false;
+};
+
+HRESULT copySample(IMFSample* sample, const Format& format, Frame& output) {
+    ComPtr<IMFMediaBuffer> buffer;
+    DWORD count = 0;
+    HRESULT hr = sample->GetBufferCount(&count);
+    if (FAILED(hr)) return hr;
+    hr = count == 1 ? sample->GetBufferByIndex(0, &buffer) : sample->ConvertToContiguousBuffer(&buffer);
+    if (FAILED(hr)) return hr;
+    BufferLock lock(buffer.Get());
+    hr = lock.lock(format.stride, format.height);
+    if (FAILED(hr)) return hr;
+    if (!lock.containsRows(format.width, format.height)) return MF_E_BUFFERTOOSMALL;
+    output.pixels.resize(size_t(format.width) * format.height * 4);
+    const size_t rowBytes = size_t(format.width) * 4;
+    for (UINT32 y = 0; y < format.height; ++y)
+        std::memcpy(output.pixels.data() + size_t(y) * rowBytes, lock.top + ptrdiff_t(y) * lock.stride, rowBytes);
+    output.width = int(format.width); output.height = int(format.height);
+    return S_OK;
+}
+
+class CameraCallback final : public IMFSourceReaderCallback {
+public:
+    explicit CameraCallback(std::shared_ptr<CameraState> state) : state_(std::move(state)) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** out) override {
+        if (!out) return E_POINTER;
+        *out = nullptr;
+        if (iid != __uuidof(IUnknown) && iid != __uuidof(IMFSourceReaderCallback)) return E_NOINTERFACE;
+        *out = static_cast<IMFSourceReaderCallback*>(this); AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ULONG(InterlockedIncrement(&references_)); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        const LONG remaining = InterlockedDecrement(&references_);
+        if (!remaining) delete this;
+        return ULONG(remaining);
+    }
+    HRESULT STDMETHODCALLTYPE OnReadSample(HRESULT status, DWORD, DWORD flags, LONGLONG, IMFSample* sample) override {
+        ComPtr<IMFSourceReader> next;
+        {
+            std::lock_guard<std::mutex> guard(state_->mutex);
+            if (!state_->running || !state_->reader) return S_OK;
+            if (SUCCEEDED(status) && (flags & (MF_SOURCE_READERF_ERROR | MF_SOURCE_READERF_ENDOFSTREAM)))
+                status = MF_E_END_OF_STREAM;
+            if (SUCCEEDED(status) && (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED)) {
+                state_->sample.Reset();
+                status = readFormat(state_->reader, state_->format);
+            }
+            if (FAILED(status)) { state_->failure = status; state_->running = false; }
+            else {
+                if (sample) {
+                    state_->sample = sample; state_->received = Clock::now();
+                    state_->receivedTick = GetTickCount64();
+                }
+                next = state_->reader;
+            }
+        }
+        // Only a single latest MF sample is kept. Pixel copying happens only
+        // when the application consumes a frame, not for every camera callback.
+        if (next) {
+            status = next->ReadSample(videoStream, 0, nullptr, nullptr, nullptr, nullptr);
+            if (FAILED(status)) setError(status);
+        }
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnEvent(DWORD, IMFMediaEvent* event) override {
+        HRESULT status = S_OK;
+        if (event && SUCCEEDED(event->GetStatus(&status)) && FAILED(status)) setError(status);
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE OnFlush(DWORD) override { return S_OK; }
+private:
+    void setError(HRESULT status) {
+        std::lock_guard<std::mutex> guard(state_->mutex);
+        if (state_->running) { state_->failure = status; state_->running = false; }
+    }
+    LONG references_ = 1;
+    std::shared_ptr<CameraState> state_;
+};
+
+HRESULT chooseCameraFormat(IMFSourceReader* reader) {
+    struct Candidate { ComPtr<IMFMediaType> type; double score; UINT32 width, height, n, d; };
+    std::vector<Candidate> candidates;
+    for (DWORD index = 0; index < 512; ++index) {
+        ComPtr<IMFMediaType> type;
+        const HRESULT hr = reader->GetNativeMediaType(videoStream, index, &type);
+        if (hr == MF_E_NO_MORE_TYPES) break;
+        if (FAILED(hr)) return hr;
+        UINT32 w = 0, h = 0, n = 0, d = 0;
+        if (FAILED(MFGetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, &w, &h)) || !w || !h || w > 7680 || h > 4320) continue;
+        MFGetAttributeRatio(type.Get(), MF_MT_FRAME_RATE, &n, &d);
+        const double fps = d ? double(n) / d : 30.0;
+        if (fps <= 0) continue;
+        const double sizeCost = 160.0 * std::abs(std::log(double(w) * h / (1280.0 * 720)));
+        const double rateCost = std::abs(fps - 10.0) * 3.0 + (fps < 5 ? 100.0 : 0.0);
+        const double excessCost = w > 1280 || h > 720 ? 300.0 : 0.0;
+        candidates.push_back({std::move(type), sizeCost + rateCost + excessCost, w, h, n, d});
+    }
+    std::stable_sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) { return a.score < b.score; });
+    HRESULT lastError = MF_E_INVALIDMEDIATYPE;
+    for (const auto& candidate : candidates) {
+        lastError = reader->SetCurrentMediaType(videoStream, nullptr, candidate.type.Get());
+        if (FAILED(lastError)) continue;
+        ComPtr<IMFMediaType> output;
+        lastError = MFCreateMediaType(&output);
+        if (FAILED(lastError)) return lastError;
+        output->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+        output->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
+        const double scale = std::min({1.0, 1280.0 / candidate.width, 720.0 / candidate.height});
+        const UINT32 width = std::max(2u, UINT32(candidate.width * scale) & ~1u);
+        const UINT32 height = std::max(2u, UINT32(candidate.height * scale) & ~1u);
+        MFSetAttributeSize(output.Get(), MF_MT_FRAME_SIZE, width, height);
+        MFSetAttributeRatio(output.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+        output->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+        if (candidate.d && uint64_t(candidate.n) < 10ull * candidate.d)
+            MFSetAttributeRatio(output.Get(), MF_MT_FRAME_RATE, candidate.n, candidate.d);
+        else MFSetAttributeRatio(output.Get(), MF_MT_FRAME_RATE, 10, 1);
+        lastError = reader->SetCurrentMediaType(videoStream, nullptr, output.Get());
+        if (SUCCEEDED(lastError)) return S_OK;
+        output->DeleteItem(MF_MT_FRAME_RATE);
+        lastError = reader->SetCurrentMediaType(videoStream, nullptr, output.Get());
+        if (SUCCEEDED(lastError)) return S_OK;
+    }
+    return lastError;
+}
+}
+
+std::vector<Monitor> enumerateMonitors() {
+    std::vector<Monitor> result;
+    EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR monitor, HDC, LPRECT, LPARAM data) -> BOOL {
+        MONITORINFOEXW info{}; info.cbSize = sizeof(info);
+        if (!GetMonitorInfoW(monitor, &info)) return TRUE;
+        auto& monitors = *reinterpret_cast<std::vector<Monitor>*>(data);
+        try {
+            std::wstring name = info.szDevice;
+            const size_t prefix = name.find(L"DISPLAY");
+            if (prefix != std::wstring::npos) name = L"Display " + name.substr(prefix + 7);
+            if (info.dwFlags & MONITORINFOF_PRIMARY) name += L" (primary)";
+            Monitor entry{name, info.rcMonitor};
+            if (info.dwFlags & MONITORINFOF_PRIMARY) monitors.insert(monitors.begin(), std::move(entry));
+            else monitors.push_back(std::move(entry));
+        } catch (...) { return FALSE; }
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&result));
+    return result;
+}
+
+std::vector<CameraDevice> enumerateCameras(std::wstring& error) {
+    error.clear();
+    std::vector<CameraDevice> result;
+    try {
+        ComPtr<IMFAttributes> attributes;
+        HRESULT hr = MFCreateAttributes(&attributes, 1);
+        if (SUCCEEDED(hr)) hr = attributes->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
+        ActivationArray devices;
+        if (SUCCEEDED(hr)) hr = MFEnumDeviceSources(attributes.Get(), &devices.values, &devices.count);
+        if (FAILED(hr)) { error = captureError(L"Cannot list cameras.", hr); return result; }
+        for (UINT32 i = 0; i < devices.count; ++i) {
+            CameraDevice device{attributeString(devices.values[i], MF_DEVSOURCE_ATTRIBUTE_FRIENDLY_NAME),
+                                attributeString(devices.values[i], MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK)};
+            if (device.name.empty()) device.name = L"Camera " + std::to_wstring(i + 1);
+            if (!device.id.empty()) result.push_back(std::move(device));
+        }
+    } catch (const std::bad_alloc&) { result.clear(); error = L"Not enough memory to list cameras."; }
+    return result;
+}
+
+bool captureDesktop(const RECT& bounds, int maxWidth, int maxHeight, bool cursor, Frame& output, std::wstring& error) {
+    error.clear();
+    const int64_t sourceWidth = int64_t(bounds.right) - bounds.left;
+    const int64_t sourceHeight = int64_t(bounds.bottom) - bounds.top;
+    if (sourceWidth <= 0 || sourceHeight <= 0 || sourceWidth > INT_MAX || sourceHeight > INT_MAX ||
+        maxWidth <= 0 || maxHeight <= 0 || maxWidth > 7680 || maxHeight > 4320) {
+        error = L"The desktop capture size is invalid."; return false;
+    }
+    RECT desktop{GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN), 0, 0};
+    desktop.right = desktop.left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    desktop.bottom = desktop.top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    RECT intersection{};
+    if (!IntersectRect(&intersection, &desktop, &bounds) || !EqualRect(&intersection, &bounds)) {
+        error = L"The selected display is no longer available. Select a display again."; return false;
+    }
+    const double scale = std::min({1.0, double(maxWidth) / sourceWidth, double(maxHeight) / sourceHeight});
+    const int width = std::max(1, int(std::lround(sourceWidth * scale)));
+    const int height = std::max(1, int(std::lround(sourceHeight * scale)));
+    ScreenDC screen;
+    thread_local DesktopSurface surface;
+    if (!screen.value || !surface.prepare(screen.value, width, height)) {
+        error = L"Windows could not prepare the desktop capture."; return false;
+    }
+    if (!StretchBlt(surface.dc, 0, 0, width, height, screen.value, bounds.left, bounds.top,
+                    int(sourceWidth), int(sourceHeight), SRCCOPY | CAPTUREBLT)) {
+        error = L"Windows could not capture the desktop. The desktop may be locked or unavailable.";
+        return false;
+    }
+    if (cursor) drawCursor(surface.dc, bounds, width, height);
+    if (!GdiFlush()) { error = L"Windows could not finish desktop capture."; return false; }
+    try {
+        output.pixels.resize(size_t(width) * height * 4);
+        std::memcpy(output.pixels.data(), surface.pixels, output.pixels.size());
+        output.width = width; output.height = height;
+        return true;
+    } catch (const std::bad_alloc&) { error = L"Not enough memory to capture the desktop."; return false; }
+}
+
+struct Camera::Impl {
+    ComPtr<IMFMediaSource> source;
+    ComPtr<IMFSourceReader> reader;
+    std::shared_ptr<CameraState> state;
+};
+Camera::Camera() : impl_(std::make_unique<Impl>()) {}
+Camera::~Camera() { stop(); }
+
+bool Camera::start(const std::wstring& id, std::wstring& error) {
+    stop(); error.clear();
+    if (id.empty()) { error = L"Select a camera first."; return false; }
+    HRESULT hr = S_OK;
+    try {
+        auto state = std::make_shared<CameraState>();
+        impl_->state = state;
+        ComPtr<IMFAttributes> attributes;
+        hr = MFCreateAttributes(&attributes, 2);
+        if (SUCCEEDED(hr)) hr = attributes->SetGUID(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE, MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID);
+        if (SUCCEEDED(hr)) hr = attributes->SetString(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK, id.c_str());
+        if (SUCCEEDED(hr)) hr = MFCreateDeviceSource(attributes.Get(), &impl_->source);
+        ComPtr<IMFSourceReaderCallback> callback;
+        callback.Attach(new CameraCallback(state));
+        attributes.Reset();
+        if (SUCCEEDED(hr)) hr = MFCreateAttributes(&attributes, 3);
+        if (SUCCEEDED(hr)) hr = attributes->SetUnknown(MF_SOURCE_READER_ASYNC_CALLBACK, callback.Get());
+        if (SUCCEEDED(hr)) hr = attributes->SetUINT32(MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING, TRUE);
+        if (SUCCEEDED(hr)) hr = attributes->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
+        if (SUCCEEDED(hr)) hr = MFCreateSourceReaderFromMediaSource(impl_->source.Get(), attributes.Get(), &impl_->reader);
+        if (SUCCEEDED(hr)) hr = impl_->reader->SetStreamSelection(allStreams, FALSE);
+        if (SUCCEEDED(hr)) hr = impl_->reader->SetStreamSelection(videoStream, TRUE);
+        if (SUCCEEDED(hr)) hr = chooseCameraFormat(impl_->reader.Get());
+        if (SUCCEEDED(hr)) hr = readFormat(impl_->reader.Get(), state->format);
+        if (SUCCEEDED(hr)) {
+            {
+                std::lock_guard<std::mutex> guard(state->mutex);
+                state->started = Clock::now(); state->reader = impl_->reader.Get(); state->running = true;
+            }
+            hr = impl_->reader->ReadSample(videoStream, 0, nullptr, nullptr, nullptr, nullptr);
+        }
+    } catch (const std::bad_alloc&) { hr = E_OUTOFMEMORY; }
+    if (FAILED(hr)) {
+        stop();
+        error = captureError(L"Cannot open the camera. Check Windows camera access and close other camera apps.", hr);
+        return false;
+    }
+    return true;
+}
+
+void Camera::stop() {
+    if (impl_->state) {
+        std::lock_guard<std::mutex> guard(impl_->state->mutex);
+        impl_->state->running = false; impl_->state->reader = nullptr; impl_->state->sample.Reset();
+    }
+    if (impl_->reader) impl_->reader->Flush(allStreams);
+    if (impl_->source) impl_->source->Shutdown();
+    impl_->reader.Reset(); impl_->source.Reset(); impl_->state.reset();
+}
+
+bool Camera::latest(Frame& output, std::wstring& error) {
+    uint64_t receivedTick = 0;
+    return latest(output, error, receivedTick);
+}
+
+bool Camera::latest(Frame& output, std::wstring& error, uint64_t& receivedTick) {
+    error.clear();
+    if (!impl_->state) { error = L"The camera is not running."; return false; }
+    ComPtr<IMFSample> sample;
+    Format format;
+    {
+        std::lock_guard<std::mutex> guard(impl_->state->mutex);
+        const auto& state = *impl_->state;
+        if (FAILED(state.failure)) {
+            error = captureError(L"The camera stopped responding. Reconnect it and try again.", state.failure);
+            return false;
+        }
+        const auto last = state.sample ? state.received : state.started;
+        if (Clock::now() - last > std::chrono::seconds(3)) {
+            error = L"No fresh camera frame arrived for 3 seconds. Check the camera connection and try again.";
+            return false;
+        }
+        if (!state.sample) return false;
+        sample = state.sample; format = state.format; receivedTick = state.receivedTick;
+    }
+    HRESULT hr = S_OK;
+    try { hr = copySample(sample.Get(), format, output); }
+    catch (const std::bad_alloc&) { hr = E_OUTOFMEMORY; }
+    if (FAILED(hr)) { error = captureError(L"Cannot read the camera frame.", hr); return false; }
+    return true;
+}
+}
+

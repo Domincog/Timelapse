@@ -1,0 +1,11 @@
+/build*/
+/dist/
+/packages/
+/.tmp/
+/engine-test-*/
+/engine-recovery-*/
+/engine-storage-*/
+/recording-soak-*/
+*.user
+*.obj
+*.pdb
