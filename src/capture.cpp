@@ -22,6 +22,59 @@ std::wstring captureError(const wchar_t* context, HRESULT hr) {
     return std::wstring(context) + L" " + errorText(hr);
 }
 
+struct MonitorEnumeration {
+    std::vector<Monitor> monitors;
+    bool failed = false;
+};
+
+template<typename Enumerate>
+std::wstring monitorIdentityImpl(const wchar_t* deviceName, Enumerate enumerate) {
+    for (DWORD index = 0;; ++index) {
+        DISPLAY_DEVICEW device{}; device.cb = sizeof(device);
+        if (!enumerate(deviceName, index, &device, EDD_GET_DEVICE_INTERFACE_NAME)) break;
+        if ((device.StateFlags & DISPLAY_DEVICE_ACTIVE) && device.DeviceID[0])
+            return L"monitor:" + std::wstring(device.DeviceID);
+    }
+    return L"gdi:" + std::wstring(deviceName);
+}
+
+const Monitor* findMonitor(const std::vector<Monitor>& monitors, const std::wstring& id) {
+    for (const auto& monitor : monitors)
+        if (CompareStringOrdinal(monitor.id.c_str(), -1, id.c_str(), -1, TRUE) == CSTR_EQUAL)
+            return &monitor;
+    return nullptr;
+}
+
+template<typename Enumerate, typename Capture>
+bool captureMonitorImpl(const std::wstring& id, int maxWidth, int maxHeight, bool cursor,
+                        Frame& output, std::wstring& error, Enumerate enumerate, Capture capture) {
+    // Keep the reusable pixel allocation, but never expose a rejected capture as valid.
+    struct Result {
+        Frame& frame;
+        bool accepted = false;
+        ~Result() { if (!accepted) frame.width = frame.height = 0; }
+    } result{output};
+    output.width = output.height = 0;
+    error.clear();
+    if (id.empty()) { error = L"Select a display before starting capture."; return false; }
+    const auto before = enumerate();
+    const auto* selected = findMonitor(before, id);
+    if (!selected) {
+        error = L"The selected display is unavailable. Reconnect it or select another display.";
+        return false;
+    }
+    const RECT bounds = selected->bounds;
+    if (!capture(bounds, maxWidth, maxHeight, cursor, output, error)) return false;
+    const auto after = enumerate();
+    const auto* current = findMonitor(after, id);
+    if (!current || !EqualRect(&current->bounds, &bounds)) {
+        error = L"The selected display changed during capture. Try recording again.";
+        return false;
+    }
+    result.accepted = true;
+    return true;
+}
+
 struct ScreenDC {
     HDC value = GetDC(nullptr);
     ~ScreenDC() { if (value) ReleaseDC(nullptr, value); }
@@ -67,8 +120,12 @@ struct DesktopSurface {
 void drawCursor(HDC dc, const RECT& bounds, int width, int height) {
     CURSORINFO cursor{sizeof(CURSORINFO)};
     if (!GetCursorInfo(&cursor) || !(cursor.flags & CURSOR_SHOWING)) return;
+    struct OwnedIcon {
+        HICON value = nullptr;
+        ~OwnedIcon() { if (value) DestroyIcon(value); }
+    } owned{CopyIcon(cursor.hCursor)};
     ICONINFO icon{};
-    if (!GetIconInfo(cursor.hCursor, &icon)) return;
+    if (!owned.value || !GetIconInfo(owned.value, &icon)) return;
     BITMAP bitmap{};
     int nativeWidth = GetSystemMetrics(SM_CXCURSOR), nativeHeight = GetSystemMetrics(SM_CYCURSOR);
     if (GetObjectW(icon.hbmColor ? icon.hbmColor : icon.hbmMask, sizeof(bitmap), &bitmap)) {
@@ -79,7 +136,7 @@ void drawCursor(HDC dc, const RECT& bounds, int width, int height) {
     const double sy = double(height) / (bounds.bottom - bounds.top);
     const int x = int(std::lround((double(cursor.ptScreenPos.x) - bounds.left - icon.xHotspot) * sx));
     const int y = int(std::lround((double(cursor.ptScreenPos.y) - bounds.top - icon.yHotspot) * sy));
-    DrawIconEx(dc, x, y, cursor.hCursor, std::max(1, int(std::lround(nativeWidth * sx))),
+    DrawIconEx(dc, x, y, owned.value, std::max(1, int(std::lround(nativeWidth * sx))),
                std::max(1, int(std::lround(nativeHeight * sy))), 0, nullptr, DI_NORMAL);
     if (icon.hbmColor) DeleteObject(icon.hbmColor);
     if (icon.hbmMask) DeleteObject(icon.hbmMask);
@@ -151,18 +208,16 @@ public:
         if (SUCCEEDED(buffer_.As(&extended))) {
             const HRESULT hr = extended->Lock2DSize(MF2DBuffer_LockFlags_Read, &top, &stride, &base_, &length_);
             if (SUCCEEDED(hr)) {
-                surface_ = extended; locked2D_ = bounded_ = true;
+                surface_ = extended; locked2D_ = true;
                 return S_OK;
             }
         }
-        if (SUCCEEDED(buffer_.As(&surface_))) {
-            const HRESULT hr = surface_->Lock2D(&top, &stride);
-            if (SUCCEEDED(hr)) { locked2D_ = true; return S_OK; }
-        }
+        // Legacy Lock2D exposes no allocation bounds. IMFMediaBuffer::Lock
+        // supplies a bounded contiguous representation using the media stride.
         DWORD maximum = 0;
         HRESULT hr = buffer_->Lock(&base_, &maximum, &length_);
         if (FAILED(hr)) return hr;
-        locked_ = bounded_ = true;
+        locked_ = true;
         if (length_ > maximum) return E_UNEXPECTED;
         stride = defaultStride; top = base_;
         if (stride < 0) {
@@ -177,7 +232,6 @@ public:
         const uint64_t pitch = uint64_t(std::abs(int64_t(stride)));
         const uint64_t rowBytes = uint64_t(width) * 4;
         if (pitch < rowBytes) return false;
-        if (!bounded_) return true;
         const uint64_t offset = pitch * (height - 1);
         const uintptr_t topAddress = reinterpret_cast<uintptr_t>(top);
         const uintptr_t baseAddress = reinterpret_cast<uintptr_t>(base_);
@@ -194,7 +248,7 @@ private:
     ComPtr<IMF2DBuffer> surface_;
     BYTE* base_ = nullptr;
     DWORD length_ = 0;
-    bool bounded_ = false, locked_ = false, locked2D_ = false;
+    bool locked_ = false, locked2D_ = false;
 };
 
 HRESULT copySample(IMFSample* sample, const Format& format, Frame& output) {
@@ -233,6 +287,11 @@ public:
         return ULONG(remaining);
     }
     HRESULT STDMETHODCALLTYPE OnReadSample(HRESULT status, DWORD, DWORD flags, LONGLONG, IMFSample* sample) override {
+        // A sample can own cleanup objects that report another callback event.
+        // Acquire the incoming reference and retire old references outside the
+        // state lock, including reset followed by replacement in one callback.
+        ComPtr<IMFSample> incoming, retired;
+        if (sample && SUCCEEDED(status) && !(flags & (MF_SOURCE_READERF_ERROR | MF_SOURCE_READERF_ENDOFSTREAM))) incoming = sample;
         ComPtr<IMFSourceReader> next;
         {
             std::lock_guard<std::mutex> guard(state_->mutex);
@@ -240,13 +299,13 @@ public:
             if (SUCCEEDED(status) && (flags & (MF_SOURCE_READERF_ERROR | MF_SOURCE_READERF_ENDOFSTREAM)))
                 status = MF_E_END_OF_STREAM;
             if (SUCCEEDED(status) && (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED)) {
-                state_->sample.Reset();
+                retired.Swap(state_->sample);
                 status = readFormat(state_->reader, state_->format);
             }
             if (FAILED(status)) { state_->failure = status; state_->running = false; }
             else {
                 if (sample) {
-                    state_->sample = sample; state_->received = Clock::now();
+                    state_->sample.Swap(incoming); state_->received = Clock::now();
                     state_->receivedTick = GetTickCount64();
                 }
                 next = state_->reader;
@@ -323,23 +382,25 @@ HRESULT chooseCameraFormat(IMFSourceReader* reader) {
 }
 
 std::vector<Monitor> enumerateMonitors() {
-    std::vector<Monitor> result;
-    EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR monitor, HDC, LPRECT, LPARAM data) -> BOOL {
+    MonitorEnumeration result;
+    const BOOL complete = EnumDisplayMonitors(nullptr, nullptr, [](HMONITOR monitor, HDC, LPRECT, LPARAM data) -> BOOL {
+        auto& result = *reinterpret_cast<MonitorEnumeration*>(data);
         MONITORINFOEXW info{}; info.cbSize = sizeof(info);
-        if (!GetMonitorInfoW(monitor, &info)) return TRUE;
-        auto& monitors = *reinterpret_cast<std::vector<Monitor>*>(data);
+        if (!GetMonitorInfoW(monitor, &info)) { result.failed = true; return FALSE; }
+        auto& monitors = result.monitors;
         try {
             std::wstring name = info.szDevice;
             const size_t prefix = name.find(L"DISPLAY");
             if (prefix != std::wstring::npos) name = L"Display " + name.substr(prefix + 7);
             if (info.dwFlags & MONITORINFOF_PRIMARY) name += L" (primary)";
-            Monitor entry{name, info.rcMonitor};
+            Monitor entry{name, info.rcMonitor, monitorIdentityImpl(info.szDevice, EnumDisplayDevicesW)};
             if (info.dwFlags & MONITORINFOF_PRIMARY) monitors.insert(monitors.begin(), std::move(entry));
             else monitors.push_back(std::move(entry));
-        } catch (...) { return FALSE; }
+        } catch (...) { result.failed = true; return FALSE; }
         return TRUE;
     }, reinterpret_cast<LPARAM>(&result));
-    return result;
+    if (!complete || result.failed) return {};
+    return std::move(result.monitors);
 }
 
 std::vector<CameraDevice> enumerateCameras(std::wstring& error) {
@@ -363,6 +424,7 @@ std::vector<CameraDevice> enumerateCameras(std::wstring& error) {
 }
 
 bool captureDesktop(const RECT& bounds, int maxWidth, int maxHeight, bool cursor, Frame& output, std::wstring& error) {
+    output.width = output.height = 0;
     error.clear();
     const int64_t sourceWidth = int64_t(bounds.right) - bounds.left;
     const int64_t sourceHeight = int64_t(bounds.bottom) - bounds.top;
@@ -400,6 +462,12 @@ bool captureDesktop(const RECT& bounds, int maxWidth, int maxHeight, bool cursor
     } catch (const std::bad_alloc&) { error = L"Not enough memory to capture the desktop."; return false; }
 }
 
+bool captureMonitor(const std::wstring& id, int maxWidth, int maxHeight, bool cursor,
+                    Frame& output, std::wstring& error) {
+    return captureMonitorImpl(id, maxWidth, maxHeight, cursor, output, error,
+                              enumerateMonitors, captureDesktop);
+}
+
 struct Camera::Impl {
     ComPtr<IMFMediaSource> source;
     ComPtr<IMFSourceReader> reader;
@@ -435,7 +503,7 @@ bool Camera::start(const std::wstring& id, std::wstring& error) {
         if (SUCCEEDED(hr)) {
             {
                 std::lock_guard<std::mutex> guard(state->mutex);
-                state->started = Clock::now(); state->reader = impl_->reader.Get(); state->running = true;
+                state->started = state->received = Clock::now(); state->reader = impl_->reader.Get(); state->running = true;
             }
             hr = impl_->reader->ReadSample(videoStream, 0, nullptr, nullptr, nullptr, nullptr);
         }
@@ -449,10 +517,12 @@ bool Camera::start(const std::wstring& id, std::wstring& error) {
 }
 
 void Camera::stop() {
+    ComPtr<IMFSample> retired;
     if (impl_->state) {
         std::lock_guard<std::mutex> guard(impl_->state->mutex);
-        impl_->state->running = false; impl_->state->reader = nullptr; impl_->state->sample.Reset();
+        impl_->state->running = false; impl_->state->reader = nullptr; retired.Swap(impl_->state->sample);
     }
+    retired.Reset();
     if (impl_->reader) impl_->reader->Flush(allStreams);
     if (impl_->source) impl_->source->Shutdown();
     impl_->reader.Reset(); impl_->source.Reset(); impl_->state.reset();
@@ -475,7 +545,9 @@ bool Camera::latest(Frame& output, std::wstring& error, uint64_t& receivedTick) 
             error = captureError(L"The camera stopped responding. Reconnect it and try again.", state.failure);
             return false;
         }
-        const auto last = state.sample ? state.received : state.started;
+        // Retiring an old-format sample does not erase its arrival time. Until
+        // the first sample, received retains the original activation deadline.
+        const auto last = state.received;
         if (Clock::now() - last > std::chrono::seconds(3)) {
             error = L"No fresh camera frame arrived for 3 seconds. Check the camera connection and try again.";
             return false;

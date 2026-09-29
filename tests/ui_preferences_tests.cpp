@@ -1,0 +1,363 @@
+// Actual native preferences and real Win32 profile I/O in owned test directories.
+// The window/control fixture stays hidden; no profile folders or sources are opened.
+#include "engine.h"
+#include "capture.h"
+#include "camera_host.h"
+#include <mfapi.h>
+#include <commctrl.h>
+#include <shlobj.h>
+#include <shellapi.h>
+#include <windowsx.h>
+#include <algorithm>
+#include <cmath>
+#include <cwchar>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iostream>
+#include <sstream>
+#include <stdexcept>
+#include <cstdlib>
+#include <new>
+
+namespace preferenceAllocation {
+thread_local bool failNext=false;
+thread_local unsigned failures=0;
+}
+void* operator new(size_t size){
+    if(preferenceAllocation::failNext){preferenceAllocation::failNext=false;++preferenceAllocation::failures;throw std::bad_alloc();}
+    if(auto memory=std::malloc(size?size:1))return memory;
+    throw std::bad_alloc();
+}
+void* operator new[](size_t size){return ::operator new(size);}
+void operator delete(void* memory)noexcept{std::free(memory);}
+void operator delete[](void* memory)noexcept{std::free(memory);}
+void operator delete(void* memory,size_t)noexcept{std::free(memory);}
+void operator delete[](void* memory,size_t)noexcept{std::free(memory);}
+
+namespace lapse {
+class FixtureEngine {
+public:
+    void configure(const Settings&) {}
+    void refreshSources() {}
+    void record() {}
+    void pause() {}
+    void setPaused(bool) {}
+    void finish() {}
+    Status status(){return {};}
+};
+std::vector<Monitor> enumerateMonitors(){throw std::runtime_error("Unexpected device enumeration.");}
+std::vector<CameraDevice> enumerateCameras(std::wstring&){throw std::runtime_error("Unexpected device enumeration.");}
+int runCameraHost(const wchar_t*){throw std::runtime_error("Unexpected application entry.");}
+}
+namespace {
+std::function<void()> beforePreferenceReplace;
+int replacementAttempts=0;
+DWORD replacementError=ERROR_SUCCESS;
+enum class WriteFault { None, DenySecond, ThrowAfterFirst };
+WriteFault writeFault=WriteFault::None;
+int keyWrites=0, failedKeyWrites=0, syntheticExceptions=0, saveDiagnostics=0;
+DWORD keyWriteError=ERROR_SUCCESS;
+HANDLE deniedWrite=INVALID_HANDLE_VALUE;
+BOOL WINAPI fixtureWriteProfile(LPCWSTR section,LPCWSTR key,LPCWSTR value,LPCWSTR path){
+    const BOOL result=WritePrivateProfileStringW(section,key,value,path);
+    const DWORD error=result?ERROR_SUCCESS:GetLastError();
+    if(section&&key){
+        ++keyWrites;
+        if(!result){++failedKeyWrites;keyWriteError=error;}
+        if(writeFault==WriteFault::DenySecond&&keyWrites==1&&result){
+            deniedWrite=CreateFileW(path,GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
+            if(deniedWrite==INVALID_HANDLE_VALUE)throw std::runtime_error("Cannot deny the next owned staging write.");
+        }else if(writeFault==WriteFault::DenySecond&&keyWrites==2&&deniedWrite!=INVALID_HANDLE_VALUE){
+            CloseHandle(deniedWrite);deniedWrite=INVALID_HANDLE_VALUE;
+        }
+        // This is a synthetic C++ exception to verify owned-stage cleanup;
+        // ordinary Win32 profile API failures are tested above as BOOL/errors.
+        if(writeFault==WriteFault::ThrowAfterFirst&&keyWrites==1&&result){
+            ++syntheticExceptions;throw std::runtime_error("Synthetic exception after staged key write.");
+        }
+    }
+    SetLastError(error);return result;
+}
+void WINAPI fixtureSaveDebug(LPCWSTR message){
+    if(std::wcscmp(message,L"Timelapse could not save preferences.\n")!=0)throw std::runtime_error("Unexpected preference diagnostic.");
+    ++saveDiagnostics;
+}
+BOOL WINAPI fixtureMoveFileEx(LPCWSTR source,LPCWSTR target,DWORD flags){
+    ++replacementAttempts;
+    if(beforePreferenceReplace)beforePreferenceReplace();
+    const BOOL result=MoveFileExW(source,target,flags);
+    replacementError=result?ERROR_SUCCESS:GetLastError();return result;
+}
+}
+#define Engine FixtureEngine
+#define MoveFileExW fixtureMoveFileEx
+#define WritePrivateProfileStringW fixtureWriteProfile
+#define OutputDebugStringW fixtureSaveDebug
+// The reject-entry sentinel intentionally makes the GUI entry unreachable.
+#pragma warning(push)
+#pragma warning(disable: 4702)
+#include "../src/main.cpp"
+#pragma warning(pop)
+#undef Engine
+#undef MoveFileExW
+#undef WritePrivateProfileStringW
+#undef OutputDebugStringW
+
+namespace {
+void require(bool value,const char* message){if(!value)throw std::runtime_error(message);}
+struct HiddenControls {
+    HiddenControls(){
+        app.window=CreateWindowExW(0,L"STATIC",L"Owned preferences fixture",WS_POPUP,0,0,500,400,nullptr,nullptr,nullptr,nullptr);
+        require(app.window!=nullptr && !IsWindowVisible(app.window),"Cannot create hidden parent.");
+        auto combo=[&](int count){
+            auto window=CreateWindowExW(0,L"COMBOBOX",L"",WS_CHILD|CBS_DROPDOWNLIST,0,0,100,100,app.window,nullptr,nullptr,nullptr);
+            require(window!=nullptr,"Cannot create owned option control.");
+            for(int i=0;i<count;++i)add(window,std::to_wstring(i));choose(window,0);return window;
+        };
+        app.mode=combo(5);app.interval=combo(6);app.videoSize=combo(2);app.encodingQuality=combo(3);
+    }
+    ~HiddenControls(){DestroyWindow(app.window);app.window=nullptr;}
+};
+struct PreferencesFixture {
+    std::filesystem::path base=std::filesystem::current_path(), directory, settingsDirectory;
+    std::vector<std::filesystem::path> ownedDirectories;
+    std::wstring priorPreferences=app.preferences, priorFolder=app.settings.folder;
+    explicit PreferencesFixture(size_t pathLength=0){
+        static unsigned counter=0;
+        directory=base/(L"ui-preferences-"+std::to_wstring(GetCurrentProcessId())+L"-"+
+                       std::to_wstring(GetTickCount64())+L"-"+std::to_wstring(++counter));
+        require(base.is_absolute() && directory.parent_path()==base,"Preferences fixture must be an absolute owned child.");
+        require(std::filesystem::create_directory(directory),"Cannot create unique owned preferences directory.");
+        ownedDirectories.push_back(directory);settingsDirectory=directory;
+        if(pathLength){
+            const size_t parentLength=pathLength-std::wstring(L"\\settings.ini").size();
+            require(settingsDirectory.wstring().size()+2<=parentLength,"Owned test prefix is too long for the settings boundary.");
+            while(settingsDirectory.wstring().size()<parentLength){
+                const size_t remaining=parentLength-settingsDirectory.wstring().size();
+                require(remaining>=2,"Cannot construct the exact owned path length.");
+                size_t component=std::min<size_t>(40,remaining-1);
+                if(remaining-component-1==1)--component;
+                settingsDirectory/=std::wstring(component,L'p');
+                require(CreateDirectoryW(fileIOPath(settingsDirectory.wstring()).c_str(),nullptr)!=FALSE,"Cannot create an owned nested directory.");
+                ownedDirectories.push_back(settingsDirectory);
+            }
+        }
+        app.preferences=(settingsDirectory/L"settings.ini").wstring();
+        require(std::filesystem::path(app.preferences).parent_path()==settingsDirectory,"INI escaped its owned directory.");
+        require(!pathLength||app.preferences.size()==pathLength,"Wrong exact settings path length.");
+        replacementAttempts=0;replacementError=ERROR_SUCCESS;beforePreferenceReplace=nullptr;
+        writeFault=WriteFault::None;keyWrites=failedKeyWrites=syntheticExceptions=saveDiagnostics=0;keyWriteError=ERROR_SUCCESS;
+    }
+    ~PreferencesFixture(){
+        preferenceAllocation::failNext=false;writeFault=WriteFault::None;
+        if(deniedWrite!=INVALID_HANDLE_VALUE){CloseHandle(deniedWrite);deniedWrite=INVALID_HANDLE_VALUE;}
+        beforePreferenceReplace=nullptr;
+        WritePrivateProfileStringW(nullptr,nullptr,nullptr,fileIOPath(app.preferences).c_str());
+        app.preferences=priorPreferences;app.settings.folder=priorFolder;
+        // Only traverse flat files in directories created by this instance,
+        // deepest first; reject reparse points and any unexpected subdirectory.
+        std::error_code error;
+        if(directory.is_absolute() && directory.parent_path()==base){
+            const auto prefix=directory.wstring()+L"\\";
+            for(auto it=ownedDirectories.rbegin();it!=ownedDirectories.rend()&&!error;++it){
+                const auto name=it->wstring();
+                if(*it!=directory&&name.compare(0,prefix.size(),prefix)!=0)break;
+                const std::filesystem::path io(fileIOPath(name));
+                const DWORD attributes=GetFileAttributesW(io.c_str());
+                if(attributes==INVALID_FILE_ATTRIBUTES||(attributes&FILE_ATTRIBUTE_REPARSE_POINT))break;
+                for(std::filesystem::directory_iterator file(io,error),end;!error&&file!=end;file.increment(error)){
+                    const DWORD childAttributes=GetFileAttributesW(file->path().c_str());
+                    if(file->path().parent_path()!=io||childAttributes==INVALID_FILE_ATTRIBUTES||
+                       (childAttributes&(FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT))){
+                        error=std::make_error_code(std::errc::permission_denied);break;
+                    }
+                    std::filesystem::remove(file->path(),error);
+                }
+                if(!error)std::filesystem::remove(io,error);
+            }
+        }
+    }
+    std::string bytes() const {
+        std::ifstream input(std::filesystem::path(fileIOPath(app.preferences)),std::ios::binary);
+        require(bool(input),"Cannot read owned INI bytes.");
+        std::string value(std::istreambuf_iterator<char>(input),{});
+        require(!input.bad(),"Cannot read complete owned INI.");return value;
+    }
+    void seed(const std::string& value) const {
+        std::ofstream output(std::filesystem::path(fileIOPath(app.preferences)),std::ios::binary);
+        output.write(value.data(),static_cast<std::streamsize>(value.size()));output.close();
+        require(bool(output),"Cannot seed owned INI.");
+    }
+    void onlySettingsRemain() const {
+        size_t count=0;
+        for(const auto& entry:std::filesystem::directory_iterator(std::filesystem::path(fileIOPath(settingsDirectory.wstring())))){
+            require(entry.path().filename()==L"settings.ini","A preference save left a temporary file.");++count;
+        }
+        require(count==1,"Settings file was removed or an unexpected file was left.");
+    }
+};
+const std::string legacy="; keep this comment\r\n[Settings]\r\nFolder=C:\\Prior\r\nInterval=4\r\nQuality=1\r\nEncodingQuality=0\r\nFuture=preserved\r\n[Another]\r\nKey=unchanged\r\n";
+const std::wstring unicodeFolder=L"C:\\Synthetic videos\\\u65e5\u672c\u8a9e-\U0001f4f7";
+std::string utf16(const std::wstring& text){const std::wstring value=L"\ufeff"+text;return {reinterpret_cast<const char*>(value.data()),value.size()*sizeof(wchar_t)};}
+void expectOptions(const std::wstring& folder,int interval,int size,int encoding){
+    require(app.settings.folder==folder,"Unicode save folder changed on reload.");
+    require(choice(app.interval)==interval && choice(app.videoSize)==size && choice(app.encodingQuality)==encoding,
+            "Persisted Interval/Quality/EncodingQuality changed.");
+    require(choice(app.mode)==0,"Preferences load did not preserve Desktop startup mode.");
+}
+void reload(){
+    app.settings.folder=L"C:\\Default";choose(app.interval,0);choose(app.videoSize,0);choose(app.encodingQuality,1);choose(app.mode,4);
+    preferences(false);
+}
+void expectUtf16(const PreferencesFixture& fixture){const auto bytes=fixture.bytes();require(bytes.size()>=2 && static_cast<unsigned char>(bytes[0])==0xff && static_cast<unsigned char>(bytes[1])==0xfe,"Saved preferences lack the Unicode BOM.");}
+void expectUnknownContent(const PreferencesFixture& fixture){
+    const auto io=fileIOPath(app.preferences);
+    wchar_t value[64]{};
+    GetPrivateProfileStringW(L"Settings",L"Future",L"",value,64,io.c_str());require(std::wstring(value)==L"preserved","Unrelated key was lost.");
+    GetPrivateProfileStringW(L"Another",L"Key",L"",value,64,io.c_str());require(std::wstring(value)==L"unchanged","Unrelated section was lost.");
+    const std::wstring comment=L"; keep this comment";
+    require(fixture.bytes().find(std::string(reinterpret_cast<const char*>(comment.data()),comment.size()*sizeof(wchar_t)))!=std::string::npos,
+            "An existing comment was lost during migration.");
+}
+void newUnicodeFile(){
+    PreferencesFixture fixture;
+    app.settings.folder=unicodeFolder;choose(app.interval,5);choose(app.videoSize,1);choose(app.encodingQuality,2);
+    preferences(true);reload();expectOptions(unicodeFolder,5,1,2);expectUtf16(fixture);fixture.onlySettingsRemain();
+    std::cout<<"PASS new Unicode folder and all numeric options roundtrip through real profile APIs\n";
+}
+void existingUnicodeRewrite(){
+    PreferencesFixture fixture;
+    const std::wstring initial=L"[Settings]\r\nFolder="+unicodeFolder+L"\r\nInterval=5\r\nQuality=1\r\nEncodingQuality=2\r\n";
+    fixture.seed(utf16(initial));reload();expectOptions(unicodeFolder,5,1,2);
+    const auto initialBytes=fixture.bytes();
+    const std::wstring changed=L"C:\\Synthetic videos\\\u65e5\u672c\u8a9e-\U0001f3a5";
+    require(changed.size()==unicodeFolder.size(),"Rewrite must keep the same Unicode string length.");
+    app.settings.folder=changed;choose(app.interval,1);choose(app.videoSize,0);choose(app.encodingQuality,0);
+    preferences(true);reload();expectOptions(changed,1,0,0);expectUtf16(fixture);
+    require(fixture.bytes().size()==initialBytes.size(),"Rewrite did not retain the same file size for the cache regression.");
+    fixture.onlySettingsRemain();std::cout<<"PASS same-length existing UTF16 rewrite does not reload cached old settings\n";
+}
+void migrateAnsi(){
+    PreferencesFixture fixture;fixture.seed(legacy);reload();expectOptions(L"C:\\Prior",4,1,0);
+    app.settings.folder=unicodeFolder;preferences(true);reload();expectOptions(unicodeFolder,4,1,0);
+    expectUtf16(fixture);expectUnknownContent(fixture);fixture.onlySettingsRemain();
+    std::cout<<"PASS ANSI migration preserves options, comments, unknown key and unrelated section\n";
+}
+struct OwnedFile {
+    HANDLE value=INVALID_HANDLE_VALUE;
+    explicit OwnedFile(HANDLE handle):value(handle){require(value!=INVALID_HANDLE_VALUE,"Cannot open owned locked INI.");}
+    ~OwnedFile(){if(value!=INVALID_HANDLE_VALUE)CloseHandle(value);}
+    void close(){if(value!=INVALID_HANDLE_VALUE){CloseHandle(value);value=INVALID_HANDLE_VALUE;}}
+};
+void replacementFailure(){
+    PreferencesFixture fixture;fixture.seed(legacy);
+    OwnedFile locked(CreateFileW(app.preferences.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr));
+    app.settings.folder=unicodeFolder;choose(app.interval,0);choose(app.videoSize,0);choose(app.encodingQuality,2);
+    preferences(true);locked.close();
+    std::cout<<"locked replacement attempts="<<replacementAttempts<<" Windows error="<<replacementError<<'\n';
+    require(replacementAttempts==1 && (replacementError==ERROR_SHARING_VIOLATION || replacementError==ERROR_ACCESS_DENIED),
+            "Did not reach a real replacement sharing/access failure.");
+    require(fixture.bytes()==legacy,"Failed replacement changed original bytes.");fixture.onlySettingsRemain();reload();expectOptions(L"C:\\Prior",4,1,0);
+    app.settings.folder=unicodeFolder;choose(app.interval,0);choose(app.videoSize,0);choose(app.encodingQuality,2);
+    preferences(true);reload();expectOptions(unicodeFolder,0,0,2);fixture.onlySettingsRemain();
+    require(replacementAttempts==2 && replacementError==ERROR_SUCCESS,"Unlocked retry did not recover normal publication.");
+    std::cout<<"PASS real replacement lock preserves original bytes/settings, removes staged file, and permits retry\n";
+}
+void readFailure(){
+    PreferencesFixture fixture;fixture.seed(legacy);
+    OwnedFile locked(CreateFileW(app.preferences.c_str(),GENERIC_READ|GENERIC_WRITE,FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+                                nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr));
+    OVERLAPPED position{};
+    require(LockFileEx(locked.value,LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY,0,MAXDWORD,MAXDWORD,&position)!=FALSE,
+            "Cannot acquire the owned snapshot-read byte-range lock.");
+    beforePreferenceReplace=[&]{UnlockFileEx(locked.value,0,MAXDWORD,MAXDWORD,&position);locked.close();};
+    // Releasing before an erroneous publication makes this test distinguish a
+    // snapshot read failure from merely being unable to replace a locked file.
+    app.settings.folder=unicodeFolder;choose(app.interval,0);choose(app.videoSize,0);choose(app.encodingQuality,2);
+    preferences(true);beforePreferenceReplace=nullptr;
+    if(locked.value!=INVALID_HANDLE_VALUE){UnlockFileEx(locked.value,0,MAXDWORD,MAXDWORD,&position);locked.close();}
+    require(replacementAttempts==0,"Failed snapshot read reached publication.");
+    require(fixture.bytes()==legacy,"Failed snapshot read changed original bytes.");fixture.onlySettingsRemain();reload();expectOptions(L"C:\\Prior",4,1,0);
+    std::cout<<"PASS real snapshot read lock preserves original bytes/settings without attempting publication\n";
+}
+void preparationAllocationFailure(){
+    PreferencesFixture fixture;fixture.seed(legacy);app.settings.folder=unicodeFolder;
+    choose(app.interval,0);choose(app.videoSize,0);choose(app.encodingQuality,2);
+    const auto failures=preferenceAllocation::failures;preferenceAllocation::failNext=true;
+    preferences(true);
+    preferenceAllocation::failNext=false;
+    require(preferenceAllocation::failures==failures+1,"Preparation allocation fault was not consumed exactly once.");
+    require(keyWrites==0&&replacementAttempts==0&&saveDiagnostics==1,"Preparation failure reached a write or lacked its diagnostic.");
+    require(fixture.bytes()==legacy,"Preparation allocation failure changed original bytes.");
+    fixture.onlySettingsRemain();reload();expectOptions(L"C:\\Prior",4,1,0);
+    app.settings.folder=unicodeFolder;preferences(true);reload();expectOptions(unicodeFolder,4,1,0);fixture.onlySettingsRemain();
+    require(replacementAttempts==1&&saveDiagnostics==1,"Healthy retry after allocation failure did not publish once.");
+    std::cout<<"PASS real preparation allocation failure stays inside preferences, preserves bytes, and permits retry\n";
+}
+void partialKeyWriteFailure(){
+    PreferencesFixture fixture;fixture.seed(legacy);app.settings.folder=unicodeFolder;
+    choose(app.interval,0);choose(app.videoSize,0);choose(app.encodingQuality,2);
+    writeFault=WriteFault::DenySecond;preferences(true);writeFault=WriteFault::None;
+    require(keyWrites==2&&failedKeyWrites==1&&(keyWriteError==ERROR_SHARING_VIOLATION||keyWriteError==ERROR_ACCESS_DENIED),
+            "Expected exactly one real sharing-denied second key write.");
+    require(replacementAttempts==0&&saveDiagnostics==1,"Failed key update reached publication or lacked its diagnostic.");
+    require(fixture.bytes()==legacy,"A partial key write published a mixed settings snapshot.");
+    fixture.onlySettingsRemain();reload();expectOptions(L"C:\\Prior",4,1,0);
+    std::cout<<"PASS real second-key sharing failure preserves the complete original and cleans the staging file\n";
+}
+void stagedExceptionCleanup(){
+    PreferencesFixture fixture;fixture.seed(legacy);app.settings.folder=unicodeFolder;
+    writeFault=WriteFault::ThrowAfterFirst;preferences(true);writeFault=WriteFault::None;
+    require(keyWrites==1&&syntheticExceptions==1&&replacementAttempts==0&&saveDiagnostics==1,
+            "Synthetic staged exception was not contained before publication.");
+    require(fixture.bytes()==legacy,"Synthetic staged exception changed original bytes.");
+    fixture.onlySettingsRemain();reload();expectOptions(L"C:\\Prior",4,1,0);
+    std::cout<<"PASS synthetic post-stage C++ exception is contained and cleans only its owned temporary file\n";
+}
+void preferencePathBoundary(size_t length){
+    std::filesystem::path ownedRoot;
+    {
+        PreferencesFixture fixture(length);ownedRoot=fixture.directory;
+        const auto friendly=app.preferences;
+        const auto temporary=friendly+L"."+std::to_wstring(GetCurrentProcessId())+L"."+std::to_wstring(GetTickCount64())+L".tmp";
+        require(temporary.size()>=MAX_PATH,"Settings temporary suffix did not cross the path boundary.");
+        fixture.seed(utf16(std::wstring(legacy.begin(),legacy.end())));
+        reload();expectOptions(L"C:\\Prior",4,1,0);
+        app.settings.folder=unicodeFolder;choose(app.interval,5);choose(app.videoSize,0);choose(app.encodingQuality,2);
+        preferences(true);reload();expectOptions(unicodeFolder,5,0,2);
+        require(app.preferences==friendly,"File I/O normalization changed the logical preference location.");
+        require(replacementAttempts==1&&replacementError==ERROR_SUCCESS&&saveDiagnostics==0,"Boundary save did not publish once.");
+        expectUtf16(fixture);expectUnknownContent(fixture);fixture.onlySettingsRemain();
+
+        // The replacement lock must keep original bytes and remove a long
+        // temporary sibling, then permit an unlocked update at the same path.
+        const auto before=fixture.bytes();
+        OwnedFile locked(CreateFileW(fileIOPath(friendly).c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr));
+        app.settings.folder=L"C:\\Another selected folder";choose(app.interval,1);choose(app.videoSize,1);choose(app.encodingQuality,0);
+        preferences(true);locked.close();
+        require(replacementAttempts==2&&(replacementError==ERROR_SHARING_VIOLATION||replacementError==ERROR_ACCESS_DENIED)&&saveDiagnostics==1,
+                "Long target did not reach the real replacement lock.");
+        require(fixture.bytes()==before,"Failed long-path replacement changed original bytes.");
+        reload();expectOptions(unicodeFolder,5,0,2);fixture.onlySettingsRemain();
+        app.settings.folder=L"C:\\Another selected folder";choose(app.interval,1);choose(app.videoSize,1);choose(app.encodingQuality,0);
+        preferences(true);reload();expectOptions(L"C:\\Another selected folder",1,1,0);
+        require(replacementAttempts==3&&replacementError==ERROR_SUCCESS&&app.preferences==friendly,"Long-path unlocked retry failed.");
+        expectUnknownContent(fixture);fixture.onlySettingsRemain();
+    }
+    require(GetFileAttributesW(fileIOPath(ownedRoot.wstring()).c_str())==INVALID_FILE_ATTRIBUTES,"Owned long-path fixture was not cleaned.");
+    std::cout<<"PASS settings path "<<length<<": real load/save, preserved values/content, locked replacement cleanup and retry\n";
+}
+}
+
+int main(){
+    try{
+        std::cout<<std::unitbuf;std::cout<<"ACP="<<GetACP()<<'\n';
+        HiddenControls controls;
+        newUnicodeFile();existingUnicodeRewrite();migrateAnsi();readFailure();replacementFailure();
+        preparationAllocationFailure();partialKeyWriteFailure();stagedExceptionCleanup();
+        preferencePathBoundary(248);preferencePathBoundary(278);
+        require(!IsWindowVisible(app.window),"Fixture became visible.");
+        std::cout<<"All 10 preference cases passed; only owned hidden controls/settings were used.\n";return 0;
+    }catch(const std::exception& error){std::cerr<<"PREFERENCES TEST FAILURE: "<<error.what()<<'\n';return 1;}
+}

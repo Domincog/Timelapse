@@ -156,8 +156,8 @@ int hostMain(const wchar_t* mappingName) {
 struct CameraClient::Impl {
     Handle mapping, mutex, stopEvent, process, job;
     View view;
-    uint64_t started = 0, lastFrame = 0, generation = 0;
-    bool delivered = false;
+    uint64_t started = 0, contentionSince = 0, generation = 0;
+    bool delivered = false, contended = false;
 };
 
 CameraClient::CameraClient() : impl_(std::make_unique<Impl>()) {}
@@ -232,7 +232,8 @@ void CameraClient::stop() {
     // The unnamed job also guarantees cleanup after a crash or forced app exit.
     impl_->job.reset(); impl_->process.reset();
     impl_->view.reset(); impl_->mapping.reset(); impl_->mutex.reset(); impl_->stopEvent.reset();
-    impl_->started = impl_->lastFrame = impl_->generation = 0; impl_->delivered = false;
+    impl_->started = impl_->contentionSince = impl_->generation = 0;
+    impl_->delivered = impl_->contended = false;
 }
 
 bool CameraClient::latest(Frame& output, std::wstring& error) {
@@ -243,12 +244,20 @@ bool CameraClient::latest(Frame& output, std::wstring& error) {
     if (lock.result == WAIT_ABANDONED) { error = L"The camera helper stopped while sharing a frame. Try again."; return false; }
     if (lock.result == WAIT_FAILED) return fail(error, L"Windows could not read the camera frame.");
     if (!lock.acquired()) {
-        if (!impl_->delivered && now - impl_->started > 8000)
-            error = L"The camera did not start within 8 seconds. Check Windows camera access and reconnect it.";
-        else if (impl_->delivered && now - impl_->lastFrame > 3000)
-            error = L"No fresh camera frame arrived for 3 seconds. Check the camera connection and try again.";
+        if (WaitForSingleObject(impl_->process.value, 0) == WAIT_OBJECT_0) {
+            error = L"The camera helper stopped unexpectedly. Reconnect the camera and try again."; return false;
+        }
+        // A slow consumer can miss many healthy publications. A brief mutex
+        // collision cannot establish that the producer's latest frame is stale.
+        if (!impl_->contended) {
+            impl_->contended = true;
+            impl_->contentionSince = now;
+        } else if (now - impl_->contentionSince > (impl_->delivered ? 3000 : 8000)) {
+            error = L"Camera frame sharing stayed unavailable. Reconnect the camera and try again.";
+        }
         return false;
     }
+    impl_->contended = false; impl_->contentionSince = 0;
     const auto& shared = *impl_->view.value;
     if (!validHeader(shared)) { error = L"The camera helper returned invalid data. Try again."; return false; }
     if (shared.state == HostState::Failed) {
@@ -278,7 +287,7 @@ bool CameraClient::latest(Frame& output, std::wstring& error) {
         output.pixels.resize(shared.bytes);
         std::memcpy(output.pixels.data(), shared.pixels, shared.bytes);
         output.width = int(shared.width); output.height = int(shared.height);
-        impl_->delivered = true; impl_->lastFrame = shared.receivedTick; impl_->generation = shared.generation;
+        impl_->delivered = true; impl_->generation = shared.generation;
         return true;
     } catch (const std::bad_alloc&) { error = L"Not enough memory to read the camera frame."; return false; }
 }

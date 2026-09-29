@@ -24,6 +24,7 @@ struct Frame {
 struct Rect { double x = 0, y = 0, w = 1, h = 1; };
 enum class Source { Desktop, Camera };
 enum class Mode { Desktop, Camera, Overlay, SideBySide, Custom };
+enum class EncodingQuality { Compact, Balanced, Detail };
 struct Layer { Source source; Rect rect; };
 std::vector<Layer> preset(Mode mode);
 Rect constrain(Rect rect);
@@ -33,4 +34,7 @@ Rect constrain(Rect rect);
 bool compose(const Frame* desktop, const Frame* camera, const std::vector<Layer>& layers,
              int width, int height, Frame& output, std::wstring& error);
 std::wstring errorText(HRESULT hr);
+// Prepare ordinary absolute paths for Windows file I/O without changing their
+// user-visible spelling. Relative and device paths retain their existing form.
+std::wstring fileIOPath(const std::wstring& path);
 }

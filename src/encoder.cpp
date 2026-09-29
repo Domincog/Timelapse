@@ -5,6 +5,7 @@
 #include <wrl/client.h>
 #include <limits>
 #include <algorithm>
+#include <cstring>
 #include <codecapi.h>
 
 namespace lapse {
@@ -15,6 +16,10 @@ constexpr LONGLONG ticksPerSecond = 10000000;
 bool fail(std::wstring& error, const wchar_t* operation, HRESULT hr) {
     error = std::wstring(operation) + L": " + errorText(hr);
     return false;
+}
+
+void appendCleanupError(std::wstring& error, const std::wstring& path, HRESULT hr) {
+    if (FAILED(hr)) error += L" Could not remove the incomplete output file (" + path + L"): " + errorText(hr);
 }
 
 HRESULT setVideoType(IMFMediaType* type, REFGUID subtype, int width, int height, int fps) {
@@ -67,8 +72,13 @@ void toNv12(const Frame& frame, BYTE* target) {
 struct Encoder::Impl {
     ComPtr<IMFSinkWriter> writer;
     ComPtr<IMFByteStream> bytes;
+    HANDLE file = INVALID_HANDLE_VALUE;
     std::wstring path;
-    std::wstring finishError;
+    // Retain the terminal outcome before allocating any diagnostic text.
+    HRESULT finishResult = S_OK, finishCleanup = S_OK;
+    bool finishEmpty = false;
+    bool publicationAttempted = false;
+    DWORD publicationResult = ERROR_INVALID_STATE;
     DWORD stream = 0;
     DWORD bufferSize = 0;
     int width = 0;
@@ -77,11 +87,54 @@ struct Encoder::Impl {
     LONGLONG frames = 0;
     bool writing = false;
 
+    ~Impl() {
+        release();
+        releaseFile(frames == 0);
+    }
+
     void release() {
         writer.Reset();
         if (bytes) bytes->Close();
         bytes.Reset();
         writing = false;
+    }
+
+    HRESULT releaseFile(bool discard) {
+        if (file == INVALID_HANDLE_VALUE) return S_OK;
+        HRESULT result = S_OK;
+        if (discard) {
+            FILE_DISPOSITION_INFO disposition{TRUE};
+            if (!SetFileInformationByHandle(file, FileDispositionInfo, &disposition, sizeof(disposition)))
+                result = HRESULT_FROM_WIN32(GetLastError());
+        }
+        CloseHandle(file);
+        file = INVALID_HANDLE_VALUE;
+        return result;
+    }
+
+    void finalize(bool retainFile = false) {
+        if (writer) {
+            finishEmpty = frames == 0;
+            finishResult = writing ? writer->Finalize() : S_OK;
+            // Release MF before owned-file cleanup or handle publication.
+            // Preserve terminal results before allocating diagnostics.
+            release();
+        }
+        if (file != INVALID_HANDLE_VALUE && (!retainFile || finishEmpty))
+            finishCleanup = releaseFile(finishEmpty);
+    }
+
+    bool finish(std::wstring& error, bool retainFile) {
+        error.clear();
+        finalize(retainFile);
+        if (finishEmpty) {
+            error = L"No video frames were recorded.";
+            appendCleanupError(error, path, finishCleanup);
+            return false;
+        }
+        if (FAILED(finishResult))
+            return fail(error, L"Cannot finalize the MP4 file", finishResult);
+        return true;
     }
 
     // Quotient/remainder avoids cumulative rounding error at rates like 30 fps.
@@ -91,17 +144,12 @@ struct Encoder::Impl {
 };
 
 Encoder::Encoder() : impl_(std::make_unique<Impl>()) {}
-Encoder::~Encoder() {
-    if (impl_->writer) {
-        impl_->writer->Finalize();
-        impl_->release();
-        if (impl_->frames == 0) DeleteFileW(impl_->path.c_str());
-    }
-}
+Encoder::~Encoder() { impl_->finalize(); }
 
-bool Encoder::open(const std::wstring& path, int width, int height, int fps, std::wstring& error) {
+bool Encoder::open(const std::wstring& path, int width, int height, int fps, std::wstring& error,
+                   EncodingQuality quality) {
     error.clear();
-    if (impl_->writer) {
+    if (impl_->writer || impl_->file != INVALID_HANDLE_VALUE) {
         error = L"Finish the current recording before opening another output file.";
         return false;
     }
@@ -122,23 +170,35 @@ bool Encoder::open(const std::wstring& path, int width, int height, int fps, std
         error = L"Playback frame rate must be between 1 and 120.";
         return false;
     }
+    if (quality != EncodingQuality::Compact && quality != EncodingQuality::Balanced && quality != EncodingQuality::Detail) {
+        error = L"Choose a valid video quality.";
+        return false;
+    }
 
     auto candidate = std::make_unique<Impl>();
-    candidate->path = path;
+    candidate->path = fileIOPath(path);
     candidate->width = width;
     candidate->height = height;
     candidate->fps = fps;
     candidate->bufferSize = static_cast<DWORD>(pixels * 3 / 2);
-    HRESULT hr = MFCreateFile(MF_ACCESSMODE_READWRITE, MF_OPENMODE_FAIL_IF_EXIST,
-                             MF_FILEFLAGS_NONE, path.c_str(), &candidate->bytes);
-    if (FAILED(hr)) {
-        return fail(error, L"Cannot create the output file (choose an unused filename)", hr);
+    // Deny rename/deletion while MF binds and writes. DELETE-only access lets
+    // MF retain its existing restriction on external writers. Cleanup acts on
+    // this owned object rather than a pathname another process could reuse.
+    candidate->file = CreateFileW(candidate->path.c_str(), DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                  nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (candidate->file == INVALID_HANDLE_VALUE) {
+        return fail(error, L"Cannot create the output file (choose an unused filename)", HRESULT_FROM_WIN32(GetLastError()));
     }
     auto abandon = [&](const wchar_t* stage, HRESULT result) {
         candidate->release();
-        DeleteFileW(path.c_str()); // Only the new file created by this open().
-        return fail(error, stage, result);
+        const HRESULT cleanup = candidate->releaseFile(true);
+        fail(error, stage, result);
+        appendCleanupError(error, candidate->path, cleanup);
+        return false;
     };
+    HRESULT hr = MFCreateFile(MF_ACCESSMODE_READWRITE, MF_OPENMODE_FAIL_IF_NOT_EXIST,
+                             MF_FILEFLAGS_NONE, candidate->path.c_str(), &candidate->bytes);
+    if (FAILED(hr)) return abandon(L"Cannot access the new output file", hr);
 
     ComPtr<IMFAttributes> attributes;
     hr = MFCreateAttributes(&attributes, 1);
@@ -152,11 +212,12 @@ bool Encoder::open(const std::wstring& path, int width, int height, int fps, std
     ComPtr<IMFMediaType> output;
     hr = MFCreateMediaType(&output);
     if (SUCCEEDED(hr)) hr = setVideoType(output.Get(), MFVideoFormat_H264, width, height, fps);
-    const UINT32 bitrate = UINT32(std::clamp<int64_t>(int64_t(width) * height * fps / 5, 1000000, 28000000));
+    const int divisor = quality == EncodingQuality::Compact ? 10 : quality == EncodingQuality::Detail ? 4 : 7;
+    const UINT32 bitrate = UINT32(std::clamp<int64_t>(int64_t(width) * height * fps / divisor, 500000, 28000000));
     if (SUCCEEDED(hr)) hr = output->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
-    // Baseline avoids B-frame reordering and decoder preroll shifts, keeping
-    // even a one-frame timelapse playable from timestamp zero.
-    if (SUCCEEDED(hr)) hr = output->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Base);
+    // Main profile enables more efficient entropy coding. Explicitly disable
+    // B frames below so even a one-frame timelapse starts at timestamp zero.
+    if (SUCCEEDED(hr)) hr = output->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main);
     if (SUCCEEDED(hr)) hr = candidate->writer->AddStream(output.Get(), &candidate->stream);
     if (FAILED(hr)) return abandon(L"Cannot configure H.264 output", hr);
 
@@ -170,9 +231,19 @@ bool Encoder::open(const std::wstring& path, int width, int height, int fps, std
     // Configure before media-type negotiation allocates encoder buffers.
     // Timelapse needs only a few workers, with no multi-frame batching.
     ComPtr<IMFAttributes> encoding;
-    if (SUCCEEDED(hr)) hr = MFCreateAttributes(&encoding, 2);
+    if (SUCCEEDED(hr)) hr = MFCreateAttributes(&encoding, 7);
     if (SUCCEEDED(hr)) hr = encoding->SetUINT32(CODECAPI_AVEncNumWorkerThreads, 2);
     if (SUCCEEDED(hr)) hr = encoding->SetUINT32(CODECAPI_AVLowLatencyMode, TRUE);
+    if (SUCCEEDED(hr)) hr = encoding->SetUINT32(CODECAPI_AVEncH264CABACEnable, TRUE);
+    if (SUCCEEDED(hr)) hr = encoding->SetUINT32(CODECAPI_AVEncMPVDefaultBPictureCount, 0);
+    // Detail prioritizes retained image information instead of a target size.
+    // The other presets retain their target-bitrate policy.
+    const auto rateControl = quality == EncodingQuality::Detail
+        ? eAVEncCommonRateControlMode_Quality : eAVEncCommonRateControlMode_UnconstrainedVBR;
+    if (SUCCEEDED(hr)) hr = encoding->SetUINT32(CODECAPI_AVEncCommonRateControlMode, rateControl);
+    if (SUCCEEDED(hr) && quality == EncodingQuality::Detail)
+        hr = encoding->SetUINT64(CODECAPI_AVEncVideoEncodeQP, 18);
+    if (SUCCEEDED(hr)) hr = encoding->SetUINT32(CODECAPI_AVEncCommonQualityVsSpeed, 100);
     if (SUCCEEDED(hr)) hr = candidate->writer->SetInputMediaType(candidate->stream, input.Get(), encoding.Get());
     if (FAILED(hr)) return abandon(L"Cannot initialize the H.264 encoder", hr);
     hr = candidate->writer->BeginWriting();
@@ -220,29 +291,38 @@ bool Encoder::write(const Frame& frame, std::wstring& error) {
     return true;
 }
 
-bool Encoder::finish(std::wstring& error) {
-    error.clear();
-    if (!impl_->writer) {
-        error = impl_->finishError;
-        return error.empty();
-    }
-    const bool empty = impl_->frames == 0;
-    const HRESULT hr = impl_->writing ? impl_->writer->Finalize() : S_OK;
-    // Finalize flushes pending samples and writes the MP4 index. The sink can
-    // close its byte stream during Finalize, so a subsequent Flush may return
-    // E_INVALIDARG even for a completely valid, successfully finalized video.
-    impl_->release();
-    if (empty) {
-        DeleteFileW(impl_->path.c_str());
-        error = impl_->finishError = L"No video frames were recorded.";
-        return false;
-    }
-    if (FAILED(hr)) {
-        fail(impl_->finishError, L"Cannot finalize the MP4 file", hr);
-        error = impl_->finishError;
-        return false;
-    }
-    return true;
+bool Encoder::finish(std::wstring& error) { return impl_->finish(error, false); }
+
+bool Encoder::finishForPublication(std::wstring& error) { return impl_->finish(error, true); }
+
+DWORD Encoder::publish(const std::wstring& destination) {
+    if (impl_->publicationAttempted) return impl_->publicationResult;
+    if (impl_->writer || impl_->file == INVALID_HANDLE_VALUE || impl_->frames == 0 || FAILED(impl_->finishResult))
+        return ERROR_INVALID_STATE;
+    if (destination.empty() || destination.find(L'\0') != std::wstring::npos)
+        return ERROR_INVALID_NAME;
+    const auto path = fileIOPath(destination);
+    if (path.size() > (std::numeric_limits<DWORD>::max() - sizeof(FILE_RENAME_INFO)) / sizeof(wchar_t))
+        return ERROR_FILENAME_EXCED_RANGE;
+    const size_t nameBytes = path.size() * sizeof(wchar_t);
+    const DWORD bufferSize = static_cast<DWORD>(sizeof(FILE_RENAME_INFO) + nameBytes);
+    std::vector<BYTE> buffer(bufferSize, 0);
+    auto* rename = reinterpret_cast<FILE_RENAME_INFO*>(buffer.data());
+    rename->ReplaceIfExists = FALSE;
+    rename->RootDirectory = nullptr;
+    rename->FileNameLength = static_cast<DWORD>(nameBytes);
+    std::memcpy(rename->FileName, path.c_str(), nameBytes);
+    // All allocation precedes this identity-bound operation. Keep the guard
+    // through Engine's success/failure message and status commit. A retry
+    // reports this result without ever renaming a reused pathname.
+    const BOOL renamed = SetFileInformationByHandle(impl_->file, FileRenameInfo, rename, bufferSize);
+    impl_->publicationResult = renamed ? ERROR_SUCCESS : GetLastError();
+    impl_->publicationAttempted = true;
+    return impl_->publicationResult;
+}
+
+void Encoder::releasePublication() noexcept {
+    if (!impl_->writer) impl_->releaseFile(false);
 }
 
 uint64_t Encoder::frames() const { return uint64_t(impl_->frames); }

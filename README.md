@@ -10,19 +10,33 @@ A small native Windows timelapse recorder. Record a display, a camera, or both i
 4. In a collage, click and drag a source to move it. Drag its lower-right corner to resize it. Use Bring forward to change overlap. Changes during recording appear in subsequent frames.
 5. Press Record. Pause skips recording until resumed; Finish finalizes the MP4. Open folder shows the saved files. The default destination is Videos/Timelapse.
 
-Tab moves between controls. In the collage preview, Space cycles between sources, arrow keys move the selected source, and Shift + arrow keys resize it. Reset layout restores the preset.
+Tab moves between controls, and Alt + O opens the save folder. In the collage preview, Space cycles between sources, arrow keys move the selected source, and Shift + arrow keys resize it. Using these keys while dragging ends the current drag and preserves the keyboard edit. Reset layout restores the preset.
+
+On smaller work areas, scroll to reach the preview and controls. The wheel scrolls vertically, Shift + wheel scrolls horizontally, and keyboard navigation brings focused controls into view.
+
+The quality selector offers Smaller file, Balanced, and More detail. Balanced is the default. More detail prioritizes image detail; its file size depends on the scene and can grow substantially with motion, texture, or frequent cuts.
 
 Desktop capture excludes this app's window on supported Windows versions. Minimize the app to stop preview updates while recording continues. Camera modes activate the camera for preview and recording. The app starts in Desktop mode so opening it does not silently activate a camera.
 
+Switching sources or devices clears the previous preview until the new selection produces a frame.
+
+Refresh keeps the selected camera and display when the device list changes. If a selected source is unavailable, choose a replacement or refresh after it returns. Record stays disabled while a source needed by the current layout is unavailable.
+
+Recording follows the selected display's identity and current bounds. If the display is missing or changes while a recording frame is captured, that frame is rejected and recording stops, attempting to save earlier frames.
+
+Saving keeps ownership of the original recording through finalization and the final filename change. An existing destination is never overwritten. If the filename change fails, the status message identifies the finished video retained at its `.recording.mp4` path. If finalization itself fails, any retained partial file may be incomplete. Save folders and preference files support long local Windows paths and Unicode names.
+
 ## Build and verify
 
-Install CMake and Visual Studio 2019 or 2022 Build Tools with the Desktop development with C++ workload and Windows 10 SDK. Run from PowerShell:
+Install CMake 3.20 or later (3.21 or later for Visual Studio 2022) and Visual Studio 2019 or 2022 Build Tools with the Desktop development with C++ workload and Windows 10 SDK. Run from PowerShell:
 
 ```powershell
 .\build.ps1 -Test
 ```
 
-The portable executable is copied to `dist/Timelapse.exe`. The build statically links the C++ runtime. Automated tests exercise compositor geometry and pixels, actual MP4 encoding and decoding, and recording lifecycle behavior through Windows Media Foundation. The desktop integration test requires an unlocked interactive Windows session with desktop capture access.
+Successful builds publish `dist/Timelapse.exe`, `dist/Timelapse-portable.zip`, and `dist/SHA256SUMS.txt`. These files are prepared before replacing the previous distribution. If publication fails, the script attempts to restore the previous files. If recovery cannot finish, the error identifies the retained staging folder.
+
+The build statically links the C++ runtime. Automated tests exercise compositor geometry and pixels, actual MP4 encoding and decoding, and recording lifecycle behavior through Windows Media Foundation. The desktop integration test requires an unlocked interactive Windows session with desktop capture access.
 
 If PowerShell scripts are disabled, run the equivalent commands directly (use `Visual Studio 17 2022` for VS 2022):
 
@@ -31,6 +45,8 @@ cmake -S . -B build -G "Visual Studio 16 2019" -A x64
 cmake --build build --config Release --parallel
 ctest --test-dir build -C Release --output-on-failure
 ```
+
+For checks that use only synthetic capture sources, add `-E "^engine_tests$"` to the CTest command. This excludes the desktop recording integration test.
 
 The executable is then in `build/release/Timelapse.exe`. Developers can launch it with `--inspect-ui` to allow window screenshots during visual QA; normal launches exclude the app from desktop capture.
 
@@ -41,8 +57,9 @@ The executable is then in `build/release/Timelapse.exe`. Developers can launch i
 - MP4 is finalized when Finish is pressed or the app closes normally. A power loss or forced termination can leave an unplayable `.recording.mp4` file; crash recovery is not implemented yet.
 - Windows N requires the Media Feature Pack. The portable executable is currently unsigned.
 - Camera compatibility and performance vary by device; automated media tests use generated frames and do not establish physical-camera compatibility.
+- Display identity uses a Windows monitor interface when available, with a GDI display-name fallback. The fallback cannot distinguish a replacement using the same name; changes that disappear and return entirely within one capture can escape detection.
 
-The app retains the latest preview and camera frame, and writes samples incrementally. Preview runs at two frames per second when idle and one while recording; minimized windows do not generate preview frames. There is no growing in-memory recording buffer. While recording, the app requests that Windows stay awake; pausing or finishing releases this request. Manual locking is still respected.
+The app retains the latest preview and camera frame, and writes samples incrementally. Preview runs at two frames per second when idle and one while recording; minimized windows do not generate preview frames. There is no growing in-memory recording buffer. The app requests that Windows stay awake while recording or saving. It releases the request while paused and after saving finishes. Manual locking is still respected.
 
 Camera access runs in a private helper process launched from the same executable. A stuck camera driver can be stopped without trapping the app in shutdown. The helper exits with its parent and uses only local shared memory; there are no network services.
 
@@ -55,4 +72,15 @@ Media implementation references: [Microsoft's sink writer tutorial](https://lear
 - `CMakeLists.txt` and `build.ps1`: build and test the app.
 - `package.ps1`: create a portable release ZIP and a source ZIP from a Release build.
 
-After building and testing, run `./package.ps1` to create both archives in `packages/`. The release ZIP is intended for GitHub Releases. Extract the source ZIP into the repository root; build files, test recordings, and local settings are excluded.
+After building and testing, run `./package.ps1` to create both archives in `packages/`. The release ZIP is intended for GitHub Releases. Extract the source ZIP into an empty folder, then run the build commands from that folder; build outputs, test recordings, and local settings are excluded.
+
+Archives and checksums are prepared before replacing existing packages. If publication fails, the script attempts to restore the previous files. If recovery cannot finish, the error names the staging directory containing the backups.
+
+Run the distribution and packaging regression checks with:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\build_tests.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\package_tests.ps1
+```
+
+They use temporary projects and dummy executable bytes. The build-script checks substitute the build and test commands, so they do not compile or launch the app.

@@ -6,6 +6,8 @@
 /engine-recovery-*/
 /engine-storage-*/
 /recording-soak-*/
+/encoding-quality-*/
+/engine-efficiency-*/
 *.user
 *.obj
 *.pdb

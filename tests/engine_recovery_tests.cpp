@@ -60,7 +60,8 @@ bool CameraClient::latest(Frame& output, std::wstring& error) {
     if (impl_->warmup > 0) { --impl_->warmup; return false; }
     output = pixels(); return true;
 }
-bool captureDesktop(const RECT&, int width, int, bool, Frame& output, std::wstring& error) {
+bool captureMonitor(const std::wstring& id, int width, int, bool, Frame& output, std::wstring& error) {
+    if (id != L"synthetic-display") { error = L"Unknown synthetic display."; return false; }
     error.clear();
     if (width == 640) {
         if (throwDesktopPreview.exchange(false)) throw std::bad_alloc();
@@ -79,7 +80,7 @@ int main() {
         (L"engine-recovery-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
     try {
         {
-            lapse::Settings settings;
+            lapse::Settings settings; settings.monitorId = L"synthetic-display";
             settings.layers = lapse::preset(lapse::Mode::Camera);
             settings.cameraId = L"controlled-test-camera";
             settings.width = 320; settings.height = 240; settings.interval = 1;
@@ -160,7 +161,7 @@ int main() {
             // At a long sample interval, desktop preview work happens between
             // due video frames. Its failure must not truncate a good recording
             // or close the healthy camera used by the same overlay.
-            lapse::Settings settings;
+            lapse::Settings settings; settings.monitorId = L"synthetic-display";
             settings.layers = lapse::preset(lapse::Mode::Overlay);
             settings.cameraId = L"controlled-test-camera";
             settings.width = 320; settings.height = 240; settings.interval = 30;

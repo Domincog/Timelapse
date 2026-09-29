@@ -2,12 +2,14 @@
 #include "core.h"
 
 namespace lapse {
-struct Monitor { std::wstring name; RECT bounds{}; };
+struct Monitor { std::wstring name; RECT bounds{}; std::wstring id; };
 struct CameraDevice { std::wstring name; std::wstring id; };
 std::vector<Monitor> enumerateMonitors();
 // The caller initializes COM and Media Foundation.
 std::vector<CameraDevice> enumerateCameras(std::wstring& error);
 bool captureDesktop(const RECT& bounds, int maxWidth, int maxHeight, bool cursor,
+                    Frame& output, std::wstring& error);
+bool captureMonitor(const std::wstring& id, int maxWidth, int maxHeight, bool cursor,
                     Frame& output, std::wstring& error);
 // Own and use on one worker thread. False + empty error from latest means
 // the camera is warming up; latest never waits for a new camera sample.

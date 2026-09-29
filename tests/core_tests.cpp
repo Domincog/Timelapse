@@ -1,8 +1,9 @@
-﻿#include "core.h"
+#include "core.h"
 #include <algorithm>
 #include <cmath>
 #include <iostream>
 #include <limits>
+#include "error_text_fixture.h"
 
 namespace {
 int failures = 0;
@@ -31,6 +32,19 @@ bool darkPixel(const lapse::Frame& frame, int x, int y) {
     const size_t offset = (size_t(y) * frame.width + x) * 4;
     return frame.pixels[offset] <= 40 && frame.pixels[offset + 1] <= 40 &&
            frame.pixels[offset + 2] <= 40 && frame.pixels[offset + 3] == 255;
+}
+void filePaths() {
+    using lapse::fileIOPath;
+    check(fileIOPath(L"C:\\Videos\\clip.mp4") == L"\\\\?\\C:\\Videos\\clip.mp4",
+          "absolute drive paths use extended I/O spelling");
+    check(fileIOPath(L"C:/Save Folder/../Videos/\u65e5\u672c.mp4") == L"\\\\?\\C:\\Videos\\\u65e5\u672c.mp4",
+          "ordinary absolute paths normalize separators and dot segments before prefixing");
+    check(fileIOPath(L"\\\\server\\share\\folder\\..\\clip.mp4") == L"\\\\?\\UNC\\server\\share\\clip.mp4",
+          "absolute UNC paths retain their server/share in extended spelling");
+    for (const auto* path : {L"", L"relative\\clip.mp4", L"C:clip.mp4", L"\\clip.mp4",
+                            L"\\\\?\\C:\\Videos\\clip.mp4", L"\\\\?\\UNC\\server\\share\\clip.mp4", L"\\\\.\\pipe\\owned"}) {
+        check(fileIOPath(path) == path, "relative, already extended and device paths retain their spelling");
+    }
 }
 void geometry() {
     using namespace lapse;
@@ -135,11 +149,59 @@ void failuresAndLimits() {
     check(errorText(static_cast<HRESULT>(0xA1234567)).find(L"A1234567") != std::wstring::npos,
           "unknown HRESULT still produces a useful diagnostic");
 }
+void errorFormattingAndAllocationCleanup() {
+    coreTestError = {};
+    coreTestError.enabled = true;
+    const std::pair<std::wstring, std::wstring> cases[] = {
+        {L"Synthetic failure.\r\n  ", L"Synthetic failure. (0x80070005)"},
+        {L"\u65e5\u672c %1!s! %2\r\n", L"\u65e5\u672c %1!s! %2 (0x80070005)"},
+        {L"First\nsecond\t \r\n", L"First\nsecond\t (0x80070005)"},
+        {L" \r\n ", L"The operation failed (0x80070005)"}
+    };
+    for (const auto& c : cases) {
+        coreTestError.message = c.first;
+        check(lapse::errorText(E_ACCESSDENIED) == c.second,
+              "error text retains Unicode/inserts and trims only trailing CR/LF/spaces");
+        check(!coreTestError.allocation && coreTestError.allocations == coreTestError.frees && !coreTestError.mismatchedFrees,
+              "successful error formatting releases each message allocation exactly once");
+    }
+    coreTestError.failLookup = true;
+    const int allocationsBefore = coreTestError.allocations;
+    check(lapse::errorText(static_cast<HRESULT>(0xA1234567)) == L"The operation failed (0xA1234567)" &&
+          coreTestError.allocations == allocationsBefore && coreTestError.code == 0xA1234567,
+          "failed message lookup preserves native fallback text and exact HRESULT without allocating a buffer");
+    coreTestError.failLookup = false;
+    coreTestError.message.assign(1000, L'x');
+    coreTestError.failCopy = true;
+    const int freesBefore = coreTestError.frees;
+    const int faultAllocationsBefore = coreTestError.allocations;
+    bool caught = false;
+    try { (void)lapse::errorText(E_OUTOFMEMORY); } catch (const std::bad_alloc&) { caught = true; }
+    coreTestFailNextAllocation = false;
+    std::cout << "error_text_copy_fault: caught=" << caught
+              << " buffers_allocated=" << coreTestError.allocations - faultAllocationsBefore
+              << " buffers_freed=" << coreTestError.frees - freesBefore
+              << " buffer_retained=" << (coreTestError.allocation != nullptr) << '\n';
+    check(caught && coreTestError.allocations == faultAllocationsBefore + 1 &&
+          coreTestError.frees == freesBefore + 1 && !coreTestError.allocation && !coreTestError.mismatchedFrees,
+          "failed message string allocation releases its FormatMessage buffer exactly once while unwinding");
+    // Keep the fixture safe when replaying this regression against old source.
+    if (coreTestError.allocation) { ::LocalFree(coreTestError.allocation); coreTestError.allocation = nullptr; }
+    coreTestError.failCopy = false;
+    check(lapse::errorText(E_OUTOFMEMORY) == coreTestError.message + L" (0x8007000E)" && !coreTestError.allocation,
+          "error formatting recovers after a one-shot allocation failure");
+    check(coreTestError.argumentsValid && coreTestError.code == static_cast<DWORD>(E_OUTOFMEMORY),
+          "error formatting uses system messages with ignored inserts and the complete HRESULT");
+    coreTestError.enabled = false;
+}
+
 }
 int main() {
+    filePaths();
     geometry();
     composition();
     failuresAndLimits();
+    errorFormattingAndAllocationCleanup();
     if (failures) { std::cerr << failures << " check(s) failed\n"; return 1; }
     std::cout << "All core checks passed\n";
     return 0;

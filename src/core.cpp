@@ -1,4 +1,5 @@
 #include "core.h"
+#include <filesystem>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -164,6 +165,22 @@ bool compose(const Frame* desktop, const Frame* camera, const std::vector<Layer>
     return false;
 }
 
+std::wstring fileIOPath(const std::wstring& path) {
+    const std::filesystem::path filename(path);
+    if (!filename.is_absolute() || path.rfind(L"\\\\?\\", 0) == 0 || path.rfind(L"\\\\.\\", 0) == 0)
+        return path;
+    // Dot segments and forward slashes must be resolved before adding the
+    // extended prefix, which disables ordinary Win32 path normalization.
+    const DWORD required = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
+    if (!required || required > 32768) return path;
+    std::wstring normalized(required, L'\0');
+    const DWORD length = GetFullPathNameW(path.c_str(), required, normalized.data(), nullptr);
+    if (!length || length >= required) return path;
+    normalized.resize(length);
+    return normalized.rfind(L"\\\\", 0) == 0
+        ? L"\\\\?\\UNC\\" + normalized.substr(2) : L"\\\\?\\" + normalized;
+}
+
 std::wstring errorText(HRESULT hr) {
     wchar_t code[16]{};
     swprintf_s(code, L"0x%08X", static_cast<unsigned>(hr));
@@ -172,9 +189,9 @@ std::wstring errorText(HRESULT hr) {
                                        FORMAT_MESSAGE_IGNORE_INSERTS,
                                        nullptr, static_cast<DWORD>(hr), 0,
                                        reinterpret_cast<wchar_t*>(&message), 0, nullptr);
+    const std::unique_ptr<wchar_t, decltype(&LocalFree)> owned(message, &LocalFree);
     std::wstring result;
-    if (count && message) result.assign(message, count);
-    if (message) LocalFree(message);
+    if (count && owned) result.assign(owned.get(), count);
     while (!result.empty() && (result.back() == L'\r' || result.back() == L'\n' || result.back() == L' '))
         result.pop_back();
     if (result.empty()) result = L"The operation failed";
