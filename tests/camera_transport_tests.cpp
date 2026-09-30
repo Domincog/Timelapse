@@ -214,7 +214,7 @@ public:
         require(WaitForSingleObject(mutex.value, 1000) == WAIT_OBJECT_0, "inspect shared header under actual mutex");
         const SharedHeader result = *static_cast<const SharedHeader*>(view_.value);
         ReleaseMutex(mutex.value);
-        require(result.magic == 0x4C43414D && result.version == 3, "expected shared protocol");
+        require(result.magic == 0x4C43414D && result.version == 4, "expected shared protocol");
         return result;
     }
     LONG copies() {

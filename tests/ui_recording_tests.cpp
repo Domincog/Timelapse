@@ -86,6 +86,10 @@ bool CameraClient::nightResult(uint64_t, Frame&, NightWindowResult&, std::wstrin
     error = L"Unexpected night result in ordinary-mode fixture."; return false;
 }
 void CameraClient::cancelNight() noexcept {}
+bool CameraClient::observeActivity(uint64_t, CameraObservation&, std::wstring& error) {
+    error=L"Unexpected activity observer in ordinary recording fixture.";return false;
+}
+void CameraClient::cancelActivityObservation() noexcept {}
 struct CameraClient::Impl {};
 CameraClient::CameraClient():impl_(std::make_unique<Impl>()){}
 CameraClient::~CameraClient(){}

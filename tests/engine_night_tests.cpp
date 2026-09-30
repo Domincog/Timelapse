@@ -242,6 +242,10 @@ void shutdownPending(const std::filesystem::path& root) {
 }
 }
 namespace lapse {
+bool CameraClient::observeActivity(uint64_t, CameraObservation&, std::wstring& error) {
+    error = L"Unexpected activity observer in an Off-mode fixture."; return false;
+}
+void CameraClient::cancelActivityObservation() noexcept {}
 struct CameraClient::Impl {bool active=false;uint64_t token=0,start=0;uint32_t duration=0;};
 CameraClient::CameraClient():impl_(std::make_unique<Impl>()){}
 CameraClient::~CameraClient()=default;

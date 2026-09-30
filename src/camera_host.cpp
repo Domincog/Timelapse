@@ -7,11 +7,12 @@
 #include <cwchar>
 #include <new>
 #include <limits>
+#include <optional>
 
 namespace lapse {
 namespace {
 constexpr uint32_t protocolMagic = 0x4C43414D;
-constexpr uint32_t protocolVersion = 3;
+constexpr uint32_t protocolVersion = 4;
 constexpr uint32_t maxWidth = 1280, maxHeight = 720;
 constexpr size_t maxPixels = size_t(maxWidth) * maxHeight * 4;
 constexpr size_t idCapacity = 4096;
@@ -19,6 +20,7 @@ constexpr wchar_t mappingPrefix[] = L"Local\\Timelapse.Camera.";
 enum class HostState : uint32_t { Starting = 1, Ready, Failed, Stopped };
 enum class PixelRequest : uint32_t { Preview, Night };
 enum class NightState : uint32_t { Idle, Waiting, Integrating, Complete, Failed };
+enum class ObservationState : uint32_t { Pending, Ready, Duplicate, Failed };
 
 struct SharedFrame {
     uint32_t magic, version;
@@ -42,6 +44,15 @@ struct SharedFrame {
     NightState nightState;
     NightWindowResult nightResult;
     wchar_t nightError[512];
+    // Independent of the full-pixel slot: acknowledgements without fresh
+    // source bytes must never relabel an earlier descriptor as a new image.
+    uint64_t observationRequested, observationCompleted;
+    uint64_t observationToken, observationCompletedToken;
+    uint64_t observationPublished, observationPublishedToken;
+    alignas(8) volatile LONG64 observationCancelled;
+    ObservationState observationState;
+    CameraObservation observation;
+    wchar_t observationError[256];
     wchar_t id[idCapacity];
     wchar_t error[512];
     uint8_t pixels[maxPixels];
@@ -86,6 +97,9 @@ bool validHeader(const SharedFrame& shared) {
 }
 uint64_t cancelledNight(SharedFrame& shared) noexcept {
     return static_cast<uint64_t>(InterlockedCompareExchange64(&shared.nightCancelled, 0, 0));
+}
+uint64_t cancelledObservation(SharedFrame& shared) noexcept {
+    return static_cast<uint64_t>(InterlockedCompareExchange64(&shared.observationCancelled, 0, 0));
 }
 
 std::wstring modulePath() {
@@ -134,24 +148,28 @@ int hostMain(const wchar_t* mappingName) {
         if (WaitForSingleObject(stop.value, 0) == WAIT_OBJECT_0) result = 0;
         else if (!camera.start(id, error)) { publishError(error); result = 9; }
         else {
-            Frame frame, nightFrame;
+            Frame frame, nightFrame, observationFrame;
             std::unique_ptr<NightAccumulator> accumulator;
             const Frame* completedNight = nullptr;
             CameraSampleInfo watermark, seen;
             NightSettings nightSettings;
             NightWindowResult nightResult;
             NightState nightState = NightState::Idle;
+            bool nightDelivered = false;
             uint64_t nightCommand = 0, nightToken = 0, nextNight = 0, nightSourceTick = 0, nightCompletedTick = 0;
             uint32_t nightDuration = 0, duplicateTimes = 0;
             int64_t lastTimestamp = 0;
             bool trustedTimestamp = false;
             std::wstring nightError;
+            CameraSampleInfo observationSeen;
+            uint64_t observationToken = 0, observationLastRequest = 0;
             const HANDLE events[] = {stop.value, request.value};
             auto cancel = [&] {
                 // Explicit cancellation releases the optional work buffers and
                 // gain history. Next ordinary preview has baseline memory/cost.
                 accumulator.reset(); nightFrame = {}; completedNight = nullptr;
                 nightState = NightState::Idle; nightResult = {}; nightCompletedTick = 0; nightError.clear();
+                nightDelivered = false;
             };
             auto nightFailed = [&](const wchar_t* message) {
                 nightState = NightState::Failed; nightError = message; completedNight = nullptr;
@@ -167,7 +185,11 @@ int hostMain(const wchar_t* mappingName) {
                 // Cancellation never waits for the sharing mutex. Even while
                 // it is held, the helper stops sampling and drops partial work.
                 if (nightCommand && cancelledNight(*view.value) >= nightCommand && nightState != NightState::Idle) cancel();
+                if (observationLastRequest && cancelledObservation(*view.value) >= observationLastRequest) {
+                    observationFrame = {}; observationSeen = {}; observationToken = observationLastRequest = 0;
+                }
                 uint64_t requested = 0, requestedToken = 0;
+                uint64_t observationRequested = 0, requestedObservationToken = 0;
                 PixelRequest requestedKind = PixelRequest::Preview;
                 {
                     SharedLock lock(mutex.value);
@@ -183,6 +205,7 @@ int hostMain(const wchar_t* mappingName) {
                         nightDuration = view.value->nightDuration;
                         nightSettings = view.value->nightSettings;
                         completedNight = nullptr; nightResult = {}; nightCompletedTick = 0; nightError.clear();
+                        nightDelivered = false;
                         watermark = {}; seen = {}; nightSourceTick = 0; duplicateTimes = 0; trustedTimestamp = false;
                         nightState = NightState::Waiting; nextNight = GetTickCount64();
                         if (cancelledNight(*view.value) >= nightCommand) cancel();
@@ -194,20 +217,37 @@ int hostMain(const wchar_t* mappingName) {
                     requestedKind = view.value->requestedKind;
                     requestedToken = view.value->requestedToken;
                     if (requested == view.value->completed) requested = 0;
+                    if (view.value->observationRequested != view.value->observationCompleted &&
+                        view.value->observationRequested > cancelledObservation(*view.value)) {
+                        observationRequested = observationLastRequest = view.value->observationRequested;
+                        requestedObservationToken = view.value->observationToken;
+                        if (observationToken != requestedObservationToken) {
+                            observationToken = requestedObservationToken; observationSeen = {};
+                        }
+                    }
                 }
+                const Frame* rawObservation = nullptr;
+                CameraSampleInfo rawInfo;
                 const uint64_t sampleAt = GetTickCount64();
                 if ((nightState == NightState::Waiting || nightState == NightState::Integrating) && sampleAt >= nextNight) {
                     CameraSampleInfo info;
                     const bool fresh = camera.latestNewer(nightFrame, error, info, seen);
+                    if (fresh) { rawObservation = &nightFrame; rawInfo = info; }
                     nightSourceTick = info.receivedTick;
                     if (!error.empty()) { publishError(error); result = 10; break; }
                     const uint64_t copiedAt = GetTickCount64();
                     if (info.receivedTick > copiedAt) nightFailed(L"The camera returned invalid source freshness data.");
                     else if (info.receivedTick && copiedAt - info.receivedTick > 3000)
                         nightFailed(L"No fresh camera frame arrived for 3 seconds. Check the camera connection and try again.");
-                    if (nightState == NightState::Integrating && info.epoch && info.epoch != watermark.epoch)
+                    const bool inWindow = fresh && info.receivedTick >= nightResult.beginTick && info.receivedTick < nightResult.endTick;
+                    // Facts from a fresh post-end sample cannot invalidate
+                    // already admitted light. A format-only observation has no
+                    // event time, so retain conservative epoch rejection.
+                    const bool inspectEpoch = !fresh || inWindow;
+                    if (nightState == NightState::Integrating && inspectEpoch && info.epoch && info.epoch != watermark.epoch)
                         nightFailed(L"The camera format or source timeline changed during the night blend. Try recording again.");
-                    if (fresh && (!nightFrame.valid() || nightFrame.width > int(maxWidth) || nightFrame.height > int(maxHeight)))
+                    if (fresh && (nightState == NightState::Waiting || (nightState == NightState::Integrating && inWindow)) &&
+                        (!nightFrame.valid() || nightFrame.width > int(maxWidth) || nightFrame.height > int(maxHeight)))
                         nightFailed(L"The camera returned an unsupported night blend frame size.");
                     if (fresh && nightState == NightState::Waiting) {
                         if (!accumulator) accumulator = std::make_unique<NightAccumulator>();
@@ -268,19 +308,64 @@ int hostMain(const wchar_t* mappingName) {
                             } else nightFailed(L"No distinct camera samples arrived during the night blend. Choose a longer blend and capture interval, or reconnect the camera.");
                         }
                     }
-                    if (nightCommand && cancelledNight(*view.value) >= nightCommand) cancel();
+                    if (nightCommand && cancelledNight(*view.value) >= nightCommand) { cancel(); rawObservation = nullptr; }
                 }
                 uint64_t receivedTick = 0;
                 const Frame* publication = nullptr;
                 if (requested && requestedKind == PixelRequest::Preview) {
-                    if (camera.latest(frame, error, receivedTick)) publication = &frame;
-                    else if (!error.empty()) { publishError(error); result = 10; break; }
+                    if (observationRequested) {
+                        CameraSampleInfo info;
+                        if (camera.latestNewer(frame, error, info, {})) {
+                            publication = &frame; receivedTick = info.receivedTick;
+                            rawObservation = &frame; rawInfo = info;
+                        }
+                    } else if (camera.latest(frame, error, receivedTick)) publication = &frame;
+                    if (!publication && !error.empty()) { publishError(error); result = 10; break; }
                 } else if (requested && requestedKind == PixelRequest::Night && requestedToken == nightToken &&
                            nightState == NightState::Complete && cancelledNight(*view.value) < nightCommand) {
                     publication = completedNight; receivedTick = nightResult.lastSampleTick;
                 }
                 if (publication && (!publication->valid() || publication->width > int(maxWidth) || publication->height > int(maxHeight))) {
                     publishError(L"The camera returned an unsupported frame size."); result = 11; break;
+                }
+                std::optional<CameraObservation> observation;
+                ObservationState observationState = ObservationState::Pending;
+                std::wstring observationError;
+                const wchar_t* observationFallback = nullptr;
+                const bool deliveringNight = publication && requestedKind == PixelRequest::Night;
+                const bool nightOwnsRawRead = nightState == NightState::Waiting || nightState == NightState::Integrating ||
+                    (nightState == NightState::Complete && !nightDelivered);
+                const bool deferObservation = deliveringNight || (nightOwnsRawRead && !rawObservation);
+                if (observationRequested && !deferObservation && cancelledObservation(*view.value) < observationRequested) {
+                    // Optional observation errors are isolated from recording.
+                    // Reuse this iteration's raw conversion (never a processed
+                    // Night result); otherwise convert only a distinct sample.
+                    try {
+                        observation.emplace();
+                        bool fresh = rawObservation && (rawInfo.epoch != observationSeen.epoch || rawInfo.sequence > observationSeen.sequence);
+                        if (!fresh && !nightOwnsRawRead) {
+                            fresh = camera.latestNewer(observationFrame, observationError, rawInfo, observationSeen);
+                            rawObservation = fresh ? &observationFrame : nullptr;
+                        }
+                        const uint64_t now = GetTickCount64();
+                        if (!observationError.empty()) observationState = ObservationState::Failed;
+                        else if (!fresh) observationState = ObservationState::Duplicate;
+                        else if (!rawInfo.epoch || !rawInfo.sequence || !rawInfo.receivedTick || rawInfo.receivedTick > now ||
+                                 now - rawInfo.receivedTick > 3000 || !rawObservation->valid() ||
+                                 rawObservation->width > int(maxWidth) || rawObservation->height > int(maxHeight) ||
+                                 !describeTimeSkipFrame(*rawObservation, observation->descriptor)) {
+                            observationState = ObservationState::Failed;
+                            observationError = L"The camera activity check returned invalid or stale source data.";
+                        } else {
+                            observation->epoch = rawInfo.epoch; observation->sequence = rawInfo.sequence;
+                            observation->receivedTick = rawInfo.receivedTick;
+                            observation->sourceWidth = rawObservation->width; observation->sourceHeight = rawObservation->height;
+                            observationState = ObservationState::Ready;
+                        }
+                    } catch (...) {
+                        observationState = ObservationState::Failed;
+                        observationFallback = L"The camera activity check is unavailable.";
+                    }
                 }
                 SharedLock lock(mutex.value);
                 if (lock.result == WAIT_ABANDONED || lock.result == WAIT_FAILED) { result = 12; break; }
@@ -297,6 +382,23 @@ int hostMain(const wchar_t* mappingName) {
                     const size_t count = std::min(nightError.size(), std::size(view.value->nightError) - 1);
                     std::wmemcpy(view.value->nightError, nightError.data(), count); view.value->nightError[count] = L'\0';
                 }
+                if (observationRequested && !deferObservation && view.value->observationRequested == observationRequested &&
+                    view.value->observationToken == requestedObservationToken && cancelledObservation(*view.value) < observationRequested) {
+                    if (observationState == ObservationState::Ready) {
+                        view.value->observation = *observation;
+                        view.value->observationPublished = observationRequested;
+                        view.value->observationPublishedToken = requestedObservationToken;
+                        observationSeen = rawInfo;
+                    }
+                    view.value->observationState = observationState;
+                    view.value->observationCompleted = observationRequested;
+                    view.value->observationCompletedToken = requestedObservationToken;
+                    const wchar_t* detail = observationFallback ? observationFallback : observationError.c_str();
+                    const size_t count = std::min(std::wcslen(detail), std::size(view.value->observationError) - 1);
+                    std::wmemcpy(view.value->observationError, detail, count);
+                    view.value->observationError[count] = L'\0';
+                    SetEvent(response.value);
+                }
                 // Odd means publication is in progress; only an even generation
                 // with a valid size can ever be copied by the client.
                 if (publication) {
@@ -310,6 +412,7 @@ int hostMain(const wchar_t* mappingName) {
                     view.value->publishedToken = requestedToken;
                     setMessage(*view.value, HostState::Ready, L"");
                     ++view.value->generation;
+                    if (deliveringNight) nightDelivered = true;
                 }
                 if (requested) {
                     view.value->completed = requested;
@@ -317,6 +420,11 @@ int hostMain(const wchar_t* mappingName) {
                     view.value->completedToken = requestedToken;
                     SetEvent(response.value);
                 }
+                // Publish an already completed blend before optional driver
+                // conversion. During integration, leave the report pending for
+                // the next existing raw Night sample instead of adding a read
+                // or a busy-loop wake that could delay the exposure window.
+                if (observationRequested && deferObservation && deliveringNight) SetEvent(request.value);
             }
             // A stuck driver shutdown affects only this helper. The parent owns
             // a kill-on-close job and bounds graceful shutdown to 500 ms.
@@ -343,6 +451,8 @@ struct CameraClient::Impl {
     uint64_t request = 0, requestedTick = 0, requestedGeneration = 0;
     PixelRequest requestedKind = PixelRequest::Preview;
     uint64_t nightCommand = 0, nightToken = 0, nightRequestedTick = 0, nightDeadline = 0;
+    uint64_t observationRequest = 0, observationLastRequest = 0, observationToken = 0, observationDeadline = 0;
+    uint64_t observationEpoch = 0, observationSequence = 0;
     bool delivered = false, contended = false, activationFailed = false;
 };
 
@@ -433,6 +543,8 @@ void CameraClient::stop() {
     impl_->started = impl_->contentionSince = impl_->generation = 0;
     impl_->request = impl_->requestedTick = impl_->requestedGeneration = 0;
     impl_->nightCommand = impl_->nightToken = impl_->nightRequestedTick = impl_->nightDeadline = 0;
+    impl_->observationRequest = impl_->observationLastRequest = impl_->observationToken = impl_->observationDeadline = 0;
+    impl_->observationEpoch = impl_->observationSequence = 0;
     impl_->requestedKind = PixelRequest::Preview;
     impl_->delivered = impl_->contended = impl_->activationFailed = false;
 }
@@ -732,6 +844,101 @@ bool CameraClient::nightResult(uint64_t token, Frame& output, NightWindowResult&
     if (response == WAIT_FAILED) return fail(error, L"Windows could not receive the camera night result.");
     return false;
 }
+void CameraClient::cancelActivityObservation() noexcept {
+    if (impl_->view.value && impl_->observationLastRequest) {
+        InterlockedExchange64(&impl_->view.value->observationCancelled, static_cast<LONG64>(impl_->observationLastRequest));
+        if (impl_->requestEvent.value) SetEvent(impl_->requestEvent.value);
+    }
+    impl_->observationRequest = impl_->observationLastRequest = impl_->observationToken = impl_->observationDeadline = 0;
+    impl_->observationEpoch = impl_->observationSequence = 0;
+}
+
+bool CameraClient::observeActivity(uint64_t token, CameraObservation& output, std::wstring& error) {
+    error.clear();
+    if (!token) { error = L"The camera activity check needs a valid session."; return false; }
+    if (!impl_->process.value || !impl_->view.value) { error = L"The camera is not running."; return false; }
+    if (impl_->observationToken != token) {
+        cancelActivityObservation(); impl_->observationToken = token;
+    }
+    if (!impl_->observationDeadline)
+        impl_->observationDeadline = GetTickCount64() + (impl_->delivered ? 3000 : 8000);
+    auto read = [&](bool& waiting) {
+        waiting = false;
+        SharedLock lock(impl_->mutex.value);
+        const uint64_t now = GetTickCount64();
+        if (now > impl_->observationDeadline) {
+            error = L"The camera activity check was not delivered within its deadline."; return false;
+        }
+        if (WaitForSingleObject(impl_->process.value, 0) == WAIT_OBJECT_0) {
+            error = L"The camera helper stopped before its activity check."; return false;
+        }
+        if (!lock.acquired()) {
+            if (lock.result != WAIT_TIMEOUT) error = L"Windows could not read the camera activity check.";
+            return false;
+        }
+        auto& shared = *impl_->view.value;
+        if (!validHeader(shared) || shared.observationCompleted > shared.observationRequested ||
+            impl_->observationRequest > shared.observationRequested) {
+            error = L"The camera helper returned invalid activity data."; return false;
+        }
+        if (shared.state == HostState::Failed || shared.state == HostState::Stopped) {
+            error = L"The camera activity check is unavailable because the camera stopped."; return false;
+        }
+        if (!impl_->observationRequest) {
+            if (shared.observationRequested >= uint64_t((std::numeric_limits<LONG64>::max)())) {
+                error = L"The camera activity request limit was reached."; return false;
+            }
+            impl_->observationRequest = impl_->observationLastRequest = ++shared.observationRequested;
+            shared.observationToken = token;
+            if (!SetEvent(impl_->requestEvent.value)) return fail(error, L"Windows could not request the camera activity check.");
+            waiting = true; return false;
+        }
+        if (shared.observationRequested != impl_->observationRequest || shared.observationToken != token) {
+            error = L"The camera activity request was replaced."; return false;
+        }
+        if (shared.observationCompleted != impl_->observationRequest) { waiting = true; return false; }
+        if (shared.observationCompletedToken != token) {
+            error = L"The camera activity response has an invalid session."; return false;
+        }
+        if (shared.observationState == ObservationState::Failed) {
+            const wchar_t* end = static_cast<const wchar_t*>(std::wmemchr(shared.observationError, L'\0', std::size(shared.observationError)));
+            error = end && end != shared.observationError ? std::wstring(shared.observationError, size_t(end - shared.observationError))
+                : L"The camera activity check is unavailable.";
+            return false;
+        }
+        if (shared.observationState == ObservationState::Duplicate || shared.observationState == ObservationState::Pending) {
+            // Retry the SAME request on the caller's next cadence. A retained
+            // sample/acknowledgement cannot extend the original deadline.
+            shared.observationCompleted = 0;
+            if (!SetEvent(impl_->requestEvent.value)) return fail(error, L"Windows could not retry the camera activity check.");
+            return false;
+        }
+        const auto& report = shared.observation;
+        if (shared.observationState != ObservationState::Ready || shared.observationPublished != impl_->observationRequest ||
+            shared.observationPublishedToken != token || !report.epoch || !report.sequence || !report.receivedTick ||
+            report.receivedTick > now || now - report.receivedTick > 3000 ||
+            report.sourceWidth <= 0 || report.sourceWidth > int(maxWidth) || report.sourceHeight <= 0 || report.sourceHeight > int(maxHeight) ||
+            (report.epoch == impl_->observationEpoch && report.sequence <= impl_->observationSequence)) {
+            error = L"The camera activity response is invalid, repeated or stale."; return false;
+        }
+        output = report;
+        impl_->observationEpoch = report.epoch; impl_->observationSequence = report.sequence;
+        impl_->observationRequest = impl_->observationDeadline = 0;
+        return true;
+    };
+    bool waiting = false;
+    if (read(waiting)) return true;
+    if (waiting && error.empty()) {
+        // Shared response signals are only hints; provenance is checked under
+        // the mutex, so a Preview/Night acknowledgement cannot supply this data.
+        const DWORD response = WaitForSingleObject(impl_->responseEvent.value, 10);
+        if (response == WAIT_OBJECT_0 && read(waiting)) return true;
+        if (response == WAIT_FAILED) fail(error, L"Windows could not receive the camera activity check.");
+    }
+    if (!error.empty()) cancelActivityObservation();
+    return false;
+}
+
 int runCameraHost(const wchar_t*) {
     int count = 0;
     wchar_t** args = CommandLineToArgvW(GetCommandLineW(), &count);

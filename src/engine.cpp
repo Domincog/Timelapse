@@ -35,6 +35,13 @@ bool validateNightCapture(const Settings& settings, std::wstring& error) {
     }
     return true;
 }
+bool sameLayers(const std::vector<Layer>& a, const std::vector<Layer>& b) noexcept {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i)
+        if (a[i].source != b[i].source || a[i].rect.x != b[i].rect.x || a[i].rect.y != b[i].rect.y ||
+            a[i].rect.w != b[i].rect.w || a[i].rect.h != b[i].rect.h) return false;
+    return true;
+}
 // Leave room for buffered samples and MP4 finalization instead of waiting for
 // the writer to fail on a full volume. This is a conservative policy, not a
 // reservation: another process can consume the remaining space after a check.
@@ -132,7 +139,8 @@ void Engine::record() {
       start_ = true; status_.state = State::Starting; status_.error = false; status_.recordingFailed = false;
       status_.message = L"Preparing recording..."; status_.frames = 0; status_.elapsed = 0; status_.savedPath.clear(); status_.savedPaths.clear();
       status_.nightEnabled = usesNightCamera(settings_); status_.nightWaiting = status_.nightEnabled;
-      status_.nightDurationMs = 0; status_.night = {}; }
+      status_.nightDurationMs = 0; status_.night = {};
+      status_.timeSkip = {}; }
     wake_.notify_one();
 }
 void Engine::pause() {
@@ -197,6 +205,141 @@ void Engine::run() {
         auto retryFrameAt = Clock::time_point::min();
         auto lastTick = Clock::now();
         Clock::duration activeDuration{};
+        TimeSkipController timeSkip;
+        TimeSkipDecision skipDecision;
+        TimeSkipStatus skipStatus;
+        bool skipping = false, observing = false, skipControllerValid = false;
+        unsigned observedSources = 0;
+        uint64_t observationToken = 0, desktopSequence = 0, observationStarted = 0;
+        std::array<uint64_t, 2> observationTicks{};
+        std::array<std::array<wchar_t, 256>, 2> observationProblems{};
+        auto nextObservation = Clock::time_point::max(), lastAdmission = Clock::time_point::min();
+        Frame observationDesktop;
+        auto activeMilliseconds = [&] {
+            const auto duration = activeDuration + (writing && !paused ? Clock::now() - lastTick : Clock::duration::zero());
+            return std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+        };
+        auto cancelObservation = [&] {
+            if (observing && camera) camera->cancelActivityObservation();
+            nextObservation = Clock::time_point::max();
+        };
+        auto resetSkipping = [&](const Settings& cfg, unsigned sourceMask) {
+            cancelObservation();
+            skipping = cfg.timeSkip.mode != TimeSkipMode::Off;
+            observing = skipping && cfg.timeSkip.mode != TimeSkipMode::Manual;
+            observedSources = sourceMask;
+            skipStatus = {}; skipStatus.enabled = skipping;
+            skipStatus.intervalMs = skipping ? cfg.intervalMs : 0;
+            observationTicks = {}; observationProblems = {};
+            observationStarted = GetTickCount64();
+            if (++observationToken == 0) ++observationToken;
+            desktopSequence = 0;
+            if (skipping) {
+                skipControllerValid = timeSkip.reset(cfg.timeSkip, cfg.intervalMs, sourceMask);
+                if (!skipControllerValid) observing = false;
+                skipDecision = timeSkip.inspect(activeMilliseconds());
+                skipStatus.reason = skipDecision.reason;
+                if (observing && !paused) nextObservation = Clock::now();
+            } else skipDecision = {};
+        };
+        auto returnToBase = [&] {
+            if (!writing || paused || !session || lastAdmission == Clock::time_point::min()) return;
+            const auto earliest = std::max(lastAdmission + std::chrono::milliseconds(session->intervalMs), Clock::now());
+            if (nightMode) {
+                // Never truncate an accepted integration window. If it has not
+                // started, bring forward a complete base-bounded window.
+                if (!nightQueued) {
+                    const auto duration = std::chrono::milliseconds(nightWindowDuration(*session, suggestedNightDurationMs));
+                    nextFrame = std::min(nextFrame, std::max(earliest, Clock::now() + duration));
+                    nightStartAt = nextFrame - duration;
+                }
+            } else nextFrame = std::min(nextFrame, earliest);
+        };
+        auto inspectSkipping = [&] {
+            if (!skipping) return;
+            if (!skipControllerValid) {
+                skipDecision = {}; skipDecision.intervalMs = session ? session->intervalMs : 1000;
+                skipStatus.intervalMs = skipDecision.intervalMs; skipStatus.reason = TimeSkipReason::Unavailable;
+                constexpr wchar_t missing[] = L"Activity observation needs a selected source; using normal cadence.";
+                skipStatus.diagnostic = {};
+                std::copy(std::begin(missing), std::end(missing), skipStatus.diagnostic.begin());
+                std::lock_guard<std::mutex> lock(mutex_); status_.timeSkip = skipStatus;
+                return;
+            }
+            const uint64_t tick = GetTickCount64();
+            uint64_t oldest = UINT64_MAX;
+            bool complete = true;
+            skipStatus.diagnostic = {};
+            if (observing) for (unsigned source = 0; source < 2; ++source) if (observedSources & (1u << source)) {
+                const auto receipt = observationTicks[source];
+                const auto age = tick >= receipt ? tick - receipt : UINT64_MAX;
+                if (!receipt || age > 3000) {
+                    complete = false;
+                    if (receipt || tick - observationStarted > 3000) timeSkip.unavailable(source);
+                }
+                oldest = std::min(oldest, receipt);
+                if (!skipStatus.diagnostic[0] && observationProblems[source][0]) skipStatus.diagnostic = observationProblems[source];
+            }
+            skipStatus.lastCheckTick = observing && oldest != UINT64_MAX ? oldest : 0;
+            skipStatus.observationDelayed = observing && ((!complete && tick - observationStarted > 1500) ||
+                (complete && oldest != UINT64_MAX && tick - oldest > 1500));
+            skipDecision = timeSkip.inspect(activeMilliseconds());
+            if (skipDecision.returnToBase) returnToBase();
+            skipStatus.reason = skipDecision.reason;
+            skipStatus.intervalMs = skipDecision.intervalMs;
+            if (skipStatus.observationDelayed && !skipStatus.diagnostic[0]) {
+                constexpr wchar_t delayed[] = L"Activity checks are delayed; unseen activity may be missed. Normal cadence resumes when observations become stale.";
+                std::copy(std::begin(delayed), std::end(delayed), skipStatus.diagnostic.begin());
+            }
+            std::lock_guard<std::mutex> lock(mutex_); status_.timeSkip = skipStatus;
+        };
+        auto observeSources = [&](const Settings& cfg) {
+            if (!observing || !writing || paused || Clock::now() < nextObservation) return;
+            nextObservation = Clock::now() + std::chrono::milliseconds(TimeSkipObservationMs);
+            for (unsigned source = 0; source < 2; ++source) if (observedSources & (1u << source)) {
+                auto problem = [&](const wchar_t* message) {
+                    timeSkip.unavailable(source);
+                    auto& text = observationProblems[source]; text = {};
+                    std::copy_n(message, std::min(wcslen(message), text.size() - 1), text.begin());
+                };
+                // Optional observation work cannot convert an allocation or
+                // source-query failure into a capture/save failure.
+                try {
+                    std::wstring error;
+                    if (source == 0) {
+                        // Keep sampling geometry and cursor policy stable.
+                        // Alternating preview/full-frame resampling can create
+                        // false motion even when the desktop is unchanged.
+                        if (!captureMonitor(cfg.monitorId, TimeSkipWidth, TimeSkipHeight, false, observationDesktop, error)) {
+                            problem(error.empty() ? L"Desktop activity observation is unavailable." : error.c_str()); continue;
+                        }
+                        TimeSkipDescriptor descriptor;
+                        if (!describeTimeSkipFrame(observationDesktop, descriptor)) { problem(L"Desktop activity observation is invalid."); continue; }
+                        const auto tick = GetTickCount64();
+                        if (timeSkip.observe(0, descriptor, observationToken, ++desktopSequence, activeMilliseconds())) {
+                            observationTicks[0] = tick; observationProblems[0] = {};
+                        }
+                    } else {
+                        CameraObservation observation;
+                        if (!cameraRunning) { problem(L"Camera activity observation is unavailable."); continue; }
+                        if (!camera->observeActivity(observationToken, observation, error)) {
+                            if (!error.empty()) problem(error.c_str());
+                            continue;
+                        }
+                        const auto tick = GetTickCount64();
+                        if (!observation.receivedTick || observation.receivedTick < observationStarted || observation.receivedTick > tick || tick - observation.receivedTick > 3000 ||
+                            !observation.epoch || !observation.sequence || observation.sourceWidth <= 0 || observation.sourceHeight <= 0) {
+                            problem(L"Camera activity observation is stale or invalid."); continue;
+                        }
+                        const int64_t observedAt = std::max<int64_t>(0, activeMilliseconds() - static_cast<int64_t>(tick - observation.receivedTick));
+                        if (timeSkip.observe(1, observation.descriptor, observation.epoch, observation.sequence, observedAt)) {
+                            observationTicks[1] = observation.receivedTick; observationProblems[1] = {};
+                        }
+                    }
+                } catch (...) { problem(L"Activity observation could not allocate a resource; using normal cadence."); }
+            }
+            inspectSkipping();
+        };
         double elapsed = 0;
         bool recordingLimitReached = false;
         auto advanceElapsed = [&](Clock::time_point now) {
@@ -236,6 +379,8 @@ void Engine::run() {
         };
         auto closeRecording = [&](const std::wstring& reason) {
             cancelNight(); nightMode = false;
+            cancelObservation(); skipping = observing = false;
+            observationDesktop = {};
             if (writing) power.saving();
             bool keepCamera;
             { std::lock_guard<std::mutex> lock(mutex_); status_.state = State::Finishing; status_.nightWaiting = false; status_.message = L"Finishing MP4..."; keepCamera = settings_.preview; }
@@ -388,6 +533,11 @@ void Engine::run() {
                   // The displayed recording clock uses whole seconds. Commands
                   // wake immediately and publish their precise elapsed time.
                   if (writing && !paused) deadline = std::min(deadline, lastTick + std::chrono::seconds(1));
+                  if (writing && !paused && skipping) {
+                      if (observing) deadline = std::min(deadline, nextObservation);
+                      if (skipDecision.nextBoundaryMs > 0)
+                          deadline = std::min(deadline, lastTick + (std::chrono::milliseconds(skipDecision.nextBoundaryMs) - activeDuration));
+                  }
                   deadline = std::min(deadline, recordingDeadline());
                   if (FAILED(com)) deadline = Clock::now() + std::chrono::seconds(1);
                   auto commanded = [&] {
@@ -416,6 +566,7 @@ void Engine::run() {
                 if (writing) { std::lock_guard<std::mutex> lock(mutex_); status_.elapsed = elapsed; }
                 if (quit) { if (writing || pending) { previewOnlyWork = false; closeRecording(L""); } break; }
                 Settings& cfg = *snapshot;
+                bool resetSkipRequested = false;
                 if (retry) { if (camera) camera->stop(); cameraRunning = false; activeCamera.clear(); }
                 if (FAILED(com)) { publishError(L"Windows media initialization failed: " + errorText(com), true); continue; }
                 if (start) {
@@ -428,9 +579,12 @@ void Engine::run() {
                     std::wstring validationError;
                     if (!validateCaptureInterval(cfg.intervalMs, validationError) ||
                         !validateVideoSize(cfg.width, cfg.height, validationError) ||
-                        (nightMode && !validateNightCapture(cfg, validationError))) {
+                        (nightMode && !validateNightCapture(cfg, validationError)) ||
+                        !normalizeTimeSkipSettings(cfg.timeSkip, validationError)) {
                         closeRecording(validationError); continue;
                     }
+                    session->timeSkip = cfg.timeSkip;
+                    resetSkipRequested = true; lastAdmission = Clock::time_point::min();
                     if (cfg.separateFiles) { desktopLayers = preset(Mode::Desktop); cameraLayers = preset(Mode::Camera); }
                     nextFrame = now;
                     retryFrameAt = Clock::time_point::min();
@@ -447,7 +601,9 @@ void Engine::run() {
                     // in-flight integration. A stopped/changed camera below
                     // still clears it together with its capture storage.
                     cancelNight(false);
+                    cancelObservation();
                     paused = pauseTarget;
+                    resetSkipRequested = skipping;
                     const bool desktopNeeded = (session && session->separateFiles) || std::any_of(cfg.layers.begin(), cfg.layers.end(),
                         [](const Layer& layer) { return layer.source == Source::Desktop; });
                     power.update(!paused, desktopNeeded);
@@ -462,7 +618,10 @@ void Engine::run() {
                 bool captureDue = pending || (writing && !paused && now >= nextFrame);
                 previewOnlyWork = !captureDue;
                 if (writing || pending) {
-                    if (!session->separateFiles) session->layers = cfg.layers;
+                    if (!session->separateFiles) {
+                        if (skipping && !sameLayers(session->layers, cfg.layers)) resetSkipRequested = true;
+                        session->layers = cfg.layers;
+                    }
                     session->preview = cfg.preview;
                     cfg = *session;
                 }
@@ -477,6 +636,22 @@ void Engine::run() {
                         closeRecording(validationError); continue;
                     }
                     std::lock_guard<std::mutex> lock(mutex_); status_.nightEnabled = useNight; status_.nightWaiting = useNight && !paused;
+                }
+                if (resetSkipRequested) {
+                    resetSkipping(cfg, (needDesktop ? 1u : 0u) | (needCamera ? 2u : 0u));
+                    if (skipping && writing && !paused && lastAdmission != Clock::time_point::min()) {
+                        nextFrame = std::max(lastAdmission + std::chrono::milliseconds(cfg.intervalMs), Clock::now());
+                        if (nightMode && !nightQueued) {
+                            const auto duration = std::chrono::milliseconds(nightWindowDuration(cfg, suggestedNightDurationMs));
+                            nextFrame = std::max(nextFrame, Clock::now() + duration);
+                            nightStartAt = nextFrame - duration;
+                        }
+                    }
+                    std::lock_guard<std::mutex> lock(mutex_); status_.timeSkip = skipStatus;
+                }
+                if (skipping && writing && !paused) {
+                    inspectSkipping();
+                    captureDue = Clock::now() >= nextFrame;
                 }
                 power.update(writing && !paused, needDesktop);
                 const bool active = pending || (writing && !paused) || cfg.preview;
@@ -498,6 +673,12 @@ void Engine::run() {
                 // Retry a retired failed attempt once under the new source generation.
                 // Healthy readers remain open; current-generation failures stay latched.
                 if (needCamera && active && !cameraRunning && (activeCamera != cfg.cameraId || cameraAttemptGeneration != previewGeneration || start)) {
+                    if (skipping && writing) {
+                        // A restarted helper can reuse its local epoch values;
+                        // do not compare its first report with the old reader.
+                        resetSkipping(cfg, (needDesktop ? 1u : 0u) | 2u);
+                        returnToBase(); inspectSkipping();
+                    }
                     activeCamera = cfg.cameraId;
                     cameraAttemptGeneration = previewGeneration;
                     sourceError.clear();
@@ -518,6 +699,14 @@ void Engine::run() {
                     else sourceError = L"No camera found. Connect a camera and refresh sources.";
                 }
                 const bool previewDue = cfg.preview && (lastPreview == Clock::time_point::min() || now - lastPreview >= std::chrono::milliseconds(writing ? 1000 : 500));
+                // Observation alone asks for a small, consistently sampled
+                // image; it never composes a preview, queries disk or writes.
+                if (observing && writing && !paused) {
+                    observeSources(cfg);
+                    advanceElapsed(Clock::now());
+                    if (limitExpired()) { previewOnlyWork = false; recordingLimitReached = true; closeRecording(L""); continue; }
+                    if (!nightMode) captureDue = Clock::now() >= nextFrame;
+                }
                 bool nightCompleted = false, firstNightPreview = false;
                 if (nightMode && !paused) {
                     // The helper owns the integration window and intermediate
@@ -583,6 +772,10 @@ void Engine::run() {
                         camera->stop(); cameraRunning = false;
                         cameraAttemptGeneration = previewGeneration;
                         sourceError = error;
+                        if (skipping && writing) {
+                            resetSkipping(cfg, (needDesktop ? 1u : 0u) | 2u);
+                            returnToBase(); inspectSkipping();
+                        }
                     }
                 }
                 const auto previewSize = previewDimensions(cfg.width, cfg.height);
@@ -686,6 +879,7 @@ void Engine::run() {
                         // startup. Start active time only when admission ends.
                         activeDuration = Clock::duration::zero(); elapsed = 0;
                         lastTick = Clock::now(); nextFrame = lastTick;
+                        if (observing) { observationStarted = GetTickCount64(); nextObservation = lastTick; }
                     } else advanceElapsed(Clock::now());
                     // A slow storage query may also cross the time limit.
                     // Admit both separate writes together, or neither of them.
@@ -695,13 +889,17 @@ void Engine::run() {
                     if (cfg.stopOnLowDiskSpace && !space.enough(cfg.separateFiles)) {
                         closeRecording(L"Recording stopped: " + recordingSpaceProblem(space, cfg.separateFiles) + L" Save folder: " + recordingFolder); continue;
                     }
+                    const auto admittedAt = Clock::now();
+                    const auto admittedActiveMs = skipping ? activeMilliseconds() : 0;
                     if (!encoder->write(composed, error)) {
                         closeRecording((cfg.separateFiles ? L"Desktop recording stopped: " : L"Recording stopped: ") + error); continue;
                     }
                     if (cfg.separateFiles && !cameraEncoder->write(cameraComposed, error)) {
                         closeRecording(L"Camera recording stopped: " + error); continue;
                     }
-                    const auto interval = std::chrono::milliseconds(cfg.intervalMs);
+                    lastAdmission = admittedAt;
+                    const auto interval = std::chrono::milliseconds(skipping ? timeSkip.onFrame(admittedActiveMs) : cfg.intervalMs);
+                    if (skipping) nextFrame = std::max(nextFrame, lastAdmission);
                     if (nightMode) {
                         suggestedNightDurationMs = completedNight.exposure.suggestedDurationMs;
                         const auto duration = std::chrono::milliseconds(nightWindowDuration(cfg, suggestedNightDurationMs));
@@ -717,6 +915,7 @@ void Engine::run() {
                         if (nextFrame <= completedAt)
                             nextFrame += interval * ((completedAt - nextFrame) / interval + 1);
                     }
+                    if (skipping) inspectSkipping();
                     std::lock_guard<std::mutex> lock(mutex_);
                     status_.frames = encoder->frames(); status_.elapsed = elapsed;
                     if (nightMode) {
@@ -791,6 +990,7 @@ void Engine::run() {
                 if (camera) camera->stop();
                 cameraRunning = false;
                 nightMode = nightQueued = nightFrameReady = false;
+                cancelObservation(); skipping = observing = false; observationDesktop = {};
                 writing = cameraWriting = pending = paused = false;
                 desktop = {}; webcam = {}; composed = {}; cameraComposed = {}; previewBuffer.reset();
                 power.update(false, false);

@@ -40,8 +40,16 @@ void durationParsing() {
           "stop duration decimal units can express whole seconds");
     check(!parseDuration(L"1",static_cast<DurationUnit>(77),100,maxStop,1,result,error), "unknown duration units rejected");
     check(!parseDuration(L"1",DurationUnit::Seconds,100,99,1,result,error) &&
-          !parseDuration(L"1",DurationUnit::Seconds,0,maxStop,1,result,error) &&
+          !parseDuration(L"1",DurationUnit::Seconds,-1,maxStop,1,result,error) &&
           !parseDuration(L"1",DurationUnit::Seconds,100,maxStop,0,result,error), "invalid parser contracts fail safely");
+    check(parseDuration(L"0",DurationUnit::Seconds,0,maxStop,1000,result,error) && result==0,
+          "recording offset permits exact zero");
+    check(parseDuration(L"0.05",DurationUnit::Minutes,0,maxStop,1000,result,error) && result==3000,
+          "zero-capable offset retains exact unit conversion");
+    check(!parseDuration(L"-1",DurationUnit::Seconds,0,maxStop,1000,result,error) &&
+          !parseDuration(L"0.001",DurationUnit::Seconds,0,maxStop,1000,result,error) &&
+          !parseDuration(L"0",DurationUnit::Seconds,0,0,1000,result,error),
+          "recording offset rejects negatives, partial seconds and invalid maximum");
     check(parseDuration(L"9223372036854775.807",DurationUnit::Seconds,1,(std::numeric_limits<int64_t>::max)(),1,result,error) &&
           result == (std::numeric_limits<int64_t>::max)(), "parser multiplication and fractional addition remain wide");
     check(!parseDuration(L"9223372036854775.808",DurationUnit::Seconds,1,(std::numeric_limits<int64_t>::max)(),1,result,error),

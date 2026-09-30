@@ -173,6 +173,7 @@ std::wstring caption(HWND box) {
 struct HiddenFixture {
     HiddenFixture() {
         app.dpi=96;app.visibleDirty=true;app.controlsUpdated=false;
+        app.skipRevision=0;app.advancedSkipRevision=app.skipSummaryRevision=app.skipVisibility=-1;app.skipSummaryCaption.clear();app.skipDetailCaption.clear();app.skipCheckAge=UINT64_MAX;
         app.window=CreateWindowExW(0,L"STATIC",L"Selection review",WS_OVERLAPPED,0,0,920,720,nullptr,nullptr,nullptr,nullptr);
         require(app.window!=nullptr,"Hidden parent creation.");
         auto child=[&](const wchar_t* cls,DWORD style) {
@@ -187,6 +188,7 @@ struct HiddenFixture {
         app.lowDisk=child(L"BUTTON",BS_AUTOCHECKBOX);SendMessageW(app.lowDisk,BM_SETCHECK,BST_CHECKED,0);
         app.nightEnabled=child(L"BUTTON",BS_AUTOCHECKBOX);app.nightDuration=combo(6);app.nightTarget=combo(3);choose(app.nightTarget,1);
         app.monitor=combo(0); app.camera=combo(0);
+        app.skipConfigure=child(L"BUTTON",BS_PUSHBUTTON);app.skipSummary=child(L"STATIC",0);app.skipDetail=child(L"STATIC",0);
         app.preview=child(L"STATIC",0);
         app.statusText=child(L"STATIC",0);
         for(auto target:{&app.refresh,&app.record,&app.pause,&app.finish,&app.folder,&app.openFolder,&app.reset,&app.forward})

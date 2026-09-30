@@ -1,6 +1,7 @@
 #pragma once
 #include "core.h"
 #include "night.h"
+#include "time_skip.h"
 #include <mutex>
 #include <thread>
 #include <condition_variable>
@@ -30,6 +31,17 @@ struct Settings {
     bool stopOnLowDiskSpace = true;
     // Camera-only software exposure; all policy is frozen with the session.
     NightSettings night;
+    TimeSkipSettings timeSkip;
+};
+struct TimeSkipStatus {
+    bool enabled = false;
+    TimeSkipReason reason = TimeSkipReason::Off;
+    // Planned cadence, not a measurement of achieved capture speed.
+    int64_t intervalMs = 0;
+    // Oldest required source receipt, in GetTickCount64's time domain.
+    uint64_t lastCheckTick = 0;
+    bool observationDelayed = false;
+    std::array<wchar_t, 256> diagnostic{};
 };
 struct Status {
     State state = State::Idle;
@@ -50,6 +62,7 @@ struct Status {
     bool nightEnabled = false, nightWaiting = false;
     uint32_t nightDurationMs = 0;
     NightResult night;
+    TimeSkipStatus timeSkip;
     std::shared_ptr<const Frame> preview;
 };
 class Engine {

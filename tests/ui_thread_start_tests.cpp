@@ -94,7 +94,7 @@ LRESULT WINAPI fakeSend(HWND window,UINT message,WPARAM value,LPARAM) {
     return 0;
 }
 DWORD WINAPI fakeProfileString(LPCWSTR,LPCWSTR key,LPCWSTR fallback,LPWSTR output,DWORD count,LPCWSTR) {
-    if(std::wcscmp(key,L"StopOnLowDiskSpace")==0 || std::wcscmp(key,L"NightEnabled")==0 || std::wcscmp(key,L"NightDurationMs")==0 || std::wcscmp(key,L"NightTargetBrightness")==0){require(count>std::wcslen(fallback),"Option buffer too small");wcscpy_s(output,count,fallback);return static_cast<DWORD>(std::wcslen(fallback));}
+    if(std::wcsncmp(key,L"TimeSkip",8)==0 || std::wcscmp(key,L"StopOnLowDiskSpace")==0 || std::wcscmp(key,L"NightEnabled")==0 || std::wcscmp(key,L"NightDurationMs")==0 || std::wcscmp(key,L"NightTargetBrightness")==0){require(count>std::wcslen(fallback),"Option buffer too small");wcscpy_s(output,count,fallback);return static_cast<DWORD>(std::wcslen(fallback));}
     ++profileReads; const wchar_t value[]=L"C:\\OwnedSynthetic";
     require(count>_countof(value),"Profile buffer too small"); std::wmemcpy(output,value,_countof(value)); return _countof(value)-1;
 }

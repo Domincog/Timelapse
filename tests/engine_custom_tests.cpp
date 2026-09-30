@@ -265,6 +265,10 @@ void idleAspectRetirement() {
 }
 }
 namespace lapse {
+bool CameraClient::observeActivity(uint64_t, CameraObservation&, std::wstring& error) {
+    error = L"Unexpected activity observer in an Off-mode fixture."; return false;
+}
+void CameraClient::cancelActivityObservation() noexcept {}
 struct CameraClient::Impl { bool active = false; };
 CameraClient::CameraClient() : impl_(std::make_unique<Impl>()) {}
 CameraClient::~CameraClient() = default;

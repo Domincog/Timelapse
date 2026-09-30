@@ -33,12 +33,12 @@ bool parseDuration(std::wstring_view text, DurationUnit unit, int64_t minMs,
     error.clear();
     text = trimmed(text);
     const int64_t multiplier = durationUnitMs(unit);
-    if (!multiplier || minMs <= 0 || maxMs < minMs || quantumMs <= 0) {
+    if (!multiplier || minMs < 0 || maxMs <= 0 || maxMs < minMs || quantumMs <= 0) {
         error = L"The duration limits are invalid.";
         return false;
     }
     if (text.empty() || text.size() > 64) {
-        error = L"Enter a positive number.";
+        error = minMs == 0 ? L"Enter zero or a positive number." : L"Enter a positive number.";
         return false;
     }
     int64_t whole = 0, fraction = 0, scale = 1;

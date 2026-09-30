@@ -14,7 +14,8 @@ enum class DurationUnit { Seconds, Minutes, Hours, Days };
 int64_t durationUnitMs(DurationUnit unit) noexcept;
 // Strict unsigned decimal, optional surrounding ASCII whitespace, up to nine
 // fractional digits. Require an exact multiple of quantumMs; never round.
-// On failure result is unchanged. Bounds and quantum must be positive.
+// On failure result is unchanged. Minimum may be zero for recording offsets;
+// maximum and quantum must be positive.
 bool parseDuration(std::wstring_view text, DurationUnit unit, int64_t minMs,
                    int64_t maxMs, int64_t quantumMs, int64_t& result,
                    std::wstring& error);

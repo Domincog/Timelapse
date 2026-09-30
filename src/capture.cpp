@@ -458,7 +458,11 @@ bool captureDesktop(const RECT& bounds, int maxWidth, int maxHeight, bool cursor
     const int width = std::max(1, int(std::lround(sourceWidth * scale)));
     const int height = std::max(1, int(std::lround(sourceHeight * scale)));
     ScreenDC screen;
-    thread_local DesktopSurface surface;
+    // Small activity checks must not retire/recreate the much larger recording
+    // or preview DIB. This second cache can retain at most 9 KiB of pixel data
+    // and acquires no GDI objects until a small capture is actually requested.
+    thread_local DesktopSurface normalSurface, smallSurface;
+    auto& surface = width <= 64 && height <= 36 ? smallSurface : normalSurface;
     if (!screen.value || !surface.prepare(screen.value, width, height)) {
         error = L"Windows could not prepare the desktop capture."; return false;
     }

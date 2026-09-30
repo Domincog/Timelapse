@@ -2,6 +2,7 @@
 #include "capture.h"
 #include "camera_host.h"
 #include "config.h"
+#include "time_skip.h"
 #include <mfapi.h>
 #include <commctrl.h>
 #include <shlobj.h>
@@ -22,7 +23,7 @@ using namespace lapse;
 namespace {
 constexpr COLORREF Ink = RGB(25, 38, 45), Muted = RGB(88, 106, 113), Accent = RGB(0, 116, 113);
 constexpr COLORREF Background = RGB(247, 249, 250), Canvas = RGB(21, 28, 34);
-enum Id { ModeBox = 100, IntervalBox, SizeBox, EncodingQualityBox, MonitorBox, CameraBox, Refresh, Record, Pause, Finish, Folder, OpenFolder, Reset, Forward, Preview, EncodingModeBox, AdvancedToggle, StopAfterBox, LowDiskBox, NightBox, NightDurationBox, NightTargetBox, NightHint, NightDetail };
+enum Id { ModeBox = 100, IntervalBox, SizeBox, EncodingQualityBox, MonitorBox, CameraBox, Refresh, Record, Pause, Finish, Folder, OpenFolder, Reset, Forward, Preview, EncodingModeBox, AdvancedToggle, StopAfterBox, LowDiskBox, NightBox, NightDurationBox, NightTargetBox, NightHint, NightDetail, SkipConfigure, SkipSummary, SkipDetail };
 constexpr int RecordingLimits[] = {0,900,3600,14400,28800,86400};
 constexpr int CaptureIntervals[] = {1000,2000,5000,10000,30000,60000};
 constexpr const wchar_t* RecordingLimitLabels[] = {L"Never",L"15 minutes",L"1 hour",L"4 hours",L"8 hours",L"24 hours"};
@@ -31,6 +32,8 @@ constexpr int NightDurations[] = {0,1000,2000,5000,10000,30000};
 constexpr const wchar_t* NightDurationLabels[] = {L"Auto",L"1 second",L"2 seconds",L"5 seconds",L"10 seconds",L"30 seconds"};
 constexpr int NightTargets[] = {64,96,128};
 constexpr const wchar_t* EncodingModeLabels[] = {L"Compatible H.264 (default)",L"Efficient H.264 (bitrate target)",L"Hardware H.264 (CPU offload)",L"Hardware HEVC (HEVC player)",L"Quality H.264 (detail)"};
+constexpr const wchar_t* SkipModeLabels[] = {L"Off",L"Quiet periods",L"Manual schedule",L"Quiet within schedule"};
+constexpr int SkipMultipliers[] = {2,4,8,16,32,64}, SkipRamps[] = {15,30,60};
 constexpr int SeparateFilesMode = 5;
 constexpr wchar_t SeparateFilesLabel[] = L"Desktop + camera (2 files)";
 constexpr UINT TrayMessage = WM_APP + 1, ShowExistingMessage = WM_APP + 2;
@@ -41,6 +44,7 @@ constexpr wchar_t SetupMutexName[] = L"Local\\Timelapse.Setup.{DC32D155-1B8D-488
 struct App {
     HWND window{}, preview{}, statusText{}, tooltip{};
     HWND customDialog{};
+    HWND skipConfigure{},skipSummary{},skipDetail{};
     HWND mode{}, interval{}, videoSize{}, encodingQuality{}, encodingMode{}, monitor{}, camera{}, refresh{}, record{}, pause{}, finish{}, folder{}, openFolder{}, reset{}, forward{};
     HWND advanced{}, stopAfter{}, lowDisk{}, nightEnabled{}, nightDuration{}, nightTarget{}, nightHint{}, nightDetail{}, labels[10]{};
     HFONT font{}, titleFont{}, smallFont{};
@@ -58,6 +62,9 @@ struct App {
     int committedInterval=2, committedSize=0, committedLimit=0;
     bool hasCustomInterval=false, hasCustomSize=false, hasCustomLimit=false;
     std::wstring advancedCaption, advancedTooltip;
+    std::wstring skipSummaryCaption,skipDetailCaption;
+    int skipRevision=0,advancedSkipRevision=-1,skipSummaryRevision=-1,skipVisibility=-1;
+    uint64_t skipCheckAge=UINT64_MAX;
     std::wstring nightValidation, statusCaption, nightHintCaption, nightDetailCaption;
     bool statusCaptionError = false;
     bool hiddenToTray = false, trayRegistered = false, trayNoticeShown = false, trayVersion4 = false;
@@ -82,6 +89,13 @@ struct App {
     ~App() { for(auto icon:trayIcons)if(icon)DestroyIcon(icon);DeleteObject(font); DeleteObject(titleFont); DeleteObject(smallFont); DeleteObject(background); }
 } app;
 void removeTray();
+void cancelOwnedDialogs() {
+    // EndDialog returns before destruction: walk ownership, not the global
+    // pointer, so an open range editor and its settings dialog both terminate.
+    for(HWND dialog=app.customDialog;dialog && dialog!=app.window;){
+        HWND owner=GetWindow(dialog,GW_OWNER);EndDialog(dialog,IDCANCEL);dialog=owner;
+    }
+}
 
 struct MediaRuntime {
     MediaRuntime() = default;
@@ -190,6 +204,43 @@ bool hasRequiredSources() {
         (!hasSource(Source::Camera) || (c>=0 && c<static_cast<int>(app.cameras.size())));
 }
 void layout();
+bool skipEnabled() { return app.settings.timeSkip.mode!=TimeSkipMode::Off; }
+bool skipScheduled(TimeSkipMode mode) { return mode==TimeSkipMode::Manual || mode==TimeSkipMode::QuietWithinSchedule; }
+bool skipAutomatic(TimeSkipMode mode) { return mode==TimeSkipMode::Quiet || mode==TimeSkipMode::QuietWithinSchedule; }
+std::wstring skipSummary(const TimeSkipSettings& policy,int intervalMs) {
+    if(policy.mode==TimeSkipMode::Off)return L"Off";
+    return std::wstring(SkipModeLabels[static_cast<int>(policy.mode)])+L" · up to "+std::to_wstring(policy.multiplier)+
+        L"× · target up to "+formatDuration(int64_t(intervalMs)*policy.multiplier,true)+L" between frames";
+}
+void updateSkipText(bool force=false) {
+    if(!app.skipSummary || !app.advancedExpanded)return;
+    if(app.hiddenToTray || IsIconic(app.window)){app.visibleDirty=true;return;}
+    if(force || app.skipSummaryRevision!=app.skipRevision){
+        const auto summary=skipSummary(app.settings.timeSkip,app.settings.intervalMs);
+        if(summary!=app.skipSummaryCaption){SetWindowTextW(app.skipSummary,summary.c_str());app.skipSummaryCaption=summary;}
+        app.skipSummaryRevision=app.skipRevision;
+    }
+    if(!skipEnabled())return;
+    std::wstring detail=L"Recording-time capture spacing; schedules use active time and exclude pauses.";
+    const auto& value=app.status.timeSkip;
+    if(app.active() && value.enabled){
+        if(app.status.state==State::Paused)detail=L"Paused; image checks and the schedule clock are paused.";
+        else {
+            const wchar_t* reason=value.reason==TimeSkipReason::Quiet?L"Quiet":value.reason==TimeSkipReason::Manual?L"Scheduled":
+                value.reason==TimeSkipReason::Checking?L"Checking image changes":value.reason==TimeSkipReason::Unavailable?L"Checks unavailable":L"Normal cadence";
+            detail=reason;
+            if(value.intervalMs>0)detail+=L" · target every "+formatDuration(value.intervalMs,true);
+            if(skipAutomatic(app.settings.timeSkip.mode)){
+                const uint64_t now=GetTickCount64();
+                app.skipCheckAge=value.lastCheckTick && now>=value.lastCheckTick?(now-value.lastCheckTick)/1000:UINT64_MAX;
+                detail+=app.skipCheckAge==UINT64_MAX?L" · waiting for source checks":L" · last source check "+std::to_wstring(app.skipCheckAge)+L" s ago";
+                if(value.observationDelayed)detail+=L" · delayed";
+            }
+            if(value.diagnostic[0])detail+=L" · "+std::wstring(value.diagnostic.data(),wcsnlen_s(value.diagnostic.data(),value.diagnostic.size()));
+        }
+    }
+    if(force || detail!=app.skipDetailCaption){SetWindowTextW(app.skipDetail,detail.c_str());app.skipDetailCaption=std::move(detail);}
+}
 int nightRow() { return hasSource(Source::Camera) ? (app.settings.night.enabled?2:1) : 0; }
 const std::wstring& statusCaption() {
     return !app.active() && !app.status.error && !app.nightValidation.empty() ? app.nightValidation : app.status.message;
@@ -225,33 +276,40 @@ void updateAdvanced() {
     if(!app.advanced)return;
     const int selection=selectedLimit();
     const int night=app.settings.night.enabled?(app.nightValidation.empty()?1:2):0;
-    if(selection!=app.advancedLimitIndex || night!=app.advancedNightState){
+    if(selection!=app.advancedLimitIndex || night!=app.advancedNightState || app.advancedSkipRevision!=app.skipRevision){
         std::wstring caption=L"&Advanced";
         if(night==2)caption+=L" · check blend";
         else if(night){caption+=L" · night";if(selection)caption+=L", "+(choice(app.stopAfter)<6?std::wstring(RecordingLimitShortLabels[std::clamp(choice(app.stopAfter),0,5)]):formatDuration(int64_t(selection)*1000,true));}
         else if(selection)caption+=L" · stop after "+(choice(app.stopAfter)<6?std::wstring(RecordingLimitLabels[std::clamp(choice(app.stopAfter),0,5)]):formatDuration(int64_t(selection)*1000,true));
+        if(skipEnabled() && night!=2)caption+=L" · "+std::to_wstring(app.settings.timeSkip.multiplier)+L"×";
         RECT bounds{};GetClientRect(app.advanced,&bounds);
-        if(selection && night!=2 && bounds.right>app.scale(40)) {
+        if((selection || skipEnabled()) && night!=2 && bounds.right>app.scale(40)) {
             HDC dc=GetDC(app.advanced);if(dc){const auto previous=SelectObject(dc,app.font);SIZE size{};
                 GetTextExtentPoint32W(dc,caption.c_str(),static_cast<int>(caption.size()),&size);
                 SelectObject(dc,previous);ReleaseDC(app.advanced,dc);
-                if(size.cx+app.scale(18)>bounds.right)caption=night?L"&Advanced · night + stop":L"&Advanced · timed stop";
+                if(size.cx+app.scale(18)>bounds.right)caption=skipEnabled()?L"&Advanced · "+std::wstring(night?L"night/":L"")+
+                    (selection?L"stop/":L"")+std::to_wstring(app.settings.timeSkip.multiplier)+L"×":night?L"&Advanced · night + stop":L"&Advanced · timed stop";
             }
         }
         if(caption!=app.advancedCaption){SetWindowTextW(app.advanced,caption.c_str());app.advancedCaption=caption;}
         app.advancedTooltip=L"Show or hide advanced options. Recording options can be changed before recording. Night mode applies only to camera content.";
         if(selection)app.advancedTooltip+=L" Stop after "+formatDuration(int64_t(selection)*1000)+L" of active recording; pauses and startup do not count.";
-        app.advancedLimitIndex=selection;app.advancedNightState=night;
+        if(skipEnabled())app.advancedTooltip+=L" Time compression: "+skipSummary(app.settings.timeSkip,app.settings.intervalMs)+L".";
+        app.advancedLimitIndex=selection;app.advancedNightState=night;app.advancedSkipRevision=app.skipRevision;
     }
     const int visibleNight=app.advancedExpanded?nightRow():0;
-    if(app.advancedVisibility==static_cast<int>(app.advancedExpanded) && app.nightVisibility==visibleNight)return;
+    const int visibleSkip=app.advancedExpanded?(skipEnabled()?2:1):0;
+    if(app.advancedVisibility==static_cast<int>(app.advancedExpanded) && app.nightVisibility==visibleNight && app.skipVisibility==visibleSkip)return;
     app.advancedVisibility=static_cast<int>(app.advancedExpanded);
     app.nightVisibility=visibleNight;
+    app.skipVisibility=visibleSkip;
     SendMessageW(app.advanced,BM_SETCHECK,app.advancedExpanded?BST_CHECKED:BST_UNCHECKED,0);
     const auto visible=[](HWND child,bool show){
         if(child && ((GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0)!=show)ShowWindow(child,show?SW_SHOWNA:SW_HIDE);
     };
     for(HWND child:{app.labels[6],app.encodingMode,app.labels[7],app.stopAfter,app.lowDisk})visible(child,app.advancedExpanded);
+    for(HWND child:{app.skipConfigure,app.skipSummary})visible(child,visibleSkip!=0);
+    visible(app.skipDetail,visibleSkip==2);
     if(!visibleNight && app.nightEnabled && GetFocus()==app.nightEnabled)SetFocus(app.advanced);
     visible(app.nightEnabled,visibleNight!=0);
     for(HWND child:{app.labels[8],app.nightDuration,app.labels[9],app.nightTarget,app.nightHint,app.nightDetail}){
@@ -260,10 +318,13 @@ void updateAdvanced() {
         visible(child,visibleNight==2);
     }
     updateNightText(true);
+    updateSkipText(true);
 }
 
 void configure() {
+    const int previousInterval=app.settings.intervalMs;
     app.settings.intervalMs = selectedInterval();
+    if(previousInterval!=app.settings.intervalMs)++app.skipRevision;
     const bool customSize=app.hasCustomSize && choice(app.videoSize)==2;
     app.settings.width = customSize?app.customWidth:choice(app.videoSize)==1?1920:1280;
     app.settings.height = customSize?app.customHeight:choice(app.videoSize)==1?1080:720;
@@ -333,7 +394,7 @@ void updateControls() {
     bool collage = !app.settings.separateFiles && app.settings.layers.size() > 1;
     EnableWindow(app.reset,collage); EnableWindow(app.forward,collage && app.selected>=0);
     updateAdvanced();
-    updateNightText(!app.controlsUpdated);updateStatusText(!app.controlsUpdated);
+    updateNightText(!app.controlsUpdated);updateSkipText(!app.controlsUpdated);updateStatusText(!app.controlsUpdated);
     app.controlsState=app.status.state;app.controlsUpdated=true;
 }
 void invalidateCanvas(RECT rect) {
@@ -348,20 +409,28 @@ void applyStatus(Status value,bool force=false) {
     const bool night=app.status.nightEnabled!=value.nightEnabled || app.status.nightWaiting!=value.nightWaiting ||
         app.status.nightDurationMs!=value.nightDurationMs || app.status.night.samples!=value.night.samples ||
         app.status.night.appliedGain!=value.night.appliedGain || app.status.night.targetLimited!=value.night.targetLimited;
+    const auto& oldSkip=app.status.timeSkip;const auto& newSkip=value.timeSkip;
+    const bool skip=state || oldSkip.enabled!=newSkip.enabled || oldSkip.reason!=newSkip.reason || oldSkip.intervalMs!=newSkip.intervalMs ||
+        oldSkip.lastCheckTick!=newSkip.lastCheckTick || oldSkip.observationDelayed!=newSkip.observationDelayed || oldSkip.diagnostic!=newSkip.diagnostic;
     app.status=std::move(value);
     // Status and tray handling remain live while hidden; only visual work waits.
     if(app.hiddenToTray || IsIconic(app.window)) {
-        if(force || stats || message || error || preview || night)app.visibleDirty=true;
+        if(force || stats || message || error || preview || night || skip)app.visibleDirty=true;
         return;
     }
     if(force || app.visibleDirty) {
-        updateControls();updateNightText();updateStatusText();
+        updateControls();updateNightText();updateSkipText();updateStatusText();
         InvalidateRect(app.window,nullptr,FALSE);InvalidateRect(app.preview,nullptr,FALSE);InvalidateRect(app.statusText,nullptr,TRUE);
         app.visibleDirty=false;return;
     }
     if(!app.controlsUpdated || app.controlsState!=app.status.state)updateControls();
     if(message || error || state)updateStatusText();
     if(night)updateNightText();
+    if(app.advancedExpanded && skipEnabled()){
+        const auto tick=app.status.timeSkip.lastCheckTick,now=GetTickCount64();
+        const auto age=tick && now>=tick?(now-tick)/1000:UINT64_MAX;
+        if(skip || (app.status.state==State::Recording && skipAutomatic(app.settings.timeSkip.mode) && age!=app.skipCheckAge))updateSkipText();
+    }
     if(preview)InvalidateRect(app.preview,nullptr,FALSE);
     if(state)invalidateCanvas({app.contentWidth-app.scale(280),app.scale(20),app.contentWidth-app.scale(26),app.scale(49)});
     if(stats)invalidateCanvas({app.scale(26),app.contentHeight-app.scale(147),app.contentWidth-app.scale(26),app.contentHeight-app.scale(123)});
@@ -426,7 +495,7 @@ void showWindow() {
     if(app.engine){applyStatus(app.engine->status(),true);configure();}
 }
 bool hideToTray() {
-    if(app.customDialog)EndDialog(app.customDialog,IDCANCEL);
+    cancelOwnedDialogs();
     applyStatus(app.engine->status());
     if(!updateTray(!app.trayRegistered)) {
         showWindow();
@@ -444,7 +513,7 @@ bool hideToTray() {
 }
 void exitApplication() {
     if(app.closeWhenDone)return;
-    if(app.customDialog)EndDialog(app.customDialog,IDCANCEL);
+    cancelOwnedDialogs();
     applyStatus(app.engine->status());
     if(app.active()) {
         if(MessageBoxW(app.window,L"Finish the current recording and exit Timelapse?",L"Finish recording",MB_OKCANCEL|MB_ICONQUESTION)!=IDOK)return;
@@ -491,7 +560,8 @@ void layout() {
     const int availableH=r.bottom+((style&WS_HSCROLL)?barH:0);
     const int minimumW=app.scale(830);
     const int night=nightRow();
-    const int previewTop=app.scale(app.advancedExpanded?(night==2?372:night==1?300:258):190);
+    const int skipHeight=skipEnabled()?80:52;
+    const int previewTop=app.scale(app.advancedExpanded?(night==2?372:night==1?300:258)+skipHeight:190);
     const int minimumH=previewTop+app.scale(160)+app.scale(191);
     bool horizontal=false, vertical=false;
     for(int i=0;i<3;++i) {
@@ -534,10 +604,13 @@ void layout() {
     move(app.labels[6],pad,app.scale(190),encodingW,app.scale(20));move(app.encodingMode,pad,app.scale(211),encodingW,app.scale(190));
     move(app.labels[7],stopX,app.scale(190),stopW,app.scale(20));move(app.stopAfter,stopX,app.scale(211),stopW,app.scale(210));
     move(app.lowDisk,diskX,app.scale(211),options-encodingW-stopW,ch);
-    move(app.nightEnabled,pad,app.scale(night==2?278:258),encodingW,ch);
-    move(app.labels[8],stopX,app.scale(257),stopW,app.scale(20));move(app.nightDuration,stopX,app.scale(278),stopW,app.scale(210));
-    move(app.labels[9],diskX,app.scale(257),options-encodingW-stopW,app.scale(20));move(app.nightTarget,diskX,app.scale(278),options-encodingW-stopW,app.scale(150));
-    move(app.nightHint,pad,app.scale(313),width,app.scale(21));move(app.nightDetail,pad,app.scale(337),width,app.scale(21));
+    move(app.skipConfigure,pad,app.scale(258),app.scale(202),ch);
+    move(app.skipSummary,pad+app.scale(216),app.scale(258),width-app.scale(216),ch);
+    move(app.skipDetail,pad,app.scale(294),width,app.scale(21));
+    move(app.nightEnabled,pad,app.scale((night==2?278:258)+skipHeight),encodingW,ch);
+    move(app.labels[8],stopX,app.scale(257+skipHeight),stopW,app.scale(20));move(app.nightDuration,stopX,app.scale(278+skipHeight),stopW,app.scale(210));
+    move(app.labels[9],diskX,app.scale(257+skipHeight),options-encodingW-stopW,app.scale(20));move(app.nightTarget,diskX,app.scale(278+skipHeight),options-encodingW-stopW,app.scale(150));
+    move(app.nightHint,pad,app.scale(313+skipHeight),width,app.scale(21));move(app.nightDetail,pad,app.scale(337+skipHeight),width,app.scale(21));
     move(app.refresh,r.right-pad-refreshW,row2,refreshW,ch);
     // The logical canvas retains a usable preview when the viewport is small.
     const int previewH=static_cast<int>(r.bottom)-previewTop-app.scale(191);
@@ -603,7 +676,7 @@ void revealFocusedControl() {
 }
 void toggleAdvanced() {
     const HWND focused=GetFocus();
-    if(app.advancedExpanded)for(HWND child:{app.encodingMode,app.stopAfter,app.lowDisk,app.nightEnabled,app.nightDuration,app.nightTarget})
+    if(app.advancedExpanded)for(HWND child:{app.encodingMode,app.stopAfter,app.lowDisk,app.skipConfigure,app.nightEnabled,app.nightDuration,app.nightTarget})
         if(child && (focused==child || (focused && IsChild(child,focused)))){SetFocus(app.advanced);break;}
     app.advancedExpanded=!app.advancedExpanded;
     updateAdvanced();layout();revealFocusedControl();
@@ -628,15 +701,17 @@ void fonts() {
     app.titleFont = CreateFontW(-app.scale(25),0,0,0,FW_SEMIBOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
     app.smallFont = CreateFontW(-app.scale(12),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
     EnumChildWindows(app.window,[](HWND w,LPARAM p)->BOOL { SendMessageW(w,WM_SETFONT,p,TRUE); return TRUE; },reinterpret_cast<LPARAM>(app.font));
-    for(HWND child:{app.statusText,app.nightHint,app.nightDetail})if(child)SendMessageW(child,WM_SETFONT,reinterpret_cast<WPARAM>(app.smallFont),TRUE);
+    for(HWND child:{app.statusText,app.nightHint,app.nightDetail,app.skipDetail})if(child)SendMessageW(child,WM_SETFONT,reinterpret_cast<WPARAM>(app.smallFont),TRUE);
 }
 
-enum class CustomKind { Interval, Size, Limit };
+enum class CustomKind { Interval, Size, Limit, Range };
 enum CustomId { CustomFirst=5001, CustomSecond, CustomUnits, CustomHelp, CustomError, CustomFirstLabel, CustomSecondLabel };
 struct CustomDraft {
     CustomKind kind=CustomKind::Interval;
     int64_t durationMs=5000;
     int width=1280,height=720,dpi=96,scrollX=0,scrollY=0;
+    int startSeconds=0,endSeconds=60;
+    HWND previousDialog{};
     HFONT font{};
     HWND first{},second{},units{},help{},error{},firstLabel{},secondLabel{},okay{},cancel{};
     bool layingOut=false;
@@ -710,6 +785,15 @@ bool validateCustom(CustomDraft& draft,std::wstring& message,HWND& invalid) {
     wchar_t first[96]{},second[96]{};invalid=draft.first;
     if(GetWindowTextLengthW(draft.first)>=96){message=L"Enter a shorter complete number.";return false;}
     GetWindowTextW(draft.first,first,96);
+    if(draft.kind==CustomKind::Range){
+        int64_t start=0,end=0;
+        if(!parseDuration(first,DurationUnit::Seconds,0,int64_t(INT_MAX)*1000,1000,start,message))return false;
+        invalid=draft.second;if(GetWindowTextLengthW(draft.second)>=96){message=L"Enter a shorter complete number.";return false;}
+        GetWindowTextW(draft.second,second,96);
+        if(!parseDuration(second,DurationUnit::Seconds,1000,int64_t(INT_MAX)*1000,1000,end,message))return false;
+        if(end<=start){message=L"End after must be later than Start after.";return false;}
+        draft.startSeconds=static_cast<int>(start/1000);draft.endSeconds=static_cast<int>(end/1000);return true;
+    }
     if(draft.kind==CustomKind::Size){
         int width=0,height=0;
         if(!parsePixelDimension(first,width,message))return false;
@@ -729,27 +813,29 @@ INT_PTR CALLBACK customProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
     auto* draft=reinterpret_cast<CustomDraft*>(GetWindowLongPtrW(window,DWLP_USER));
     try {
         if(message==WM_INITDIALOG){
-            draft=reinterpret_cast<CustomDraft*>(lp);SetWindowLongPtrW(window,DWLP_USER,lp);app.customDialog=window;
+            draft=reinterpret_cast<CustomDraft*>(lp);SetWindowLongPtrW(window,DWLP_USER,lp);draft->previousDialog=app.customDialog;app.customDialog=window;
             draft->dpi=static_cast<int>(GetDpiForWindow(window));if(draft->dpi<=0)draft->dpi=app.dpi;
-            const bool size=draft->kind==CustomKind::Size,interval=draft->kind==CustomKind::Interval;
-            SetWindowTextW(window,size?L"Custom video size":interval?L"Custom capture interval":L"Custom stop time");
+            const bool range=draft->kind==CustomKind::Range,size=draft->kind==CustomKind::Size,interval=draft->kind==CustomKind::Interval;
+            SetWindowTextW(window,range?L"Compression range":size?L"Custom video size":interval?L"Custom capture interval":L"Custom stop time");
             const auto child=[&](const wchar_t* type,const wchar_t* text,DWORD style,int id){return CreateWindowExW(std::wcscmp(type,L"EDIT")==0?WS_EX_CLIENTEDGE:0,
                 type,text,WS_CHILD|WS_VISIBLE|style,0,0,1,1,window,reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),GetModuleHandleW(nullptr),nullptr);};
-            draft->firstLabel=child(L"STATIC",size?L"&Width (pixels)":L"&Value",0,CustomFirstLabel);
+            draft->firstLabel=child(L"STATIC",range?L"&Start after (seconds)":size?L"&Width (pixels)":L"&Value",0,CustomFirstLabel);
             draft->first=child(L"EDIT",L"",WS_TABSTOP|ES_AUTOHSCROLL,CustomFirst);
-            draft->secondLabel=child(L"STATIC",size?L"&Height (pixels)":L"&Units",0,CustomSecondLabel);
-            if(size)draft->second=child(L"EDIT",L"",WS_TABSTOP|ES_AUTOHSCROLL,CustomSecond);
+            draft->secondLabel=child(L"STATIC",range?L"&End after (seconds)":size?L"&Height (pixels)":L"&Units",0,CustomSecondLabel);
+            if(size || range)draft->second=child(L"EDIT",L"",WS_TABSTOP|ES_AUTOHSCROLL,CustomSecond);
             else {draft->units=child(L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL,CustomUnits);
                 for(const auto* unit:{L"Seconds",L"Minutes",L"Hours"})add(draft->units,unit);if(!interval)add(draft->units,L"Days");choose(draft->units,0);}
-            draft->help=child(L"STATIC",size?L"Use even dimensions from 48 to 4096 pixels, at most 8,847,360 pixels total. Sources fit inside the video without stretching.":
+            draft->help=child(L"STATIC",range?L"Use whole active seconds from 0 to 2,147,483,647. Pauses and initial preparation do not count. Start is included; end is excluded. Overlapping or touching ranges merge when you return to the schedule.":size?L"Use even dimensions from 48 to 4096 pixels, at most 8,847,360 pixels total. Sources fit inside the video without stretching.":
                 interval?L"Choose 0.1 seconds to 24 hours. Decimals use a point and must resolve to whole milliseconds. Playback stays at 30 fps.":
                 L"Choose 1 to 2,147,483,647 seconds of active recording. Pauses and initial preparation do not count. Decimals must resolve to whole seconds.",SS_NOPREFIX,CustomHelp);
             draft->error=child(L"STATIC",L"",SS_NOPREFIX,CustomError);
             draft->okay=child(L"BUTTON",L"OK",WS_TABSTOP|BS_DEFPUSHBUTTON,IDOK);draft->cancel=child(L"BUTTON",L"Cancel",WS_TABSTOP|BS_PUSHBUTTON,IDCANCEL);
-            if(!draft->firstLabel || !draft->secondLabel || !draft->first || !(size?draft->second:draft->units) || !draft->help || !draft->error || !draft->okay || !draft->cancel){EndDialog(window,-1);return TRUE;}
-            SendMessageW(draft->first,EM_SETLIMITTEXT,80,0);if(size)SendMessageW(draft->second,EM_SETLIMITTEXT,80,0);
-            SetWindowTextW(draft->first,(size?std::to_wstring(draft->width):secondsInput(draft->durationMs)).c_str());
-            if(size)SetWindowTextW(draft->second,std::to_wstring(draft->height).c_str());customFont(window,*draft);
+            if(!draft->firstLabel || !draft->secondLabel || !draft->first || !((size || range)?draft->second:draft->units) || !draft->help || !draft->error || !draft->okay || !draft->cancel){EndDialog(window,-1);return TRUE;}
+            // Native paste must reach the rejection threshold, never truncate
+            // below it into a different valid numeric prefix.
+            SendMessageW(draft->first,EM_SETLIMITTEXT,96,0);if(draft->second)SendMessageW(draft->second,EM_SETLIMITTEXT,96,0);
+            SetWindowTextW(draft->first,(range?std::to_wstring(draft->startSeconds):size?std::to_wstring(draft->width):secondsInput(draft->durationMs)).c_str());
+            if(draft->second)SetWindowTextW(draft->second,std::to_wstring(range?draft->endSeconds:draft->height).c_str());customFont(window,*draft);
             RECT rect{0,0,draft->scale(420),draft->scale(250)};AdjustWindowRectExForDpi(&rect,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_STYLE)),FALSE,
                 static_cast<DWORD>(GetWindowLongPtrW(window,GWL_EXSTYLE)),draft->dpi);
             RECT owner{};GetWindowRect(app.window,&owner);OffsetRect(&rect,(owner.left+owner.right-(rect.right-rect.left))/2-rect.left,(owner.top+owner.bottom-(rect.bottom-rect.top))/2-rect.top);
@@ -777,7 +863,7 @@ INT_PTR CALLBACK customProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             return FALSE;
         case WM_CTLCOLORSTATIC:if(reinterpret_cast<HWND>(lp)==draft->error){SetTextColor(reinterpret_cast<HDC>(wp),RGB(164,40,40));SetBkColor(reinterpret_cast<HDC>(wp),GetSysColor(COLOR_BTNFACE));return reinterpret_cast<INT_PTR>(GetSysColorBrush(COLOR_BTNFACE));}break;
         case WM_CLOSE:EndDialog(window,IDCANCEL);return TRUE;
-        case WM_DESTROY:if(draft->font){DeleteObject(draft->font);draft->font=nullptr;}if(app.customDialog==window)app.customDialog=nullptr;return TRUE;
+        case WM_DESTROY:if(draft->font){DeleteObject(draft->font);draft->font=nullptr;}if(app.customDialog==window)app.customDialog=IsWindow(draft->previousDialog)?draft->previousDialog:nullptr;return TRUE;
         }
     } catch (...) {EndDialog(window,-1);return TRUE;}
     return FALSE;
@@ -803,6 +889,208 @@ void editCustom(CustomKind kind) {
     else if(outcome==-1)MessageBoxW(app.window,L"The custom settings dialog could not be opened. Try again.",L"Timelapse",MB_OK|MB_ICONERROR);
     if(!app.closeWhenDone){SetFocus(box);revealFocusedControl();}
 }
+enum SkipId { SkipMode=5101,SkipSpeed,SkipRamp,SkipQuiet,SkipQuietUnits,SkipRanges,SkipAdd,SkipEdit,SkipRemove,SkipRepeat,SkipRepeatUnits,SkipHelp,SkipError };
+struct SkipDraft : CustomDraft {
+    TimeSkipSettings policy;
+    bool readOnly=false,repeatCleared=false;
+    int naturalHeight=0;
+    HWND mode{},speed{},ramp{},quiet{},quietUnits{},ranges{},add{},edit{},remove{},repeat{},repeatUnits{};
+    HWND labels[8]{};
+};
+HWND skipChild(HWND window,const wchar_t* type,const wchar_t* value,DWORD style,int id) {
+    return CreateWindowExW((std::wcscmp(type,L"EDIT")==0 || std::wcscmp(type,L"LISTBOX")==0)?WS_EX_CLIENTEDGE:0,
+        type,value,WS_CHILD|WS_VISIBLE|style,0,0,1,1,window,reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),GetModuleHandleW(nullptr),nullptr);
+}
+void skipLayout(HWND window,SkipDraft& draft) {
+    if(draft.layingOut)return;draft.layingOut=true;
+    const auto mode=static_cast<TimeSkipMode>(std::clamp(choice(draft.mode),0,3));
+    const bool enabled=mode!=TimeSkipMode::Off,automatic=skipAutomatic(mode),scheduled=skipScheduled(mode);
+    const auto visible=[](HWND child,bool show){if(child && ((GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0)!=show)ShowWindow(child,show?SW_SHOWNA:SW_HIDE);};
+    for(HWND child:{draft.labels[1],draft.speed,draft.labels[2],draft.ramp})visible(child,enabled);
+    for(HWND child:{draft.labels[3],draft.quiet,draft.labels[7],draft.quietUnits})visible(child,automatic);
+    for(HWND child:{draft.labels[4],draft.ranges,draft.add,draft.edit,draft.remove,draft.labels[5],draft.repeat,draft.labels[6],draft.repeatUnits})visible(child,scheduled);
+    RECT client{};GetClientRect(window,&client);const auto style=GetWindowLongPtrW(window,GWL_STYLE);
+    const int barW=GetSystemMetricsForDpi(SM_CXVSCROLL,draft.dpi),barH=GetSystemMetricsForDpi(SM_CYHSCROLL,draft.dpi);
+    const int availableW=client.right+((style&WS_VSCROLL)?barW:0),availableH=client.bottom+((style&WS_HSCROLL)?barH:0);
+    const int pad=draft.scale(18),gap=draft.scale(14),minimumWidth=draft.scale(360);
+    const int quietTop=134,scheduleTop=automatic?196:134,repeatTop=scheduleTop+160;
+    const int helpTop=!enabled?78:scheduled?repeatTop+68:automatic?200:138;
+    const auto wrapped=[&](HWND child,int width,int minimum){wchar_t value[2048]{};GetWindowTextW(child,value,2048);
+        RECT r{0,0,std::max(1,width),0};HDC dc=GetDC(window);if(!dc)return minimum;const auto previous=SelectObject(dc,draft.font);
+        DrawTextW(dc,value,-1,&r,DT_CALCRECT|DT_WORDBREAK|DT_NOPREFIX);SelectObject(dc,previous);ReleaseDC(window,dc);return std::max(minimum,int(r.bottom));};
+    bool horizontal=false,vertical=false;int helpHeight=0,errorHeight=0,errorTop=0,buttonTop=0,minHeight=0;
+    const auto measure=[&](int width){helpHeight=wrapped(draft.help,width-2*pad,draft.scale(40));errorTop=draft.scale(helpTop)+helpHeight+draft.scale(10);
+        errorHeight=wrapped(draft.error,width-2*pad,draft.scale(22));buttonTop=errorTop+errorHeight+draft.scale(12);minHeight=buttonTop+draft.scale(44);};
+    for(int i=0;i<3;++i){horizontal=availableW-(vertical?barW:0)<minimumWidth;measure(std::max(minimumWidth,availableW-(vertical?barW:0)));vertical=availableH-(horizontal?barH:0)<minHeight;}
+    ShowScrollBar(window,SB_HORZ,horizontal);ShowScrollBar(window,SB_VERT,vertical);GetClientRect(window,&client);
+    const int width=std::max(minimumWidth,int(client.right));measure(width);const int height=std::max(minHeight,int(client.bottom));
+    draft.naturalHeight=minHeight;
+    draft.scrollX=std::clamp(draft.scrollX,0,width-int(std::max(1L,client.right)));draft.scrollY=std::clamp(draft.scrollY,0,height-int(std::max(1L,client.bottom)));
+    SCROLLINFO info{sizeof(info),SIF_RANGE|SIF_PAGE|SIF_POS};info.nMax=width-1;info.nPage=std::max(1L,client.right);info.nPos=draft.scrollX;SetScrollInfo(window,SB_HORZ,&info,TRUE);
+    info.nMax=height-1;info.nPage=std::max(1L,client.bottom);info.nPos=draft.scrollY;SetScrollInfo(window,SB_VERT,&info,TRUE);
+    const int half=(width-2*pad-gap)/2,x2=pad+half+gap;
+    const auto move=[&](HWND child,int x,int y,int w,int h){MoveWindow(child,x-draft.scrollX,y-draft.scrollY,w,h,TRUE);};
+    move(draft.labels[0],pad,draft.scale(16),width-2*pad,draft.scale(20));move(draft.mode,pad,draft.scale(38),width-2*pad,draft.scale(160));
+    move(draft.labels[1],pad,draft.scale(76),half,draft.scale(20));move(draft.speed,pad,draft.scale(98),half,draft.scale(200));
+    move(draft.labels[2],x2,draft.scale(76),half,draft.scale(20));move(draft.ramp,x2,draft.scale(98),half,draft.scale(150));
+    move(draft.labels[3],pad,draft.scale(quietTop),half,draft.scale(20));move(draft.quiet,pad,draft.scale(quietTop+22),half,draft.scale(28));
+    move(draft.labels[7],x2,draft.scale(quietTop),half,draft.scale(20));
+    move(draft.quietUnits,x2,draft.scale(quietTop+22),half,draft.scale(150));
+    move(draft.labels[4],pad,draft.scale(scheduleTop),width-2*pad,draft.scale(20));move(draft.ranges,pad,draft.scale(scheduleTop+22),width-2*pad,draft.scale(94));
+    move(draft.add,pad,draft.scale(scheduleTop+122),draft.scale(80),draft.scale(28));move(draft.edit,pad+draft.scale(94),draft.scale(scheduleTop+122),draft.scale(80),draft.scale(28));
+    move(draft.remove,pad+draft.scale(188),draft.scale(scheduleTop+122),draft.scale(92),draft.scale(28));
+    move(draft.labels[5],pad,draft.scale(repeatTop),half,draft.scale(20));move(draft.repeat,pad,draft.scale(repeatTop+22),half,draft.scale(28));
+    move(draft.labels[6],x2,draft.scale(repeatTop),half,draft.scale(20));move(draft.repeatUnits,x2,draft.scale(repeatTop+22),half,draft.scale(150));
+    move(draft.help,pad,draft.scale(helpTop),width-2*pad,helpHeight);move(draft.error,pad,errorTop,width-2*pad,errorHeight);
+    move(draft.okay,width-pad-draft.scale(174),buttonTop,draft.scale(80),draft.scale(28));move(draft.cancel,width-pad-draft.scale(80),buttonTop,draft.scale(80),draft.scale(28));
+    draft.layingOut=false;
+}
+void skipFitHeight(HWND window,SkipDraft& draft) {
+    RECT rect{},client{};GetWindowRect(window,&rect);GetClientRect(window,&client);
+    rect.bottom+=draft.naturalHeight-client.bottom;
+    rect=fitWindow(rect,workArea(MonitorFromWindow(window,MONITOR_DEFAULTTONEAREST)));
+    SetWindowPos(window,nullptr,rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top,SWP_NOZORDER|SWP_NOACTIVATE);
+    skipLayout(window,draft);
+}
+void skipReveal(HWND window,SkipDraft& draft,HWND child) {
+    if(!child || !IsChild(window,child))return;RECT bounds{},client{};GetWindowRect(child,&bounds);
+    MapWindowPoints(nullptr,window,reinterpret_cast<POINT*>(&bounds),2);GetClientRect(window,&client);
+    if(bounds.left<0)draft.scrollX+=bounds.left;else if(bounds.right>client.right)draft.scrollX+=bounds.right-client.right;
+    if(bounds.top<0)draft.scrollY+=bounds.top;else if(bounds.bottom>client.bottom)draft.scrollY+=bounds.bottom-client.bottom;skipLayout(window,draft);
+}
+void skipHelp(SkipDraft& draft) {
+    const auto mode=static_cast<TimeSkipMode>(std::clamp(choice(draft.mode),0,3));
+    std::wstring text=mode==TimeSkipMode::Off?L"Off keeps the selected Capture every interval throughout the recording.":
+        mode==TimeSkipMode::Manual?L"Manual schedule accelerates even when something moves. Ranges use active recording time; pauses and initial preparation do not count. Zero repeat means one schedule. Touching or overlapping ranges merge.":
+        L"Image changes in either selected source keep normal speed; this does not detect people. Checks are best effort, about once a second; brief or small changes may be missed. Detected activity returns to normal speed promptly, interrupting the transition.";
+    if(mode==TimeSkipMode::QuietWithinSchedule)text+=L" Accelerates only when quiet AND inside a range. Checks continue outside ranges. Schedule times exclude pauses and initial preparation; zero repeat means one schedule.";
+    if(mode!=TimeSkipMode::Off)text+=L" Transitions count saved video frames (30 fps); real recording time depends on the capture interval. Short ranges may reach a lower speed. No intermediate pictures are generated. Both output files share the cadence. Night blends retain their full duration, bounded by the original interval.";
+    if(draft.readOnly)text=L"Recording options are frozen for this session. "+text;
+    if(draft.repeatCleared)text+=L" The retained repeat was reset to Never because an edited range exceeded it; your ranges are retained.";
+    SetWindowTextW(draft.help,text.c_str());
+}
+void skipList(SkipDraft& draft,int selected=-1) {
+    SendMessageW(draft.ranges,LB_RESETCONTENT,0,0);
+    for(unsigned i=0;i<draft.policy.rangeCount;++i){const auto& range=draft.policy.ranges[i];
+        const auto text=formatDuration(int64_t(range.startSeconds)*1000)+L" → "+formatDuration(int64_t(range.endSeconds)*1000);
+        SendMessageW(draft.ranges,LB_ADDSTRING,0,reinterpret_cast<LPARAM>(text.c_str()));}
+    if(draft.policy.rangeCount)SendMessageW(draft.ranges,LB_SETCURSEL,std::clamp(selected,0,int(draft.policy.rangeCount)-1),0);
+    const bool selection=SendMessageW(draft.ranges,LB_GETCURSEL,0,0)!=LB_ERR;
+    EnableWindow(draft.add,!draft.readOnly && draft.policy.rangeCount<TimeSkipMaxRanges);
+    EnableWindow(draft.edit,!draft.readOnly && selection);EnableWindow(draft.remove,!draft.readOnly && selection);
+}
+bool skipDuration(HWND edit,HWND units,int64_t minimum,int64_t& result,std::wstring& error) {
+    wchar_t value[96]{};if(GetWindowTextLengthW(edit)>=96){error=L"Enter a shorter complete number.";return false;}GetWindowTextW(edit,value,96);
+    return parseDuration(value,static_cast<DurationUnit>(std::clamp(choice(units),0,3)),minimum,int64_t(INT_MAX)*1000,1000,result,error);
+}
+bool skipClearInactiveRepeat(TimeSkipSettings& policy) {
+    if(!skipScheduled(policy.mode) && policy.repeatSeconds>0)
+        for(unsigned i=0;i<policy.rangeCount;++i)if(policy.ranges[i].endSeconds>policy.repeatSeconds){policy.repeatSeconds=0;return true;}
+    return false;
+}
+bool validateSkip(SkipDraft& draft,TimeSkipSettings& output,std::wstring& error,HWND& invalid) {
+    auto policy=draft.policy;policy.mode=static_cast<TimeSkipMode>(std::clamp(choice(draft.mode),0,3));
+    const int speed=choice(draft.speed);if(speed>=0 && speed<6)policy.multiplier=SkipMultipliers[speed];
+    policy.rampFrames=SkipRamps[std::clamp(choice(draft.ramp),0,2)];
+    int64_t value=0;
+    if(skipAutomatic(policy.mode)){invalid=draft.quiet;if(!skipDuration(draft.quiet,draft.quietUnits,1000,value,error))return false;policy.quietAfterMs=value;}
+    if(skipScheduled(policy.mode)){invalid=draft.repeat;if(!skipDuration(draft.repeat,draft.repeatUnits,0,value,error))return false;policy.repeatSeconds=static_cast<int>(value/1000);invalid=draft.ranges;}
+    skipClearInactiveRepeat(policy);
+    if(!normalizeTimeSkipSettings(policy,error))return false;output=policy;return true;
+}
+void skipRange(HWND window,SkipDraft& draft,bool edit) {
+    if(draft.readOnly || app.active())return;
+    const int selected=static_cast<int>(SendMessageW(draft.ranges,LB_GETCURSEL,0,0));
+    if((edit && (selected<0 || selected>=int(draft.policy.rangeCount))) || (!edit && draft.policy.rangeCount>=TimeSkipMaxRanges))return;
+    CustomDraft range;range.kind=CustomKind::Range;
+    if(edit){range.startSeconds=draft.policy.ranges[selected].startSeconds;range.endSeconds=draft.policy.ranges[selected].endSeconds;}
+    else if(draft.policy.rangeCount){range.startSeconds=draft.policy.ranges[draft.policy.rangeCount-1].endSeconds;
+        range.endSeconds=range.startSeconds<=INT_MAX-60?range.startSeconds+60:INT_MAX;}
+    CustomTemplate resource;const auto outcome=DialogBoxIndirectParamW(GetModuleHandleW(nullptr),&resource.dialog,window,customProc,reinterpret_cast<LPARAM>(&range));
+    if(!IsWindow(window))return;
+    if(outcome==IDOK && !app.active()){
+        auto candidate=draft.policy;candidate.mode=TimeSkipMode::Off;candidate.repeatSeconds=0;
+        candidate.ranges[edit?selected:candidate.rangeCount++]={range.startSeconds,range.endSeconds};
+        std::wstring error;
+        if(normalizeTimeSkipSettings(candidate,error)){
+            draft.policy.ranges=candidate.ranges;draft.policy.rangeCount=candidate.rangeCount;skipList(draft,edit?selected:int(candidate.rangeCount)-1);
+            SetWindowTextW(draft.error,L"Ranges sorted; touching or overlapping ranges merged.");
+        } else SetWindowTextW(draft.error,error.c_str());
+    } else if(outcome==-1)SetWindowTextW(draft.error,L"The range editor could not be opened. Try again.");
+    if(!app.hiddenToTray){SetFocus(draft.ranges);skipReveal(window,draft,draft.ranges);}
+}
+INT_PTR CALLBACK skipProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
+    auto* draft=reinterpret_cast<SkipDraft*>(GetWindowLongPtrW(window,DWLP_USER));
+    try {
+        if(message==WM_INITDIALOG){
+            draft=reinterpret_cast<SkipDraft*>(lp);SetWindowLongPtrW(window,DWLP_USER,lp);draft->previousDialog=app.customDialog;app.customDialog=window;
+            draft->dpi=static_cast<int>(GetDpiForWindow(window));if(draft->dpi<=0)draft->dpi=app.dpi;SetWindowTextW(window,L"Time compression");
+            const auto label=[&](int index,const wchar_t* text){return draft->labels[index]=skipChild(window,L"STATIC",text,0,5200+index);};
+            const auto combo=[&](int id){return skipChild(window,L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL,id);};
+            const auto button=[&](const wchar_t* text,int id){return skipChild(window,L"BUTTON",text,WS_TABSTOP|BS_PUSHBUTTON,id);};
+            label(0,L"&Mode");draft->mode=combo(SkipMode);for(auto value:SkipModeLabels)add(draft->mode,value);choose(draft->mode,static_cast<int>(draft->policy.mode));
+            label(1,L"Ma&ximum extra speed");draft->speed=combo(SkipSpeed);for(int value:SkipMultipliers)add(draft->speed,std::to_wstring(value)+L"×");
+            label(2,L"&Transition (video time)");draft->ramp=combo(SkipRamp);for(auto value:{L"0.5 s (15 frames)",L"1 s (30 frames)",L"2 s (60 frames)"})add(draft->ramp,value);
+            choose(draft->speed,1);choose(draft->ramp,1);
+            bool foundSpeed=false;for(int i=0;i<6;++i)if(SkipMultipliers[i]==draft->policy.multiplier){choose(draft->speed,i);foundSpeed=true;}
+            if(!foundSpeed){add(draft->speed,std::to_wstring(draft->policy.multiplier)+L"×");choose(draft->speed,6);}
+            for(int i=0;i<3;++i)if(SkipRamps[i]==draft->policy.rampFrames)choose(draft->ramp,i);
+            label(3,L"&Quiet for (active time)");draft->quiet=skipChild(window,L"EDIT",secondsInput(draft->policy.quietAfterMs).c_str(),WS_TABSTOP|ES_AUTOHSCROLL,SkipQuiet);
+            label(7,L"Quiet u&nits");draft->quietUnits=combo(SkipQuietUnits);
+            label(4,L"Active-time &ranges (start → end, up to 16)");draft->ranges=skipChild(window,L"LISTBOX",L"",WS_TABSTOP|LBS_NOTIFY|LBS_NOINTEGRALHEIGHT|WS_VSCROLL,SkipRanges);
+            draft->add=button(L"&Add...",SkipAdd);draft->edit=button(L"&Edit...",SkipEdit);draft->remove=button(L"&Remove",SkipRemove);
+            label(5,L"Repeat e&very (0 = never)");draft->repeat=skipChild(window,L"EDIT",std::to_wstring(draft->policy.repeatSeconds).c_str(),WS_TABSTOP|ES_AUTOHSCROLL,SkipRepeat);
+            label(6,L"&Units");draft->repeatUnits=combo(SkipRepeatUnits);
+            for(HWND box:{draft->quietUnits,draft->repeatUnits}){for(auto value:{L"Seconds",L"Minutes",L"Hours",L"Days"})add(box,value);choose(box,0);}
+            draft->help=skipChild(window,L"STATIC",L"",SS_NOPREFIX,SkipHelp);draft->error=skipChild(window,L"STATIC",L"",SS_NOPREFIX,SkipError);
+            draft->okay=skipChild(window,L"BUTTON",L"OK",WS_TABSTOP|BS_DEFPUSHBUTTON,IDOK);draft->cancel=button(draft->readOnly?L"Close":L"Cancel",IDCANCEL);
+            bool okay=true;for(HWND child:{draft->mode,draft->speed,draft->ramp,draft->quiet,draft->quietUnits,draft->ranges,draft->add,draft->edit,draft->remove,draft->repeat,draft->repeatUnits,draft->help,draft->error,draft->okay,draft->cancel})if(!child)okay=false;
+            for(HWND child:draft->labels)if(!child)okay=false;if(!okay){EndDialog(window,-1);return TRUE;}
+            for(HWND child:{draft->quiet,draft->repeat})SendMessageW(child,EM_SETLIMITTEXT,96,0);
+            for(HWND child:{draft->mode,draft->speed,draft->ramp,draft->quiet,draft->quietUnits,draft->repeat,draft->repeatUnits,draft->okay})EnableWindow(child,!draft->readOnly);
+            if(draft->readOnly)ShowWindow(draft->okay,SW_HIDE);skipList(*draft);skipHelp(*draft);customFont(window,*draft);
+            RECT rect{0,0,draft->scale(540),draft->scale(skipScheduled(draft->policy.mode)?680:460)};
+            AdjustWindowRectExForDpi(&rect,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_STYLE)),FALSE,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_EXSTYLE)),draft->dpi);
+            RECT owner{};GetWindowRect(app.window,&owner);OffsetRect(&rect,(owner.left+owner.right-(rect.right-rect.left))/2-rect.left,(owner.top+owner.bottom-(rect.bottom-rect.top))/2-rect.top);
+            rect=fitWindow(rect,workArea(MonitorFromWindow(app.window,MONITOR_DEFAULTTONEAREST)));SetWindowPos(window,nullptr,rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top,SWP_NOZORDER|SWP_NOACTIVATE);
+            skipLayout(window,*draft);skipFitHeight(window,*draft);SetFocus(draft->readOnly?draft->cancel:draft->mode);skipReveal(window,*draft,GetFocus());return FALSE;
+        }
+        if(!draft)return FALSE;
+        switch(message){
+        case WM_SIZE:skipLayout(window,*draft);return TRUE;
+        case WM_DPICHANGED:{draft->dpi=HIWORD(wp);customFont(window,*draft);RECT rect=*reinterpret_cast<RECT*>(lp);rect=fitWindow(rect,workArea(MonitorFromRect(&rect,MONITOR_DEFAULTTONEAREST)));
+            SetWindowPos(window,nullptr,rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top,SWP_NOZORDER|SWP_NOACTIVATE);skipLayout(window,*draft);skipReveal(window,*draft,GetFocus());return TRUE;}
+        case WM_HSCROLL:case WM_VSCROLL:{const int bar=message==WM_HSCROLL?SB_HORZ:SB_VERT;SCROLLINFO info{sizeof(info),SIF_ALL};GetScrollInfo(window,bar,&info);int position=info.nPos;
+            switch(LOWORD(wp)){case SB_LINEUP:position-=draft->scale(24);break;case SB_LINEDOWN:position+=draft->scale(24);break;case SB_PAGEUP:position-=info.nPage;break;case SB_PAGEDOWN:position+=info.nPage;break;case SB_THUMBPOSITION:case SB_THUMBTRACK:position=info.nTrackPos;break;case SB_TOP:position=0;break;case SB_BOTTOM:position=info.nMax;break;default:return TRUE;}
+            (bar==SB_HORZ?draft->scrollX:draft->scrollY)=position;skipLayout(window,*draft);return TRUE;}
+        case WM_COMMAND:{const int id=LOWORD(wp);
+            if(id==IDCANCEL){EndDialog(window,IDCANCEL);return TRUE;}
+            if(id==IDOK){if(draft->readOnly || app.active()){EndDialog(window,IDCANCEL);return TRUE;}TimeSkipSettings policy;std::wstring error;HWND invalid=draft->mode;
+                if(validateSkip(*draft,policy,error,invalid)){draft->policy=policy;EndDialog(window,IDOK);return TRUE;}
+                SetWindowTextW(draft->error,error.c_str());skipLayout(window,*draft);skipFitHeight(window,*draft);SetFocus(invalid);skipReveal(window,*draft,invalid);return TRUE;}
+            if((id==SkipAdd || id==SkipEdit || (id==SkipRanges && HIWORD(wp)==LBN_DBLCLK)) && !draft->readOnly){skipRange(window,*draft,id!=SkipAdd);return TRUE;}
+            if(id==SkipRemove && !draft->readOnly && !app.active()){const int selected=static_cast<int>(SendMessageW(draft->ranges,LB_GETCURSEL,0,0));
+                if(selected>=0 && selected<int(draft->policy.rangeCount)){for(unsigned i=selected+1;i<draft->policy.rangeCount;++i)draft->policy.ranges[i-1]=draft->policy.ranges[i];--draft->policy.rangeCount;skipList(*draft,selected);}return TRUE;}
+            if(id==SkipMode && HIWORD(wp)==CBN_SELCHANGE){
+                auto policy=draft->policy;policy.mode=static_cast<TimeSkipMode>(std::clamp(choice(draft->mode),0,3));
+                if(!draft->readOnly && skipClearInactiveRepeat(policy)){draft->policy.repeatSeconds=0;draft->repeatCleared=true;SetWindowTextW(draft->repeat,L"0");choose(draft->repeatUnits,0);}
+                skipHelp(*draft);SetWindowTextW(draft->error,L"");skipLayout(window,*draft);skipFitHeight(window,*draft);skipReveal(window,*draft,draft->mode);return TRUE;}
+            if(id==SkipRanges && HIWORD(wp)==LBN_SELCHANGE){const bool selected=SendMessageW(draft->ranges,LB_GETCURSEL,0,0)!=LB_ERR;EnableWindow(draft->edit,!draft->readOnly && selected);EnableWindow(draft->remove,!draft->readOnly && selected);}
+            if(HIWORD(wp)==EN_SETFOCUS || HIWORD(wp)==CBN_SETFOCUS || HIWORD(wp)==BN_SETFOCUS || HIWORD(wp)==LBN_SETFOCUS)skipReveal(window,*draft,reinterpret_cast<HWND>(lp));return FALSE;}
+        case WM_CTLCOLORSTATIC:if(reinterpret_cast<HWND>(lp)==draft->error){SetTextColor(reinterpret_cast<HDC>(wp),RGB(164,40,40));SetBkColor(reinterpret_cast<HDC>(wp),GetSysColor(COLOR_BTNFACE));return reinterpret_cast<INT_PTR>(GetSysColorBrush(COLOR_BTNFACE));}break;
+        case WM_CLOSE:EndDialog(window,IDCANCEL);return TRUE;
+        case WM_DESTROY:if(draft->font){DeleteObject(draft->font);draft->font=nullptr;}if(app.customDialog==window)app.customDialog=IsWindow(draft->previousDialog)?draft->previousDialog:nullptr;return TRUE;
+        }
+    } catch(...){EndDialog(window,-1);return TRUE;}return FALSE;
+}
+void editSkip() {
+    if(app.customDialog)return;SkipDraft draft;draft.policy=app.settings.timeSkip;draft.readOnly=app.active();CustomTemplate resource;
+    const auto outcome=DialogBoxIndirectParamW(GetModuleHandleW(nullptr),&resource.dialog,app.window,skipProc,reinterpret_cast<LPARAM>(&draft));
+    if(!IsWindow(app.window))return;
+    if(outcome==IDOK && !draft.readOnly && !app.active()){app.settings.timeSkip=draft.policy;++app.skipRevision;configure();updateControls();layout();}
+    else if(outcome==-1)MessageBoxW(app.window,L"Time compression settings could not be opened. Try again.",L"Timelapse",MB_OK|MB_ICONERROR);
+    if(!app.closeWhenDone && !app.hiddenToTray){SetFocus(app.skipConfigure);revealFocusedControl();}
+}
 void selectFolder() {
     try {
         Microsoft::WRL::ComPtr<IFileOpenDialog> dialog;
@@ -827,6 +1115,43 @@ void selectFolder() {
         // Contain allocation failure before returning through the Win32 callback.
         MessageBoxW(app.window,L"Timelapse could not change the save folder. Close other applications, then try again.",L"Timelapse",MB_OK|MB_ICONERROR);
     }
+}
+constexpr const wchar_t* SkipKeys[]={L"TimeSkipMode",L"TimeSkipMultiplier",L"TimeSkipQuietAfterMs",L"TimeSkipRampFrames",L"TimeSkipRepeatSeconds",L"TimeSkipRanges"};
+bool skipInteger(std::wstring_view value,int64_t minimum,int64_t maximum,int64_t& result) {
+    if(value.empty() || (value.size()>1 && value.front()==L'0'))return false;
+    int64_t parsed=0;
+    for(wchar_t c:value){if(c<L'0' || c>L'9' || parsed>(maximum-(c-L'0'))/10)return false;parsed=parsed*10+c-L'0';}
+    if(parsed<minimum || parsed>maximum)return false;result=parsed;return true;
+}
+std::array<std::wstring,6> skipValues(const TimeSkipSettings& policy) {
+    std::array<std::wstring,6> values{std::to_wstring(static_cast<int>(policy.mode)),std::to_wstring(policy.multiplier),
+        std::to_wstring(policy.quietAfterMs),std::to_wstring(policy.rampFrames),std::to_wstring(policy.repeatSeconds),L""};
+    for(unsigned i=0;i<policy.rangeCount;++i){if(i)values[5]+=L";";values[5]+=std::to_wstring(policy.ranges[i].startSeconds)+L":"+std::to_wstring(policy.ranges[i].endSeconds);}
+    return values;
+}
+bool parseSkipValues(const std::array<std::wstring,6>& values,TimeSkipSettings& output) {
+    TimeSkipSettings policy;int64_t value=0;
+    if(!skipInteger(values[0],0,3,value))return false;policy.mode=static_cast<TimeSkipMode>(value);
+    if(!skipInteger(values[1],2,64,value))return false;policy.multiplier=static_cast<int>(value);
+    if(!skipInteger(values[2],1000,int64_t(INT_MAX)*1000,value) || value%1000)return false;policy.quietAfterMs=value;
+    if(!skipInteger(values[3],15,60,value))return false;policy.rampFrames=static_cast<int>(value);
+    if(!skipInteger(values[4],0,INT_MAX,value))return false;policy.repeatSeconds=static_cast<int>(value);
+    std::wstring_view ranges=values[5];
+    while(!ranges.empty()){
+        if(policy.rangeCount==TimeSkipMaxRanges)return false;
+        const auto end=ranges.find(L';');const auto part=ranges.substr(0,end);const auto colon=part.find(L':');int64_t start=0,stop=0;
+        if(colon==std::wstring_view::npos || !skipInteger(part.substr(0,colon),0,INT_MAX,start) || !skipInteger(part.substr(colon+1),1,INT_MAX,stop))return false;
+        policy.ranges[policy.rangeCount++]={static_cast<int>(start),static_cast<int>(stop)};
+        if(end==std::wstring_view::npos)break;ranges.remove_prefix(end+1);if(ranges.empty())return false;
+    }
+    std::wstring error;if(!normalizeTimeSkipSettings(policy,error))return false;output=policy;return true;
+}
+TimeSkipSettings loadSkip(const wchar_t* path) {
+    std::array<std::wstring,6> values;bool complete=true;
+    for(size_t i=0;i<values.size();++i){wchar_t value[512]{};
+        const DWORD count=GetPrivateProfileStringW(L"Settings",SkipKeys[i],L"?",value,512,path);
+        if(count>=511 || std::wcscmp(value,L"?")==0)complete=false;values[i]=value;}
+    TimeSkipSettings policy;if(!complete || !parseSkipValues(values,policy))return {};return policy;
 }
 bool savePreferences() {
     try {
@@ -866,6 +1191,9 @@ bool savePreferences() {
         const auto recordingLimit=std::to_wstring(std::clamp(choice(app.stopAfter),0,app.hasCustomLimit?6:5));
         const auto customInterval=std::to_wstring(app.customIntervalMs), customWidth=std::to_wstring(app.customWidth),customHeight=std::to_wstring(app.customHeight);
         const auto customLimit=std::to_wstring(app.customLimitSeconds);
+        auto skipPolicy=app.settings.timeSkip;std::wstring skipError;
+        if(!normalizeTimeSkipSettings(skipPolicy,skipError))return false;
+        const auto skip=skipValues(skipPolicy);
         const auto nightDuration=std::to_wstring(NightDurations[app.nightDuration?std::clamp(choice(app.nightDuration),0,5):0]);
         const auto nightTarget=std::to_wstring(NightTargets[app.nightTarget?std::clamp(choice(app.nightTarget),0,2):1]);
         struct TemporaryFile {
@@ -898,6 +1226,7 @@ bool savePreferences() {
             WritePrivateProfileStringW(L"Settings",L"NightEnabled",app.nightEnabled && SendMessageW(app.nightEnabled,BM_GETCHECK,0,0)==BST_CHECKED?L"1":L"0",pending.path) &&
             WritePrivateProfileStringW(L"Settings",L"NightDurationMs",nightDuration.c_str(),pending.path) &&
             WritePrivateProfileStringW(L"Settings",L"NightTargetBrightness",nightTarget.c_str(),pending.path);
+        for(size_t i=0;saved && i<skip.size();++i)saved=WritePrivateProfileStringW(L"Settings",SkipKeys[i],skip[i].c_str(),pending.path)!=FALSE;
         // This cache-flush form returns zero even when successful.
         WritePrivateProfileStringW(nullptr,nullptr,nullptr,pending.path);
         if(!saved)return false;
@@ -937,11 +1266,12 @@ void preferences(bool save) {
         };
         app.hasCustomInterval=app.hasCustomSize=app.hasCustomLimit=false;
         app.customIntervalMs=5000;app.customWidth=1280;app.customHeight=720;app.customLimitSeconds=900;
-        if(interval==6){app.hasCustomInterval=exactInteger(L"CaptureIntervalMs",MinCaptureIntervalMs,MaxCaptureIntervalMs,app.customIntervalMs);choose(app.interval,app.hasCustomInterval?6:2);}
-        if(videoSize==2){std::wstring error;app.hasCustomSize=exactInteger(L"VideoWidth",MinVideoDimension,MaxVideoDimension,app.customWidth) &&
+        int exactSelector=0;
+        if(interval==6){app.hasCustomInterval=exactInteger(L"Interval",6,6,exactSelector) && exactInteger(L"CaptureIntervalMs",MinCaptureIntervalMs,MaxCaptureIntervalMs,app.customIntervalMs);choose(app.interval,app.hasCustomInterval?6:2);}
+        if(videoSize==2){std::wstring error;app.hasCustomSize=exactInteger(L"Quality",2,2,exactSelector) && exactInteger(L"VideoWidth",MinVideoDimension,MaxVideoDimension,app.customWidth) &&
             exactInteger(L"VideoHeight",MinVideoDimension,MaxVideoDimension,app.customHeight) && validateVideoSize(app.customWidth,app.customHeight,error);
             choose(app.videoSize,app.hasCustomSize?2:0);}
-        if(recordingLimit==6){app.hasCustomLimit=exactInteger(L"RecordingLimitSeconds",1,INT_MAX,app.customLimitSeconds);choose(app.stopAfter,app.hasCustomLimit?6:0);}
+        if(recordingLimit==6){app.hasCustomLimit=exactInteger(L"RecordingLimit",6,6,exactSelector) && exactInteger(L"RecordingLimitSeconds",1,INT_MAX,app.customLimitSeconds);choose(app.stopAfter,app.hasCustomLimit?6:0);}
         // Add the custom display row before selecting it: CB_SETCURSEL cannot
         // select an item that does not yet exist in an older preset-only list.
         app.committedInterval=app.hasCustomInterval?6:interval==6?2:std::clamp(interval,0,5);
@@ -962,6 +1292,7 @@ void preferences(bool save) {
         };
         loadNightChoice(L"NightDurationMs",app.nightDuration,NightDurations,0);
         loadNightChoice(L"NightTargetBrightness",app.nightTarget,NightTargets,1);
+        app.settings.timeSkip=loadSkip(path);++app.skipRevision;
         // Launch on desktop: opening the app never silently turns on a camera.
         choose(app.mode,0);
         updateAdvanced();
@@ -971,8 +1302,21 @@ void preferences(bool save) {
 }
 
 RECT layerRect(const Layer& l) {
-    int width=app.videoRect.right-app.videoRect.left, height=app.videoRect.bottom-app.videoRect.top;
-    return {app.videoRect.left+static_cast<LONG>(l.rect.x*width),app.videoRect.top+static_cast<LONG>(l.rect.y*height),app.videoRect.left+static_cast<LONG>((l.rect.x+l.rect.w)*width),app.videoRect.top+static_cast<LONG>((l.rect.y+l.rect.h)*height)};
+    const LONG width=app.videoRect.right-app.videoRect.left,height=app.videoRect.bottom-app.videoRect.top;
+    if(width<=0 || height<=0)return {app.videoRect.left,app.videoRect.top,app.videoRect.left,app.videoRect.top};
+    const auto rect=constrain(l.rect);
+    const LONG left=std::min(width-1,static_cast<LONG>(rect.x*width)),top=std::min(height-1,static_cast<LONG>(rect.y*height));
+    return {app.videoRect.left+left,app.videoRect.top+top,
+        app.videoRect.left+std::min(width,std::max(left+1,static_cast<LONG>((rect.x+rect.w)*width))),
+        app.videoRect.top+std::min(height,std::max(top+1,static_cast<LONG>((rect.y+rect.h)*height)))};
+}
+RECT layerGripRect(const RECT& layer,int preferredPixels) {
+    const LONG width=layer.right-layer.left,height=layer.bottom-layer.top;
+    // A single physical pixel has no distinct body and corner. Keep pointer
+    // movement available; Shift+arrows still resize the normalized rectangle.
+    if(width<=0 || height<=0 || (width==1 && height==1))return {layer.right,layer.bottom,layer.right,layer.bottom};
+    const LONG gripWidth=std::min<LONG>(preferredPixels,std::max(1L,width/3)),gripHeight=std::min<LONG>(preferredPixels,std::max(1L,height/3));
+    return {layer.right-gripWidth,layer.bottom-gripHeight,layer.right,layer.bottom};
 }
 void customized() {
     app.settings.separateFiles=false;
@@ -1006,14 +1350,14 @@ LRESULT CALLBACK previewProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
             RECT tag={layer.left+app.scale(5),layer.top+app.scale(4),layer.left+app.scale(82),layer.top+app.scale(25)};
             HBRUSH label=CreateSolidBrush(RGB(23,41,47));FillRect(mem,&tag,label);DeleteObject(label);
             text(mem,app.settings.layers[i].source==Source::Desktop?L"Desktop":L"Camera",tag,RGB(239,248,250),app.smallFont,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
-            if(selected) {RECT handle={layer.right-app.scale(12),layer.bottom-app.scale(12),layer.right,layer.bottom};HBRUSH h=CreateSolidBrush(RGB(83,229,205));FillRect(mem,&handle,h);DeleteObject(h);}
+            if(selected) {RECT handle=layerGripRect(layer,app.scale(12));HBRUSH h=CreateSolidBrush(RGB(83,229,205));FillRect(mem,&handle,h);DeleteObject(h);}
         }
         BitBlt(dc,0,0,r.right,r.bottom,mem,0,0,SRCCOPY);SelectObject(mem,old);DeleteObject(bmp);DeleteDC(mem);EndPaint(w,&ps);return 0;
     }
     case WM_LBUTTONDOWN: {
         SetFocus(w); if(app.settings.separateFiles || app.settings.layers.size()<2) return 0;
         POINT p{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};app.selected=-1;
-        for(int i=static_cast<int>(app.settings.layers.size())-1;i>=0;--i) {RECT r=layerRect(app.settings.layers[i]);if(PtInRect(&r,p)){app.selected=i;app.dragStart=p;app.dragRect=app.settings.layers[i].rect;app.resizing=p.x>=r.right-app.scale(18)&&p.y>=r.bottom-app.scale(18);app.dragging=true;SetCapture(w);break;}}
+        for(int i=static_cast<int>(app.settings.layers.size())-1;i>=0;--i) {RECT r=layerRect(app.settings.layers[i]);if(PtInRect(&r,p)){app.selected=i;app.dragStart=p;app.dragRect=app.settings.layers[i].rect;const RECT grip=layerGripRect(r,app.scale(18));app.resizing=PtInRect(&grip,p)!=FALSE;app.dragging=true;SetCapture(w);break;}}
         updateControls();InvalidateRect(w,nullptr,FALSE);return 0;
     }
     case WM_MOUSEMOVE:
@@ -1062,6 +1406,8 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         app.startupComplete=false;app.advancedExpanded=false;app.advancedLimitIndex=app.advancedVisibility=-1;
         app.advancedNightState=app.nightVisibility=-1;app.nightValidation.clear();app.statusCaption.clear();app.statusCaptionError=false;app.nightHintCaption.clear();app.nightDetailCaption.clear();
         app.customDialog=nullptr;app.advancedCaption.clear();app.advancedTooltip.clear();
+        app.skipRevision=0;app.advancedSkipRevision=app.skipSummaryRevision=app.skipVisibility=-1;app.skipCheckAge=UINT64_MAX;
+        app.skipSummaryCaption.clear();app.skipDetailCaption.clear();app.settings.timeSkip={};
         app.hasCustomInterval=app.hasCustomSize=app.hasCustomLimit=false;
         app.customIntervalMs=5000;app.customWidth=1280;app.customHeight=720;app.customLimitSeconds=900;
         app.committedInterval=2;app.committedSize=app.committedLimit=0;
@@ -1091,6 +1437,9 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         for(auto label:EncodingModeLabels)add(app.encodingMode,label);
         app.stopAfter=combo(7,L"S&top after",StopAfterBox);for(auto label:RecordingLimitLabels)add(app.stopAfter,label);
         app.lowDisk=requiredControl(L"BUTTON",L"Stop on &low disk space",WS_TABSTOP|BS_AUTOCHECKBOX,LowDiskBox);
+        app.skipConfigure=button(L"Time &compression...",SkipConfigure);
+        app.skipSummary=requiredControl(L"STATIC",L"Off",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX,SkipSummary);
+        app.skipDetail=requiredControl(L"STATIC",L"",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX,SkipDetail);
         app.nightEnabled=requiredControl(L"BUTTON",L"&Night camera (software blend)",WS_TABSTOP|BS_AUTOCHECKBOX,NightBox);
         app.nightDuration=combo(8,L"Blend d&uration",NightDurationBox);for(auto label:NightDurationLabels)add(app.nightDuration,label);
         app.nightTarget=combo(9,L"Auto &brightness",NightTargetBox);for(auto label:{L"Dark",L"Balanced",L"Bright"})add(app.nightTarget,label);
@@ -1106,6 +1455,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         }
         SendMessageW(app.statusText,WM_SETFONT,reinterpret_cast<WPARAM>(app.smallFont),TRUE);
         SendMessageW(app.nightHint,WM_SETFONT,reinterpret_cast<WPARAM>(app.smallFont),TRUE);SendMessageW(app.nightDetail,WM_SETFONT,reinterpret_cast<WPARAM>(app.smallFont),TRUE);
+        SendMessageW(app.skipDetail,WM_SETFONT,reinterpret_cast<WPARAM>(app.smallFont),TRUE);
         app.tooltip=CreateWindowExW(WS_EX_TOPMOST,TOOLTIPS_CLASSW,nullptr,WS_POPUP|TTS_ALWAYSTIP|TTS_NOPREFIX,0,0,0,0,w,nullptr,nullptr,nullptr);
         TOOLINFOW tip{sizeof(tip)};tip.uFlags=TTF_IDISHWND|TTF_SUBCLASS;tip.hwnd=w;tip.uId=reinterpret_cast<UINT_PTR>(app.statusText);tip.lpszText=LPSTR_TEXTCALLBACKW;
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));SendMessageW(app.tooltip,TTM_SETMAXTIPWIDTH,0,app.scale(520));
@@ -1134,7 +1484,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         tip.lpszText=const_cast<LPWSTR>(L"Automatic camera brightness uses 8-bit brightness references: Dark 64/255, Balanced 96/255, Bright 128/255. This is processed image brightness, not sensor exposure. Gain and highlight limits can leave the target unmet.");
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
         tip.lpszText=LPSTR_TEXTCALLBACKW;
-        for(HWND child:{app.nightHint,app.nightDetail}){tip.uId=reinterpret_cast<UINT_PTR>(child);SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));}
+        for(HWND child:{app.nightHint,app.nightDetail,app.skipSummary,app.skipDetail}){tip.uId=reinterpret_cast<UINT_PTR>(child);SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));}
         preferences(false);refreshSources();changeLayout(true);
         try {
             app.engine=std::make_unique<Engine>();
@@ -1246,6 +1596,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         }
         switch(id) {
         case AdvancedToggle:toggleAdvanced();break;
+        case SkipConfigure:editSkip();break;
         case LowDiskBox:if(!app.active())configure();break;
         case NightBox:if(!app.active()){configure();updateControls();layout();revealFocusedControl();}break;
         case TrayShow:showWindow();break;
@@ -1274,7 +1625,8 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
     case WM_NOTIFY:
         if(reinterpret_cast<NMHDR*>(lp)->code==TTN_GETDISPINFOW){
             auto info=reinterpret_cast<NMTTDISPINFOW*>(lp);const auto child=reinterpret_cast<HWND>(info->hdr.idFrom);
-            info->lpszText=const_cast<LPWSTR>((child==app.advanced?app.advancedTooltip:child==app.nightHint?app.nightHintCaption:child==app.nightDetail?app.nightDetailCaption:statusCaption()).c_str());return 0;
+            info->lpszText=const_cast<LPWSTR>((child==app.advanced?app.advancedTooltip:child==app.nightHint?app.nightHintCaption:child==app.nightDetail?app.nightDetailCaption:
+                child==app.skipSummary?app.skipSummaryCaption:child==app.skipDetail?app.skipDetailCaption:statusCaption()).c_str());return 0;
         }break;
     case WM_CTLCOLORSTATIC: {
         const auto child=reinterpret_cast<HWND>(lp);const bool warning=(child==app.statusText && statusCaptionError()) || (child==app.nightHint && !app.nightValidation.empty());
@@ -1294,6 +1646,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         RECT stats={p,r.bottom-app.scale(147),r.right-p,r.bottom-app.scale(123)};
         std::wstring detail;
         if(app.active() || app.status.frames)detail=std::to_wstring(app.status.frames)+L" frames  ·  "+timeText(double(app.status.frames)/30,false)+L" video  ·  "+timeText(app.status.elapsed,true)+L" recording";
+        else if(skipEnabled())detail=L"Base interval "+formatDuration(app.settings.intervalMs)+L" · time compression up to "+std::to_wstring(app.settings.timeSkip.multiplier)+L"×";
         else {wchar_t buf[140];const double videoSeconds=120000.0/std::max(MinCaptureIntervalMs,app.settings.intervalMs);
             swprintf_s(buf,L"  ·  1 hour becomes %.*f seconds of video",videoSeconds<1?3:videoSeconds<10?1:0,videoSeconds);
             detail=L"Every "+formatDuration(app.settings.intervalMs)+buf;}
@@ -1307,7 +1660,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
     case WM_ENDSESSION:
         // Confirmed session shutdown reaches WM_DESTROY and joins the engine,
         // giving the encoder a chance to finalize before Windows terminates us.
-        if(wp){if(app.customDialog)EndDialog(app.customDialog,IDCANCEL);DestroyWindow(w);}
+        if(wp){cancelOwnedDialogs();DestroyWindow(w);}
         return 0;
     case WM_DESTROY:removeTray();KillTimer(w,1);if(app.startupComplete)preferences(true);app.startupComplete=false;app.engine.reset();PostQuitMessage(0);return 0;
     }

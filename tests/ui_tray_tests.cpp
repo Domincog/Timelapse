@@ -22,6 +22,8 @@ int confirmations=0,confirmation=IDOK,menus=0,menuX=0,menuY=0;
 UINT pauseFlags=0,finishFlags=0,exitFlags=0;
 bool failAdd=false,failModify=false,failVersion=false;
 bool iconic=false;
+ULONGLONG now=1000000;
+ULONGLONG WINAPI ticks(){return now;}
 int statusQueries=0,enables=0,textWrites=0;
 struct Invalidated {HWND window;bool whole;RECT rect;};
 std::vector<Invalidated> invalidated;
@@ -81,6 +83,7 @@ int runCameraHost(const wchar_t*){throw std::runtime_error("Unexpected applicati
 #define SetWindowTextW probe::setText
 #define InvalidateRect probe::invalidate
 #define IsIconic probe::isIconic
+#define GetTickCount64 probe::ticks
 #pragma warning(push)
 #pragma warning(disable: 4702)
 #include "../src/main.cpp"
@@ -99,6 +102,7 @@ int runCameraHost(const wchar_t*){throw std::runtime_error("Unexpected applicati
 #undef SetWindowTextW
 #undef InvalidateRect
 #undef IsIconic
+#undef GetTickCount64
 
 namespace {
 using probe::require;
@@ -108,6 +112,8 @@ struct Fixture {
         app.visibleDirty=true;app.controlsUpdated=app.trayStateValid=probe::iconic=false;
         app.advancedExpanded=false;app.advancedLimitIndex=app.advancedVisibility=-1;
         app.advancedNightState=app.nightVisibility=-1;app.nightValidation.clear();
+        app.skipRevision=0;app.advancedSkipRevision=app.skipSummaryRevision=app.skipVisibility=-1;app.skipCheckAge=UINT64_MAX;
+        app.skipSummaryCaption.clear();app.skipDetailCaption.clear();probe::now=1000000;
         app.scrollX=app.scrollY=0;app.contentWidth=920;app.contentHeight=720;
         app.hiddenToTray=app.trayRegistered=app.trayNoticeShown=app.trayVersion4=app.startupComplete=false;
         app.taskbarCreated=0;app.trayTooltip.clear();
@@ -122,6 +128,7 @@ struct Fixture {
         app.stopAfter=combo(6);app.lowDisk=child(L"BUTTON",BS_AUTOCHECKBOX);SendMessageW(app.lowDisk,BM_SETCHECK,BST_CHECKED,0);
         app.nightEnabled=child(L"BUTTON",BS_AUTOCHECKBOX);app.nightDuration=combo(6);app.nightTarget=combo(3);choose(app.nightTarget,1);
         app.nightHint=child(L"STATIC",0);app.nightDetail=child(L"STATIC",0);
+        app.skipConfigure=child(L"BUTTON",BS_PUSHBUTTON);app.skipSummary=child(L"STATIC",0);app.skipDetail=child(L"STATIC",0);
         app.monitors={{L"Synthetic display",{0,0,640,360},L"owned-display"}};app.cameras={{L"Synthetic camera",L"owned-camera"}};
         app.preview=child(L"STATIC",0);app.statusText=child(L"STATIC",0);
         for(auto p:{&app.refresh,&app.record,&app.pause,&app.finish,&app.folder,&app.openFolder,&app.reset,&app.forward})*p=child(L"BUTTON",BS_PUSHBUTTON);
@@ -240,9 +247,21 @@ void nightResultDetails(){Fixture f;app.settings.layers=preset(Mode::Camera);app
     app.advancedExpanded=false;probe::resetWork();probe::current.night.samples=32;f.tick();require(probe::textWrites==0,"Collapsed night facts rewrote hidden detail.");
     app.advancedExpanded=true;updateNightText();GetWindowTextW(app.nightDetail,value,300);require(std::wstring(value).find(L"32 camera frames")!=std::wstring::npos,"Expanding night details left stale facts.");
 }
+void compressionResultWork(){Fixture f;app.advancedExpanded=true;app.settings.timeSkip.mode=TimeSkipMode::Quiet;++app.skipRevision;
+    probe::current.state=State::Recording;probe::current.timeSkip.enabled=true;probe::current.timeSkip.reason=TimeSkipReason::Quiet;
+    probe::current.timeSkip.intervalMs=4000;probe::current.timeSkip.lastCheckTick=probe::now;f.tick();probe::resetWork();
+    for(int i=0;i<1000;++i)f.tick();require(probe::statusQueries==1000 && probe::textWrites==0 && probe::enables==0 && probe::invalidated.empty(),"Unchanged compression facts repeated visual work or lost status checks.");
+    probe::now+=3000;f.tick();require(probe::textWrites==1 && app.skipDetailCaption.find(L"3 s ago")!=std::wstring::npos,"Old source check appeared permanently fresh while worker status stayed unchanged.");
+    app.advancedExpanded=false;probe::resetWork();probe::now+=3000;probe::current.timeSkip.reason=TimeSkipReason::Unavailable;f.tick();require(probe::textWrites==0 && probe::invalidated.empty(),"Collapsed compression status rewrote hidden details.");
+    app.advancedExpanded=true;updateSkipText();require(app.skipDetailCaption.find(L"6 s ago")!=std::wstring::npos && app.skipDetailCaption.find(L"unavailable")!=std::wstring::npos,"Expansion lost deferred facts or check age.");
+    f.close();probe::resetWork();probe::now+=5000;probe::current.timeSkip.intervalMs=1000;f.tick();require(probe::textWrites==0 && probe::invalidated.empty() && app.visibleDirty,"Hidden compression update performed visual work.");
+    f.command(TrayShow);require(app.skipDetailCaption.find(L"11 s ago")!=std::wstring::npos && app.skipDetailCaption.find(L"target every 1 s")!=std::wstring::npos,"Tray restore lost current target cadence or source age.");
+    probe::current.state=State::Paused;f.tick();probe::resetWork();probe::now+=10000;for(int i=0;i<1000;++i)f.tick();
+    require(probe::textWrites==0 && app.skipDetailCaption.find(L"paused")!=std::wstring::npos,"Paused compression facts polled visible ages or claimed checks.");
+}
 }
 int main(){std::cout<<std::unitbuf;try{
     hideAndShow();failedRegistration();restart(false);restart(true);legacyFallback();menuAndCommands();exitOutcome(false);exitOutcome(true);backgroundFailure();modifierFailure();cleanupAndStartup();
-    unchangedWork();scopedPaint();deferredVisuals(false);deferredVisuals(true);unchangedTrayTip();nightResultDetails();
-    std::cout<<"PASS 17 tray/status cases: owned hidden windows, synthetic engine, no tray icons, captures, input, or settings writes.\n";return 0;
+    unchangedWork();scopedPaint();deferredVisuals(false);deferredVisuals(true);unchangedTrayTip();nightResultDetails();compressionResultWork();
+    std::cout<<"PASS 18 tray/status cases: owned hidden windows, synthetic engine, no tray icons, captures, input, or settings writes.\n";return 0;
 }catch(const std::exception& error){std::cerr<<"FAIL: "<<error.what()<<'\n';return 1;}}

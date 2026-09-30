@@ -131,9 +131,25 @@ void dialogDpiAndLifecycle(){
     require(!IsWindow(app.window) && !app.customDialog,"Tray Exit left an owned custom dialog or owner behind.");
     std::cout<<"PASS owned dialog DPI/reflow/scroll reachability, cleanup and explicit tray Exit\n";
 }
+void nativeNumericInsertion(){
+    HiddenFixture owned;setupCustom();
+    for(int field=0;field<4;++field){
+        const auto kind=field==0?CustomKind::Interval:field==1?CustomKind::Limit:CustomKind::Size;
+        dialogScript=[field](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<CustomDraft*>(parameter);
+            const HWND edit=field==3?draft.second:draft.first;const std::wstring prefix=field<2?L"1":L"720";
+            const auto payload=prefix+std::wstring(110-prefix.size(),L' ')+L"junk";
+            SendMessageW(edit,EM_SETSEL,0,-1);SendMessageW(edit,EM_REPLACESEL,FALSE,reinterpret_cast<LPARAM>(payload.c_str()));
+            require(SendMessageW(edit,EM_GETLIMITTEXT,0,0)==96 && GetWindowTextLengthW(edit)==96,"Native edit truncation bypasses validator rejection length.");
+            accept(window);require(!dialogOutcome && !caption(draft.error).empty(),"Native pasted invalid suffix was truncated into a valid custom value.");
+            SendMessageW(edit,EM_SETSEL,0,-1);SendMessageW(edit,EM_REPLACESEL,FALSE,reinterpret_cast<LPARAM>(prefix.c_str()));accept(window);
+            require(dialogOutcome==IDOK,"Ordinary exact native insertion was rejected.");};
+        invoke(kind);
+    }
+    std::cout<<"PASS actual native paste rejects truncated invalid interval, stop, width and height inputs while exact insertion remains valid\n";
+}
 }
 int main(){
-    try{intervalAndCancellation();dimensionsAndLimit();activeAndNight();dialogDpiAndLifecycle();
+    try{intervalAndCancellation();dimensionsAndLimit();activeAndNight();nativeNumericInsertion();dialogDpiAndLifecycle();
         std::cout<<"All custom UI cases passed with hidden controls and synthetic engine.\n";return 0;
     }catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
 }
