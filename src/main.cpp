@@ -21,7 +21,9 @@ using namespace lapse;
 namespace {
 constexpr COLORREF Ink = RGB(25, 38, 45), Muted = RGB(88, 106, 113), Accent = RGB(0, 116, 113);
 constexpr COLORREF Background = RGB(247, 249, 250), Canvas = RGB(21, 28, 34);
-enum Id { ModeBox = 100, IntervalBox, SizeBox, EncodingQualityBox, MonitorBox, CameraBox, Refresh, Record, Pause, Finish, Folder, OpenFolder, Reset, Forward, Preview, EncodingModeBox };
+enum Id { ModeBox = 100, IntervalBox, SizeBox, EncodingQualityBox, MonitorBox, CameraBox, Refresh, Record, Pause, Finish, Folder, OpenFolder, Reset, Forward, Preview, EncodingModeBox, AdvancedToggle, StopAfterBox };
+constexpr int RecordingLimits[] = {0,900,3600,14400,28800,86400};
+constexpr const wchar_t* RecordingLimitLabels[] = {L"Never",L"15 minutes",L"1 hour",L"4 hours",L"8 hours",L"24 hours"};
 constexpr int SeparateFilesMode = 5;
 constexpr wchar_t SeparateFilesLabel[] = L"Desktop + camera (2 files)";
 constexpr UINT TrayMessage = WM_APP + 1, ShowExistingMessage = WM_APP + 2;
@@ -32,7 +34,7 @@ constexpr wchar_t SetupMutexName[] = L"Local\\Timelapse.Setup.{DC32D155-1B8D-488
 struct App {
     HWND window{}, preview{}, statusText{}, tooltip{};
     HWND mode{}, interval{}, videoSize{}, encodingQuality{}, encodingMode{}, monitor{}, camera{}, refresh{}, record{}, pause{}, finish{}, folder{}, openFolder{}, reset{}, forward{};
-    HWND labels[7]{};
+    HWND advanced{}, stopAfter{}, labels[8]{};
     HFONT font{}, titleFont{}, smallFont{};
     HBRUSH background = CreateSolidBrush(Background);
     int dpi = 96, selected = -1, modeIndex = 0;
@@ -40,6 +42,8 @@ struct App {
     bool dragging = false, resizing = false, closeWhenDone = false, inspectUI = false;
     bool layingOut = false;
     bool startupComplete = false;
+    bool advancedExpanded = false;
+    int advancedLimitIndex = -1, advancedVisibility = -1;
     bool hiddenToTray = false, trayRegistered = false, trayNoticeShown = false, trayVersion4 = false;
     UINT taskbarCreated = 0;
     std::wstring trayTooltip;
@@ -141,6 +145,21 @@ bool hasRequiredSources() {
     return (!hasSource(Source::Desktop) || (m>=0 && m<static_cast<int>(app.monitors.size()))) &&
         (!hasSource(Source::Camera) || (c>=0 && c<static_cast<int>(app.cameras.size())));
 }
+void updateAdvanced() {
+    if(!app.advanced)return;
+    const int selection=std::clamp(choice(app.stopAfter),0,5);
+    if(selection!=app.advancedLimitIndex){
+        std::wstring caption=L"&Advanced";
+        if(selection)caption+=L" · stop after "+std::wstring(RecordingLimitLabels[selection]);
+        SetWindowTextW(app.advanced,caption.c_str());app.advancedLimitIndex=selection;
+    }
+    if(app.advancedVisibility==static_cast<int>(app.advancedExpanded))return;
+    app.advancedVisibility=static_cast<int>(app.advancedExpanded);
+    SendMessageW(app.advanced,BM_SETCHECK,app.advancedExpanded?BST_CHECKED:BST_UNCHECKED,0);
+    for(HWND child:{app.labels[6],app.encodingMode,app.labels[7],app.stopAfter})
+        if(child && ((GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0)!=app.advancedExpanded)
+            ShowWindow(child,app.advancedExpanded?SW_SHOWNA:SW_HIDE);
+}
 
 void configure() {
     static const int intervals[] = {1,2,5,10,30,60};
@@ -149,6 +168,7 @@ void configure() {
     app.settings.height = choice(app.videoSize) == 1 ? 1080 : 720;
     app.settings.encodingQuality = static_cast<EncodingQuality>(std::clamp(choice(app.encodingQuality),0,2));
     app.settings.encodingMode = static_cast<EncodingMode>(std::clamp(choice(app.encodingMode),0,4));
+    app.settings.recordingLimitSeconds = RecordingLimits[std::clamp(choice(app.stopAfter),0,5)];
     int m = choice(app.monitor), c = choice(app.camera);
     if (m >= 0 && m < static_cast<int>(app.monitors.size())) {
         app.settings.monitor = app.monitors[m].bounds;
@@ -189,7 +209,7 @@ void refreshSources() {
 }
 void updateControls() {
     const bool idle = !app.active();
-    for (auto control : {app.mode,app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.refresh,app.folder}) EnableWindow(control,idle);
+    for (auto control : {app.mode,app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.refresh,app.folder}) EnableWindow(control,idle);
     EnableWindow(app.monitor,idle && hasSource(Source::Desktop));
     EnableWindow(app.camera,idle && hasSource(Source::Camera) && !app.cameras.empty());
     EnableWindow(app.record,idle && hasRequiredSources());
@@ -198,6 +218,7 @@ void updateControls() {
     SetWindowTextW(app.pause,app.status.state==State::Paused ? L"&Resume" : L"&Pause");
     bool collage = !app.settings.separateFiles && app.settings.layers.size() > 1;
     EnableWindow(app.reset,collage); EnableWindow(app.forward,collage && app.selected>=0);
+    updateAdvanced();
 }
 void changeLayout(bool reset) {
     app.modeIndex = choice(app.mode);
@@ -314,7 +335,8 @@ void layout() {
     const int availableW=r.right+((style&WS_VSCROLL)?barW:0);
     const int availableH=r.bottom+((style&WS_HSCROLL)?barH:0);
     const int minimumW=app.scale(830);
-    const int minimumH=app.scale(190)+app.scale(160)+app.scale(191);
+    const int previewTop=app.scale(app.advancedExpanded?258:190);
+    const int minimumH=previewTop+app.scale(160)+app.scale(191);
     bool horizontal=false, vertical=false;
     for(int i=0;i<3;++i) {
         horizontal=availableW-(vertical?barW:0)<minimumW;
@@ -346,14 +368,17 @@ void layout() {
     move(app.labels[2],sizeX,label,sizeW,app.scale(20)); move(app.videoSize,sizeX,row1,sizeW,app.scale(140));
     move(app.labels[3],qualityX,label,qualityW,app.scale(20)); move(app.encodingQuality,qualityX,row1,qualityW,app.scale(160));
     const int refreshW=app.scale(92), optionsW=width-refreshW-3*gap;
-    const int deviceW=optionsW*31/100, encoderW=optionsW-2*deviceW;
-    const int cameraX=pad+deviceW+gap, encoderX=cameraX+deviceW+gap;
+    const int deviceW=optionsW*31/100, advancedW=optionsW-2*deviceW;
+    const int cameraX=pad+deviceW+gap, advancedX=cameraX+deviceW+gap;
     move(app.labels[4],pad,app.scale(121),deviceW,app.scale(20)); move(app.monitor,pad,row2,deviceW,app.scale(220));
     move(app.labels[5],cameraX,app.scale(121),deviceW,app.scale(20)); move(app.camera,cameraX,row2,deviceW,app.scale(220));
-    move(app.labels[6],encoderX,app.scale(121),encoderW,app.scale(20)); move(app.encodingMode,encoderX,row2,encoderW,app.scale(190));
+    move(app.advanced,advancedX,row2,advancedW,ch);
+    const int optionW=(width-gap)/2;
+    move(app.labels[6],pad,app.scale(190),optionW,app.scale(20));move(app.encodingMode,pad,app.scale(211),optionW,app.scale(190));
+    move(app.labels[7],pad+optionW+gap,app.scale(190),width-optionW-gap,app.scale(20));move(app.stopAfter,pad+optionW+gap,app.scale(211),width-optionW-gap,app.scale(210));
     move(app.refresh,r.right-pad-refreshW,row2,refreshW,ch);
     // The logical canvas retains a usable preview when the viewport is small.
-    const int previewTop=app.scale(190), previewH=static_cast<int>(r.bottom)-previewTop-app.scale(191);
+    const int previewH=static_cast<int>(r.bottom)-previewTop-app.scale(191);
     move(app.preview,pad,previewTop,width,previewH);
     RECT previewClient{};GetClientRect(app.preview,&previewClient);
     app.videoRect=previewVideoRect(previewClient);
@@ -366,6 +391,7 @@ void layout() {
     move(app.finish,pad+app.scale(276),r.bottom-app.scale(54),app.scale(106),app.scale(34));
     move(app.openFolder,r.right-pad-app.scale(133),r.bottom-app.scale(54),app.scale(133),app.scale(34));
     app.layingOut = false;
+    updateAdvanced();
     InvalidateRect(app.window,nullptr,TRUE);
 }
 void scrollTo(int x,int y) {
@@ -396,6 +422,7 @@ void revealFocusedControl() {
     HWND child=GetFocus();
     if(!child || !IsChild(app.window,child))return;
     while(GetParent(child)!=app.window)child=GetParent(child);
+    if(!(GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE))return;
     RECT target{}, viewport{};GetWindowRect(child,&target);GetClientRect(app.window,&viewport);
     MapWindowPoints(nullptr,app.window,reinterpret_cast<POINT*>(&target),2);
     OffsetRect(&target,app.scrollX,app.scrollY);
@@ -411,6 +438,13 @@ void revealFocusedControl() {
     scrollTo(reveal(app.scrollX,viewport.right,target.left,target.right),
              reveal(app.scrollY,viewport.bottom,target.top,target.bottom));
 }
+void toggleAdvanced() {
+    const HWND focused=GetFocus();
+    if(app.advancedExpanded && (focused==app.encodingMode || focused==app.stopAfter ||
+        (focused && (IsChild(app.encodingMode,focused) || IsChild(app.stopAfter,focused)))))SetFocus(app.advanced);
+    app.advancedExpanded=!app.advancedExpanded;
+    updateAdvanced();layout();revealFocusedControl();
+}
 bool scrollWheelMessage(const MSG& message) {
     if(message.message!=WM_MOUSEWHEEL && message.message!=WM_MOUSEHWHEEL)return false;
     if(GET_KEYSTATE_WPARAM(message.wParam)&MK_CONTROL)return false;
@@ -420,7 +454,7 @@ bool scrollWheelMessage(const MSG& message) {
     if((horizontal?app.contentWidth:app.contentHeight)<=(horizontal?viewport.right:viewport.bottom))return false;
     // Open lists own their wheel input. Closed lists must not change recording
     // settings when the user's wheel gesture is scrolling the surrounding page.
-    for(HWND box:{app.mode,app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.monitor,app.camera})
+    for(HWND box:{app.mode,app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.monitor,app.camera})
         if(SendMessageW(box,CB_GETDROPPEDSTATE,0,0))return false;
     SendMessageW(app.window,message.message,message.wParam,message.lParam);
     return true;
@@ -492,6 +526,7 @@ bool savePreferences() {
         const auto interval=std::to_wstring(choice(app.interval)), quality=std::to_wstring(choice(app.videoSize));
         const auto encodingQuality=std::to_wstring(choice(app.encodingQuality));
         const auto encodingMode=std::to_wstring(choice(app.encodingMode));
+        const auto recordingLimit=std::to_wstring(std::clamp(choice(app.stopAfter),0,5));
         struct TemporaryFile {
             const wchar_t* path;
             HANDLE file=INVALID_HANDLE_VALUE;
@@ -512,7 +547,8 @@ bool savePreferences() {
             WritePrivateProfileStringW(L"Settings",L"Interval",interval.c_str(),pending.path) &&
             WritePrivateProfileStringW(L"Settings",L"Quality",quality.c_str(),pending.path) &&
             WritePrivateProfileStringW(L"Settings",L"EncodingQuality",encodingQuality.c_str(),pending.path) &&
-            WritePrivateProfileStringW(L"Settings",L"EncodingMode",encodingMode.c_str(),pending.path);
+            WritePrivateProfileStringW(L"Settings",L"EncodingMode",encodingMode.c_str(),pending.path) &&
+            WritePrivateProfileStringW(L"Settings",L"RecordingLimit",recordingLimit.c_str(),pending.path);
         // This cache-flush form returns zero even when successful.
         WritePrivateProfileStringW(nullptr,nullptr,nullptr,pending.path);
         if(!saved)return false;
@@ -539,8 +575,11 @@ void preferences(bool save) {
         choose(app.encodingQuality,std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Settings",L"EncodingQuality",1,path)),0,2));
         const UINT encodingMode=GetPrivateProfileIntW(L"Settings",L"EncodingMode",0,path);
         choose(app.encodingMode,encodingMode<=4?static_cast<int>(encodingMode):0);
+        const UINT recordingLimit=GetPrivateProfileIntW(L"Settings",L"RecordingLimit",0,path);
+        choose(app.stopAfter,recordingLimit<=5?static_cast<int>(recordingLimit):0);
         // Launch on desktop: opening the app never silently turns on a camera.
         choose(app.mode,0);
+        updateAdvanced();
     } else if(!savePreferences()) {
         OutputDebugStringW(L"Timelapse could not save preferences.\n");
     }
@@ -635,7 +674,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         return 0;
     }
     case WM_CREATE: {
-        app.startupComplete=false;
+        app.startupComplete=false;app.advancedExpanded=false;app.advancedLimitIndex=app.advancedVisibility=-1;
         try {
         app.window=w;app.dpi=static_cast<int>(GetDpiForWindow(w));fonts();
         bool controlsReady=true;
@@ -654,10 +693,13 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         app.videoSize=combo(2,L"Video si&ze",SizeBox);add(app.videoSize,L"720p");add(app.videoSize,L"1080p");
         app.encodingQuality=combo(3,L"Video &quality",EncodingQualityBox);for(auto s:{L"Smaller file",L"Balanced",L"More detail"})add(app.encodingQuality,s);
         app.monitor=combo(4,L"&Display",MonitorBox);app.camera=combo(5,L"Ca&mera",CameraBox);
+        auto button=[&](const wchar_t* s,int id){return requiredControl(L"BUTTON",s,WS_TABSTOP|BS_PUSHBUTTON,id);};
+        app.advanced=requiredControl(L"BUTTON",L"&Advanced",WS_TABSTOP|BS_AUTOCHECKBOX|BS_PUSHLIKE,AdvancedToggle);
+        app.refresh=button(L"Re&fresh",Refresh);
         app.encodingMode=combo(6,L"Encodin&g",EncodingModeBox);
         for(auto s:{L"Compatible H.264",L"Efficient H.264",L"Hardware H.264",L"Hardware HEVC",L"Quality H.264"})add(app.encodingMode,s);
-        auto button=[&](const wchar_t* s,int id){return requiredControl(L"BUTTON",s,WS_TABSTOP|BS_PUSHBUTTON,id);};
-        app.refresh=button(L"Re&fresh",Refresh);app.record=button(L"●  &Record",Record);app.pause=button(L"&Pause",Pause);app.finish=button(L"&Finish",Finish);app.folder=button(L"&Change...",Folder);app.openFolder=button(L"&Open folder",OpenFolder);app.reset=button(L"Reset layout",Reset);app.forward=button(L"Bring forward",Forward);
+        app.stopAfter=combo(7,L"S&top after",StopAfterBox);for(auto label:RecordingLimitLabels)add(app.stopAfter,label);
+        app.record=button(L"●  &Record",Record);app.pause=button(L"&Pause",Pause);app.finish=button(L"&Finish",Finish);app.folder=button(L"&Change...",Folder);app.openFolder=button(L"&Open folder",OpenFolder);app.reset=button(L"Reset layout",Reset);app.forward=button(L"Bring forward",Forward);
         app.preview=requiredControl(L"LapsePreview",L"Collage preview. Space selects a layer. Arrow keys move it. Shift and arrow keys resize it.",WS_TABSTOP,Preview);
         app.statusText=requiredControl(L"STATIC",app.status.message.c_str(),SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX,210);
         if(!controlsReady) {
@@ -674,6 +716,12 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
         tip.uId=reinterpret_cast<UINT_PTR>(app.mode);
         tip.lpszText=const_cast<LPWSTR>(L"Separate files records full-frame desktop and camera videos together. The side-by-side preview is only for monitoring; each source has its own MP4.");
+        SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
+        tip.uId=reinterpret_cast<UINT_PTR>(app.advanced);
+        tip.lpszText=const_cast<LPWSTR>(L"Show or hide advanced options. Checked means expanded. Encoding and the recording time limit can be changed before recording.");
+        SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
+        tip.uId=reinterpret_cast<UINT_PTR>(app.stopAfter);
+        tip.lpszText=const_cast<LPWSTR>(L"Finish and save automatically after this much active recording time. Pauses and initial startup do not count. Never records until you choose Finish.");
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
         preferences(false);refreshSources();changeLayout(true);
         try {
@@ -737,7 +785,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
     case WM_GETMINMAXINFO: {
         auto info=reinterpret_cast<MINMAXINFO*>(lp);
         const RECT work=workArea(MonitorFromWindow(w,MONITOR_DEFAULTTONEAREST));
-        info->ptMinTrackSize={std::min<LONG>(app.scale(830),work.right-work.left),std::min<LONG>(app.scale(630),work.bottom-work.top)};
+        info->ptMinTrackSize={std::min<LONG>(app.scale(830),work.right-work.left),std::min<LONG>(app.scale(600),work.bottom-work.top)};
         return 0;
     }
     case WM_TIMER: {
@@ -777,6 +825,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
             InvalidateRect(w,nullptr,FALSE);return 0;
         }
         switch(id) {
+        case AdvancedToggle:toggleAdvanced();break;
         case TrayShow:showWindow();break;
         case TrayPause:if(!app.closeWhenDone && (app.status.state==State::Recording || app.status.state==State::Paused))app.engine->setPaused(app.status.state!=State::Paused);break;
         case TrayFinish:if(!app.closeWhenDone)app.engine->finish();break;
@@ -895,7 +944,7 @@ int runGui(HINSTANCE instance,int show,bool& windowCreationFailed) {
     const RECT work=workArea(MonitorFromPoint(cursor,MONITOR_DEFAULTTOPRIMARY));
     const int margin=app.scale(16);
     const int width=std::min(app.scale(920),std::max(1,static_cast<int>(work.right-work.left)-2*margin));
-    const int height=std::min(app.scale(740),std::max(1,static_cast<int>(work.bottom-work.top)-2*margin));
+    const int height=std::min(app.scale(680),std::max(1,static_cast<int>(work.bottom-work.top)-2*margin));
     HWND window=CreateWindowExW(0,cls.lpszClassName,L"Timelapse",WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,work.left+(work.right-work.left-width)/2,work.top+(work.bottom-work.top-height)/2,width,height,nullptr,nullptr,instance,nullptr);
     if(!window){windowCreationFailed=true;return 1;}
     if(const HMENU menu=GetSystemMenu(window,FALSE)){AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING,ExitSystemCommand,L"E&xit Timelapse");}

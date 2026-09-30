@@ -14,6 +14,8 @@ A small native Windows timelapse recorder. Record a display, a camera, or both i
 
 **System tray:** Closing the window hides Timelapse while recording continues. Reopen it from its tray icon or the Start menu. Right-click the tray icon for Show, Pause/Resume, Finish, or Exit. Exit finishes an active recording before closing; a saving failure brings the window back with the recovery information. Hidden windows stop preview processing. If Windows cannot add the tray icon, the app stays accessible in its window.
 
+**Advanced options:** Expand Advanced (Alt + A) for the encoder selector and optional Stop after limit. Choose 15 minutes, 1 hour, 4 hours, 8 hours, or 24 hours of active recording. Initial startup and paused time do not count. Timelapse automatically finishes and saves the video or pair of videos at the limit, including while hidden in the tray. Finishing may wait for a capture or encoding operation already in progress and for the files to save. The default is Never. The selected limit is remembered and stays visible in the collapsed Advanced label; recording settings remain locked while recording. Finishing a hidden recording also releases the camera.
+
 The installer keeps Timelapse in your user account's `LocalAppData\Programs\Timelapse` directory and adds Start menu and uninstall entries. Start with Windows is optional and starts the app in the tray without recording. Exit Timelapse from its tray menu before upgrading or uninstalling. Uninstalling preserves your recordings and settings.
 
 Tab moves between controls, and Alt + O opens the save folder. In the collage preview, Space cycles between sources, arrow keys move the selected source, and Shift + arrow keys resize it. Using these keys while dragging ends the current drag and preserves the keyboard edit. Reset layout restores the preset.
@@ -22,7 +24,7 @@ On smaller work areas, scroll to reach the preview and controls. The wheel scrol
 
 The quality selector offers Smaller file, Balanced, and More detail. Balanced is the default. More detail prioritizes image detail; its file size depends on the scene and can grow substantially with motion, texture, or frequent cuts.
 
-Choose an encoding mode separately from resolution and quality:
+Expand Advanced to choose an encoding mode separately from resolution and quality:
 
 | Encoding | Use |
 | --- | --- |
@@ -74,7 +76,7 @@ The executable is then in `build/release/Timelapse.exe`. Developers can launch i
 
 - One display and one camera at a time; 720p or 1080p output, preserving source aspect ratios. Camera input is capped at 720p to limit processing; 1080p preserves additional desktop detail.
 - The desktop must remain unlocked and awake. Protected content may appear black. A removed display or unavailable camera stops recording and attempts to save captured frames.
-- MP4 is finalized when Finish is pressed or Exit is selected from the tray. Closing the window keeps recording. A power loss or forced termination can leave an unplayable `.recording.mp4` file; crash recovery is not implemented yet.
+- MP4 is finalized by Finish, Exit, or an automatic time limit. Closing the window keeps recording. A power loss or forced termination can leave an unplayable `.recording.mp4` file; crash recovery is not implemented yet.
 - Windows N requires the Media Feature Pack. The app and installer are currently unsigned.
 - Camera compatibility and performance vary by device; automated media tests use generated frames and do not establish physical-camera compatibility.
 - Display identity uses a Windows monitor interface when available, with a GDI display-name fallback. The fallback cannot distinguish a replacement using the same name; changes that disappear and return entirely within one capture can escape detection.
@@ -137,7 +139,7 @@ This also checks BT.709 limited-range color metadata. FFmpeg is used only by the
 
 After building and testing, run `./package.ps1` to create both archives in `packages/`. The release ZIP is intended for GitHub Releases. Extract the source ZIP into an empty folder, then run the build commands from that folder; build outputs, test recordings, and local settings are excluded.
 
-To also create `Timelapse-v0.3.0-windows-x64-setup.exe`, supply an installed or portable Inno Setup 7 compiler:
+To also create `Timelapse-v0.4.0-windows-x64-setup.exe`, supply an installed or portable Inno Setup 7 compiler:
 
 ```powershell
 .\package.ps1 -InstallerCompiler 'C:\Path\To\Inno Setup 7\ISCC.exe'

@@ -43,6 +43,7 @@ struct Gate {
 std::atomic<uint64_t> captureCalls{0};
 std::atomic<bool> failCapture{false}, failFinish{false}, failRename{false};
 std::atomic<int> captureWidth{0};
+std::atomic<int> captureGateWidth{0};
 int confirmations=0, errorDialogs=0, foregroundCalls=0, destroyCalls=0;
 std::wstring dialogMessage;
 int WINAPI messageBox(HWND,LPCWSTR message,LPCWSTR title,UINT flags) {
@@ -73,7 +74,8 @@ int runCameraHost(const wchar_t*) { throw std::runtime_error("Unexpected applica
 bool captureMonitor(const std::wstring& id,int width,int,bool,Frame& output,std::wstring& error) {
     error.clear();
     if(id!=L"owned-display"){error=L"Synthetic display unavailable.";return false;}
-    ++probe::captureCalls;probe::captureWidth=width;probe::captureGate.enter();
+    ++probe::captureCalls;probe::captureWidth=width;
+    if(!probe::captureGateWidth || probe::captureGateWidth==width)probe::captureGate.enter();
     if(probe::failCapture) { error=L"Synthetic display capture failed.";return false; }
     output.width=32;output.height=18;output.pixels.assign(32*18*4,100);return true;
 }
@@ -142,6 +144,7 @@ Status waitState(State state){
 struct HiddenFixture {
     explicit HiddenFixture(const wchar_t* name){
         probe::failCapture=false;probe::failFinish=false;probe::failRename=false;
+        probe::captureGateWidth=0;
         probe::confirmations=probe::errorDialogs=probe::foregroundCalls=probe::destroyCalls=0;
         probe::dialogMessage.clear();
         app.settings={};app.status={};app.selected=-1;app.closeWhenDone=false;app.modeIndex=0;
@@ -271,9 +274,12 @@ bool terminalFailure(int kind) {
     HiddenFixture f(kind==0?L"due-capture-failure":kind==1?L"finalize-failure":L"rename-failure");
     f.start(kind==0);
     if(kind==0) {
+        // Preview and recording have independent deadlines; gate the due
+        // full-resolution sample regardless of which preview arrives first.
+        probe::captureGateWidth=app.settings.width;
         probe::captureGate.arm();probe::captureGate.wait();
         require(probe::captureWidth==app.settings.width,"Failure control must be a real due recording capture");
-        probe::failCapture=true;requestClose();probe::captureGate.release();
+        probe::failCapture=true;requestClose();probe::captureGate.release();probe::captureGateWidth=0;
     } else {
         probe::failFinish=kind==1;probe::failRename=kind==2;
         probe::finishGate.arm();requestClose();probe::finishGate.wait();probe::finishGate.release();

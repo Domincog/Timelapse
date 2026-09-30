@@ -20,6 +20,9 @@ struct Settings {
     bool preview = true;
     // Capture both selected sources on one schedule into independent videos.
     bool separateFiles = false;
+    // Active recording time, excluding initial startup and pauses. Nonpositive
+    // values keep recording until the user finishes or a capture/save fails.
+    int recordingLimitSeconds = 0;
 };
 struct Status {
     State state = State::Idle;

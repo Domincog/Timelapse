@@ -147,11 +147,16 @@ LRESULT WINAPI fixtureDispatchMessage(const MSG* message){
     if(message->hwnd==app.preview)return previewProc(app.preview,message->message,message->wParam,message->lParam);
     return windowProc(app.window,message->message,message->wParam,message->lParam);
 }
-std::vector<HWND> tabControls(){return {app.mode,app.interval,app.videoSize,app.encodingQuality,app.monitor,app.camera,app.encodingMode,app.refresh,app.record,app.pause,app.finish,app.folder,app.openFolder,app.reset,app.forward,app.preview};}
+std::vector<HWND> tabControls(){
+    std::vector<HWND> result={app.mode,app.interval,app.videoSize,app.encodingQuality,app.monitor,app.camera,app.advanced,app.refresh};
+    if(app.advancedExpanded){result.push_back(app.encodingMode);result.push_back(app.stopAfter);}
+    for(HWND child:{app.record,app.pause,app.finish,app.folder,app.openFolder,app.reset,app.forward,app.preview})result.push_back(child);
+    return result;
+}
 struct HiddenWindow {
     HiddenWindow(int width,int height,int dpi){
         app.dpi=dpi;app.scrollX=app.scrollY=app.wheelVertical=app.wheelHorizontal=0;
-        app.contentWidth=app.contentHeight=0;app.layingOut=app.dragging=false;
+        app.contentWidth=app.contentHeight=0;app.layingOut=app.dragging=app.advancedExpanded=false;app.advancedLimitIndex=app.advancedVisibility=-1;
         ownedFocus=ownedCapture=nullptr;
         app.window=CreateWindowExW(0,L"STATIC",L"Owned hidden scrolling fixture",WS_POPUP|WS_CLIPCHILDREN,0,0,width,height,nullptr,nullptr,nullptr,nullptr);
         require(app.window && !IsWindowVisible(app.window),"Hidden parent creation failed.");
@@ -160,9 +165,11 @@ struct HiddenWindow {
         app.mode=combo(0,L"&Source",ModeBox);app.interval=combo(1,L"Capture &every",IntervalBox);
         app.videoSize=combo(2,L"Video si&ze",SizeBox);app.encodingQuality=combo(3,L"Video &quality",EncodingQualityBox);
         app.monitor=combo(4,L"&Display",MonitorBox);app.camera=combo(5,L"Ca&mera",CameraBox);
-        app.encodingMode=combo(6,L"Encodin&g",EncodingModeBox);
         auto button=[&](const wchar_t* name,int id){return child(L"BUTTON",name,WS_TABSTOP|BS_PUSHBUTTON,id);};
-        app.refresh=button(L"Re&fresh",Refresh);app.record=button(L"&Record",Record);app.pause=button(L"&Pause",Pause);app.finish=button(L"&Finish",Finish);
+        app.advanced=child(L"BUTTON",L"&Advanced",WS_TABSTOP|BS_AUTOCHECKBOX|BS_PUSHLIKE,AdvancedToggle);app.refresh=button(L"Re&fresh",Refresh);
+        app.encodingMode=combo(6,L"Encodin&g",EncodingModeBox);app.stopAfter=combo(7,L"S&top after",StopAfterBox);
+        SendMessageW(app.stopAfter,CB_RESETCONTENT,0,0);for(auto name:RecordingLimitLabels)add(app.stopAfter,name);choose(app.stopAfter,0);
+        app.record=button(L"&Record",Record);app.pause=button(L"&Pause",Pause);app.finish=button(L"&Finish",Finish);
         app.folder=button(L"&Change...",Folder);app.openFolder=button(L"&Open folder",OpenFolder);app.reset=button(L"Reset layout",Reset);app.forward=button(L"Bring forward",Forward);
         app.preview=child(L"STATIC",L"Preview",WS_TABSTOP,Preview);app.statusText=child(L"STATIC",L"Ready",SS_LEFT|SS_CENTERIMAGE,210);
         SetWindowLongPtrW(app.window,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(fixtureWindowProc));
@@ -180,8 +187,9 @@ void checkLayout(){
     require(app.scrollX>=0 && app.scrollX<=app.contentWidth-view.right && app.scrollY>=0 && app.scrollY<=app.contentHeight-view.bottom,"Offsets exceed viewport range.");
     require(!intersects(bounds(app.forward),bounds(app.folder)),"Bring forward overlaps Change folder.");
     require(!intersects(bounds(app.finish),bounds(app.openFolder)),"Finish overlaps Open folder.");
-    require(!intersects(bounds(app.monitor),bounds(app.camera)) && !intersects(bounds(app.camera),bounds(app.encodingMode)) &&
-            !intersects(bounds(app.encodingMode),bounds(app.refresh)),"Source or encoding controls overlap.");
+    require(!intersects(bounds(app.monitor),bounds(app.camera)) && !intersects(bounds(app.camera),bounds(app.advanced)) &&
+            !intersects(bounds(app.advanced),bounds(app.refresh)),"Source or Advanced controls overlap.");
+    if(app.advancedExpanded)require(!intersects(bounds(app.encodingMode),bounds(app.stopAfter))&&bounds(app.encodingMode).bottom<bounds(app.preview).top,"Advanced options overlap each other or preview.");
     HDC textDc=GetDC(app.mode);auto oldFont=SelectObject(textDc,app.font);SIZE labelSize{};
     GetTextExtentPoint32W(textDc,SeparateFilesLabel,static_cast<int>(std::wcslen(SeparateFilesLabel)),&labelSize);
     SelectObject(textDc,oldFont);ReleaseDC(app.mode,textDc);
@@ -236,6 +244,33 @@ void scenario(int dpi,bool constrained){
         require(app.scrollX==0 && app.scrollY==0 && !(GetWindowLongPtrW(app.window,GWL_STYLE)&(WS_HSCROLL|WS_VSCROLL)),"Roomy resize left scroll offsets or bars.");
     }
     std::cout<<"PASS layout dpi="<<dpi<<" client_input="<<width<<'x'<<height<<" mode="<<(constrained?"constrained":"roomy")<<" real_window_dpi="<<GetDpiForWindow(app.window)<<'\n';
+}
+void advancedDisclosure(int dpi){
+    HiddenWindow owned(MulDiv(500,dpi,96),MulDiv(400,dpi,96),dpi);
+    auto styledVisible=[](HWND child){return (GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0;};
+    require(!app.advancedExpanded&&!styledVisible(app.encodingMode)&&!styledVisible(app.stopAfter)&&SendMessageW(app.advanced,BM_GETCHECK,0,0)==BST_UNCHECKED,"Advanced options were not collapsed by default.");
+    const auto collapsedHeight=app.contentHeight;
+    for(int i=0;i<6;++i){
+        choose(app.stopAfter,i);updateAdvanced();wchar_t label[128]{};GetWindowTextW(app.advanced,label,128);
+        require(i==0 || std::wstring(label).find(RecordingLimitLabels[i])!=std::wstring::npos,"Collapsed disclosure hides a configured time limit.");
+        std::wstring measured=label;measured.erase(std::remove(measured.begin(),measured.end(),L'&'),measured.end());
+        HDC dc=GetDC(app.advanced);auto old=SelectObject(dc,app.font);SIZE extent{};GetTextExtentPoint32W(dc,measured.c_str(),static_cast<int>(measured.size()),&extent);
+        SelectObject(dc,old);ReleaseDC(app.advanced,dc);
+        require(extent.cx+app.scale(18)<=bounds(app.advanced).right-bounds(app.advanced).left,"Finite-limit disclosure caption truncates at minimum layout width.");
+    }
+    ownedFocus=app.advanced;windowProc(app.window,WM_COMMAND,AdvancedToggle,0);
+    require(app.advancedExpanded&&styledVisible(app.encodingMode)&&styledVisible(app.stopAfter)&&SendMessageW(app.advanced,BM_GETCHECK,0,0)==BST_CHECKED,"Disclosure did not expose accessible checked state/options.");
+    require(app.contentHeight==collapsedHeight+app.scale(68),"Expanded options failed to claim their own layout row.");
+    require(GetNextDlgTabItem(app.window,app.refresh,FALSE)==app.encodingMode&&GetNextDlgTabItem(app.window,app.encodingMode,FALSE)==app.stopAfter,"Expanded native tab order skipped advanced options.");
+    checkLayout();checkFocusReachability();scrollTo(INT_MAX,INT_MAX);ownedFocus=app.stopAfter;
+    windowProc(app.window,WM_COMMAND,AdvancedToggle,0);
+    require(!app.advancedExpanded&&ownedFocus==app.advanced&&!styledVisible(app.labels[6])&&!styledVisible(app.labels[7]),"Collapsing stranded keyboard focus or labels.");
+    require(app.contentHeight==collapsedHeight&&GetNextDlgTabItem(app.window,app.refresh,FALSE)==app.record,"Collapsed row retained blank height or hidden tab stops.");
+    checkLayout();checkFocusReachability();
+    app.status.state=State::Recording;updateControls();windowProc(app.window,WM_COMMAND,AdvancedToggle,0);
+    require(app.advancedExpanded&&IsWindowEnabled(app.advanced)&&!IsWindowEnabled(app.stopAfter)&&!IsWindowEnabled(app.encodingMode),"Recording froze disclosure or allowed advanced edits.");
+    app.status={};updateControls();
+    std::cout<<"PASS Advanced disclosure dpi="<<dpi<<" default, finite summaries, expansion, focus transfer, native tab order, scroll clamp, active lock\n";
 }
 POINT beginDrag(){
     app.settings.layers={{Source::Desktop,{0,0,1,1}},{Source::Camera,{.2,.3,.3,.3}}};app.selected=-1;
@@ -314,7 +349,7 @@ void originalScenarios(){
 int main(){
     try{
         std::cout<<std::unitbuf;SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        for(int dpi:{96,144,192,288}){scenario(dpi,false);scenario(dpi,true);}
-        dragChecks();barDependency();dpiAndRouting();originalScenarios();std::cout<<"PASS 14 hidden scrolling cases\n";return 0;
+        for(int dpi:{96,144,192,288}){scenario(dpi,false);scenario(dpi,true);advancedDisclosure(dpi);}
+        dragChecks();barDependency();dpiAndRouting();originalScenarios();std::cout<<"PASS 18 hidden scrolling and disclosure cases\n";return 0;
     }catch(const std::exception& e){std::cerr<<"FIXTURE FAILURE: "<<e.what()<<'\n';return 1;}
 }

@@ -131,7 +131,23 @@ void Engine::run() {
         auto lastPreview = Clock::time_point::min(), nextFrame = Clock::now();
         auto retryFrameAt = Clock::time_point::min();
         auto lastTick = Clock::now();
+        Clock::duration activeDuration{};
         double elapsed = 0;
+        bool recordingLimitReached = false;
+        auto advanceElapsed = [&](Clock::time_point now) {
+            if (writing && !paused) activeDuration += now - lastTick;
+            lastTick = now;
+            elapsed = std::chrono::duration<double>(activeDuration).count();
+        };
+        auto recordingDeadline = [&] {
+            return writing && !paused && session && session->recordingLimitSeconds > 0
+                ? lastTick + (std::chrono::seconds(session->recordingLimitSeconds) - activeDuration)
+                : Clock::time_point::max();
+        };
+        auto limitExpired = [&] {
+            return writing && !paused && session && session->recordingLimitSeconds > 0 &&
+                activeDuration >= std::chrono::seconds(session->recordingLimitSeconds);
+        };
         auto publishError = [&](const std::wstring& message, bool reset) {
             std::lock_guard<std::mutex> lock(mutex_);
             // An unconsumed Record command owns the next attempt's status.
@@ -155,7 +171,11 @@ void Engine::run() {
         };
         auto closeRecording = [&](const std::wstring& reason) {
             if (writing) power.saving();
-            { std::lock_guard<std::mutex> lock(mutex_); status_.state = State::Finishing; status_.message = L"Finishing MP4..."; }
+            bool keepCamera;
+            { std::lock_guard<std::mutex> lock(mutex_); status_.state = State::Finishing; status_.message = L"Finishing MP4..."; keepCamera = settings_.preview; }
+            // Hidden idle workers have no next tick on which to release the
+            // device. Finish/cancel must stop it before returning to that wait.
+            if (!keepCamera && cameraRunning) { camera->stop(); cameraRunning = false; activeCamera.clear(); }
             if (session && session->separateFiles) {
                 std::array<std::wstring, 2> errors;
                 const std::array<bool, 2> opened{writing, cameraWriting};
@@ -181,7 +201,7 @@ void Engine::run() {
                 for (size_t mask = 0; mask < reports.size(); ++mask) {
                     auto& report = reports[mask];
                     report.error = !reason.empty();
-                    report.message = reason;
+                    report.message = reason.empty() && recordingLimitReached ? L"Recording time limit reached." : reason;
                     for (size_t i = 0; i < writers.size(); ++i) {
                         if (!report.message.empty()) report.message += L" ";
                         report.message += i == 0 ? L"Desktop: " : L"Camera: ";
@@ -223,6 +243,7 @@ void Engine::run() {
                 if (encoder) encoder->releasePublication();
                 if (cameraEncoder) cameraEncoder->releasePublication();
                 writing = cameraWriting = pending = paused = false; previewProblem_ = false;
+                recordingLimitReached = false;
                 desktop = {}; webcam = {}; composed = {}; cameraComposed = {};
                 power.update(false, false);
                 return;
@@ -237,7 +258,8 @@ void Engine::run() {
                 // file. Once renamed, status publication below cannot allocate.
                 savedPath = finalPath;
                 savedPaths.push_back(finalPath);
-                message = reason.empty() ? L"Saved: " + finalPath : reason + L" Captured frames were saved.";
+                message = reason.empty() ? (recordingLimitReached ? L"Recording time limit reached. Saved: " : L"Saved: ") + finalPath
+                    : reason + L" Captured frames were saved.";
                 const DWORD renameError = encoder->publish(finalPathIO);
                 ok = renameError == ERROR_SUCCESS;
                 if (!ok) {
@@ -262,6 +284,7 @@ void Engine::run() {
             status_.message.swap(message);
             if (encoder) encoder->releasePublication();
             writing = pending = paused = false; previewProblem_ = false;
+            recordingLimitReached = false;
             desktop = {}; webcam = {}; composed = {};
             power.update(false, false);
         };
@@ -271,7 +294,7 @@ void Engine::run() {
             const auto generation = previewGeneration_;
             const auto revision = settingsRevision_;
             const bool start = start_, stop = stop_, pauseRequested = pauseRequested_, pauseTarget = pauseTarget_, retry = retrySources_;
-            wake_.wait_for(lock, std::chrono::seconds(1), [&] {
+            wake_.wait_until(lock, std::min(Clock::now() + std::chrono::seconds(1), recordingDeadline()), [&] {
                 return quit_ || previewGeneration_ != generation || settingsRevision_ != revision || start_ != start ||
                     stop_ != stop || pauseRequested_ != pauseRequested || pauseTarget_ != pauseTarget || retrySources_ != retry;
             });
@@ -295,6 +318,7 @@ void Engine::run() {
                   // The displayed recording clock uses whole seconds. Commands
                   // wake immediately and publish their precise elapsed time.
                   if (writing && !paused) deadline = std::min(deadline, lastTick + std::chrono::seconds(1));
+                  deadline = std::min(deadline, recordingDeadline());
                   if (FAILED(com)) deadline = Clock::now() + std::chrono::seconds(1);
                   auto commanded = [&] {
                       return quit_ || start_ || stop_ || pauseRequested_ || retrySources_ || settingsRevision_ != settingsRevision;
@@ -307,7 +331,7 @@ void Engine::run() {
                   quit = quit_;
                   previewGeneration = previewGeneration_;
                   previewOnlyWork = !start_ && !stop_ && !quit_ && !pending &&
-                      (!writing || paused || Clock::now() < nextFrame);
+                      (!writing || paused || Clock::now() < nextFrame) && Clock::now() < recordingDeadline();
                   if (!quit) {
                       snapshot.emplace(settings_);
                       settingsRevision = settingsRevision_;
@@ -315,8 +339,7 @@ void Engine::run() {
                       start_ = stop_ = pauseRequested_ = retrySources_ = false;
                   } }
                 const auto now = Clock::now();
-                if (writing && !paused) elapsed += std::chrono::duration<double>(now - lastTick).count();
-                lastTick = now;
+                advanceElapsed(now);
                 // Preview deadlines can coincide with every clock deadline.
                 // Publish time even when this wake also refreshes the image.
                 if (writing) { std::lock_guard<std::mutex> lock(mutex_); status_.elapsed = elapsed; }
@@ -327,11 +350,18 @@ void Engine::run() {
                 if (start) {
                     previewOnlyWork = false;
                     session.emplace(cfg); pending = true; elapsed = 0;
+                    activeDuration = Clock::duration::zero(); recordingLimitReached = false;
                     if (cfg.separateFiles) { desktopLayers = preset(Mode::Desktop); cameraLayers = preset(Mode::Camera); }
                     nextFrame = now;
                     retryFrameAt = Clock::time_point::min();
                 }
                 if (stop && (pending || writing)) { previewOnlyWork = false; closeRecording(L""); continue; }
+                // The time limit takes precedence over a sample due at exactly
+                // the same instant, and remains active during source retries.
+                if (limitExpired()) {
+                    previewOnlyWork = false; recordingLimitReached = true;
+                    closeRecording(L""); continue;
+                }
                 if (pauseRequested && writing && paused != pauseTarget) {
                     paused = pauseTarget;
                     const bool desktopNeeded = (session && session->separateFiles) || std::any_of(cfg.layers.begin(), cfg.layers.end(),
@@ -470,11 +500,21 @@ void Engine::run() {
                         cameraWriting = true;
                     }
                     pending = false;
+                    // Initial source warmup and opening either writer are
+                    // preparation, not active recording time. Anchor sampling
+                    // and the optional deadline to the first admitted frame.
+                    lastTick = Clock::now(); nextFrame = lastTick;
                     power.update(true, needDesktop);
                     std::lock_guard<std::mutex> lock(mutex_);
                     status_.state = State::Recording; status_.error = false; status_.message = recordingMessage(cfg.separateFiles);
                 }
                 if (captureDue && writing && !paused) {
+                    advanceElapsed(Clock::now());
+                    // A slow capture/composition may have crossed the limit.
+                    // Admit both separate writes together, or neither of them.
+                    if (limitExpired()) {
+                        recordingLimitReached = true; closeRecording(L""); continue;
+                    }
                     if (!encoder->write(composed, error)) {
                         closeRecording((cfg.separateFiles ? L"Desktop recording stopped: " : L"Recording stopped: ") + error); continue;
                     }

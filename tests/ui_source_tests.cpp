@@ -96,7 +96,7 @@ int runCameraHost(const wchar_t*) { if(startupUnderTest)return -1; throw std::ru
 }
 namespace {
 bool overrideIndexes=false;
-UINT savedInterval=0, savedSize=0, savedEncoding=0, savedEncodingMode=0;
+UINT savedInterval=0, savedSize=0, savedEncoding=0, savedEncodingMode=0, savedRecordingLimit=0;
 UINT WINAPI fixtureProfileInt(LPCWSTR, LPCWSTR key, INT fallback, LPCWSTR) {
     ++profileReads;
     if(!overrideIndexes) return fallback;
@@ -104,6 +104,7 @@ UINT WINAPI fixtureProfileInt(LPCWSTR, LPCWSTR key, INT fallback, LPCWSTR) {
     if(std::wcscmp(key,L"Quality")==0)return savedSize;
     if(std::wcscmp(key,L"EncodingQuality")==0)return savedEncoding;
     if(std::wcscmp(key,L"EncodingMode")==0)return savedEncodingMode;
+    if(std::wcscmp(key,L"RecordingLimit")==0)return savedRecordingLimit;
     throw std::runtime_error("Unexpected persisted index.");
 }
 DWORD WINAPI fixtureProfileString(LPCWSTR,LPCWSTR,LPCWSTR fallback,LPWSTR target,DWORD capacity,LPCWSTR) {
@@ -180,7 +181,7 @@ struct HiddenFixture {
             auto handle=child(L"COMBOBOX",CBS_DROPDOWNLIST);
             for(int i=0;i<count;++i)add(handle,std::to_wstring(i)); choose(handle,0); return handle;
         };
-        app.mode=combo(6); app.interval=combo(6); app.videoSize=combo(2); app.encodingQuality=combo(3); app.encodingMode=combo(5);
+        app.mode=combo(6); app.interval=combo(6); app.videoSize=combo(2); app.encodingQuality=combo(3); app.encodingMode=combo(5);app.stopAfter=combo(6);
         app.monitor=combo(0); app.camera=combo(0);
         app.preview=child(L"STATIC",0);
         for(auto target:{&app.refresh,&app.record,&app.pause,&app.finish,&app.folder,&app.openFolder,&app.reset,&app.forward})
@@ -316,7 +317,7 @@ void activeControls() {
     seed(true);
     for(auto state:{State::Starting,State::Recording,State::Paused,State::Finishing}) {
         app.status.state=state; updateControls();
-        for(auto control:{app.refresh,app.mode,app.monitor,app.camera,app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.folder,app.record})
+        for(auto control:{app.refresh,app.mode,app.monitor,app.camera,app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.folder,app.record})
             require(!IsWindowEnabled(control),"An active-session source/settings control remained enabled.");
     }
     std::cout<<"PASS Refresh/source/settings controls disabled in Starting, Recording, Paused and Finishing.\n";
@@ -424,6 +425,12 @@ void indexLoads() {
         require(app.settings.encodingMode==static_cast<EncodingMode>(mode<=4?mode:0),"Persisted encoding mode mapping failed.");
     }
     savedEncodingMode=0;
+    const int seconds[]={0,900,3600,14400,28800,86400};
+    for(UINT limit:{0u,1u,2u,3u,4u,5u,6u,999u,static_cast<UINT>(-1)}){
+        savedRecordingLimit=limit;preferences(false);configure();
+        require(app.settings.recordingLimitSeconds==seconds[limit<=5?limit:0]&&lapse::configured.recordingLimitSeconds==app.settings.recordingLimitSeconds,"Persisted recording-limit mapping failed.");
+    }
+    savedRecordingLimit=0;
     overrideIndexes=false; std::cout<<"PASS persisted defaults, valid indexes, high clamp and negative clamp; startup mode remains Desktop.\n";
 }
 void separateSources() {
