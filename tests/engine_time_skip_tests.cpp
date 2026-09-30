@@ -31,10 +31,21 @@ std::atomic<unsigned> observationReports{0};
 std::atomic<int> cameraScene{0}, desktopScene{0}, observationMode{0}, observationDelay{0}, writeDelay{0};
 std::atomic<bool> lowSpace{false};
 std::atomic<uint64_t> retainedReceipt{0};
+std::atomic<bool> gateNextWrite{false}, writeGateEntered{false};
+std::mutex writeGateMutex;
+std::condition_variable writeGateWake;
+bool writeGateOpen = false;
+void releaseWriteGate() {
+    { std::lock_guard<std::mutex> lock(writeGateMutex); writeGateOpen = true; }
+    writeGateWake.notify_all();
+}
+struct ScopedWriteGateRelease { ~ScopedWriteGateRelease() { releaseWriteGate(); } };
 void reset() {
     std::lock_guard<std::mutex> lock(evidenceMutex); writes.clear(); windows.clear();
     starts=captures=observerCaptures=checks=cancels=nightCancels=queries=opens=observationReports=0;
     cameraScene=desktopScene=observationMode=observationDelay=writeDelay=0; lowSpace=false; retainedReceipt=0;
+    gateNextWrite = writeGateEntered = false;
+    { std::lock_guard<std::mutex> gateLock(writeGateMutex); writeGateOpen = false; }
 }
 std::vector<Write> submitted() { std::lock_guard<std::mutex> lock(evidenceMutex); return writes; }
 std::vector<Window> begun() { std::lock_guard<std::mutex> lock(evidenceMutex); return windows; }
@@ -59,6 +70,10 @@ public:
     bool write(const Frame& frame,std::wstring& error) {
         { std::lock_guard<std::mutex> lock(evidenceMutex); writes.push_back({GetTickCount64(),
             std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(),secondary_}); }
+        if (gateNextWrite.exchange(false)) {
+            std::unique_lock<std::mutex> lock(writeGateMutex); writeGateEntered = true;
+            if (!writeGateWake.wait_for(lock, 5s, [] { return writeGateOpen; })) { error = L"Synthetic write gate timed out."; return false; }
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(writeDelay.exchange(0)));
         return real_.write(frame,error);
     }
@@ -280,6 +295,30 @@ void splitPolicyContinuity(const std::filesystem::path& root) {
     }
     std::cout<<"PASS file splits preserve manual schedule, quiet dwell and shared paired cadence.\n";
 }
+void splitResumeObservation(const std::filesystem::path& root, bool split, bool manual = false) {
+    reset(); auto settings = config(root / (manual ? L"resume-split-manual" : split ? L"resume-split-quiet" : L"resume-off-quiet"),
+        manual ? TimeSkipMode::Manual : TimeSkipMode::Quiet);
+    settings.layers = preset(Mode::Desktop); settings.segmentDurationSeconds = split ? 1 : 0;
+    gateNextWrite = true;
+    Engine engine; ScopedWriteGateRelease release;
+    engine.configure(settings); engine.record();
+    await(engine, [](const auto&) { return writeGateEntered.load(); });
+    engine.setPaused(true); // Queued before this admitted write crosses the cut.
+    std::this_thread::sleep_for(1100ms); releaseWriteGate();
+    const auto paused = await(engine, [](const auto& s) { return s.state == State::Paused; });
+    require(paused.elapsed >= 1 && paused.completedSegments == 0, "Pause did not retain the overdue first part");
+    std::this_thread::sleep_for(100ms);
+    require(engine.status().elapsed == paused.elapsed, "Boundary pause consumed active time");
+    const auto before = observerCaptures.load(); engine.setPaused(false);
+    const auto resumed = await(engine, [&](const auto& s) {
+        return s.frames >= 2 && s.timeSkip.intervalMs > 100 && (manual || observerCaptures >= before + 2);
+    }, 5000);
+    require(!split || resumed.completedSegments > 0, "Resume did not finalize the overdue part");
+    require(checks == 0 && starts == 0 && (!manual || observerCaptures == 0), "Desktop/manual resume enabled unrelated camera observation");
+    const auto saved = finish(engine); spacing(submitted());
+    if (split) split_test::verify(settings.folder, saved, false); else decode(saved, 160, 120, 1);
+    std::cout << "PASS Resume restarts desktop observation across overdue split; split=" << split << " manual=" << manual << ".\n";
+}
 void combinedAndSourceReset(const std::filesystem::path& root) {
     reset();auto settings=config(root/L"combined",TimeSkipMode::QuietWithinSchedule);
     settings.timeSkip.repeatSeconds=0;settings.timeSkip.ranges[0]={3,30};
@@ -357,7 +396,9 @@ int main(){
     if(FAILED(MFStartup(MF_VERSION))){CoUninitialize();return 1;}
     const auto root=std::filesystem::current_path()/(L"engine-time-skip-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64()));
     int result=0;
-    try{validation(root);offAndManual(root);pairedActivity(root);unavailableAndPause(root);resetReceipt(root);scheduleAndLimit(root);optionalSlowQueryLimit(root);splitPolicyContinuity(root);combinedAndSourceReset(root);nightWindows(root);nightSourceTransition(root);
+    try{validation(root);offAndManual(root);pairedActivity(root);unavailableAndPause(root);resetReceipt(root);scheduleAndLimit(root);optionalSlowQueryLimit(root);splitPolicyContinuity(root);
+        splitResumeObservation(root,false);splitResumeObservation(root,true);splitResumeObservation(root,true,true);
+        combinedAndSourceReset(root);nightWindows(root);nightSourceTransition(root);
         std::filesystem::remove_all(root);std::cout<<"All synthetic time-skipping engine contracts passed.\n";
     }catch(const std::exception& error){std::cerr<<error.what()<<'\n';std::wcerr<<L"Artifacts retained at "<<root.wstring()<<L'\n';result=1;}
     MFShutdown();CoUninitialize();return result;

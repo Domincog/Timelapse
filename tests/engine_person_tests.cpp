@@ -30,6 +30,15 @@ std::atomic<unsigned> cameraReports{0}, activityCalls{0}, desktopObservations{0}
 std::atomic<int> verdict{1}, sourceMode{0}, detectorMode{0}, startupDelay{0}, inferenceDelay{25}, cameraDelay{25};
 std::atomic<bool> throwConstruction{false}, startedBeforeVideo{false};
 std::atomic<uint64_t> oldReceipt{0};
+std::atomic<bool> gateNextWrite{false}, writeGateEntered{false};
+std::mutex writeGateMutex;
+std::condition_variable writeGateWake;
+bool writeGateOpen = false;
+void releaseWriteGate() {
+    { std::lock_guard<std::mutex> lock(writeGateMutex); writeGateOpen = true; }
+    writeGateWake.notify_all();
+}
+struct ScopedWriteGateRelease { ~ScopedWriteGateRelease() { releaseWriteGate(); } };
 void resetEvidence() {
     std::lock_guard<std::mutex> lock(evidenceMutex);
     writes.clear(); tokens.clear(); requestTicks.clear(); nightDurations.clear();
@@ -37,6 +46,8 @@ void resetEvidence() {
     cameraReports=activityCalls=desktopObservations=detectorCancels=0;
     verdict=1;sourceMode=detectorMode=startupDelay=0;inferenceDelay=cameraDelay=25;
     throwConstruction=startedBeforeVideo=false;oldReceipt=0;
+    gateNextWrite = writeGateEntered = false;
+    { std::lock_guard<std::mutex> gateLock(writeGateMutex); writeGateOpen = false; }
 }
 void pixels(lapse::Frame& frame,int width,int height) {
     frame.width=width;frame.height=height;frame.pixels.resize(size_t(width)*height*4);
@@ -53,6 +64,10 @@ public:
     }
     bool write(const Frame& frame,std::wstring& error) {
         {std::lock_guard<std::mutex> lock(evidenceMutex);writes.push_back({std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(),secondary_});}
+        if (gateNextWrite.exchange(false)) {
+            std::unique_lock<std::mutex> lock(writeGateMutex); writeGateEntered = true;
+            if (!writeGateWake.wait_for(lock, 5s, [] { return writeGateOpen; })) { error = L"Synthetic write gate timed out."; return false; }
+        }
         return real_.write(frame,error);
     }
     bool finish(std::wstring& e){return real_.finish(e);}
@@ -203,6 +218,26 @@ void splitPresenceContinuity(const std::filesystem::path& root) {
     boundedCadence(); split_test::verify(s.folder,done,true);
     std::cout<<"split files preserve absence dwell, detector lifetime, person return and shared playback\n";
 }
+void splitResumePerson(const std::filesystem::path& root, bool split) {
+    resetEvidence(); auto s = configuration(root / (split ? L"resume-split-person" : L"resume-off-person"));
+    s.segmentDurationSeconds = split ? 1 : 0;
+    s.preview = true; // Keep the source alive; a camera restart must not mask a lost policy reset.
+    gateNextWrite = true;
+    Engine e; ScopedWriteGateRelease release; e.configure(s); e.record();
+    await(e, [](const auto&) { return writeGateEntered.load(); });
+    e.setPaused(true); std::this_thread::sleep_for(1100ms); releaseWriteGate();
+    const auto paused = await(e, [](const auto& x) { return x.state == State::Paused; });
+    require(paused.elapsed >= 1 && paused.completedSegments == 0 && detectorLive == 0,
+        "Pause did not retain the overdue part and retire optional detector work");
+    e.setPaused(false);
+    const auto resumed = await(e, [](const auto& x) { return detectorSubmits >= 2 && x.timeSkip.intervalMs > 100; }, 5000);
+    require(detectorStarts == 1 && (!split || resumed.completedSegments > 0) && activityCalls == 0 && desktopObservations == 0,
+        "Boundary resume failed to restart one detector or enabled unrelated image observation");
+    const auto done = finish(e);
+    require(detectorLive == 0, "Boundary-resumed detector survived Finish");
+    boundedCadence(); if (split) split_test::verify(s.folder, done, false); else decode(done);
+    std::cout << "visible-camera person checks restart after overdue split on Resume; split=" << split << "\n";
+}
 }
 
 namespace lapse {
@@ -255,6 +290,7 @@ int main(){
     const HRESULT com=CoInitializeEx(nullptr,COINIT_MULTITHREADED);if(FAILED(com))return 1;if(FAILED(MFStartup(MF_VERSION))){CoUninitialize();return 1;}
     const auto root=std::filesystem::current_path()/(L"engine-person-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64()));int code=0;
     try{offAndNoCamera(root/L"isolation");accelerateAndActivity(root);pauseProvenance(root);malformedAndDuplicate(root);failuresLatch(root/L"failures");asynchronousDeadlines(root);scheduledNight(root);splitPresenceContinuity(root);
+        splitResumePerson(root,false);splitResumePerson(root,true);
         std::filesystem::remove_all(root);std::cout<<"All synthetic person engine contracts passed.\n";
     }catch(const std::exception& e){std::cerr<<e.what()<<'\n';std::wcerr<<L"Retained artifacts: "<<root.wstring()<<L'\n';code=1;}
     MFShutdown();CoUninitialize();return code;

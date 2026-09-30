@@ -613,8 +613,9 @@ void Engine::run() {
                     if (report.paths.empty()) report.message += previousFiles;
                     if (!report.paths.empty()) report.first = report.paths.front();
                 }
-                // No allocations after the first rename. Each outcome includes
-                // the other writer's retained pathname if that rename throws.
+                // Reports are ready before either rename; a later publish may
+                // allocate before its own rename. The status commit below does
+                // not allocate, even when that later publication throws.
                 size_t published = 0;
                 for (size_t i = 0; i < count; ++i) if (finalized[i]) {
                     try { if (writers[i]->publish(*finalIO[i]) == ERROR_SUCCESS) published |= size_t(1) << i; }
@@ -896,14 +897,11 @@ void Engine::run() {
                     if (!previewProblem_)
                         status_.message = paused ? L"Paused. Resume when you are ready." : recordingMessage(session && session->separateFiles);
                 }
-                if (segmentExpired()) {
-                    previewOnlyWork = false;
-                    if (!finishSegment(L"", false) || recordingLimitReached) closeRecording(L"");
-                    // Preserve queued commands and all scheduler/source state.
-                    continue;
-                }
                 bool captureDue = pending || (writing && !paused && now >= nextFrame);
-                previewOnlyWork = !captureDue;
+                // An overdue part still owns required work while applying the
+                // consumed command/configuration changes below. If those fail,
+                // do not discard their reset intent as a disposable preview.
+                previewOnlyWork = !captureDue && !segmentExpired();
                 if (writing || pending) {
                     if (!session->separateFiles) {
                         if (skipping && !sameLayers(session->layers, cfg.layers)) resetSkipRequested = true;
@@ -935,6 +933,14 @@ void Engine::run() {
                         }
                     }
                     std::lock_guard<std::mutex> lock(mutex_); status_.timeSkip = skipStatus;
+                }
+                if (segmentExpired()) {
+                    previewOnlyWork = false;
+                    if (!finishSegment(L"", false) || recordingLimitReached) closeRecording(L"");
+                    // Apply a consumed Resume/source reset before this early
+                    // return, then preserve commands queued during saving.
+                    // Ordinary rollover does not reset observation or Night.
+                    continue;
                 }
                 if (skipping && writing && !paused) {
                     inspectSkipping();

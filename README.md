@@ -122,7 +122,7 @@ The executable is then in `build/release/Timelapse.exe`. Developers can launch i
 
 - One display and one camera at a time; 720p, 1080p, or custom output within the size limits above, preserving source aspect ratios. Camera input is capped at 720p to limit processing; larger output does not add camera detail. Desktop output can retain more detail when the selected display provides it.
 - The desktop must remain unlocked and awake. Protected content may appear black. A removed display or unavailable camera stops recording and attempts to save captured frames.
-- MP4 is finalized by Finish, Exit, or an automatic time limit. Closing the window keeps recording. Ordinary MP4 can be unplayable after forced termination or power loss. Optional H.264 recovery mode improves the chance of playing completed sections after interruption, with the limits described above.
+- MP4 is finalized by Finish, Exit, an automatic time limit, or a configured file-split boundary. Closing the window keeps recording. An unfinished ordinary MP4 can be unplayable after forced termination or power loss. Optional H.264 recovery mode improves the chance of playing completed sections after interruption, with the limits described above.
 - Windows N requires the Media Feature Pack. The app and installer are currently unsigned.
 - Camera compatibility and performance vary by device; automated media tests use generated frames and do not establish physical-camera compatibility.
 - Display identity uses a Windows monitor interface when available, with a GDI display-name fallback. The fallback cannot distinguish a replacement using the same name; changes that disappear and return entirely within one capture can escape detection.
@@ -194,7 +194,7 @@ This also checks BT.709 limited-range color metadata. FFmpeg is used only by the
 
 After building and testing, run `./package.ps1` to create both archives in `packages/`. The release ZIP is intended for GitHub Releases. Extract the source ZIP into an empty folder, then run the build commands from that folder; build outputs, test recordings, and local settings are excluded.
 
-To also create `Timelapse-v0.14.0-windows-x64-setup.exe`, supply an installed or portable Inno Setup 7 compiler:
+To also create `Timelapse-v0.15.0-windows-x64-setup.exe`, supply an installed or portable Inno Setup 7 compiler:
 
 ```powershell
 .\package.ps1 -InstallerCompiler 'C:\Path\To\Inno Setup 7\ISCC.exe'
