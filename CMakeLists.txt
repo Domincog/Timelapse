@@ -1,15 +1,22 @@
 cmake_minimum_required(VERSION 3.20)
-project(Timelapse VERSION 0.8.0 LANGUAGES CXX RC)
+project(Timelapse VERSION 0.9.0 LANGUAGES CXX RC)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 add_compile_definitions(UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
 add_compile_options(/W4 /permissive- /utf-8 /EHsc)
+add_library(lapse_person STATIC src/person_pixels.cpp src/person_client.cpp src/person_pack.cpp src/person_pack_dialog.cpp)
+target_include_directories(lapse_person PUBLIC src)
+target_link_libraries(lapse_person PUBLIC ole32 user32 gdi32 shell32 bcrypt winhttp)
 add_library(lapse_core STATIC src/core.cpp src/config.cpp src/night.cpp src/time_skip.cpp src/capture.cpp src/camera_host.cpp src/encoder.cpp)
 target_include_directories(lapse_core PUBLIC src)
-target_link_libraries(lapse_core PUBLIC mfplat mfreadwrite mfuuid mf ole32 oleaut32 gdi32 user32 shlwapi shell32)
+target_link_libraries(lapse_core PUBLIC mfplat mfreadwrite mfuuid mf ole32 oleaut32 gdi32 user32 shlwapi shell32 lapse_person)
 add_executable(Timelapse WIN32 src/main.cpp src/engine.cpp src/app.rc src/app.manifest)
 target_link_libraries(Timelapse PRIVATE lapse_core comctl32 comdlg32 shell32 dwmapi)
+# Network code is used only by an explicitly requested optional-model download.
+# Keep WinHTTP out of ordinary app/camera-helper startup.
+target_link_libraries(Timelapse PRIVATE delayimp)
+target_link_options(Timelapse PRIVATE /DELAYLOAD:winhttp.dll)
 set_target_properties(Timelapse PROPERTIES RUNTIME_OUTPUT_DIRECTORY_RELEASE "${CMAKE_BINARY_DIR}/release")
 enable_testing()
 add_executable(night_tests tests/night_tests.cpp)
@@ -238,3 +245,43 @@ add_executable(ui_time_skip_tests tests/ui_time_skip_tests.cpp)
 target_link_libraries(ui_time_skip_tests PRIVATE lapse_core comctl32 comdlg32 shell32 dwmapi)
 add_test(NAME ui_time_skip_tests COMMAND ui_time_skip_tests)
 set_tests_properties(ui_time_skip_tests PROPERTIES TIMEOUT 20)
+
+add_executable(time_skip_person_tests tests/time_skip_person_tests.cpp src/time_skip.cpp)
+target_include_directories(time_skip_person_tests PRIVATE src)
+add_test(NAME time_skip_person_tests COMMAND time_skip_person_tests)
+set_tests_properties(time_skip_person_tests PROPERTIES TIMEOUT 15)
+
+add_executable(camera_person_tests tests/camera_person_tests.cpp src/core.cpp src/config.cpp src/night.cpp src/time_skip.cpp)
+target_include_directories(camera_person_tests PRIVATE src)
+target_link_libraries(camera_person_tests PRIVATE mfplat mfreadwrite mfuuid mf ole32 user32 gdi32 shell32)
+add_test(NAME camera_person_tests COMMAND camera_person_tests)
+set_tests_properties(camera_person_tests PROPERTIES TIMEOUT 40)
+
+add_executable(engine_person_tests tests/engine_person_tests.cpp)
+target_link_libraries(engine_person_tests PRIVATE lapse_core)
+add_test(NAME engine_person_tests COMMAND engine_person_tests)
+set_tests_properties(engine_person_tests PROPERTIES TIMEOUT 100)
+
+# Includes the actual client with isolated process/file seams. Normal CTest uses
+# a synthetic owned worker and needs no installed/downloaded detector payload.
+add_executable(person_client_tests tests/person_client_tests.cpp)
+target_include_directories(person_client_tests PRIVATE src)
+target_link_libraries(person_client_tests PRIVATE ole32)
+add_test(NAME person_client_tests COMMAND person_client_tests)
+set_tests_properties(person_client_tests PROPERTIES TIMEOUT 30)
+
+add_executable(person_pack_tests tests/person_pack_tests.cpp)
+target_include_directories(person_pack_tests PRIVATE src)
+target_link_libraries(person_pack_tests PRIVATE bcrypt winhttp user32 gdi32 shell32 ole32 uuid)
+add_test(NAME person_pack_tests COMMAND person_pack_tests)
+set_tests_properties(person_pack_tests PROPERTIES TIMEOUT 20)
+
+# Standalone source-including fixtures also need the bounded pixel helper and
+# optional client symbols. Unreferenced archive objects add no runtime work.
+get_property(lapse_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+foreach(lapse_target IN LISTS lapse_targets)
+    get_target_property(lapse_type ${lapse_target} TYPE)
+    if(lapse_type STREQUAL "EXECUTABLE" AND NOT lapse_target STREQUAL "person_client_tests" AND NOT lapse_target STREQUAL "person_pack_tests")
+        target_link_libraries(${lapse_target} PRIVATE lapse_person)
+    endif()
+endforeach()

@@ -20,7 +20,12 @@ if (-not (Test-Path -LiteralPath $PackageScript -PathType Leaf)) { throw "Packag
 New-Item -ItemType Directory -Path $workRoot | Out-Null
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
-$mutationState = @{ Enabled = $false; Done = $false; Path = ''; Text = '' }
+$mutationState = @{ Enabled = $false; Done = $false; Path = ''; Text = ''; MatchName = 'Timelapse.exe' }
+$workerName = 'Timelapse-person-nanodet-r1.exe'
+$personSources = @('person-pack/README.md', 'person-pack/CMakeLists.txt', 'person-pack/build.ps1',
+    'person-pack/model.cpp', 'person-pack/model.h', 'person-pack/model.rc.in', 'person-pack/resources.h', 'person-pack/worker.cpp',
+    'person-pack/tests/model_fixture.cpp', 'person-pack/tests/model_tests.cpp', 'person-pack/tests/worker_tests.cpp',
+    'person-pack/NOTICE.txt', 'person-pack/NanoDet-LICENSE.txt', 'person-pack/ncnn-LICENSE.txt', 'third-party/ncnn-LICENSE.txt')
 
 function Assert([bool]$Condition, [string]$Message) { if (-not $Condition) { throw $Message } }
 function Write-Text([string]$Path, [string]$Text) { [System.IO.File]::WriteAllText($Path, $Text, $utf8) }
@@ -38,7 +43,7 @@ function Get-FileHash {
     param([string]$Algorithm = 'SHA256', [string[]]$LiteralPath)
     $result = Microsoft.PowerShell.Utility\Get-FileHash @PSBoundParameters
     if ($mutationState.Enabled -and -not $mutationState.Done -and $LiteralPath.Count -eq 1 -and
-        (Split-Path -Leaf $LiteralPath[0]) -eq 'Timelapse.exe') {
+        (Split-Path -Leaf $LiteralPath[0]) -eq $mutationState.MatchName) {
         [System.IO.File]::WriteAllText($mutationState.Path, $mutationState.Text, (New-Object System.Text.UTF8Encoding($false)))
         $mutationState.Done = $true
     }
@@ -48,10 +53,27 @@ function Get-FileHash {
 # object in a closure instead of resolving $script: variables inside the child.
 Set-Item -Path Function:Get-FileHash -Value (${function:Get-FileHash}.GetNewClosure())
 
+function Write-WorkerMetadata([string]$Root, [uint64]$Bytes = 0, [string]$Hash = '') {
+    Write-Text (Join-Path $Root 'src/person_pack_metadata.h') @"
+#pragma once
+#include <cstdint>
+namespace lapse {
+inline constexpr wchar_t PersonPackFilename[] = L"$workerName";
+inline constexpr uint64_t PersonPackExpectedBytes = $Bytes;
+inline constexpr char PersonPackExpectedSha256[] = "$Hash";
+}
+"@
+}
+function Pin-FakeWorker([string]$Root) {
+    $file = Join-Path $Root 'build/release/PersonWorker.exe'
+    Write-WorkerMetadata $Root (Get-Item -LiteralPath $file).Length (File-Sha $file)
+    $file
+}
+
 function New-Fixture([string]$Name, [string]$Script = $PackageScript) {
     $root = Join-Path $workRoot $Name
     New-Item -ItemType Directory -Path $root | Out-Null
-    foreach ($dir in @('build/release', 'src', 'tests', 'tools', 'installer')) { New-Item -ItemType Directory -Path (Join-Path $root $dir) | Out-Null }
+    foreach ($dir in @('build/release', 'src', 'tests', 'tools', 'installer', 'person-pack/tests', 'person-pack/build', 'third-party')) { New-Item -ItemType Directory -Path (Join-Path $root $dir) -Force | Out-Null }
     Copy-Item -LiteralPath $Script -Destination (Join-Path $root 'package.ps1')
     Write-Text (Join-Path $root '.gitignore') "build/`npackages/`n"
     Write-Text (Join-Path $root 'README.md') "Owned synthetic package $Name.`n"
@@ -59,6 +81,12 @@ function New-Fixture([string]$Name, [string]$Script = $PackageScript) {
     Write-Text (Join-Path $root 'build.ps1') "throw 'Fixture build must never run.'`n"
     Write-Text (Join-Path $root 'src/app.cpp') "// Owned synthetic app input.`n"
     Write-Text (Join-Path $root 'src/helper.h') "// Owned synthetic header input.`n"
+    Write-WorkerMetadata $root
+    foreach ($name in $personSources) { Write-Text (Join-Path $root $name) "Owned public source or notice sentinel: $name`n" }
+    Write-Text (Join-Path $root 'person-pack/build/generated.cpp') "Unselected generated build sentinel.`n"
+    Write-Text (Join-Path $root 'person-pack/model-archive.zip') "Unselected archive sentinel.`n"
+    Write-Text (Join-Path $root 'person-pack/evaluation.jpg') "Unselected photograph sentinel.`n"
+    Write-Text (Join-Path $root 'third-party/internal.txt') "Unselected private notice sentinel.`n"
     Write-Text (Join-Path $root 'tests/probe.cpp') "// Owned synthetic test input.`n"
     Write-Text (Join-Path $root 'tests/fixture.cmake') "# Owned synthetic CMake test fixture.`n"
     Write-Text (Join-Path $root 'tests/package_tests.ps1') "# Selected packaging regression sentinel.`n"
@@ -69,6 +97,8 @@ function New-Fixture([string]$Name, [string]$Script = $PackageScript) {
     Write-Text (Join-Path $root 'installer/build-installer.ps1') @'
 param($Compiler, $Version, $PayloadDirectory, $OutputDirectory)
 if ($Compiler -eq 'FAIL') { throw 'Owned compiler failure.' }
+$names = @(Get-ChildItem -LiteralPath $PayloadDirectory -File | Select-Object -ExpandProperty Name)
+if ($names.Count -ne 3 -or @($names | Where-Object {$_ -notin @('Timelapse.exe','README.md','SHA256SUMS.txt')}).Count) { throw 'Unexpected installer payload member.' }
 $payload = [System.IO.File]::ReadAllText((Join-Path $PayloadDirectory 'Timelapse.exe'))
 $hash = [System.IO.File]::ReadAllText((Join-Path $PayloadDirectory 'SHA256SUMS.txt'))
 [System.IO.File]::WriteAllText((Join-Path $OutputDirectory "Timelapse-v$Version-windows-x64-setup.exe"), $payload + "`n" + $hash)
@@ -77,21 +107,24 @@ $hash = [System.IO.File]::ReadAllText((Join-Path $PayloadDirectory 'SHA256SUMS.t
     Write-Text (Join-Path $root 'src/local.txt') "Unselected local text sentinel.`n"
     Write-Text (Join-Path $root 'private-note.txt') "Unselected root note sentinel.`n"
     Write-Text (Join-Path $root 'build/release/Timelapse.exe') "FAKE EXE ORIGINAL $Name"
+    Write-Text (Join-Path $root 'build/release/PersonWorker.exe') "FAKE WORKER ORIGINAL $Name"
     $root
 }
 
-function Invoke-Package([string]$Root, [string]$UseVersion = $version, [string]$Compiler = '') {
+function Invoke-Package([string]$Root, [string]$UseVersion = $version, [string]$Compiler = '', [string]$Worker = '') {
     $options = @{ Version = $UseVersion; BuildDirectory = 'build' }
     if ($Compiler) { $options.InstallerCompiler = $Compiler }
+    if ($Worker) { $options.PersonWorker = $Worker }
     & (Join-Path $Root 'package.ps1') @options | Out-Null
 }
 
-function Get-Inputs([string]$Root, [bool]$ExcludeExe = $false) {
+function Get-Inputs([string]$Root, [bool]$ExcludeExe = $false, [bool]$ExcludeWorker = $false) {
     $map = @{}
     foreach ($file in (Get-ChildItem -LiteralPath $Root -File -Force)) { $map[$file.FullName.Substring($Root.Length + 1)] = File-Sha $file.FullName }
-    foreach ($dir in @('src', 'tests', 'build', 'tools', 'installer')) {
+    foreach ($dir in @('src', 'tests', 'build', 'tools', 'installer', 'person-pack', 'third-party')) {
         foreach ($file in (Get-ChildItem -LiteralPath (Join-Path $Root $dir) -File -Recurse -Force)) {
             if ($ExcludeExe -and $file.Name -eq 'Timelapse.exe') { continue }
+            if ($ExcludeWorker -and $file.Name -eq 'PersonWorker.exe') { continue }
             $map[$file.FullName.Substring($Root.Length + 1)] = File-Sha $file.FullName
         }
     }
@@ -141,17 +174,25 @@ function Read-Release([string]$Root, [string]$UseVersion = $version) {
     } finally { $zip.Dispose() }
 }
 
-function Assert-Package([string]$Root, [string]$UseVersion = $version, [bool]$HasInstaller = $false) {
+function Assert-Package([string]$Root, [string]$UseVersion = $version, [bool]$HasInstaller = $false, [bool]$HasWorker = $false) {
     $packages = Join-Path $Root 'packages'
     $release = Read-Release $Root $UseVersion
     Assert ($release.Embedded -eq ($release.ExeHash + '  Timelapse.exe')) 'Embedded hash differs from actual archived EXE bytes.'
     $lines = @(Get-Content -LiteralPath (Join-Path $packages 'SHA256SUMS.txt'))
-    Assert ($lines.Count -eq $(if ($HasInstaller) { 3 } else { 2 })) 'External checksum index has the wrong artifact count.'
+    Assert ($lines.Count -eq (2 + [int]$HasInstaller + [int]$HasWorker)) 'External checksum index has the wrong artifact count.'
     foreach ($line in $lines) {
         $parts = $line -split '  ', 2
         Assert ($parts.Count -eq 2 -and (File-Sha (Join-Path $packages $parts[1])) -eq $parts[0]) 'External archive checksum mismatch.'
     }
     $expected = @('.gitignore', 'README.md', 'CMakeLists.txt', 'build.ps1', 'package.ps1', 'src/app.cpp', 'src/helper.h', 'tests/probe.cpp', 'tests/fixture.cmake', 'tests/package_tests.ps1', 'tests/build_tests.ps1', 'tools/verify-encoding-quality.ps1', 'installer/Timelapse.iss', 'installer/build-installer.ps1', 'tests/installer_tests.ps1')
+    $expected += @('src/person_pack_metadata.h') + $personSources
+    if ($HasWorker) {
+        $metadata = [IO.File]::ReadAllText((Join-Path $Root 'src/person_pack_metadata.h'))
+        $size = [uint64][regex]::Match($metadata, 'PersonPackExpectedBytes\s*=\s*([0-9]+)').Groups[1].Value
+        $hash = [regex]::Match($metadata, 'PersonPackExpectedSha256\[\]\s*=\s*"([0-9a-fA-F]{64})"').Groups[1].Value
+        $asset = Join-Path $packages $workerName
+        Assert ((Get-Item -LiteralPath $asset).Length -eq $size -and (File-Sha $asset) -eq $hash) 'Published worker differs from source metadata.'
+    }
     $zip = [System.IO.Compression.ZipFile]::OpenRead((Join-Path $packages "Timelapse-v$UseVersion-source.zip"))
     try {
         Assert ($zip.Entries.Count -eq $expected.Count) 'Source allowlist entry count changed.'
@@ -169,7 +210,7 @@ function Assert-Package([string]$Root, [string]$UseVersion = $version, [bool]$Ha
 function Seed-Package([string]$Root) { Invoke-Package $Root; Assert-Package $Root }
 function Replace-FakeExe([string]$Root) { Write-Text (Join-Path $Root 'build/release/Timelapse.exe') 'FAKE EXE REPLACEMENT' }
 
-function Assert-StableFailure([string]$Root, [string]$LockedRelative = '', [string]$UseVersion = $version, [bool]$Exclusive = $false, [string]$Compiler = '') {
+function Assert-StableFailure([string]$Root, [string]$LockedRelative = '', [string]$UseVersion = $version, [bool]$Exclusive = $false, [string]$Compiler = '', [string]$Worker = '') {
     $inputs = Get-Inputs $Root
     $outputs = Get-Outputs $Root
     $held = $null
@@ -180,7 +221,7 @@ function Assert-StableFailure([string]$Root, [string]$LockedRelative = '', [stri
         $held = [System.IO.File]::Open((Join-Path $Root $LockedRelative), [System.IO.FileMode]::Open, $access, $sharing)
     }
     $failure = $null
-    try { Invoke-Package $Root $UseVersion $Compiler } catch { $failure = $_.Exception.Message }
+    try { Invoke-Package $Root $UseVersion $Compiler $Worker } catch { $failure = $_.Exception.Message }
     finally { if ($held) { $held.Dispose() } }
     Assert ($null -ne $failure) 'Expected packaging operation to fail.'
     Assert-SameMap $inputs (Get-Inputs $Root) 'Packaging altered source/input files'
@@ -190,6 +231,85 @@ function Assert-StableFailure([string]$Root, [string]$LockedRelative = '', [stri
 }
 
 $cases = @(
+    @{ Name = 'person_worker_success_and_isolation'; Body = {
+        param($root)
+        $worker = Pin-FakeWorker $root
+        $before = Get-Inputs $root
+        Invoke-Package $root $version 'OWNED-STUB' $worker
+        Assert-Package $root $version $true $true
+        Assert-SameMap $before (Get-Inputs $root) 'Worker packaging altered inputs'
+        Assert ((File-Sha (Join-Path $root "packages/$workerName")) -eq (File-Sha $worker)) 'Standalone worker bytes changed.'
+        # A later core-only package remains supported and does not advertise a
+        # worker unless explicitly supplied. Existing version assets stay intact.
+        Invoke-Package $root $version 'OWNED-STUB'
+        Assert-Package $root $version $true $false
+    } },
+    @{ Name = 'person_worker_preflight'; Body = {
+        param($root)
+        Seed-Package $root
+        $worker = Join-Path $root 'build/release/PersonWorker.exe'
+        $failure = Assert-StableFailure $root '' $version $false 'FAIL' $worker
+        Assert ($failure -like '*metadata*') 'Unpinned worker was not rejected before installer compilation.'
+        $worker = Pin-FakeWorker $root
+        Assert-StableFailure $root '' $version $false '' (Join-Path $root 'missing-worker.exe')
+        $size = (Get-Item -LiteralPath $worker).Length; $hash = File-Sha $worker
+        Write-WorkerMetadata $root ($size + 1) $hash
+        $failure = Assert-StableFailure $root '' $version $false 'FAIL' $worker
+        Assert ($failure -like '*size does not match*') 'Worker size mismatch did not fail before installer compilation.'
+        Write-WorkerMetadata $root $size ('0' * 64)
+        $failure = Assert-StableFailure $root '' $version $false '' $worker
+        Assert ($failure -like '*SHA-256 does not match*') 'Worker hash mismatch was not rejected.'
+        Write-WorkerMetadata $root $size 'not-a-sha256'
+        Assert-StableFailure $root '' $version $false '' $worker
+        Write-WorkerMetadata $root $size $hash
+        $metadataPath = Join-Path $root 'src/person_pack_metadata.h'
+        Write-Text $metadataPath ([IO.File]::ReadAllText($metadataPath).Replace($workerName, '../unexpected.exe'))
+        $failure = Assert-StableFailure $root '' $version $false '' $worker
+        Assert ($failure -like '*metadata*') 'Unexpected metadata asset path was not rejected.'
+    } },
+    @{ Name = 'person_worker_existing_asset_rollback'; Body = {
+        param($root)
+        $worker = Pin-FakeWorker $root
+        Invoke-Package $root $version 'OWNED-STUB' $worker
+        Assert-Package $root $version $true $true
+        Write-Text $worker 'FAKE WORKER REPLACEMENT'
+        $worker = Pin-FakeWorker $root
+        Replace-FakeExe $root
+        Assert-StableFailure $root "packages/$workerName" $version $false 'OWNED-STUB' $worker
+        Assert-StableFailure $root 'packages/SHA256SUMS.txt' $version $false 'OWNED-STUB' $worker
+        Assert-StableFailure $root 'packages/SHA256SUMS.txt' $newVersion $false 'OWNED-STUB' $worker
+        Assert (-not (Test-Path -LiteralPath (Join-Path $root "packages/Timelapse-v$newVersion-windows-x64-setup.exe"))) 'New installer survived failed worker transaction.'
+    } },
+    @{ Name = 'person_worker_new_asset_rollback'; Body = {
+        param($root)
+        $worker = Pin-FakeWorker $root
+        Seed-Package $root; Replace-FakeExe $root
+        Assert-StableFailure $root 'packages/SHA256SUMS.txt' $newVersion $false 'OWNED-STUB' $worker
+        Assert (-not (Test-Path -LiteralPath (Join-Path $root "packages/$workerName"))) 'New worker survived failed checksum publication.'
+        Assert-Package $root
+    } },
+    @{ Name = 'person_worker_locked_and_required_inputs'; Body = {
+        param($root)
+        $worker = Pin-FakeWorker $root
+        Seed-Package $root
+        Assert-StableFailure $root 'build/release/PersonWorker.exe' $version $true '' $worker
+        Remove-Item -LiteralPath (Join-Path $root 'person-pack/NOTICE.txt')
+        Assert-StableFailure $root
+    } },
+    @{ Name = 'person_worker_mutation_after_hash'; Body = {
+        param($root)
+        $worker = Pin-FakeWorker $root
+        $before = Get-Inputs $root $false $true
+        $originalHash = File-Sha $worker
+        $mutationState.Path = $worker; $mutationState.Text = 'FAKE WORKER CHANGED AFTER HASH'
+        $mutationState.MatchName = $workerName; $mutationState.Enabled = $true; $mutationState.Done = $false
+        try { Invoke-Package $root $version '' $worker } finally { $mutationState.Enabled = $false }
+        Assert $mutationState.Done 'Deterministic worker mutation did not run.'
+        Assert-Package $root $version $false $true
+        Assert ((File-Sha (Join-Path $root "packages/$workerName")) -eq $originalHash) 'Published worker read mutable original after verification.'
+        Assert-SameMap $before (Get-Inputs $root $false $true) 'Worker mutation test altered other inputs'
+        Assert ([IO.File]::ReadAllText($worker) -eq $mutationState.Text) 'Original worker mutation was lost.'
+    } },
     @{ Name = 'installer_atomic_publication'; Body = {
         param($root)
         $before = Get-Inputs $root
@@ -277,7 +397,7 @@ foreach ($case in $cases) {
     $failure = $null; $details = @()
     try { $root = New-Fixture $case.Name; $details = @(& $case.Body $root) }
     catch { $failure = $_.Exception.Message }
-    finally { $timer.Stop(); $mutationState.Enabled = $false }
+    finally { $timer.Stop(); $mutationState.Enabled = $false; $mutationState.MatchName = 'Timelapse.exe' }
     $passed = $null -eq $failure
     $results += [pscustomobject]@{ Name = $case.Name; Passed = $passed; ElapsedMs = $timer.ElapsedMilliseconds; Failure = $failure; Details = $details }
     Write-Output ("{0}: passed={1} elapsed_ms={2}{3}" -f $case.Name, $passed, $timer.ElapsedMilliseconds, $(if ($failure) { ' error=' + $failure } else { '' }))

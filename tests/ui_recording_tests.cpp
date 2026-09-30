@@ -132,6 +132,7 @@ uint64_t Encoder::frames()const{return impl_->count;}
 #define DestroyWindow probe::destroy
 #define ShowWindow probe::show
 #define Shell_NotifyIconW probe::tray
+#include "ui_person_pack_stub.h"
 #include "../src/main.cpp"
 #undef Shell_NotifyIconW
 #undef ShowWindow
@@ -350,3 +351,5 @@ int main(){
         return 0;
     }catch(const std::exception& error){std::cerr<<"FIXTURE_FAILURE: "<<error.what()<<'\n';return 1;}
 }
+
+#include "engine_person_camera_stub.h"

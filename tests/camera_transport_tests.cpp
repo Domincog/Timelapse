@@ -45,6 +45,8 @@ struct TestView {
 struct TestControl { volatile LONG ready, latestCalls; DWORD processId; wchar_t transportName[128]; };
 // Inspect only the header of this fixture's own mapping; actual transport code
 // performs all publication and CameraClient consumption.
+// Protocol 5 adds person observation data after the existing request/pixel
+// metadata. This fixed prefix through completed retains its original layout.
 struct SharedHeader {
     uint32_t magic, version, state, width, height, bytes;
     uint64_t generation, receivedTick;
@@ -214,7 +216,7 @@ public:
         require(WaitForSingleObject(mutex.value, 1000) == WAIT_OBJECT_0, "inspect shared header under actual mutex");
         const SharedHeader result = *static_cast<const SharedHeader*>(view_.value);
         ReleaseMutex(mutex.value);
-        require(result.magic == 0x4C43414D && result.version == 4, "expected shared protocol");
+        require(result.magic == 0x4C43414D && result.version == 5, "expected shared protocol");
         return result;
     }
     LONG copies() {

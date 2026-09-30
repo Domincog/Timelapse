@@ -480,3 +480,5 @@ int main() {
     std::cout << "Engine preview publication: " << (cases - failures) << '/' << cases << " passed.\n";
     return failures ? 1 : 0;
 }
+
+#include "engine_person_camera_stub.h"

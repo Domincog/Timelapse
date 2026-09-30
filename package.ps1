@@ -1,4 +1,4 @@
-param([string]$Version = '0.8.0', [string]$BuildDirectory = 'build', [string]$InstallerCompiler = '')
+param([string]$Version = '0.9.0', [string]$BuildDirectory = 'build', [string]$InstallerCompiler = '', [string]$PersonWorker = '')
 $ErrorActionPreference = 'Stop'
 if ($Version -notmatch '^\d+\.\d+\.\d+([-.][A-Za-z0-9.-]+)?$') { throw 'Use a version such as 0.1.0 or 0.1.0-beta.1.' }
 $projectRoot = $PSScriptRoot
@@ -9,12 +9,13 @@ New-Item -ItemType Directory -Path $packages -Force | Out-Null
 Add-Type -AssemblyName System.IO.Compression
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
-function Copy-PackageInput([string]$Source, [string]$Destination) {
+function Copy-PackageInput([string]$Source, [string]$Destination, [uint64]$ExpectedWorkerBytes = 0) {
     [System.IO.Directory]::CreateDirectory([System.IO.Path]::GetDirectoryName($Destination)) | Out-Null
     # Refuse concurrent writes/deletion while copying; later hashes and ZIP reads
     # use only this private copy, even if the build output subsequently changes.
     $inputStream = [System.IO.File]::Open($Source, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
     try {
+        if ($ExpectedWorkerBytes -and $inputStream.Length -ne $ExpectedWorkerBytes) { throw 'Optional person worker size does not match frozen source metadata.' }
         $outputStream = [System.IO.File]::Open($Destination, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write)
         try { $inputStream.CopyTo($outputStream) } finally { $outputStream.Dispose() }
     } finally { $inputStream.Dispose() }
@@ -52,7 +53,11 @@ try {
     # out of the source archive. Freeze every selected input before publishing.
     $sourceFiles = @()
     foreach ($name in @('.gitignore', 'README.md', 'CMakeLists.txt', 'build.ps1', 'package.ps1', 'tools/verify-encoding-quality.ps1',
-        'installer/Timelapse.iss', 'installer/build-installer.ps1', 'tests/installer_tests.ps1')) {
+        'installer/Timelapse.iss', 'installer/build-installer.ps1', 'tests/installer_tests.ps1',
+        'person-pack/README.md', 'person-pack/CMakeLists.txt', 'person-pack/build.ps1',
+        'person-pack/model.cpp', 'person-pack/model.h', 'person-pack/model.rc.in', 'person-pack/resources.h', 'person-pack/worker.cpp',
+        'person-pack/tests/model_fixture.cpp', 'person-pack/tests/model_tests.cpp', 'person-pack/tests/worker_tests.cpp',
+        'person-pack/NOTICE.txt', 'person-pack/NanoDet-LICENSE.txt', 'person-pack/ncnn-LICENSE.txt', 'third-party/ncnn-LICENSE.txt')) {
         $sourceFiles += @{ Path = (Join-Path $projectRoot $name); Name = $name }
     }
     foreach ($directory in @('src', 'tests')) {
@@ -70,6 +75,27 @@ try {
     $frozenExecutable = Join-Path $stage 'Timelapse.exe'
     Copy-PackageInput $executable $frozenExecutable
     $exeHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $frozenExecutable).Hash.ToLowerInvariant()
+    $personWorkerName = ''
+    if ($PersonWorker) {
+        # Validate the same immutable metadata that goes into the source ZIP.
+        # Development metadata may remain unpinned for ordinary core packaging.
+        $metadata = [System.IO.File]::ReadAllText((Join-Path $inputs 'src/person_pack_metadata.h'))
+        $names = [regex]::Matches($metadata, '(?m)^\s*inline\s+constexpr\s+wchar_t\s+PersonPackFilename\[\]\s*=\s*L"([^"]+)"\s*;\s*$')
+        $sizes = [regex]::Matches($metadata, '(?m)^\s*inline\s+constexpr\s+uint64_t\s+PersonPackExpectedBytes\s*=\s*([0-9]+)(?:ULL|ull)?\s*;\s*$')
+        $hashes = [regex]::Matches($metadata, '(?m)^\s*inline\s+constexpr\s+char\s+PersonPackExpectedSha256\[\]\s*=\s*"([0-9a-fA-F]{64})"\s*;\s*$')
+        $expectedBytes = [uint64]0
+        if ($names.Count -ne 1 -or $names[0].Groups[1].Value -cne 'Timelapse-person-nanodet-r1.exe' -or
+            $sizes.Count -ne 1 -or -not [uint64]::TryParse($sizes[0].Groups[1].Value, [ref]$expectedBytes) -or
+            $expectedBytes -eq 0 -or $hashes.Count -ne 1) {
+            throw 'Optional person worker metadata must contain one pinned filename, positive size and SHA-256 before packaging.'
+        }
+        $personWorkerName = $names[0].Groups[1].Value
+        $frozenWorker = Join-Path $stage $personWorkerName
+        Copy-PackageInput ([System.IO.Path]::GetFullPath($PersonWorker)) $frozenWorker $expectedBytes
+        if ((Get-Item -LiteralPath $frozenWorker).Length -ne $expectedBytes) { throw 'Optional person worker size does not match frozen source metadata.' }
+        $workerHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $frozenWorker).Hash.ToLowerInvariant()
+        if ($workerHash -cne $hashes[0].Groups[1].Value.ToLowerInvariant()) { throw 'Optional person worker SHA-256 does not match frozen source metadata.' }
+    }
     $releaseName = "Timelapse-v$Version-windows-x64.zip"
     $sourceName = "Timelapse-v$Version-source.zip"
     $releaseZip = Join-Path $stage $releaseName
@@ -93,6 +119,7 @@ try {
         if (-not (Test-Path -LiteralPath (Join-Path $stage $installerName) -PathType Leaf)) { throw 'Installer compiler produced no setup executable.' }
         $artifactNames += $installerName
     }
+    if ($personWorkerName) { $artifactNames += $personWorkerName }
     $hashes = Get-FileHash -Algorithm SHA256 -LiteralPath @($artifactNames | ForEach-Object { Join-Path $stage $_ })
     $hashes | ForEach-Object { $_.Hash.ToLowerInvariant() + '  ' + (Split-Path -Leaf $_.Path) } | Set-Content -LiteralPath (Join-Path $stage 'SHA256SUMS.txt') -Encoding ascii
 

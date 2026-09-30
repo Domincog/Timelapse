@@ -156,6 +156,7 @@ int runCameraHost(const wchar_t*){return helperResult;}
 #define GetPrivateProfileIntW fakeProfileInt
 #define GetPrivateProfileStringW fakeProfileString
 #define WritePrivateProfileStringW fakeProfileWrite
+#include "ui_person_pack_stub.h"
 #include "../src/main.cpp"
 #undef Engine
 #undef CoInitializeEx

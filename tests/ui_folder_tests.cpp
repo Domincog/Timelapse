@@ -89,6 +89,7 @@ int runCameraHost(const wchar_t*){fixture::forbidden();return -1;}
 #define WritePrivateProfileStringW fixture::writeProfile
 #define GetPrivateProfileStringW fixture::readProfile
 #define GetPrivateProfileIntW fixture::readInt
+#include "ui_person_pack_stub.h"
 #include "../src/main.cpp"
 #undef Engine
 #undef SendMessageW

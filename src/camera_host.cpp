@@ -1,5 +1,6 @@
 #include "camera_host.h"
 #include "capture.h"
+#include "person_pixels.h"
 #include <mfapi.h>
 #include <shellapi.h>
 #include <algorithm>
@@ -12,7 +13,7 @@
 namespace lapse {
 namespace {
 constexpr uint32_t protocolMagic = 0x4C43414D;
-constexpr uint32_t protocolVersion = 4;
+constexpr uint32_t protocolVersion = 5;
 constexpr uint32_t maxWidth = 1280, maxHeight = 720;
 constexpr size_t maxPixels = size_t(maxWidth) * maxHeight * 4;
 constexpr size_t idCapacity = 4096;
@@ -21,6 +22,7 @@ enum class HostState : uint32_t { Starting = 1, Ready, Failed, Stopped };
 enum class PixelRequest : uint32_t { Preview, Night };
 enum class NightState : uint32_t { Idle, Waiting, Integrating, Complete, Failed };
 enum class ObservationState : uint32_t { Pending, Ready, Duplicate, Failed };
+enum class ObservationKind : uint32_t { Activity, Person };
 
 struct SharedFrame {
     uint32_t magic, version;
@@ -52,6 +54,8 @@ struct SharedFrame {
     alignas(8) volatile LONG64 observationCancelled;
     ObservationState observationState;
     CameraObservation observation;
+    ObservationKind observationKind, observationCompletedKind, observationPublishedKind;
+    person::Source personSource;
     wchar_t observationError[256];
     wchar_t id[idCapacity];
     wchar_t error[512];
@@ -70,6 +74,11 @@ struct View {
     SharedFrame* value = nullptr;
     ~View() { reset(); }
     void reset(SharedFrame* next = nullptr) { if (value) UnmapViewOfFile(value); value = next; }
+};
+struct PersonView {
+    uint8_t* value = nullptr;
+    ~PersonView() { reset(); }
+    void reset(uint8_t* next = nullptr) { if (value) UnmapViewOfFile(value); value = next; }
 };
 struct SharedLock {
     HANDLE mutex;
@@ -113,7 +122,8 @@ std::wstring modulePath() {
 int hostMain(const wchar_t* mappingName) {
     const std::wstring name = mappingName;
     if (name.compare(0, std::size(mappingPrefix) - 1, mappingPrefix) != 0 || name.size() > 128) return 2;
-    Handle mapping, mutex, stop, request, response;
+    Handle mapping, mutex, stop, request, response, personMapping;
+    PersonView personView;
     mapping.value = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, name.c_str());
     mutex.value = OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, (name + L".mutex").c_str());
     stop.value = OpenEventW(SYNCHRONIZE, FALSE, (name + L".stop").c_str());
@@ -149,6 +159,8 @@ int hostMain(const wchar_t* mappingName) {
         else if (!camera.start(id, error)) { publishError(error); result = 9; }
         else {
             Frame frame, nightFrame, observationFrame;
+            std::unique_ptr<CameraPersonInput> personInput;
+            std::unique_ptr<person_pixels::Cache> personCache;
             std::unique_ptr<NightAccumulator> accumulator;
             const Frame* completedNight = nullptr;
             CameraSampleInfo watermark, seen;
@@ -190,6 +202,7 @@ int hostMain(const wchar_t* mappingName) {
                 }
                 uint64_t requested = 0, requestedToken = 0;
                 uint64_t observationRequested = 0, requestedObservationToken = 0;
+                ObservationKind requestedObservationKind = ObservationKind::Activity;
                 PixelRequest requestedKind = PixelRequest::Preview;
                 {
                     SharedLock lock(mutex.value);
@@ -221,6 +234,7 @@ int hostMain(const wchar_t* mappingName) {
                         view.value->observationRequested > cancelledObservation(*view.value)) {
                         observationRequested = observationLastRequest = view.value->observationRequested;
                         requestedObservationToken = view.value->observationToken;
+                        requestedObservationKind = view.value->observationKind;
                         if (observationToken != requestedObservationToken) {
                             observationToken = requestedObservationToken; observationSeen = {};
                         }
@@ -353,7 +367,7 @@ int hostMain(const wchar_t* mappingName) {
                         else if (!rawInfo.epoch || !rawInfo.sequence || !rawInfo.receivedTick || rawInfo.receivedTick > now ||
                                  now - rawInfo.receivedTick > 3000 || !rawObservation->valid() ||
                                  rawObservation->width > int(maxWidth) || rawObservation->height > int(maxHeight) ||
-                                 !describeTimeSkipFrame(*rawObservation, observation->descriptor)) {
+                                 requestedObservationKind > ObservationKind::Person) {
                             observationState = ObservationState::Failed;
                             observationError = L"The camera activity check returned invalid or stale source data.";
                         } else {
@@ -361,6 +375,29 @@ int hostMain(const wchar_t* mappingName) {
                             observation->receivedTick = rawInfo.receivedTick;
                             observation->sourceWidth = rawObservation->width; observation->sourceHeight = rawObservation->height;
                             observationState = ObservationState::Ready;
+                            if (requestedObservationKind == ObservationKind::Activity) {
+                                if (!describeTimeSkipFrame(*rawObservation, observation->descriptor)) {
+                                    observationState = ObservationState::Failed;
+                                    observationError = L"The camera activity image is invalid.";
+                                }
+                            } else {
+                                if (!personView.value) {
+                                    if (!personMapping.value) personMapping.value = OpenFileMappingW(FILE_MAP_WRITE, FALSE, (name + L".person").c_str());
+                                    if (personMapping.value) personView.reset(static_cast<uint8_t*>(MapViewOfFile(
+                                        personMapping.value, FILE_MAP_WRITE, 0, 0, person::MaxBgrBytes)));
+                                }
+                                if (!personInput) personInput = std::make_unique<CameraPersonInput>();
+                                if (!personCache) personCache = std::make_unique<person_pixels::Cache>();
+                                person_pixels::Geometry geometry;
+                                if (!personView.value || !person_pixels::prepare(rawObservation->pixels.data(), rawObservation->pixels.size(),
+                                        rawObservation->width, rawObservation->height, personInput->bgr.data(), personInput->bgr.size(), geometry, *personCache)) {
+                                    observationState = ObservationState::Failed;
+                                    observationError = L"The camera person-check image could not be prepared.";
+                                } else {
+                                    personInput->source = {requestedObservationToken, rawInfo.epoch, rawInfo.sequence, rawInfo.receivedTick,
+                                        uint32_t(rawObservation->width), uint32_t(rawObservation->height), uint32_t(geometry.width), uint32_t(geometry.height)};
+                                }
+                            }
                         }
                     } catch (...) {
                         observationState = ObservationState::Failed;
@@ -383,16 +420,24 @@ int hostMain(const wchar_t* mappingName) {
                     std::wmemcpy(view.value->nightError, nightError.data(), count); view.value->nightError[count] = L'\0';
                 }
                 if (observationRequested && !deferObservation && view.value->observationRequested == observationRequested &&
-                    view.value->observationToken == requestedObservationToken && cancelledObservation(*view.value) < observationRequested) {
+                    view.value->observationToken == requestedObservationToken && view.value->observationKind == requestedObservationKind &&
+                    cancelledObservation(*view.value) < observationRequested) {
                     if (observationState == ObservationState::Ready) {
                         view.value->observation = *observation;
+                        if (requestedObservationKind == ObservationKind::Person) {
+                            const auto& source = personInput->source;
+                            std::memcpy(personView.value, personInput->bgr.data(), size_t(source.width) * source.height * 3);
+                            view.value->personSource = source;
+                        }
                         view.value->observationPublished = observationRequested;
                         view.value->observationPublishedToken = requestedObservationToken;
+                        view.value->observationPublishedKind = requestedObservationKind;
                         observationSeen = rawInfo;
                     }
                     view.value->observationState = observationState;
                     view.value->observationCompleted = observationRequested;
                     view.value->observationCompletedToken = requestedObservationToken;
+                    view.value->observationCompletedKind = requestedObservationKind;
                     const wchar_t* detail = observationFallback ? observationFallback : observationError.c_str();
                     const size_t count = std::min(std::wcslen(detail), std::size(view.value->observationError) - 1);
                     std::wmemcpy(view.value->observationError, detail, count);
@@ -445,14 +490,17 @@ int hostMain(const wchar_t* mappingName) {
 }
 
 struct CameraClient::Impl {
-    Handle mapping, mutex, stopEvent, requestEvent, responseEvent, process, job;
+    Handle mapping, mutex, stopEvent, requestEvent, responseEvent, process, job, personMapping;
     View view;
+    PersonView personView;
+    std::wstring mappingName;
     uint64_t started = 0, contentionSince = 0, generation = 0;
     uint64_t request = 0, requestedTick = 0, requestedGeneration = 0;
     PixelRequest requestedKind = PixelRequest::Preview;
     uint64_t nightCommand = 0, nightToken = 0, nightRequestedTick = 0, nightDeadline = 0;
     uint64_t observationRequest = 0, observationLastRequest = 0, observationToken = 0, observationDeadline = 0;
     uint64_t observationEpoch = 0, observationSequence = 0;
+    ObservationKind observationKind = ObservationKind::Activity;
     bool delivered = false, contended = false, activationFailed = false;
 };
 
@@ -471,6 +519,7 @@ bool CameraClient::start(const std::wstring& id, std::wstring& error) {
         wchar_t token[40]{};
         StringFromGUID2(guid, token, static_cast<int>(std::size(token)));
         const std::wstring name = std::wstring(mappingPrefix) + token;
+        impl_->mappingName = name;
         impl_->mapping.value = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(SharedFrame), name.c_str());
         if (!impl_->mapping.value || GetLastError() == ERROR_ALREADY_EXISTS) {
             fail(error, L"Windows could not reserve the camera frame."); stop(); return false;
@@ -539,6 +588,7 @@ void CameraClient::stop() {
     // The unnamed job also guarantees cleanup after a crash or forced app exit.
     impl_->job.reset(); impl_->process.reset();
     impl_->view.reset(); impl_->mapping.reset(); impl_->mutex.reset(); impl_->stopEvent.reset();
+    impl_->personView.reset(); impl_->personMapping.reset(); impl_->mappingName.clear();
     impl_->requestEvent.reset(); impl_->responseEvent.reset();
     impl_->started = impl_->contentionSince = impl_->generation = 0;
     impl_->request = impl_->requestedTick = impl_->requestedGeneration = 0;
@@ -854,17 +904,37 @@ void CameraClient::cancelActivityObservation() noexcept {
 }
 
 bool CameraClient::observeActivity(uint64_t token, CameraObservation& output, std::wstring& error) {
+    return observe(token, &output, nullptr, error, true);
+}
+bool CameraClient::personInput(uint64_t token, CameraPersonInput& output, std::wstring& error, bool requestNew) {
+    return observe(token, nullptr, &output, error, requestNew);
+}
+bool CameraClient::observe(uint64_t token, CameraObservation* activity, CameraPersonInput* personOutput, std::wstring& error, bool requestNew) {
     error.clear();
     if (!token) { error = L"The camera activity check needs a valid session."; return false; }
     if (!impl_->process.value || !impl_->view.value) { error = L"The camera is not running."; return false; }
-    if (impl_->observationToken != token) {
-        cancelActivityObservation(); impl_->observationToken = token;
+    if (!requestNew && (!impl_->observationRequest || impl_->observationToken != token || impl_->observationKind != ObservationKind::Person)) return false;
+    const ObservationKind kind = personOutput ? ObservationKind::Person : ObservationKind::Activity;
+    if (impl_->observationToken != token || impl_->observationKind != kind) {
+        cancelActivityObservation(); impl_->observationToken = token; impl_->observationKind = kind;
+    }
+    if (personOutput && !impl_->personView.value) {
+        if (!impl_->personMapping.value) {
+            impl_->personMapping.value = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+                static_cast<DWORD>(person::MaxBgrBytes), (impl_->mappingName + L".person").c_str());
+            if (!impl_->personMapping.value || GetLastError() == ERROR_ALREADY_EXISTS) {
+                impl_->personMapping.reset();
+                error = L"Windows could not reserve the optional person-check image."; return false;
+            }
+        }
+        impl_->personView.reset(static_cast<uint8_t*>(MapViewOfFile(impl_->personMapping.value, FILE_MAP_READ, 0, 0, person::MaxBgrBytes)));
+        if (!impl_->personView.value) { error = L"Windows could not access the optional person-check image."; return false; }
     }
     if (!impl_->observationDeadline)
         impl_->observationDeadline = GetTickCount64() + (impl_->delivered ? 3000 : 8000);
     auto read = [&](bool& waiting) {
         waiting = false;
-        SharedLock lock(impl_->mutex.value);
+        SharedLock lock(impl_->mutex.value, personOutput ? 0 : 10);
         const uint64_t now = GetTickCount64();
         if (now > impl_->observationDeadline) {
             error = L"The camera activity check was not delivered within its deadline."; return false;
@@ -890,14 +960,15 @@ bool CameraClient::observeActivity(uint64_t token, CameraObservation& output, st
             }
             impl_->observationRequest = impl_->observationLastRequest = ++shared.observationRequested;
             shared.observationToken = token;
+            shared.observationKind = kind;
             if (!SetEvent(impl_->requestEvent.value)) return fail(error, L"Windows could not request the camera activity check.");
             waiting = true; return false;
         }
-        if (shared.observationRequested != impl_->observationRequest || shared.observationToken != token) {
+        if (shared.observationRequested != impl_->observationRequest || shared.observationToken != token || shared.observationKind != kind) {
             error = L"The camera activity request was replaced."; return false;
         }
         if (shared.observationCompleted != impl_->observationRequest) { waiting = true; return false; }
-        if (shared.observationCompletedToken != token) {
+        if (shared.observationCompletedToken != token || shared.observationCompletedKind != kind) {
             error = L"The camera activity response has an invalid session."; return false;
         }
         if (shared.observationState == ObservationState::Failed) {
@@ -909,26 +980,36 @@ bool CameraClient::observeActivity(uint64_t token, CameraObservation& output, st
         if (shared.observationState == ObservationState::Duplicate || shared.observationState == ObservationState::Pending) {
             // Retry the SAME request on the caller's next cadence. A retained
             // sample/acknowledgement cannot extend the original deadline.
+            if (!requestNew) return false;
             shared.observationCompleted = 0;
             if (!SetEvent(impl_->requestEvent.value)) return fail(error, L"Windows could not retry the camera activity check.");
             return false;
         }
         const auto& report = shared.observation;
         if (shared.observationState != ObservationState::Ready || shared.observationPublished != impl_->observationRequest ||
-            shared.observationPublishedToken != token || !report.epoch || !report.sequence || !report.receivedTick ||
+            shared.observationPublishedToken != token || shared.observationPublishedKind != kind || !report.epoch || !report.sequence || !report.receivedTick ||
             report.receivedTick > now || now - report.receivedTick > 3000 ||
             report.sourceWidth <= 0 || report.sourceWidth > int(maxWidth) || report.sourceHeight <= 0 || report.sourceHeight > int(maxHeight) ||
             (report.epoch == impl_->observationEpoch && report.sequence <= impl_->observationSequence)) {
             error = L"The camera activity response is invalid, repeated or stale."; return false;
         }
-        output = report;
+        if (personOutput) {
+            const auto& source = shared.personSource;
+            if (!person::validGeometry(source) || source.sessionToken != token || source.cameraEpoch != report.epoch ||
+                source.sequence != report.sequence || source.receivedTick != report.receivedTick ||
+                source.sourceWidth != uint32_t(report.sourceWidth) || source.sourceHeight != uint32_t(report.sourceHeight)) {
+                error = L"The camera person-check image has invalid source data."; return false;
+            }
+            std::memcpy(personOutput->bgr.data(), impl_->personView.value, size_t(source.width) * source.height * 3);
+            personOutput->source = source;
+        } else *activity = report;
         impl_->observationEpoch = report.epoch; impl_->observationSequence = report.sequence;
         impl_->observationRequest = impl_->observationDeadline = 0;
         return true;
     };
     bool waiting = false;
     if (read(waiting)) return true;
-    if (waiting && error.empty()) {
+    if (waiting && error.empty() && !personOutput) {
         // Shared response signals are only hints; provenance is checked under
         // the mutex, so a Preview/Night acknowledgement cannot supply this data.
         const DWORD response = WaitForSingleObject(impl_->responseEvent.value, 10);

@@ -34,9 +34,17 @@ Choose a maximum extra speed from 2x to 64x. At Capture every 5 seconds, 4x targ
 
 Add up to 16 ranges using offsets from recording-ready time, optionally repeating them at a chosen active duration. Overlapping or touching ranges merge. Initial preparation and pauses do not count, including for repeats: a repeating 24-hour schedule follows active recording time, not midnight or the wall clock. Stop after continues to count the full active recording time. Pause/resume and source/layout changes restart compression from the normal interval.
 
-Automatic modes request small raw-image checks once per second, including while hidden, and wait for the chosen quiet duration (two minutes by default). Change in either selected source prevents automatic compression. The check measures image changes, not people or semantic importance. Very small, low-contrast, repetitive, or brief changes between checks may be missed. Desktop checks omit the cursor. Noise can conservatively prevent acceleration. An unavailable or stale check restores the normal capture interval and has its own status detail; a busy capture, encoder, or disk can delay checks.
+Quiet modes request small raw-image checks once per second, including while hidden, and wait for the chosen quiet duration (two minutes by default). Change in either selected source prevents quiet-mode compression. These checks measure image changes, not people or semantic importance. Very small, low-contrast, repetitive, or brief changes between checks may be missed. Desktop checks omit the cursor. Noise can conservatively prevent acceleration. An unavailable or stale check restores the normal capture interval and has its own status detail; a busy capture, encoder, or disk can delay checks.
 
 Detected change returns directly to the normal interval rather than continuing a long slowdown. The next frame still respects Capture every, so return is not an immediate-event capture guarantee. Night camera checks use raw images, keep each blend bounded by the original Capture every, and never shorten an in-progress blend. Its response also includes the remaining or newly started full blend window. Current target cadence and actual last-check age are shown in Advanced. Off and manual-only modes do no image-change checking; automatic checking adds work, so fewer encoded frames does not by itself establish lower total CPU use or energy consumption.
+
+**Optional person checks:** Time compression also offers No person detected (camera) and No person within schedule (camera). They check only the selected camera and can accelerate when other objects move. People or activity shown only on the desktop are not checked. Both saved files still share the same cadence. Choose how long no person must be detected before acceleration; two minutes is the default. Distinct qualified camera checks must span that full active duration. A detected person, uncertain result, missing check or stale image clears that history and returns toward the next normal capture deadline. A full Night exposure still finishes before its frame can be saved.
+
+Choose Manage detector, then Download / reinstall to obtain the optional local NanoDet-m model and CPU runtime (about 3.7 MiB installed). Opening the app, selecting a person mode, and pressing Record never download it. The default installer and portable ZIP do not contain this payload. It is stored in `LocalAppData\Timelapse\Person\NanoDet-r1` for both installed and portable users. Manage can remove it while recording is stopped. Uninstall preserves this optional per-user data with your preferences; remove it through Manage if wanted. Installation does not enable the feature.
+
+Person checks run locally, at most once per second, after recording begins. Camera thumbnails are not sent over the network or saved separately. No detector is loaded for ordinary preview, Off, either Quiet mode, Manual schedule, or while paused. A separate owned process contains detector crashes and hangs; recording continues at its normal cadence if the model is missing, invalid or unavailable. Restart recording to retry a detector that failed. The app verifies the exact published worker size and SHA-256 before launch. Checks and their extra raw camera reads use CPU and memory while enabled; saving fewer frames does not guarantee reduced total power.
+
+The detector can miss people, especially when small, obscured, unusual or poorly lit, and brief visits between checks can be skipped. Blank or low-detail inputs suppress absence-based acceleration, but this is not a general blocked-lens detector. Very dark Night scenes may remain at normal speed. This feature is a recording convenience, not an occupancy or security guarantee. The normal capture interval still limits how promptly a newly detected person appears in the saved video.
 
 The installer keeps Timelapse in your user account's `LocalAppData\Programs\Timelapse` directory and adds Start menu and uninstall entries. Start with Windows is optional and starts the app in the tray without recording. Exit Timelapse from its tray menu before upgrading or uninstalling. Uninstalling preserves your recordings and settings.
 
@@ -162,10 +170,11 @@ This also checks BT.709 limited-range color metadata. FFmpeg is used only by the
 - `CMakeLists.txt` and `build.ps1`: build and test the app.
 - `package.ps1`: create a portable release ZIP and a source ZIP from a Release build.
 - `installer/`: Inno Setup source and compiler wrapper for the per-user installer.
+- `person-pack/`: separately built optional detector, pinned dependency instructions, licenses and model/protocol checks. A normal app build needs no model download.
 
 After building and testing, run `./package.ps1` to create both archives in `packages/`. The release ZIP is intended for GitHub Releases. Extract the source ZIP into an empty folder, then run the build commands from that folder; build outputs, test recordings, and local settings are excluded.
 
-To also create `Timelapse-v0.8.0-windows-x64-setup.exe`, supply an installed or portable Inno Setup 7 compiler:
+To also create `Timelapse-v0.9.0-windows-x64-setup.exe`, supply an installed or portable Inno Setup 7 compiler:
 
 ```powershell
 .\package.ps1 -InstallerCompiler 'C:\Path\To\Inno Setup 7\ISCC.exe'
@@ -189,3 +198,94 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\package_tests.ps1
 ```
 
 They use temporary projects and dummy executable bytes. The build-script checks substitute the build and test commands, so they do not compile or launch the app.
+
+## Thumbnail resize attribution
+
+The optional camera-thumbnail preprocessing adapts Tencent/ncnn's scalar resize arithmetic (Copyright 2018 Tencent). Changes add bounded BGRA-to-BGR input, fixed coefficient storage and allocation-free aspect resizing. The main recorder contains this small adaptation; the full inference runtime is only in the optional worker. The upstream license and notices follow.
+
+Tencent is pleased to support the open source community by making ncnn available.
+Copyright (C) 2017 Tencent.  All rights reserved.
+If you have downloaded a copy of the ncnn binary from Tencent, please note that the ncnn binary is licensed under the BSD 3-Clause License.
+If you have downloaded a copy of the ncnn source code from Tencent, please note that ncnn source code is licensed under the BSD 3-Clause License, except for the third-party components listed below which are subject to different license terms.  Your integration of ncnn into your own projects may require compliance with the BSD 3-Clause License, as well as the other licenses applicable to the third-party components included within ncnn.
+A copy of the BSD 3-Clause License is included in this file.
+
+Other dependencies and licenses:
+
+Open Source Software Licensed Under the zlib License:
+The below software in this distribution may have been modified by Tencent (“Tencent Modifications”). All Tencent Modifications are Copyright (C) 2017 Tencent.
+----------------------------------------------------------------------------------------
+1. neon_mathfun.h
+Copyright (C) 2011 Julien Pommier
+
+2. sse_mathfun.h
+Copyright (C) 2007 Julien Pommier
+
+3. avx_mathfun.h
+Copyright (C) 2012 Giovanni Garberoglio
+Interdisciplinary Laboratory for Computational Science (LISC)
+Fondazione Bruno Kessler and University of Trento
+via Sommarive, 18
+I-38123 Trento (Italy)
+
+
+Terms of the zlib License:
+---------------------------------------------------
+Copyright (c) <year> <copyright holders>
+
+This software is provided 'as-is', without any express or implied warranty. In no event will the authors be held liable for any damages arising from the use of this software.
+
+Permission is granted to anyone to use this software for any purpose, including commercial applications, and to alter it and redistribute it freely, subject to the following restrictions:
+
+1. The origin of this software must not be misrepresented; you must not claim that you wrote the original software. If you use this software in a product, an acknowledgment in the product documentation would be appreciated but is not required.
+2. Altered source versions must be plainly marked as such, and must not be misrepresented as being the original software.
+3. This notice may not be removed or altered from any source distribution.
+
+
+
+Open Source Software Licensed Under the BSD 2-Clause License:
+The below software in this distribution may have been modified by Tencent (“Tencent Modifications”). All Tencent Modifications are Copyright (C) 2017 Tencent.
+----------------------------------------------------------------------------------------
+1. squeezenet  1.1
+Copyright (c) 2016 Forrest N. Iandola and Matthew W. Moskewicz and Khalid Ashraf and Song Han and William J. Dally and Kurt Keutzer
+All rights reserved.
+
+2. caffe.proto  master
+All contributions by the University of California:
+Copyright (c) 2014-2017 The Regents of the University of California (Regents)
+All rights reserved.
+
+All other contributions:
+Copyright (c) 2014-2017, the respective contributors
+All rights reserved.
+
+
+Terms of the BSD 2-Clause License:
+--------------------------------------------------------------------
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+
+Open Source Software Licensed Under the BSD 3-Clause License:
+The below software in this distribution may have been modified by Tencent (“Tencent Modifications”). All Tencent Modifications are Copyright (C) 2017 Tencent.
+----------------------------------------------------------------------------------------
+1. android.toolchain.cmake  master
+Copyright (c) 2010-2011, Ethan Rublee
+Copyright (c) 2011-2014, Andrey Kamaev
+All rights reserved.
+
+
+Terms of the BSD 3-Clause License:
+--------------------------------------------------------------------
+
+Redistribution and use in source and binary forms, with or without modification, are permitted provided that the following conditions are met:
+
+Redistributions of source code must retain the above copyright notice, this list of conditions and the following disclaimer.
+Redistributions in binary form must reproduce the above copyright notice, this list of conditions and the following disclaimer in the documentation and/or other materials provided with the distribution.
+Neither the name of [copyright holder] nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

@@ -98,6 +98,7 @@ BOOL WINAPI fixtureMoveFileEx(LPCWSTR source,LPCWSTR target,DWORD flags){
 // The reject-entry sentinel intentionally makes the GUI entry unreachable.
 #pragma warning(push)
 #pragma warning(disable: 4702)
+#include "ui_person_pack_stub.h"
 #include "../src/main.cpp"
 #pragma warning(pop)
 #undef Engine
@@ -440,11 +441,17 @@ void timeCompressionPreferences(){
     require(WritePrivateProfileStringW(L"Settings",SkipKeys[5],oversized.c_str(),app.preferences.c_str())!=FALSE,"Cannot seed oversized range string.");reload();require(app.settings.timeSkip.mode==TimeSkipMode::Off,"Truncated saved schedule accepted.");
     restore();require(WritePrivateProfileStringW(L"Settings",SkipKeys[5],L"5:20;0:5;40:60",app.preferences.c_str())!=FALSE,"Cannot seed touching saved schedule.");reload();
     require(app.settings.timeSkip.rangeCount==2 && app.settings.timeSkip.ranges[0].startSeconds==0 && app.settings.timeSkip.ranges[0].endSeconds==20,"Loaded overlaps/touching ranges did not merge.");
-    for(auto mode:{TimeSkipMode::Off,TimeSkipMode::Quiet,TimeSkipMode::Manual,TimeSkipMode::QuietWithinSchedule}){
+    for(auto mode:{TimeSkipMode::Off,TimeSkipMode::Quiet,TimeSkipMode::Manual,TimeSkipMode::QuietWithinSchedule,TimeSkipMode::NoPerson,TimeSkipMode::NoPersonWithinSchedule}){
         app.settings.timeSkip.mode=mode;preferences(true);reload();require(app.settings.timeSkip.mode==mode,"Saved compression mode changed.");}
+    const unsigned inspections=lapse::uiPersonPackInspections;
+    configure();require(choice(app.mode)==0 && app.settings.timeSkip.mode==TimeSkipMode::NoPersonWithinSchedule && lapse::uiPersonPackInspections==inspections,
+        "Loading a person policy changed Desktop startup or inspected its optional pack.");
+    require(WritePrivateProfileStringW(L"Settings",SkipKeys[0],L"6",app.preferences.c_str())!=FALSE,"Cannot seed future mode.");reload();
+    require(app.settings.timeSkip.mode==TimeSkipMode::Off,"Unknown numeric policy mode enabled a partial policy.");
+    restore();reload();app.settings.timeSkip.mode=TimeSkipMode::NoPersonWithinSchedule;preferences(true);reload();
     const auto before=fixture.bytes();keyWrites=0;app.settings.timeSkip={};writeFault=WriteFault::DenyCompression;preferences(true);writeFault=WriteFault::None;
     require(keyWrites==20 && failedKeyWrites==1 && fixture.bytes()==before,"Final compression-key failure published a partial policy.");
-    fixture.onlySettingsRemain();reload();require(app.settings.timeSkip.mode==TimeSkipMode::QuietWithinSchedule,"Failed complete policy write lost original mode.");
+    fixture.onlySettingsRemain();reload();require(app.settings.timeSkip.mode==TimeSkipMode::NoPersonWithinSchedule,"Failed complete policy write lost original mode.");
     app.settings.timeSkip={};
     std::cout<<"PASS real compression preferences: exact six-key policy, every missing/malformed key Off, bounded ranges, merged loads, preserved content and final-key atomic failure\n";
 }

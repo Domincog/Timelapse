@@ -96,6 +96,7 @@ int WINAPI fixtureDrawText(HDC dc,LPCWSTR value,int count,LPRECT rect,UINT flags
 // The reject-entry sentinel intentionally makes the GUI entry unreachable.
 #pragma warning(push)
 #pragma warning(disable: 4702)
+#include "ui_person_pack_stub.h"
 #include "../src/main.cpp"
 #pragma warning(pop)
 #undef Engine
@@ -301,6 +302,10 @@ void compressionDisclosure(int dpi){
     require(GetNextDlgTabItem(app.window,app.lowDisk,FALSE)==app.skipConfigure,"Compression button not in native Advanced tab order.");
     app.settings.timeSkip.mode=TimeSkipMode::Quiet;app.settings.timeSkip.multiplier=64;++app.skipRevision;updateControls();layout();
     require(app.contentHeight==off+app.scale(28) && visible(app.skipDetail) && bounds(app.skipDetail).bottom<bounds(app.preview).top,"Enabled compression detail overlaps preview or has wrong height.");
+    const unsigned inspections=lapse::uiPersonPackInspections;
+    app.settings.timeSkip.mode=TimeSkipMode::NoPersonWithinSchedule;++app.skipRevision;updateControls();layout();
+    require(app.contentHeight==off+app.scale(28) && app.skipDetailCaption.find(L"Select camera")!=std::wstring::npos && lapse::uiPersonPackInspections==inspections,
+        "Person policy changed base geometry, hid camera scope or inspected its pack from a main refresh.");
     paintCheck();require(drawnText[3].value.find(L"Base interval")!=std::wstring::npos && drawnText[3].value.find(L"1 hour becomes")==std::wstring::npos,"Enabled compression promised a fixed resulting video duration.");
     for(int limit=0;limit<6;++limit){choose(app.stopAfter,limit);updateAdvanced();wchar_t value[200]{};GetWindowTextW(app.advanced,value,200);
         std::wstring measured=value;measured.erase(std::remove(measured.begin(),measured.end(),L'&'),measured.end());HDC dc=GetDC(app.advanced);auto prior=SelectObject(dc,app.font);SIZE size{};

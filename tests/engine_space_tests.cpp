@@ -566,3 +566,5 @@ int main(int argc, char** argv) {
     }
     MFShutdown(); CoUninitialize(); return result;
 }
+
+#include "engine_person_camera_stub.h"

@@ -311,3 +311,5 @@ int main() {
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; std::wcerr << L"Artifacts retained at " << root.wstring() << L'\n'; result = 1; }
     MFShutdown(); CoUninitialize(); return result;
 }
+
+#include "engine_person_camera_stub.h"

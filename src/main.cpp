@@ -3,6 +3,7 @@
 #include "camera_host.h"
 #include "config.h"
 #include "time_skip.h"
+#include "person_pack.h"
 #include <mfapi.h>
 #include <commctrl.h>
 #include <shlobj.h>
@@ -32,7 +33,7 @@ constexpr int NightDurations[] = {0,1000,2000,5000,10000,30000};
 constexpr const wchar_t* NightDurationLabels[] = {L"Auto",L"1 second",L"2 seconds",L"5 seconds",L"10 seconds",L"30 seconds"};
 constexpr int NightTargets[] = {64,96,128};
 constexpr const wchar_t* EncodingModeLabels[] = {L"Compatible H.264 (default)",L"Efficient H.264 (bitrate target)",L"Hardware H.264 (CPU offload)",L"Hardware HEVC (HEVC player)",L"Quality H.264 (detail)"};
-constexpr const wchar_t* SkipModeLabels[] = {L"Off",L"Quiet periods",L"Manual schedule",L"Quiet within schedule"};
+constexpr const wchar_t* SkipModeLabels[] = {L"Off",L"Quiet periods",L"Manual schedule",L"Quiet within schedule",L"No person detected (camera)",L"No person within schedule (camera)"};
 constexpr int SkipMultipliers[] = {2,4,8,16,32,64}, SkipRamps[] = {15,30,60};
 constexpr int SeparateFilesMode = 5;
 constexpr wchar_t SeparateFilesLabel[] = L"Desktop + camera (2 files)";
@@ -65,6 +66,8 @@ struct App {
     std::wstring skipSummaryCaption,skipDetailCaption;
     int skipRevision=0,advancedSkipRevision=-1,skipSummaryRevision=-1,skipVisibility=-1;
     uint64_t skipCheckAge=UINT64_MAX;
+    PersonPackInfo personPack{};
+    bool personPackKnown=false;
     std::wstring nightValidation, statusCaption, nightHintCaption, nightDetailCaption;
     bool statusCaptionError = false;
     bool hiddenToTray = false, trayRegistered = false, trayNoticeShown = false, trayVersion4 = false;
@@ -205,11 +208,20 @@ bool hasRequiredSources() {
 }
 void layout();
 bool skipEnabled() { return app.settings.timeSkip.mode!=TimeSkipMode::Off; }
-bool skipScheduled(TimeSkipMode mode) { return mode==TimeSkipMode::Manual || mode==TimeSkipMode::QuietWithinSchedule; }
+bool skipScheduled(TimeSkipMode mode) { return mode==TimeSkipMode::Manual || mode==TimeSkipMode::QuietWithinSchedule || mode==TimeSkipMode::NoPersonWithinSchedule; }
 bool skipAutomatic(TimeSkipMode mode) { return mode==TimeSkipMode::Quiet || mode==TimeSkipMode::QuietWithinSchedule; }
+bool skipPerson(TimeSkipMode mode) { return mode==TimeSkipMode::NoPerson || mode==TimeSkipMode::NoPersonWithinSchedule; }
+bool skipObserved(TimeSkipMode mode) { return skipAutomatic(mode) || skipPerson(mode); }
+TimeSkipMode skipMode(HWND control) { return static_cast<TimeSkipMode>(std::clamp(choice(control),0,static_cast<int>(std::size(SkipModeLabels))-1)); }
+std::wstring personAvailability() {
+    if(!hasSource(Source::Camera))return L"Select camera content for person checks; recording otherwise uses the normal capture interval.";
+    if(!app.personPackKnown)return L"Camera person checks require the optional detector; manage it in Time compression.";
+    if(app.personPack.state!=PersonPackState::Ready)return L"Person detector unavailable; recording uses the normal capture interval. Manage it in Time compression.";
+    return L"Checks the selected camera, not the desktop. Missing, uncertain or stale checks keep the normal capture interval.";
+}
 std::wstring skipSummary(const TimeSkipSettings& policy,int intervalMs) {
     if(policy.mode==TimeSkipMode::Off)return L"Off";
-    return std::wstring(SkipModeLabels[static_cast<int>(policy.mode)])+L" · up to "+std::to_wstring(policy.multiplier)+
+    return std::wstring(SkipModeLabels[std::clamp(static_cast<int>(policy.mode),0,static_cast<int>(std::size(SkipModeLabels))-1)])+L" · up to "+std::to_wstring(policy.multiplier)+
         L"× · target up to "+formatDuration(int64_t(intervalMs)*policy.multiplier,true)+L" between frames";
 }
 void updateSkipText(bool force=false) {
@@ -222,15 +234,18 @@ void updateSkipText(bool force=false) {
     }
     if(!skipEnabled())return;
     std::wstring detail=L"Recording-time capture spacing; schedules use active time and exclude pauses.";
+    if(skipPerson(app.settings.timeSkip.mode))detail=personAvailability();
     const auto& value=app.status.timeSkip;
     if(app.active() && value.enabled){
-        if(app.status.state==State::Paused)detail=L"Paused; image checks and the schedule clock are paused.";
+        if(app.status.state==State::Paused)detail=L"Paused; source checks and the schedule clock are paused.";
         else {
             const wchar_t* reason=value.reason==TimeSkipReason::Quiet?L"Quiet":value.reason==TimeSkipReason::Manual?L"Scheduled":
-                value.reason==TimeSkipReason::Checking?L"Checking image changes":value.reason==TimeSkipReason::Unavailable?L"Checks unavailable":L"Normal cadence";
+                value.reason==TimeSkipReason::NoPerson?L"No person detected":value.reason==TimeSkipReason::PersonPresent?L"Person detected":
+                value.reason==TimeSkipReason::Checking?(skipPerson(app.settings.timeSkip.mode)?L"Checking for absence":L"Checking image changes"):
+                value.reason==TimeSkipReason::Unavailable?L"Checks unavailable":L"Normal cadence";
             detail=reason;
             if(value.intervalMs>0)detail+=L" · target every "+formatDuration(value.intervalMs,true);
-            if(skipAutomatic(app.settings.timeSkip.mode)){
+            if(skipObserved(app.settings.timeSkip.mode)){
                 const uint64_t now=GetTickCount64();
                 app.skipCheckAge=value.lastCheckTick && now>=value.lastCheckTick?(now-value.lastCheckTick)/1000:UINT64_MAX;
                 detail+=app.skipCheckAge==UINT64_MAX?L" · waiting for source checks":L" · last source check "+std::to_wstring(app.skipCheckAge)+L" s ago";
@@ -295,6 +310,7 @@ void updateAdvanced() {
         app.advancedTooltip=L"Show or hide advanced options. Recording options can be changed before recording. Night mode applies only to camera content.";
         if(selection)app.advancedTooltip+=L" Stop after "+formatDuration(int64_t(selection)*1000)+L" of active recording; pauses and startup do not count.";
         if(skipEnabled())app.advancedTooltip+=L" Time compression: "+skipSummary(app.settings.timeSkip,app.settings.intervalMs)+L".";
+        if(skipPerson(app.settings.timeSkip.mode))app.advancedTooltip+=L" Person checks use only selected camera content and require the optional detector. Missing, uncertain or stale checks keep the normal capture interval.";
         app.advancedLimitIndex=selection;app.advancedNightState=night;app.advancedSkipRevision=app.skipRevision;
     }
     const int visibleNight=app.advancedExpanded?nightRow():0;
@@ -429,7 +445,7 @@ void applyStatus(Status value,bool force=false) {
     if(app.advancedExpanded && skipEnabled()){
         const auto tick=app.status.timeSkip.lastCheckTick,now=GetTickCount64();
         const auto age=tick && now>=tick?(now-tick)/1000:UINT64_MAX;
-        if(skip || (app.status.state==State::Recording && skipAutomatic(app.settings.timeSkip.mode) && age!=app.skipCheckAge))updateSkipText();
+        if(skip || (app.status.state==State::Recording && skipObserved(app.settings.timeSkip.mode) && age!=app.skipCheckAge))updateSkipText();
     }
     if(preview)InvalidateRect(app.preview,nullptr,FALSE);
     if(state)invalidateCanvas({app.contentWidth-app.scale(280),app.scale(20),app.contentWidth-app.scale(26),app.scale(49)});
@@ -889,26 +905,41 @@ void editCustom(CustomKind kind) {
     else if(outcome==-1)MessageBoxW(app.window,L"The custom settings dialog could not be opened. Try again.",L"Timelapse",MB_OK|MB_ICONERROR);
     if(!app.closeWhenDone){SetFocus(box);revealFocusedControl();}
 }
-enum SkipId { SkipMode=5101,SkipSpeed,SkipRamp,SkipQuiet,SkipQuietUnits,SkipRanges,SkipAdd,SkipEdit,SkipRemove,SkipRepeat,SkipRepeatUnits,SkipHelp,SkipError };
+enum SkipId { SkipMode=5101,SkipSpeed,SkipRamp,SkipQuiet,SkipQuietUnits,SkipRanges,SkipAdd,SkipEdit,SkipRemove,SkipRepeat,SkipRepeatUnits,SkipHelp,SkipError,SkipPackInfo,SkipPackManage };
 struct SkipDraft : CustomDraft {
     TimeSkipSettings policy;
-    bool readOnly=false,repeatCleared=false;
+    bool readOnly=false,repeatCleared=false,packChecked=false;
     int naturalHeight=0;
     HWND mode{},speed{},ramp{},quiet{},quietUnits{},ranges{},add{},edit{},remove{},repeat{},repeatUnits{};
+    HWND packInfo{},packManage{};
     HWND labels[8]{};
 };
+void skipPackInfo(SkipDraft& draft,bool refresh=false) {
+    if(!skipPerson(skipMode(draft.mode)))return;
+    if(!draft.readOnly && !app.active() && (refresh || !draft.packChecked)) {
+        app.personPack=inspectPersonPack();app.personPackKnown=true;draft.packChecked=true;++app.skipRevision;
+    }
+    std::wstring text=L"Person detector: ";
+    text+=!app.personPackKnown?L"not checked":app.personPack.state==PersonPackState::Ready?L"installed":
+        app.personPack.state==PersonPackState::Missing?L"not installed":L"unavailable";
+    if(!hasSource(Source::Camera))text+=L". Camera content is not selected; recording uses normal cadence.";
+    else if(app.personPackKnown && app.personPack.state!=PersonPackState::Ready)text+=L". Recording uses normal cadence until available.";
+    SetWindowTextW(draft.packInfo,text.c_str());
+    EnableWindow(draft.packManage,!draft.readOnly && !app.active());
+}
 HWND skipChild(HWND window,const wchar_t* type,const wchar_t* value,DWORD style,int id) {
     return CreateWindowExW((std::wcscmp(type,L"EDIT")==0 || std::wcscmp(type,L"LISTBOX")==0)?WS_EX_CLIENTEDGE:0,
         type,value,WS_CHILD|WS_VISIBLE|style,0,0,1,1,window,reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),GetModuleHandleW(nullptr),nullptr);
 }
 void skipLayout(HWND window,SkipDraft& draft) {
     if(draft.layingOut)return;draft.layingOut=true;
-    const auto mode=static_cast<TimeSkipMode>(std::clamp(choice(draft.mode),0,3));
-    const bool enabled=mode!=TimeSkipMode::Off,automatic=skipAutomatic(mode),scheduled=skipScheduled(mode);
+    const auto mode=skipMode(draft.mode);
+    const bool enabled=mode!=TimeSkipMode::Off,automatic=skipObserved(mode),scheduled=skipScheduled(mode),person=skipPerson(mode);
     const auto visible=[](HWND child,bool show){if(child && ((GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0)!=show)ShowWindow(child,show?SW_SHOWNA:SW_HIDE);};
     for(HWND child:{draft.labels[1],draft.speed,draft.labels[2],draft.ramp})visible(child,enabled);
     for(HWND child:{draft.labels[3],draft.quiet,draft.labels[7],draft.quietUnits})visible(child,automatic);
     for(HWND child:{draft.labels[4],draft.ranges,draft.add,draft.edit,draft.remove,draft.labels[5],draft.repeat,draft.labels[6],draft.repeatUnits})visible(child,scheduled);
+    for(HWND child:{draft.packInfo,draft.packManage})visible(child,person);
     RECT client{};GetClientRect(window,&client);const auto style=GetWindowLongPtrW(window,GWL_STYLE);
     const int barW=GetSystemMetricsForDpi(SM_CXVSCROLL,draft.dpi),barH=GetSystemMetricsForDpi(SM_CYHSCROLL,draft.dpi);
     const int availableW=client.right+((style&WS_VSCROLL)?barW:0),availableH=client.bottom+((style&WS_HSCROLL)?barH:0);
@@ -918,8 +949,11 @@ void skipLayout(HWND window,SkipDraft& draft) {
     const auto wrapped=[&](HWND child,int width,int minimum){wchar_t value[2048]{};GetWindowTextW(child,value,2048);
         RECT r{0,0,std::max(1,width),0};HDC dc=GetDC(window);if(!dc)return minimum;const auto previous=SelectObject(dc,draft.font);
         DrawTextW(dc,value,-1,&r,DT_CALCRECT|DT_WORDBREAK|DT_NOPREFIX);SelectObject(dc,previous);ReleaseDC(window,dc);return std::max(minimum,int(r.bottom));};
-    bool horizontal=false,vertical=false;int helpHeight=0,errorHeight=0,errorTop=0,buttonTop=0,minHeight=0;
-    const auto measure=[&](int width){helpHeight=wrapped(draft.help,width-2*pad,draft.scale(40));errorTop=draft.scale(helpTop)+helpHeight+draft.scale(10);
+    const int packButtonWidth=draft.scale(146);
+    bool horizontal=false,vertical=false;int helpHeight=0,errorHeight=0,errorTop=0,buttonTop=0,minHeight=0,packHeight=0,packExtra=0;
+    const auto measure=[&](int width){packHeight=person?wrapped(draft.packInfo,width-2*pad-gap-packButtonWidth,draft.scale(28)):0;
+        packExtra=person?packHeight+draft.scale(16):0;
+        helpHeight=wrapped(draft.help,width-2*pad,draft.scale(40));errorTop=draft.scale(helpTop)+packExtra+helpHeight+draft.scale(10);
         errorHeight=wrapped(draft.error,width-2*pad,draft.scale(22));buttonTop=errorTop+errorHeight+draft.scale(12);minHeight=buttonTop+draft.scale(44);};
     for(int i=0;i<3;++i){horizontal=availableW-(vertical?barW:0)<minimumWidth;measure(std::max(minimumWidth,availableW-(vertical?barW:0)));vertical=availableH-(horizontal?barH:0)<minHeight;}
     ShowScrollBar(window,SB_HORZ,horizontal);ShowScrollBar(window,SB_VERT,vertical);GetClientRect(window,&client);
@@ -936,12 +970,14 @@ void skipLayout(HWND window,SkipDraft& draft) {
     move(draft.labels[3],pad,draft.scale(quietTop),half,draft.scale(20));move(draft.quiet,pad,draft.scale(quietTop+22),half,draft.scale(28));
     move(draft.labels[7],x2,draft.scale(quietTop),half,draft.scale(20));
     move(draft.quietUnits,x2,draft.scale(quietTop+22),half,draft.scale(150));
-    move(draft.labels[4],pad,draft.scale(scheduleTop),width-2*pad,draft.scale(20));move(draft.ranges,pad,draft.scale(scheduleTop+22),width-2*pad,draft.scale(94));
-    move(draft.add,pad,draft.scale(scheduleTop+122),draft.scale(80),draft.scale(28));move(draft.edit,pad+draft.scale(94),draft.scale(scheduleTop+122),draft.scale(80),draft.scale(28));
-    move(draft.remove,pad+draft.scale(188),draft.scale(scheduleTop+122),draft.scale(92),draft.scale(28));
-    move(draft.labels[5],pad,draft.scale(repeatTop),half,draft.scale(20));move(draft.repeat,pad,draft.scale(repeatTop+22),half,draft.scale(28));
-    move(draft.labels[6],x2,draft.scale(repeatTop),half,draft.scale(20));move(draft.repeatUnits,x2,draft.scale(repeatTop+22),half,draft.scale(150));
-    move(draft.help,pad,draft.scale(helpTop),width-2*pad,helpHeight);move(draft.error,pad,errorTop,width-2*pad,errorHeight);
+    move(draft.packInfo,pad,draft.scale(196),width-2*pad-gap-packButtonWidth,packHeight);
+    move(draft.packManage,width-pad-packButtonWidth,draft.scale(196),packButtonWidth,draft.scale(28));
+    move(draft.labels[4],pad,draft.scale(scheduleTop)+packExtra,width-2*pad,draft.scale(20));move(draft.ranges,pad,draft.scale(scheduleTop+22)+packExtra,width-2*pad,draft.scale(94));
+    move(draft.add,pad,draft.scale(scheduleTop+122)+packExtra,draft.scale(80),draft.scale(28));move(draft.edit,pad+draft.scale(94),draft.scale(scheduleTop+122)+packExtra,draft.scale(80),draft.scale(28));
+    move(draft.remove,pad+draft.scale(188),draft.scale(scheduleTop+122)+packExtra,draft.scale(92),draft.scale(28));
+    move(draft.labels[5],pad,draft.scale(repeatTop)+packExtra,half,draft.scale(20));move(draft.repeat,pad,draft.scale(repeatTop+22)+packExtra,half,draft.scale(28));
+    move(draft.labels[6],x2,draft.scale(repeatTop)+packExtra,half,draft.scale(20));move(draft.repeatUnits,x2,draft.scale(repeatTop+22)+packExtra,half,draft.scale(150));
+    move(draft.help,pad,draft.scale(helpTop)+packExtra,width-2*pad,helpHeight);move(draft.error,pad,errorTop,width-2*pad,errorHeight);
     move(draft.okay,width-pad-draft.scale(174),buttonTop,draft.scale(80),draft.scale(28));move(draft.cancel,width-pad-draft.scale(80),buttonTop,draft.scale(80),draft.scale(28));
     draft.layingOut=false;
 }
@@ -959,11 +995,15 @@ void skipReveal(HWND window,SkipDraft& draft,HWND child) {
     if(bounds.top<0)draft.scrollY+=bounds.top;else if(bounds.bottom>client.bottom)draft.scrollY+=bounds.bottom-client.bottom;skipLayout(window,draft);
 }
 void skipHelp(SkipDraft& draft) {
-    const auto mode=static_cast<TimeSkipMode>(std::clamp(choice(draft.mode),0,3));
+    const auto mode=skipMode(draft.mode);
+    SetWindowTextW(draft.labels[3],skipPerson(mode)?L"No &person for (active time)":L"&Quiet for (active time)");
+    SetWindowTextW(draft.labels[7],skipPerson(mode)?L"Dwell u&nits":L"Quiet u&nits");
     std::wstring text=mode==TimeSkipMode::Off?L"Off keeps the selected Capture every interval throughout the recording.":
         mode==TimeSkipMode::Manual?L"Manual schedule accelerates even when something moves. Ranges use active recording time; pauses and initial preparation do not count. Zero repeat means one schedule. Touching or overlapping ranges merge.":
+        skipPerson(mode)?L"Checks only the selected camera. Speeds up after sustained no-person detections, even when other things move. Detected people return to normal speed promptly, interrupting the transition. Checks can miss people; missing, uncertain or stale results keep normal speed. No person checks run while paused. Desktop content is not checked.":
         L"Image changes in either selected source keep normal speed; this does not detect people. Checks are best effort, about once a second; brief or small changes may be missed. Detected activity returns to normal speed promptly, interrupting the transition.";
     if(mode==TimeSkipMode::QuietWithinSchedule)text+=L" Accelerates only when quiet AND inside a range. Checks continue outside ranges. Schedule times exclude pauses and initial preparation; zero repeat means one schedule.";
+    if(mode==TimeSkipMode::NoPersonWithinSchedule)text+=L" Accelerates only when absence is qualified AND inside a range. Checks continue outside ranges. Schedule times exclude pauses and initial preparation; zero repeat means one schedule.";
     if(mode!=TimeSkipMode::Off)text+=L" Transitions count saved video frames (30 fps); real recording time depends on the capture interval. Short ranges may reach a lower speed. No intermediate pictures are generated. Both output files share the cadence. Night blends retain their full duration, bounded by the original interval.";
     if(draft.readOnly)text=L"Recording options are frozen for this session. "+text;
     if(draft.repeatCleared)text+=L" The retained repeat was reset to Never because an edited range exceeded it; your ranges are retained.";
@@ -989,11 +1029,11 @@ bool skipClearInactiveRepeat(TimeSkipSettings& policy) {
     return false;
 }
 bool validateSkip(SkipDraft& draft,TimeSkipSettings& output,std::wstring& error,HWND& invalid) {
-    auto policy=draft.policy;policy.mode=static_cast<TimeSkipMode>(std::clamp(choice(draft.mode),0,3));
+    auto policy=draft.policy;policy.mode=skipMode(draft.mode);
     const int speed=choice(draft.speed);if(speed>=0 && speed<6)policy.multiplier=SkipMultipliers[speed];
     policy.rampFrames=SkipRamps[std::clamp(choice(draft.ramp),0,2)];
     int64_t value=0;
-    if(skipAutomatic(policy.mode)){invalid=draft.quiet;if(!skipDuration(draft.quiet,draft.quietUnits,1000,value,error))return false;policy.quietAfterMs=value;}
+    if(skipObserved(policy.mode)){invalid=draft.quiet;if(!skipDuration(draft.quiet,draft.quietUnits,1000,value,error))return false;policy.quietAfterMs=value;}
     if(skipScheduled(policy.mode)){invalid=draft.repeat;if(!skipDuration(draft.repeat,draft.repeatUnits,0,value,error))return false;policy.repeatSeconds=static_cast<int>(value/1000);invalid=draft.ranges;}
     skipClearInactiveRepeat(policy);
     if(!normalizeTimeSkipSettings(policy,error))return false;output=policy;return true;
@@ -1042,13 +1082,15 @@ INT_PTR CALLBACK skipProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             label(5,L"Repeat e&very (0 = never)");draft->repeat=skipChild(window,L"EDIT",std::to_wstring(draft->policy.repeatSeconds).c_str(),WS_TABSTOP|ES_AUTOHSCROLL,SkipRepeat);
             label(6,L"&Units");draft->repeatUnits=combo(SkipRepeatUnits);
             for(HWND box:{draft->quietUnits,draft->repeatUnits}){for(auto value:{L"Seconds",L"Minutes",L"Hours",L"Days"})add(box,value);choose(box,0);}
+            draft->packInfo=skipChild(window,L"STATIC",L"",SS_NOPREFIX,SkipPackInfo);
+            draft->packManage=button(L"Manage &detector...",SkipPackManage);
             draft->help=skipChild(window,L"STATIC",L"",SS_NOPREFIX,SkipHelp);draft->error=skipChild(window,L"STATIC",L"",SS_NOPREFIX,SkipError);
             draft->okay=skipChild(window,L"BUTTON",L"OK",WS_TABSTOP|BS_DEFPUSHBUTTON,IDOK);draft->cancel=button(draft->readOnly?L"Close":L"Cancel",IDCANCEL);
-            bool okay=true;for(HWND child:{draft->mode,draft->speed,draft->ramp,draft->quiet,draft->quietUnits,draft->ranges,draft->add,draft->edit,draft->remove,draft->repeat,draft->repeatUnits,draft->help,draft->error,draft->okay,draft->cancel})if(!child)okay=false;
+            bool okay=true;for(HWND child:{draft->mode,draft->speed,draft->ramp,draft->quiet,draft->quietUnits,draft->ranges,draft->add,draft->edit,draft->remove,draft->repeat,draft->repeatUnits,draft->packInfo,draft->packManage,draft->help,draft->error,draft->okay,draft->cancel})if(!child)okay=false;
             for(HWND child:draft->labels)if(!child)okay=false;if(!okay){EndDialog(window,-1);return TRUE;}
             for(HWND child:{draft->quiet,draft->repeat})SendMessageW(child,EM_SETLIMITTEXT,96,0);
-            for(HWND child:{draft->mode,draft->speed,draft->ramp,draft->quiet,draft->quietUnits,draft->repeat,draft->repeatUnits,draft->okay})EnableWindow(child,!draft->readOnly);
-            if(draft->readOnly)ShowWindow(draft->okay,SW_HIDE);skipList(*draft);skipHelp(*draft);customFont(window,*draft);
+            for(HWND child:{draft->mode,draft->speed,draft->ramp,draft->quiet,draft->quietUnits,draft->repeat,draft->repeatUnits,draft->packManage,draft->okay})EnableWindow(child,!draft->readOnly);
+            if(draft->readOnly)ShowWindow(draft->okay,SW_HIDE);skipList(*draft);skipPackInfo(*draft);skipHelp(*draft);customFont(window,*draft);
             RECT rect{0,0,draft->scale(540),draft->scale(skipScheduled(draft->policy.mode)?680:460)};
             AdjustWindowRectExForDpi(&rect,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_STYLE)),FALSE,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_EXSTYLE)),draft->dpi);
             RECT owner{};GetWindowRect(app.window,&owner);OffsetRect(&rect,(owner.left+owner.right-(rect.right-rect.left))/2-rect.left,(owner.top+owner.bottom-(rect.bottom-rect.top))/2-rect.top);
@@ -1065,6 +1107,13 @@ INT_PTR CALLBACK skipProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             (bar==SB_HORZ?draft->scrollX:draft->scrollY)=position;skipLayout(window,*draft);return TRUE;}
         case WM_COMMAND:{const int id=LOWORD(wp);
             if(id==IDCANCEL){EndDialog(window,IDCANCEL);return TRUE;}
+            if(id==SkipPackManage){
+                if(!draft->readOnly && !app.active() && skipPerson(skipMode(draft->mode))){
+                    showPersonPackDialog(window);
+                    if(IsWindow(window) && IsWindow(app.window)){skipPackInfo(*draft,true);skipLayout(window,*draft);skipFitHeight(window,*draft);skipReveal(window,*draft,draft->packManage);}
+                }
+                return TRUE;
+            }
             if(id==IDOK){if(draft->readOnly || app.active()){EndDialog(window,IDCANCEL);return TRUE;}TimeSkipSettings policy;std::wstring error;HWND invalid=draft->mode;
                 if(validateSkip(*draft,policy,error,invalid)){draft->policy=policy;EndDialog(window,IDOK);return TRUE;}
                 SetWindowTextW(draft->error,error.c_str());skipLayout(window,*draft);skipFitHeight(window,*draft);SetFocus(invalid);skipReveal(window,*draft,invalid);return TRUE;}
@@ -1072,9 +1121,9 @@ INT_PTR CALLBACK skipProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             if(id==SkipRemove && !draft->readOnly && !app.active()){const int selected=static_cast<int>(SendMessageW(draft->ranges,LB_GETCURSEL,0,0));
                 if(selected>=0 && selected<int(draft->policy.rangeCount)){for(unsigned i=selected+1;i<draft->policy.rangeCount;++i)draft->policy.ranges[i-1]=draft->policy.ranges[i];--draft->policy.rangeCount;skipList(*draft,selected);}return TRUE;}
             if(id==SkipMode && HIWORD(wp)==CBN_SELCHANGE){
-                auto policy=draft->policy;policy.mode=static_cast<TimeSkipMode>(std::clamp(choice(draft->mode),0,3));
+                auto policy=draft->policy;policy.mode=skipMode(draft->mode);
                 if(!draft->readOnly && skipClearInactiveRepeat(policy)){draft->policy.repeatSeconds=0;draft->repeatCleared=true;SetWindowTextW(draft->repeat,L"0");choose(draft->repeatUnits,0);}
-                skipHelp(*draft);SetWindowTextW(draft->error,L"");skipLayout(window,*draft);skipFitHeight(window,*draft);skipReveal(window,*draft,draft->mode);return TRUE;}
+                skipPackInfo(*draft);skipHelp(*draft);SetWindowTextW(draft->error,L"");skipLayout(window,*draft);skipFitHeight(window,*draft);skipReveal(window,*draft,draft->mode);return TRUE;}
             if(id==SkipRanges && HIWORD(wp)==LBN_SELCHANGE){const bool selected=SendMessageW(draft->ranges,LB_GETCURSEL,0,0)!=LB_ERR;EnableWindow(draft->edit,!draft->readOnly && selected);EnableWindow(draft->remove,!draft->readOnly && selected);}
             if(HIWORD(wp)==EN_SETFOCUS || HIWORD(wp)==CBN_SETFOCUS || HIWORD(wp)==BN_SETFOCUS || HIWORD(wp)==LBN_SETFOCUS)skipReveal(window,*draft,reinterpret_cast<HWND>(lp));return FALSE;}
         case WM_CTLCOLORSTATIC:if(reinterpret_cast<HWND>(lp)==draft->error){SetTextColor(reinterpret_cast<HDC>(wp),RGB(164,40,40));SetBkColor(reinterpret_cast<HDC>(wp),GetSysColor(COLOR_BTNFACE));return reinterpret_cast<INT_PTR>(GetSysColorBrush(COLOR_BTNFACE));}break;
@@ -1085,10 +1134,12 @@ INT_PTR CALLBACK skipProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
 }
 void editSkip() {
     if(app.customDialog)return;SkipDraft draft;draft.policy=app.settings.timeSkip;draft.readOnly=app.active();CustomTemplate resource;
+    const int priorRevision=app.skipRevision;
     const auto outcome=DialogBoxIndirectParamW(GetModuleHandleW(nullptr),&resource.dialog,app.window,skipProc,reinterpret_cast<LPARAM>(&draft));
     if(!IsWindow(app.window))return;
     if(outcome==IDOK && !draft.readOnly && !app.active()){app.settings.timeSkip=draft.policy;++app.skipRevision;configure();updateControls();layout();}
-    else if(outcome==-1)MessageBoxW(app.window,L"Time compression settings could not be opened. Try again.",L"Timelapse",MB_OK|MB_ICONERROR);
+    else if(priorRevision!=app.skipRevision)updateControls();
+    if(outcome==-1)MessageBoxW(app.window,L"Time compression settings could not be opened. Try again.",L"Timelapse",MB_OK|MB_ICONERROR);
     if(!app.closeWhenDone && !app.hiddenToTray){SetFocus(app.skipConfigure);revealFocusedControl();}
 }
 void selectFolder() {
@@ -1131,7 +1182,7 @@ std::array<std::wstring,6> skipValues(const TimeSkipSettings& policy) {
 }
 bool parseSkipValues(const std::array<std::wstring,6>& values,TimeSkipSettings& output) {
     TimeSkipSettings policy;int64_t value=0;
-    if(!skipInteger(values[0],0,3,value))return false;policy.mode=static_cast<TimeSkipMode>(value);
+    if(!skipInteger(values[0],0,static_cast<int>(TimeSkipMode::NoPersonWithinSchedule),value))return false;policy.mode=static_cast<TimeSkipMode>(value);
     if(!skipInteger(values[1],2,64,value))return false;policy.multiplier=static_cast<int>(value);
     if(!skipInteger(values[2],1000,int64_t(INT_MAX)*1000,value) || value%1000)return false;policy.quietAfterMs=value;
     if(!skipInteger(values[3],15,60,value))return false;policy.rampFrames=static_cast<int>(value);
@@ -1408,6 +1459,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         app.customDialog=nullptr;app.advancedCaption.clear();app.advancedTooltip.clear();
         app.skipRevision=0;app.advancedSkipRevision=app.skipSummaryRevision=app.skipVisibility=-1;app.skipCheckAge=UINT64_MAX;
         app.skipSummaryCaption.clear();app.skipDetailCaption.clear();app.settings.timeSkip={};
+        app.personPack={};app.personPackKnown=false;
         app.hasCustomInterval=app.hasCustomSize=app.hasCustomLimit=false;
         app.customIntervalMs=5000;app.customWidth=1280;app.customHeight=720;app.customLimitSeconds=900;
         app.committedInterval=2;app.committedSize=app.committedLimit=0;

@@ -120,6 +120,7 @@ int runCameraHost(const wchar_t*){throw std::runtime_error("Unexpected applicati
 #define OutputDebugStringW fakeDebug
 #pragma warning(push)
 #pragma warning(disable: 4702) // The helper-entry sentinel deliberately throws.
+#include "ui_person_pack_stub.h"
 #include "../src/main.cpp"
 #pragma warning(pop)
 #undef Engine

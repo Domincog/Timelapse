@@ -6,7 +6,7 @@ namespace lapse {
 constexpr unsigned TimeSkipMaxRanges = 16;
 constexpr int TimeSkipWidth = 64, TimeSkipHeight = 36;
 constexpr int TimeSkipObservationMs = 1000;
-enum class TimeSkipMode { Off, Quiet, Manual, QuietWithinSchedule };
+enum class TimeSkipMode { Off, Quiet, Manual, QuietWithinSchedule, NoPerson, NoPersonWithinSchedule };
 struct TimeSkipRange { int startSeconds = 0, endSeconds = 0; };
 struct TimeSkipSettings {
     TimeSkipMode mode = TimeSkipMode::Off;
@@ -26,7 +26,13 @@ struct TimeSkipDescriptor {
 // Fixed sixteen stratified BGRA samples per thumbnail cell; no allocation.
 // This is an image-change descriptor, not semantic activity recognition.
 bool describeTimeSkipFrame(const Frame& frame, TimeSkipDescriptor& output) noexcept;
-enum class TimeSkipReason { Off, Normal, Checking, Quiet, Manual, Unavailable };
+enum class TimeSkipReason { Off, Normal, Checking, Quiet, Manual, Unavailable, NoPerson, PersonPresent };
+enum class PersonPresence { Unknown, Present, QualifiedAbsent };
+struct PersonObservation {
+    PersonPresence presence = PersonPresence::Unknown;
+    uint64_t epoch = 0, sequence = 0;
+    int64_t activeMs = 0;
+};
 struct TimeSkipDecision {
     int64_t intervalMs = 0;
     int64_t nextBoundaryMs = 0; // Absolute active time; zero when no boundary.
@@ -45,6 +51,11 @@ public:
     bool observe(unsigned sourceIndex, const TimeSkipDescriptor&, uint64_t epoch,
                  uint64_t sequence, int64_t activeMs) noexcept;
     void unavailable(unsigned sourceIndex) noexcept;
+    // Engine validates model/session identity and wall-clock source freshness.
+    // A person observation describes the selected camera only. Qualification
+    // requires distinct negative reports spanning the full active-time dwell.
+    bool observePerson(const PersonObservation&) noexcept;
+    void personUnavailable() noexcept;
     // Does not advance ramp phase. May request a prompt base-rate return after
     // activity, unavailable input, a schedule boundary or a discontinuous clock.
     TimeSkipDecision inspect(int64_t activeMs) noexcept;
@@ -59,8 +70,16 @@ private:
         unsigned weak = 0;
         bool initialized = false, available = false, compared = false;
     };
+    struct PersonDetector {
+        uint64_t epoch = 0, sequence = 0;
+        int64_t observationMs = -1, absentSinceMs = -1;
+        unsigned absentCount = 0;
+        PersonPresence presence = PersonPresence::Unknown;
+        bool initialized = false, available = false;
+    };
     TimeSkipSettings settings_;
     std::array<Detector, 2> sources_{};
+    PersonDetector person_;
     std::array<int64_t, 61> intervals_{}, returnSpans_{};
     int64_t baseMs_ = 1000, lastInspectMs_ = -1, lastFrameMs_ = -1, windowStartMs_ = -1, windowEndMs_ = 0;
     unsigned sourceMask_ = 0, phase_ = 0;

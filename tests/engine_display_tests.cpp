@@ -329,3 +329,5 @@ int main() {
         return 1;
     }
 }
+
+#include "engine_person_camera_stub.h"

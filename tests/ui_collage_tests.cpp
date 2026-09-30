@@ -50,6 +50,7 @@ SHORT WINAPI fixtureGetKeyState(int key) { return key == VK_SHIFT && shiftDown ?
 // The reject-entry sentinel intentionally makes the GUI entry unreachable.
 #pragma warning(push)
 #pragma warning(disable: 4702)
+#include "ui_person_pack_stub.h"
 #include "../src/main.cpp"
 #pragma warning(pop)
 #undef Engine

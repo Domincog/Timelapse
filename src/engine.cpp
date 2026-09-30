@@ -3,6 +3,7 @@
 #include "capture.h"
 #include "camera_host.h"
 #include "encoder.h"
+#include "person_client.h"
 #include <objbase.h>
 #include <chrono>
 #include <filesystem>
@@ -19,6 +20,9 @@ const wchar_t* recordingMessage(bool separateFiles) {
 bool usesNightCamera(const Settings& settings) {
     return settings.night.enabled && (settings.separateFiles || std::any_of(settings.layers.begin(), settings.layers.end(),
         [](const Layer& layer) { return layer.source == Source::Camera; }));
+}
+bool usesPersonChecks(TimeSkipMode mode) noexcept {
+    return mode == TimeSkipMode::NoPerson || mode == TimeSkipMode::NoPersonWithinSchedule;
 }
 int nightWindowDuration(const Settings& settings, int suggested) {
     const int maximum = std::min(NightMaxDurationMs, settings.intervalMs);
@@ -168,6 +172,8 @@ void Engine::run() {
         // Construct allocating resources inside the guarded operation that
         // needs them, so construction failure cannot escape this worker.
         std::optional<CameraClient> camera;
+        std::optional<PersonClient> personClient;
+        std::unique_ptr<CameraPersonInput> personInput;
         std::optional<Encoder> encoder;
         std::optional<Encoder> cameraEncoder;
         RecordingPower power;
@@ -209,11 +215,16 @@ void Engine::run() {
         TimeSkipDecision skipDecision;
         TimeSkipStatus skipStatus;
         bool skipping = false, observing = false, skipControllerValid = false;
+        bool personMode = false, personStarted = false, personFault = false;
+        bool personCameraPending = false, personInputReady = false, personInferencePending = false;
+        person::Source personSubmitted{}, personLastSource{};
+        std::array<wchar_t, 256> personFailure{};
         unsigned observedSources = 0;
         uint64_t observationToken = 0, desktopSequence = 0, observationStarted = 0;
         std::array<uint64_t, 2> observationTicks{};
         std::array<std::array<wchar_t, 256>, 2> observationProblems{};
         auto nextObservation = Clock::time_point::max(), lastAdmission = Clock::time_point::min();
+        auto nextPersonPoll = Clock::time_point::max();
         Frame observationDesktop;
         auto activeMilliseconds = [&] {
             const auto duration = activeDuration + (writing && !paused ? Clock::now() - lastTick : Clock::duration::zero());
@@ -221,13 +232,19 @@ void Engine::run() {
         };
         auto cancelObservation = [&] {
             if (observing && camera) camera->cancelActivityObservation();
+            if (personClient) personClient->cancel();
+            personClient.reset(); personInput.reset();
+            personStarted = personCameraPending = personInputReady = personInferencePending = false;
+            personSubmitted = {}; personLastSource = {};
+            nextPersonPoll = Clock::time_point::max();
             nextObservation = Clock::time_point::max();
         };
         auto resetSkipping = [&](const Settings& cfg, unsigned sourceMask) {
             cancelObservation();
             skipping = cfg.timeSkip.mode != TimeSkipMode::Off;
+            personMode = usesPersonChecks(cfg.timeSkip.mode);
             observing = skipping && cfg.timeSkip.mode != TimeSkipMode::Manual;
-            observedSources = sourceMask;
+            observedSources = personMode ? sourceMask & 2u : sourceMask;
             skipStatus = {}; skipStatus.enabled = skipping;
             skipStatus.intervalMs = skipping ? cfg.intervalMs : 0;
             observationTicks = {}; observationProblems = {};
@@ -235,7 +252,7 @@ void Engine::run() {
             if (++observationToken == 0) ++observationToken;
             desktopSequence = 0;
             if (skipping) {
-                skipControllerValid = timeSkip.reset(cfg.timeSkip, cfg.intervalMs, sourceMask);
+                skipControllerValid = timeSkip.reset(cfg.timeSkip, cfg.intervalMs, observedSources);
                 if (!skipControllerValid) observing = false;
                 skipDecision = timeSkip.inspect(activeMilliseconds());
                 skipStatus.reason = skipDecision.reason;
@@ -260,9 +277,10 @@ void Engine::run() {
             if (!skipControllerValid) {
                 skipDecision = {}; skipDecision.intervalMs = session ? session->intervalMs : 1000;
                 skipStatus.intervalMs = skipDecision.intervalMs; skipStatus.reason = TimeSkipReason::Unavailable;
-                constexpr wchar_t missing[] = L"Activity observation needs a selected source; using normal cadence.";
+                const wchar_t* missing = personMode ? L"Person checks need a selected camera; using normal cadence."
+                    : L"Activity observation needs a selected source; using normal cadence.";
                 skipStatus.diagnostic = {};
-                std::copy(std::begin(missing), std::end(missing), skipStatus.diagnostic.begin());
+                std::copy_n(missing, std::min(wcslen(missing), skipStatus.diagnostic.size() - 1), skipStatus.diagnostic.begin());
                 std::lock_guard<std::mutex> lock(mutex_); status_.timeSkip = skipStatus;
                 return;
             }
@@ -275,7 +293,9 @@ void Engine::run() {
                 const auto age = tick >= receipt ? tick - receipt : UINT64_MAX;
                 if (!receipt || age > 3000) {
                     complete = false;
-                    if (receipt || tick - observationStarted > 3000) timeSkip.unavailable(source);
+                    if (receipt || tick - observationStarted > 3000) {
+                        if (personMode) timeSkip.personUnavailable(); else timeSkip.unavailable(source);
+                    }
                 }
                 oldest = std::min(oldest, receipt);
                 if (!skipStatus.diagnostic[0] && observationProblems[source][0]) skipStatus.diagnostic = observationProblems[source];
@@ -288,12 +308,136 @@ void Engine::run() {
             skipStatus.reason = skipDecision.reason;
             skipStatus.intervalMs = skipDecision.intervalMs;
             if (skipStatus.observationDelayed && !skipStatus.diagnostic[0]) {
-                constexpr wchar_t delayed[] = L"Activity checks are delayed; unseen activity may be missed. Normal cadence resumes when observations become stale.";
-                std::copy(std::begin(delayed), std::end(delayed), skipStatus.diagnostic.begin());
+                const wchar_t* delayed = personMode ? L"Person checks are delayed. Normal cadence resumes when source images become stale."
+                    : L"Activity checks are delayed; unseen activity may be missed. Normal cadence resumes when observations become stale.";
+                std::copy_n(delayed, std::min(wcslen(delayed), skipStatus.diagnostic.size() - 1), skipStatus.diagnostic.begin());
             }
             std::lock_guard<std::mutex> lock(mutex_); status_.timeSkip = skipStatus;
         };
+        auto personProblem = [&](const wchar_t* text, bool hardFailure) {
+            timeSkip.personUnavailable();
+            auto& message = observationProblems[1]; message = {};
+            std::copy_n(text, std::min(wcslen(text), message.size() - 1), message.begin());
+            if (hardFailure) {
+                // A broken/missing detector never restarts itself within this
+                // recording, including after pause, layout or source resets.
+                personFault = true; personFailure = message; cancelObservation();
+            }
+        };
+        auto validPersonSource = [&](const person::Source& source, uint64_t tick) {
+            return source.sessionToken == observationToken && source.cameraEpoch && source.sequence &&
+                source.receivedTick && source.receivedTick >= observationStarted && source.receivedTick <= tick &&
+                tick - source.receivedTick <= person::SourceFreshnessMs && person::validGeometry(source);
+        };
+        auto observePeople = [&] {
+            if (!observing || !writing || paused || !encoder || !encoder->frames()) return;
+            if (personFault) {
+                nextObservation = nextPersonPoll = Clock::time_point::max();
+                personProblem(personFailure[0] ? personFailure.data() :
+                    L"Person checks stopped for this recording; using normal cadence. Start a new recording to retry.", false);
+                inspectSkipping(); return;
+            }
+            const auto now = Clock::now();
+            const bool requestDue = now >= nextObservation;
+            if (!requestDue && now < nextPersonPoll) return;
+            if (requestDue) nextObservation = now + std::chrono::milliseconds(TimeSkipObservationMs);
+            nextPersonPoll = Clock::time_point::max();
+            try {
+                if (!personStarted) {
+                    std::wstring error;
+                    if (!personClient) personClient.emplace();
+                    if (!personClient->start(observationToken, error)) {
+                        personProblem(error.empty() ? L"The optional person detector could not start; using normal cadence." : error.c_str(), true);
+                        inspectSkipping(); return;
+                    }
+                    personStarted = true;
+                    // The detector also rejects source samples retained from
+                    // before its own asynchronous startup request.
+                    observationStarted = std::max(observationStarted, GetTickCount64());
+                }
+                PersonCheckResult result;
+                const auto state = personClient->poll(result);
+                if (state == PersonPoll::Unavailable) {
+                    const auto* detail = personClient->diagnostic();
+                    personProblem(detail && detail[0] ? detail : L"The optional person detector is unavailable; using normal cadence.", true);
+                    inspectSkipping(); return;
+                }
+                bool detectorReady = state == PersonPoll::Ready;
+                if (state == PersonPoll::Complete) {
+                    const auto tick = GetTickCount64();
+                    if (!personInferencePending || !person::sameSource(result.source, personSubmitted)) {
+                        personProblem(L"The optional person detector returned the wrong source identity; using normal cadence.", true);
+                        inspectSkipping(); return;
+                    }
+                    personInferencePending = false; detectorReady = true;
+                    if (!validPersonSource(result.source, tick)) {
+                        personProblem(L"The person-check source image is stale or invalid; using normal cadence.", false);
+                    } else {
+                        PersonPresence presence = PersonPresence::Unknown;
+                        if (result.output.verdict == person::Verdict::Present) presence = PersonPresence::Present;
+                        else if (result.output.verdict == person::Verdict::QualifiedAbsent) presence = PersonPresence::QualifiedAbsent;
+                        const auto age = tick - result.source.receivedTick;
+                        const int64_t observedAt = std::max<int64_t>(0, activeMilliseconds() - static_cast<int64_t>(age));
+                        if (timeSkip.observePerson({presence, result.source.cameraEpoch, result.source.sequence, observedAt})) {
+                            observationTicks[1] = result.source.receivedTick;
+                            observationProblems[1] = {}; personLastSource = result.source;
+                            if (presence == PersonPresence::Unknown) {
+                                personProblem(result.output.reason == person::Reason::InsufficientDetail
+                                    ? L"Too little image detail for absence checks; using normal cadence."
+                                    : L"The person check is uncertain; using normal cadence.", false);
+                            }
+                        } else personProblem(L"The person check repeated or regressed its source; using normal cadence.", false);
+                    }
+                }
+                // Poll replies independently of the one-second request cadence.
+                // Pending reads must not request another camera conversion.
+                if (detectorReady && !personInferencePending && !personInputReady && (requestDue || personCameraPending)) {
+                    if (!cameraRunning) personProblem(L"The selected camera is unavailable for person checks; using normal cadence.", false);
+                    else {
+                        if (!personInput) personInput = std::make_unique<CameraPersonInput>();
+                        std::wstring error;
+                        personCameraPending = true;
+                        if (camera->personInput(observationToken, *personInput, error, requestDue)) {
+                            personCameraPending = false;
+                            const auto& source = personInput->source;
+                            const bool newer = !personLastSource.cameraEpoch ||
+                                (source.receivedTick >= personLastSource.receivedTick && source.cameraEpoch >= personLastSource.cameraEpoch &&
+                                 (source.cameraEpoch != personLastSource.cameraEpoch || source.sequence > personLastSource.sequence));
+                            if (validPersonSource(source, GetTickCount64()) && newer) {
+                                if (personLastSource.cameraEpoch &&
+                                    (source.cameraEpoch != personLastSource.cameraEpoch ||
+                                     source.sourceWidth != personLastSource.sourceWidth || source.sourceHeight != personLastSource.sourceHeight ||
+                                     source.width != personLastSource.width || source.height != personLastSource.height)) {
+                                    // Changed source geometry/epoch cannot carry
+                                    // an old absence dwell into the new image.
+                                    timeSkip.personUnavailable(); observationTicks[1] = 0;
+                                }
+                                personInputReady = true;
+                            }
+                            else personProblem(L"The camera person-check image is stale or repeated; using normal cadence.", false);
+                        } else if (!error.empty()) {
+                            personCameraPending = false;
+                            personProblem(error.c_str(), false);
+                        }
+                    }
+                }
+                if (detectorReady && personInputReady) {
+                    if (!validPersonSource(personInput->source, GetTickCount64())) {
+                        personInputReady = false;
+                        personProblem(L"The camera person-check image became stale before submission; using normal cadence.", false);
+                    } else if (personClient->submit(*personInput)) {
+                        personSubmitted = personInput->source; personInputReady = false; personInferencePending = true;
+                    }
+                }
+                if (state == PersonPoll::Pending || personInferencePending || personCameraPending || personInputReady)
+                    nextPersonPoll = Clock::now() + std::chrono::milliseconds(50);
+            } catch (...) {
+                personProblem(L"Person checks could not allocate a resource; using normal cadence.", true);
+            }
+            inspectSkipping();
+        };
         auto observeSources = [&](const Settings& cfg) {
+            if (personMode) { observePeople(); return; }
             if (!observing || !writing || paused || Clock::now() < nextObservation) return;
             nextObservation = Clock::now() + std::chrono::milliseconds(TimeSkipObservationMs);
             for (unsigned source = 0; source < 2; ++source) if (observedSources & (1u << source)) {
@@ -534,7 +678,10 @@ void Engine::run() {
                   // wake immediately and publish their precise elapsed time.
                   if (writing && !paused) deadline = std::min(deadline, lastTick + std::chrono::seconds(1));
                   if (writing && !paused && skipping) {
-                      if (observing) deadline = std::min(deadline, nextObservation);
+                      if (observing) {
+                          deadline = std::min(deadline, nextObservation);
+                          if (personMode) deadline = std::min(deadline, nextPersonPoll);
+                      }
                       if (skipDecision.nextBoundaryMs > 0)
                           deadline = std::min(deadline, lastTick + (std::chrono::milliseconds(skipDecision.nextBoundaryMs) - activeDuration));
                   }
@@ -571,6 +718,7 @@ void Engine::run() {
                 if (FAILED(com)) { publishError(L"Windows media initialization failed: " + errorText(com), true); continue; }
                 if (start) {
                     previewOnlyWork = false;
+                    personFault = false; personFailure = {};
                     session.emplace(cfg); pending = true; elapsed = 0;
                     activeDuration = Clock::duration::zero(); recordingLimitReached = false;
                     cancelNight(); nightMode = usesNightCamera(cfg);

@@ -138,6 +138,7 @@ int fakeHost(const wchar_t*) { require(false,"Unexpected application entry"); re
 #define runCameraHost fakeHost
 #pragma warning(push)
 #pragma warning(disable: 4702) // The helper-entry sentinel makes GUI entry unreachable.
+#include "ui_person_pack_stub.h"
 #include "../src/main.cpp"
 #pragma warning(pop)
 #undef CreateSolidBrush

@@ -246,3 +246,5 @@ int main() {
     MFShutdown(); CoUninitialize();
     return result;
 }
+
+#include "engine_person_camera_stub.h"

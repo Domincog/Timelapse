@@ -34,6 +34,8 @@ void setupSkip(){
     app.advanced=app.nightHint=app.nightDetail=nullptr;app.customDialog=nullptr;app.advancedExpanded=false;app.hiddenToTray=false;
     app.hasCustomInterval=app.hasCustomSize=app.hasCustomLimit=false;choose(app.interval,2);choose(app.videoSize,0);choose(app.stopAfter,0);
     seed(false);skipScript={};skipDialogCalls=0;skipDialogFailure=false;
+    app.personPack={};app.personPackKnown=false;lapse::uiPersonPackInfo={};lapse::uiPersonPackInspections=0;
+    lapse::uiPersonPackDialogs=0;lapse::uiPersonPackOwner=nullptr;lapse::uiPersonPackInstallOnDialog=false;
 }
 void mode(HWND window,SkipDraft& draft,TimeSkipMode value){choose(draft.mode,static_cast<int>(value));skipProc(window,WM_COMMAND,MAKEWPARAM(SkipMode,CBN_SELCHANGE),reinterpret_cast<LPARAM>(draft.mode));}
 void rangeDraft(HWND window,CustomDraft& draft,int start,int end){SetWindowTextW(draft.first,std::to_wstring(start).c_str());SetWindowTextW(draft.second,std::to_wstring(end).c_str());customProc(window,WM_COMMAND,IDOK,0);}
@@ -169,6 +171,84 @@ void statusAndNestedClose(){
     editSkip();require(!app.customDialog && app.settings.timeSkip.mode==TimeSkipMode::Quiet,"Nested close left an orphan dialog or committed draft.");
     std::cout<<"PASS truthful live status, failure priority, hidden deferral, pause wording and nested close ownership\n";
 }
+void personModesAndManagement(){
+    HiddenFixture owned;setupSkip();const int initial=lapse::configurationCalls;
+    skipScript=[](HWND window,DLGPROC,LPARAM parameter){
+        auto& draft=*reinterpret_cast<SkipDraft*>(parameter);
+        const auto visible=[](HWND child){return (GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0;};
+        require(SendMessageW(draft.mode,CB_GETCOUNT,0,0)==6 && lapse::uiPersonPackInspections==0 && !visible(draft.packManage),
+            "Default editor inspected pack or lacks six explicit modes.");
+        mode(window,draft,TimeSkipMode::NoPerson);
+        require(lapse::uiPersonPackInspections==1 && lapse::uiPersonPackDialogs==0 && visible(draft.packInfo) && visible(draft.packManage),
+            "Person mode did not expose one inspected explicit management action.");
+        require(caption(draft.labels[3]).find(L"person")!=std::wstring::npos && visible(draft.quiet) && !visible(draft.ranges),
+            "Person mode did not reuse dwell without an unsolicited schedule.");
+        require(caption(draft.packInfo).find(L"not selected")!=std::wstring::npos && caption(draft.help).find(L"even when other things move")!=std::wstring::npos,
+            "Person scope/absence trigger explanation missing.");
+        for(int i=0;i<10;++i){skipLayout(window,draft);skipHelp(draft);updateControls();}
+        require(lapse::uiPersonPackInspections==1 && !lapse::uiPersonPackDialogs,"Repeated layout/status inspected or opened the pack.");
+        lapse::uiPersonPackInstallOnDialog=true;skipProc(window,WM_COMMAND,SkipPackManage,0);
+        require(lapse::uiPersonPackDialogs==1 && lapse::uiPersonPackOwner==window && lapse::uiPersonPackInspections==2 &&
+            caption(draft.packInfo).find(L"installed")!=std::wstring::npos,"Explicit manager did not refresh cached availability.");
+        mode(window,draft,TimeSkipMode::Quiet);skipProc(window,WM_COMMAND,SkipPackManage,0);
+        require(!visible(draft.packManage) && lapse::uiPersonPackDialogs==1,"Hidden manager remained actionable outside person mode.");
+        mode(window,draft,TimeSkipMode::NoPersonWithinSchedule);
+        require(visible(draft.ranges) && visible(draft.quiet) && lapse::uiPersonPackInspections==2,"Person schedule lost controls or repeated hash inspection.");
+        skipProc(window,WM_COMMAND,IDCANCEL,0);
+    };
+    editSkip();require(app.settings.timeSkip.mode==TimeSkipMode::Off && lapse::configurationCalls==initial && app.personPackKnown,
+        "Explicit pack management committed a cancelled recording policy.");
+    skipScript=[](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);
+        mode(window,draft,TimeSkipMode::NoPersonWithinSchedule);SetWindowTextW(draft.quiet,L"1.5");choose(draft.quietUnits,1);
+        draft.policy.rangeCount=1;draft.policy.ranges[0]={0,600};skipList(draft);skipProc(window,WM_COMMAND,IDOK,0);require(outcome()==IDOK,"Valid person policy rejected.");};
+    editSkip();require(app.settings.timeSkip.mode==TimeSkipMode::NoPersonWithinSchedule && app.settings.timeSkip.quietAfterMs==90000 &&
+        app.settings.timeSkip.rangeCount==1 && app.settings.timeSkip.ranges[0].endSeconds==600 && IsWindowEnabled(app.record),
+        "Exact person policy lost values or camera-only checks blocked ordinary desktop recording.");
+    const unsigned inspections=lapse::uiPersonPackInspections,dialogs=lapse::uiPersonPackDialogs;
+    for(auto state:{State::Starting,State::Recording,State::Paused,State::Finishing}){
+        app.status.state=state;
+        skipScript=[](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);
+            require(draft.readOnly && !IsWindowEnabled(draft.packManage),"Active manager remained enabled.");
+            skipProc(window,WM_COMMAND,SkipPackManage,0);skipProc(window,WM_COMMAND,IDCANCEL,0);};
+        editSkip();
+    }
+    require(inspections==lapse::uiPersonPackInspections && dialogs==lapse::uiPersonPackDialogs,"Active inspection/forged management did pack work.");
+    app.status={};std::cout<<"PASS explicit person modes, exact reused dwell/schedule, cached management, cancel isolation and active locks\n";
 }
-int main(){try{transactionalRanges();boundsAndFreeze();modalLayoutAndInactiveDraft();strictPolicy();nativeCompressionInsertion();statusAndNestedClose();std::cout<<"All six time-compression UI groups passed using owned hidden windows only.\n";return 0;}
+void personLayoutAndStatus(){
+    HiddenFixture owned;setupSkip();app.settings.timeSkip.mode=TimeSkipMode::NoPersonWithinSchedule;
+    app.settings.timeSkip.rangeCount=1;app.settings.timeSkip.ranges[0]={0,600};
+    skipScript=[](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);
+        for(int dpi:{96,144,192,288}){
+            RECT suggested{0,0,320,260};skipProc(window,WM_DPICHANGED,MAKELONG(dpi,dpi),reinterpret_cast<LPARAM>(&suggested));
+            for(HWND child:{draft.packInfo,draft.help,draft.error}){RECT bounds{};GetClientRect(child,&bounds);wchar_t value[2048]{};GetWindowTextW(child,value,2048);
+                RECT measured{0,0,bounds.right,0};HDC dc=GetDC(window);auto prior=SelectObject(dc,draft.font);
+                DrawTextW(dc,value,-1,&measured,DT_CALCRECT|DT_WORDBREAK|DT_NOPREFIX);SelectObject(dc,prior);ReleaseDC(window,dc);
+                require(bounds.bottom>=measured.bottom,"Person management/help text clipped at constrained DPI.");}
+            for(HWND child:{draft.quiet,draft.packManage,draft.ranges,draft.repeat,draft.okay,draft.cancel}){
+                skipReveal(window,draft,child);RECT bounds{},client{};GetWindowRect(child,&bounds);MapWindowPoints(nullptr,window,reinterpret_cast<POINT*>(&bounds),2);GetClientRect(window,&client);
+                require(bounds.right>0 && bounds.left<client.right && bounds.bottom>0 && bounds.top<client.bottom,"Person dialog keyboard control unreachable.");}
+            HDC dc=GetDC(window);auto prior=SelectObject(dc,draft.font);RECT combo{};GetClientRect(draft.mode,&combo);
+            for(const auto* label:SkipModeLabels){SIZE size{};GetTextExtentPoint32W(dc,label,static_cast<int>(std::wcslen(label)),&size);
+                require(size.cx+draft.scale(28)<=combo.right,"Selected person mode label truncates at minimum canvas width.");}
+            auto manage=caption(draft.packManage);manage.erase(std::remove(manage.begin(),manage.end(),L'&'),manage.end());SIZE extent{};RECT button{};GetClientRect(draft.packManage,&button);
+            GetTextExtentPoint32W(dc,manage.c_str(),static_cast<int>(manage.size()),&extent);
+            require(extent.cx+draft.scale(12)<=button.right,"Detector management button truncates at constrained DPI.");
+            SelectObject(dc,prior);ReleaseDC(window,dc);
+        }
+        skipProc(window,WM_COMMAND,IDCANCEL,0);
+    };
+    editSkip();app.advancedExpanded=true;++app.skipRevision;
+    Status status;status.state=State::Recording;status.timeSkip.enabled=true;status.timeSkip.intervalMs=20000;
+    status.timeSkip.lastCheckTick=GetTickCount64()-2000;status.message=L"Keep original save failure";status.error=true;
+    for(auto item:{std::pair{TimeSkipReason::NoPerson,L"No person detected"},std::pair{TimeSkipReason::PersonPresent,L"Person detected"},
+        std::pair{TimeSkipReason::Checking,L"Checking for absence"},std::pair{TimeSkipReason::Unavailable,L"Checks unavailable"}}){
+        status.timeSkip.reason=item.first;applyStatus(status,true);require(app.skipDetailCaption.find(item.second)!=std::wstring::npos &&
+            app.skipDetailCaption.find(L"source check")!=std::wstring::npos && statusCaption()==L"Keep original save failure", "Person status lost scope, age or error priority.");}
+    const unsigned inspections=lapse::uiPersonPackInspections;for(int i=0;i<10;++i)applyStatus(status);
+    require(lapse::uiPersonPackInspections==inspections,"Person status polling hashed the pack.");
+    app.status={};std::cout<<"PASS person modal DPI/wrap/focus/labels and truthful status without polling pack work\n";
+}
+}
+int main(){try{transactionalRanges();boundsAndFreeze();modalLayoutAndInactiveDraft();strictPolicy();nativeCompressionInsertion();statusAndNestedClose();personModesAndManagement();personLayoutAndStatus();std::cout<<"All eight time-compression UI groups passed using owned hidden windows only.\n";return 0;}
 catch(const std::exception& error){std::cerr<<"TIME COMPRESSION UI FAILURE: "<<error.what()<<'\n';return 1;}}

@@ -1,0 +1,23 @@
+Timelapse optional person-detection worker (candidate, 2026).
+
+The separately built worker contains Tencent/ncnn runtime code and the official
+NanoDet-m320 stored-FP16 model; inference uses CPU float arithmetic.
+
+ncnn: Tencent, tag 20260526, commit e54f7b1f88434e1d844ea0551b880a1cfb079ce1.
+Copyright (C) 2017 Tencent. BSD 3-Clause and bundled third-party notices are
+retained verbatim in ncnn-LICENSE.txt. Runtime sources are unchanged; build
+configuration removes unused operators, quantized inference, graphics backends
+and threading. Runtime dispatch retains SSE2 baseline and optional AVX-family
+kernels. No OpenCV dependency is included.
+
+NanoDet: RangiLyu, v0.4.0, commit c63d7cb0b9bfb2e742d9cc8d3fb26eb00df3221e.
+Copyright 2020-2021 RangiLyu. Apache License 2.0 is retained in
+NanoDet-LICENSE.txt. The official ncnn-nanodet-m.zip release supplies the exact
+nanodet_m.param and nanodet_m.bin files embedded without modification.
+Preprocessing and output decoding follow the release's ncnn demonstration;
+Timelapse adds bounded full-scene input, strict finite/shape checks, conservative
+absence thresholds, a low-detail gate, and independent process supervision.
+
+The model is an imperfect visual detector. Its result is an optional sampling
+hint, not proof that a scene is empty. No third-party endorsement is implied.
+This build carries no evaluation photographs or training dataset.

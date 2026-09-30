@@ -86,6 +86,7 @@ int runCameraHost(const wchar_t*){throw std::runtime_error("Unexpected applicati
 #define GetTickCount64 probe::ticks
 #pragma warning(push)
 #pragma warning(disable: 4702)
+#include "ui_person_pack_stub.h"
 #include "../src/main.cpp"
 #pragma warning(pop)
 #undef Engine

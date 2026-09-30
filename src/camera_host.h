@@ -2,6 +2,7 @@
 #include "core.h"
 #include "night.h"
 #include "time_skip.h"
+#include "person_protocol.h"
 
 namespace lapse {
 struct NightWindowResult {
@@ -13,6 +14,10 @@ struct CameraObservation {
     TimeSkipDescriptor descriptor;
     uint64_t epoch = 0, sequence = 0, receivedTick = 0;
     int sourceWidth = 0, sourceHeight = 0;
+};
+struct CameraPersonInput {
+    person::Source source;
+    person::Input bgr;
 };
 // Camera drivers run in a private child of the same portable executable.
 // start/latest do not wait for driver activation or a new camera frame.
@@ -38,8 +43,13 @@ public:
     // false with an empty error means pending/duplicate, never evidence of quiet.
     // A token identifies the current recording/source selection, not an image.
     bool observeActivity(uint64_t token, CameraObservation& output, std::wstring& error);
+    // Full-scene raw thumbnail for the independent optional detector. Its
+    // additional mapping and pixel buffers are created only on first demand.
+    // Mutually exclusive with activity observation for a session token.
+    bool personInput(uint64_t token, CameraPersonInput& output, std::wstring& error, bool requestNew = true);
     void cancelActivityObservation() noexcept;
 private:
+    bool observe(uint64_t token, CameraObservation*, CameraPersonInput*, std::wstring& error, bool requestNew);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

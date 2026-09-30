@@ -138,6 +138,7 @@ DWORD WINAPI fixtureProfileString(LPCWSTR,LPCWSTR key,LPCWSTR fallback,LPWSTR ta
 #define CreateMutexW fixtureCreateMutex
 #define CloseHandle fixtureCloseHandle
 #define RegisterWindowMessageW fixtureRegisterMessage
+#include "ui_person_pack_stub.h"
 #include "../src/main.cpp"
 #undef SHGetKnownFolderPath
 #undef CoTaskMemFree

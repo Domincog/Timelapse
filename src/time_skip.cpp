@@ -8,7 +8,7 @@ namespace {
 constexpr int pixels = TimeSkipWidth * TimeSkipHeight;
 enum class Invalid { None, Mode, Multiplier, Quiet, Ramp, Repeat, Count, Range, Period, Empty };
 Invalid normalize(TimeSkipSettings& value) noexcept {
-    if (value.mode < TimeSkipMode::Off || value.mode > TimeSkipMode::QuietWithinSchedule) return Invalid::Mode;
+    if (value.mode < TimeSkipMode::Off || value.mode > TimeSkipMode::NoPersonWithinSchedule) return Invalid::Mode;
     if (value.multiplier < 2 || value.multiplier > 64) return Invalid::Multiplier;
     if (value.quietAfterMs < 1000 || value.quietAfterMs > int64_t(INT_MAX) * 1000 || value.quietAfterMs % 1000) return Invalid::Quiet;
     if (value.rampFrames != 15 && value.rampFrames != 30 && value.rampFrames != 60) return Invalid::Ramp;
@@ -30,10 +30,12 @@ Invalid normalize(TimeSkipSettings& value) noexcept {
     }
     value.rangeCount = count;
     for (unsigned i = count; i < TimeSkipMaxRanges; ++i) value.ranges[i] = {};
-    if (!count && (value.mode == TimeSkipMode::Manual || value.mode == TimeSkipMode::QuietWithinSchedule)) return Invalid::Empty;
+    if (!count && (value.mode == TimeSkipMode::Manual || value.mode == TimeSkipMode::QuietWithinSchedule ||
+                  value.mode == TimeSkipMode::NoPersonWithinSchedule)) return Invalid::Empty;
     return Invalid::None;
 }
 bool automatic(TimeSkipMode mode) noexcept { return mode == TimeSkipMode::Quiet || mode == TimeSkipMode::QuietWithinSchedule; }
+bool personMode(TimeSkipMode mode) noexcept { return mode == TimeSkipMode::NoPerson || mode == TimeSkipMode::NoPersonWithinSchedule; }
 int64_t addBounded(int64_t a, int64_t b) noexcept {
     return b > INT64_MAX - a ? INT64_MAX : a + b;
 }
@@ -120,7 +122,9 @@ bool normalizeTimeSkipSettings(TimeSkipSettings& settings, std::wstring& error) 
     case Invalid::None: settings = candidate; return true;
     case Invalid::Mode: error = L"Choose a valid time-compression mode."; break;
     case Invalid::Multiplier: error = L"Time-compression speed must be between 2 and 64 times the normal capture interval."; break;
-    case Invalid::Quiet: error = L"Quiet time must be a whole number of seconds between 1 and 2147483647."; break;
+    case Invalid::Quiet: error = personMode(settings.mode)
+        ? L"No-person time must be a whole number of seconds between 1 and 2147483647."
+        : L"Quiet time must be a whole number of seconds between 1 and 2147483647."; break;
     case Invalid::Ramp: error = L"Choose a transition of 15, 30, or 60 output frames."; break;
     case Invalid::Repeat: error = L"The schedule repeat duration cannot be negative."; break;
     case Invalid::Count: error = L"Use at most 16 time-compression ranges."; break;
@@ -153,8 +157,10 @@ bool TimeSkipController::reset(const TimeSkipSettings& settings, int64_t base, u
     phase_ = 0; descending_ = finished_ = returnPending_ = false;
     lastInspectMs_ = lastFrameMs_ = windowStartMs_ = -1; windowEndMs_ = 0;
     for (auto& source : sources_) { source.initialized = source.available = source.compared = false; source.observationMs = -1; source.weak = 0; }
+    person_ = {};
     if (base != baseMs_ || mask > 3 || normalize(settings_) != Invalid::None) { settings_.mode = TimeSkipMode::Off; return false; }
     if (automatic(settings_.mode) && !mask) { settings_.mode = TimeSkipMode::Off; return false; }
+    if (personMode(settings_.mode) && !(mask & 2)) { settings_.mode = TimeSkipMode::Off; return false; }
     for (int i = 0; i <= settings_.rampFrames; ++i) {
         const double x = double(i) / settings_.rampFrames;
         const double eased = x * x * x * (10 + x * (-15 + 6 * x));
@@ -169,6 +175,7 @@ void TimeSkipController::baseReturn() noexcept {
     phase_ = 0; descending_ = finished_ = false;
 }
 void TimeSkipController::unavailable(unsigned index) noexcept {
+    if (personMode(settings_.mode)) { if (index == 1) personUnavailable(); return; }
     if (index >= sources_.size() || !(sourceMask_ & (1u << index))) return;
     sources_[index].available = sources_[index].initialized = sources_[index].compared = false;
     sources_[index].weak = 0;
@@ -176,6 +183,7 @@ void TimeSkipController::unavailable(unsigned index) noexcept {
 }
 bool TimeSkipController::observe(unsigned index, const TimeSkipDescriptor& input, uint64_t epoch,
                                  uint64_t sequence, int64_t activeMs) noexcept {
+    if (personMode(settings_.mode)) return false;
     if (!valid_ || index >= sources_.size() || !(sourceMask_ & (1u << index))) return false;
     auto& source = sources_[index];
     if (!epoch || !sequence || activeMs < 0 || (source.initialized && epoch == source.epoch &&
@@ -202,26 +210,72 @@ bool TimeSkipController::observe(unsigned index, const TimeSkipDescriptor& input
     source.previous = input; source.sequence = sequence; source.observationMs = activeMs; source.available = true;
     return true;
 }
+void TimeSkipController::personUnavailable() noexcept {
+    if (!personMode(settings_.mode)) return;
+    person_.available = false; person_.presence = PersonPresence::Unknown;
+    person_.absentSinceMs = -1; person_.absentCount = 0;
+    baseReturn();
+}
+bool TimeSkipController::observePerson(const PersonObservation& input) noexcept {
+    if (!valid_ || !personMode(settings_.mode) || !(sourceMask_ & 2)) return false;
+    if (input.presence < PersonPresence::Unknown || input.presence > PersonPresence::QualifiedAbsent ||
+        !input.epoch || !input.sequence || input.activeMs < 0 ||
+        (person_.initialized && (input.activeMs <= person_.observationMs ||
+            (input.epoch == person_.epoch && input.sequence <= person_.sequence)))) {
+        personUnavailable(); return false;
+    }
+    const bool restart = !person_.initialized || !person_.available || input.epoch != person_.epoch ||
+        input.activeMs - person_.observationMs > 3000;
+    if (restart) personUnavailable();
+    person_.epoch = input.epoch; person_.sequence = input.sequence;
+    person_.observationMs = input.activeMs; person_.initialized = true;
+    person_.presence = input.presence; person_.available = input.presence != PersonPresence::Unknown;
+    if (input.presence != PersonPresence::QualifiedAbsent) {
+        person_.absentSinceMs = -1; person_.absentCount = 0; baseReturn();
+    } else {
+        if (!person_.absentCount) person_.absentSinceMs = input.activeMs;
+        if (person_.absentCount < 2) ++person_.absentCount;
+    }
+    return true;
+}
 TimeSkipDecision TimeSkipController::evaluate(int64_t activeMs) noexcept {
     TimeSkipDecision result; result.intervalMs = baseMs_;
     if (!valid_ || settings_.mode == TimeSkipMode::Off) return result;
     if (activeMs < 0 || (lastInspectMs_ >= 0 && activeMs < lastInspectMs_)) {
         for (unsigned i = 0; i < sources_.size(); ++i) unavailable(i);
+        personUnavailable();
         baseReturn(); windowStartMs_ = -1; windowEndMs_ = 0; lastFrameMs_ = -1;
         result.reason = TimeSkipReason::Unavailable; lastInspectMs_ = activeMs; return result;
     }
     lastInspectMs_ = activeMs;
     const auto window = windowAt(settings_, activeMs);
-    const bool scheduled = settings_.mode == TimeSkipMode::Manual || settings_.mode == TimeSkipMode::QuietWithinSchedule;
+    const bool scheduled = settings_.mode == TimeSkipMode::Manual || settings_.mode == TimeSkipMode::QuietWithinSchedule ||
+        settings_.mode == TimeSkipMode::NoPersonWithinSchedule;
     result.insideSchedule = window.inside;
     if (scheduled) {
         result.nextBoundaryMs = window.next;
         const int64_t start = window.inside ? window.start : -1;
         if (start != windowStartMs_) { baseReturn(); windowStartMs_ = start; }
         windowEndMs_ = window.inside ? window.end : 0;
-        if (!window.inside) { baseReturn(); result.reason = TimeSkipReason::Normal; return result; }
+        if (!window.inside) {
+            if (personMode(settings_.mode) && (!person_.initialized || !person_.available ||
+                person_.observationMs > activeMs || activeMs - person_.observationMs > 3000))
+                personUnavailable();
+            baseReturn(); result.reason = TimeSkipReason::Normal; return result;
+        }
     }
-    if (automatic(settings_.mode)) {
+    if (personMode(settings_.mode)) {
+        if (!person_.initialized || !person_.available || person_.observationMs > activeMs || activeMs - person_.observationMs > 3000) {
+            personUnavailable(); result.reason = TimeSkipReason::Unavailable; return result;
+        }
+        if (person_.presence == PersonPresence::Present) {
+            baseReturn(); result.reason = TimeSkipReason::PersonPresent; return result;
+        }
+        if (person_.absentCount < 2 || person_.observationMs - person_.absentSinceMs < settings_.quietAfterMs) {
+            baseReturn(); result.reason = TimeSkipReason::Checking; return result;
+        }
+        result.reason = TimeSkipReason::NoPerson;
+    } else if (automatic(settings_.mode)) {
         bool quiet = true;
         for (unsigned i = 0; i < sources_.size(); ++i) if (sourceMask_ & (1u << i)) {
             auto& source = sources_[i];
@@ -243,7 +297,7 @@ int64_t TimeSkipController::onFrame(int64_t activeMs) noexcept {
     const auto status = evaluate(activeMs);
     if (activeMs < 0 || activeMs <= lastFrameMs_) return status.intervalMs;
     lastFrameMs_ = activeMs; returnPending_ = false;
-    if (status.reason != TimeSkipReason::Quiet && status.reason != TimeSkipReason::Manual) return baseMs_;
+    if (status.reason != TimeSkipReason::Quiet && status.reason != TimeSkipReason::Manual && status.reason != TimeSkipReason::NoPerson) return baseMs_;
     if (finished_) return baseMs_;
     const bool bounded = windowEndMs_ != 0;
     const int64_t remaining = bounded ? std::max(int64_t(0), windowEndMs_ - activeMs) : INT64_MAX;
