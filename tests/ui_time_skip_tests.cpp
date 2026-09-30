@@ -2,6 +2,7 @@
 // nonactivating tool window wholly offscreen; other dialogs remain hidden.
 // No device capture, ordinary application launch, persistent UI or settings I/O.
 #include <windows.h>
+#include <commctrl.h>
 #include <functional>
 #include <vector>
 namespace {
@@ -10,16 +11,38 @@ struct ModalOutcome {HWND window{};INT_PTR value=0;};
 std::vector<ModalOutcome> modalOutcomes;
 int skipDialogCalls=0;
 bool skipDialogFailure=false;
+HWND reportedOpenWheelCombo{},yieldWheelCombo{};
+int nativeWheelYields=0;
+BOOL WINAPI skipWheelPreference(UINT action,UINT parameter,PVOID value,UINT flags){
+    if(action==SPI_GETWHEELSCROLLLINES || action==SPI_GETWHEELSCROLLCHARS){*static_cast<UINT*>(value)=3;return TRUE;}
+    return SystemParametersInfoW(action,parameter,value,flags);
+}
+LRESULT WINAPI skipWheelSend(HWND window,UINT message,WPARAM wp,LPARAM lp){
+    if(message==CB_GETDROPPEDSTATE && window==reportedOpenWheelCombo)return TRUE;
+    return SendMessageW(window,message,wp,lp);
+}
+LRESULT CALLBACK skipWheelDefault(HWND window,UINT message,WPARAM wp,LPARAM lp){
+    // Observe native-control ownership without opening a popup or changing its
+    // selection during the explicit Ctrl/open-dropdown yield checks.
+    if(window==yieldWheelCombo && (message==WM_MOUSEWHEEL || message==WM_MOUSEHWHEEL)){++nativeWheelYields;return 0;}
+    return DefSubclassProc(window,message,wp,lp);
+}
 INT_PTR WINAPI skipOwnedDialog(HINSTANCE,LPCDLGTEMPLATEW,HWND,DLGPROC,LPARAM);
 BOOL WINAPI skipOwnedEndDialog(HWND window,INT_PTR value){for(auto& modal:modalOutcomes)if(modal.window==window)modal.value=value;return TRUE;}
 }
 #define DialogBoxIndirectParamW skipOwnedDialog
 #define EndDialog skipOwnedEndDialog
+#define SendMessageW skipWheelSend
+#define DefSubclassProc skipWheelDefault
+#define SystemParametersInfoW skipWheelPreference
 #define main sourceFixtureMain
 #include "ui_source_tests.cpp"
 #undef main
 #undef EndDialog
 #undef DialogBoxIndirectParamW
+#undef SendMessageW
+#undef DefSubclassProc
+#undef SystemParametersInfoW
 namespace {
 INT_PTR WINAPI skipOwnedDialog(HINSTANCE instance,LPCDLGTEMPLATEW resource,HWND owner,DLGPROC procedure,LPARAM parameter){
     ++skipDialogCalls;if(skipDialogFailure)return -1;
@@ -35,6 +58,7 @@ void setupSkip(){
     app.advanced=app.nightHint=app.nightDetail=nullptr;app.customDialog=nullptr;app.advancedExpanded=false;app.hiddenToTray=false;
     app.hasCustomInterval=app.hasCustomSize=app.hasCustomLimit=false;choose(app.interval,2);choose(app.videoSize,0);choose(app.stopAfter,0);
     seed(false);skipScript={};skipDialogCalls=0;skipDialogFailure=false;
+    reportedOpenWheelCombo=yieldWheelCombo=nullptr;nativeWheelYields=0;
     app.personPack={};app.personPackKnown=false;lapse::uiPersonPackInfo={};lapse::uiPersonPackInspections=0;
     lapse::uiPersonPackDialogs=0;lapse::uiPersonPackOwner=nullptr;lapse::uiPersonPackInstallOnDialog=false;
 }
@@ -394,6 +418,50 @@ void nativeScheduleMnemonicsAndReadOnlyEnter(){
     }
     app.status={};std::cout<<"PASS unambiguous native range/Remove mnemonics, canceled drafts and Enter-to-close across active states\n";
 }
+void nativePageWheelOwnership(){
+    const auto position=[](HWND window){SCROLLINFO info{sizeof(info),SIF_POS};require(GetScrollInfo(window,SB_VERT,&info)!=FALSE,"Native page scrollbar unavailable.");return info.nPos;};
+    const auto constrain=[](HWND window){RECT suggested{0,0,320,230};SendMessageW(window,WM_DPICHANGED,MAKELONG(192,192),reinterpret_cast<LPARAM>(&suggested));
+        SCROLLINFO info{sizeof(info),SIF_ALL};require(GetScrollInfo(window,SB_VERT,&info)!=FALSE && int64_t(info.nMax)-info.nPage+1>info.nMin,"Wheel fixture must have real vertical overflow.");};
+    const auto wheel=[](HWND target,WORD keys=0){SendMessageW(target,WM_MOUSEWHEEL,MAKEWPARAM(keys,static_cast<WORD>(-WHEEL_DELTA)),0);};
+    for(bool readOnly:{false,true}){
+        HiddenFixture owned;setupSkip();app.settings.timeSkip.mode=TimeSkipMode::QuietWithinSchedule;
+        app.settings.timeSkip.rangeCount=16;for(unsigned i=0;i<16;++i)app.settings.timeSkip.ranges[i]={int(i*60),int(i*60+30)};
+        app.status.state=readOnly?State::Recording:State::Idle;
+        const auto accepted=skipValues(app.settings.timeSkip);const int configurationCount=lapse::configurationCalls;int nested=0;HWND outer{};
+        skipScript=[&](HWND window,DLGPROC procedure,LPARAM parameter){
+            if(procedure==customProc){
+                ++nested;auto& draft=*reinterpret_cast<CustomDraft*>(parameter);require(outer && draft.kind==CustomKind::Range,"Unexpected nested wheel owner.");
+                constrain(window);const int outerBefore=position(outer);const auto first=caption(draft.first),second=caption(draft.second);
+                for(HWND target:{draft.help,draft.first}){SetFocus(draft.first);SendMessageW(window,WM_VSCROLL,SB_TOP,0);const HWND focused=GetFocus();wheel(target);
+                    require(position(window)>0 && position(outer)==outerBefore && GetFocus()==focused && !outcome(),"Nested wheel moved the outer page, changed focus or failed to scroll its own page.");}
+                require(caption(draft.first)==first && caption(draft.second)==second,"Nested page wheel changed range values.");
+                SendMessageW(window,WM_COMMAND,IDCANCEL,0);return;
+            }
+            auto& draft=*reinterpret_cast<SkipDraft*>(parameter);outer=window;require(draft.readOnly==readOnly,"Wheel inspection lock mismatch.");constrain(window);
+            const auto policy=skipValues(draft.policy);const int speed=choice(draft.speed);const auto quiet=caption(draft.quiet),repeat=caption(draft.repeat);
+            std::vector<HWND> targets{window,draft.help,draft.cancel};if(!readOnly){targets.push_back(draft.quiet);targets.push_back(draft.speed);}
+            for(HWND target:targets){SetFocus(readOnly?draft.cancel:draft.quiet);SendMessageW(window,WM_VSCROLL,SB_TOP,0);const HWND focused=GetFocus();wheel(target);
+                require(position(window)>0 && GetFocus()==focused && !outcome(),"Compression wheel did not scroll the page without focus/action side effects.");
+                require(choice(draft.speed)==speed && caption(draft.quiet)==quiet && caption(draft.repeat)==repeat && skipValues(draft.policy)==policy,"Page or closed-combo wheel changed the compression draft.");}
+            if(!readOnly){
+                struct YieldReset {~YieldReset(){reportedOpenWheelCombo=yieldWheelCombo=nullptr;}} reset;
+                yieldWheelCombo=draft.speed;SendMessageW(window,WM_VSCROLL,SB_TOP,0);const int before=nativeWheelYields;
+                wheel(draft.speed,MK_CONTROL);require(position(window)==0 && nativeWheelYields==before+1,"Ctrl+wheel failed to yield to native combo processing.");
+                reportedOpenWheelCombo=draft.speed;wheel(draft.speed);require(position(window)==0 && nativeWheelYields==before+2,"Open dropdown failed to retain native wheel ownership.");
+            }
+            SetFocus(draft.ranges);SendMessageW(window,WM_VSCROLL,SB_TOP,0);SendMessageW(draft.ranges,LB_SETTOPINDEX,0,0);
+            const auto selected=SendMessageW(draft.ranges,LB_GETCURSEL,0,0);UINT nativeLines=3;SystemParametersInfoW(SPI_GETWHEELSCROLLLINES,0,&nativeLines,0);wheel(draft.ranges);
+            const auto listTop=SendMessageW(draft.ranges,LB_GETTOPINDEX,0,0);
+            require((nativeLines?listTop>0:listTop==0) && position(window)==0 && SendMessageW(draft.ranges,LB_GETCURSEL,0,0)==selected && !outcome(),"Native range list wheel moved its parent or changed selection instead of preserving local scroll behavior.");
+            if(!readOnly){SendMessageW(draft.edit,BM_CLICK,0,0);require(nested==1 && app.customDialog==window && !outcome(),"Nested range wheel left wrong modal ownership.");}
+            require(skipValues(draft.policy)==policy && choice(draft.speed)==speed && caption(draft.quiet)==quiet && caption(draft.repeat)==repeat,"Wheel inspection changed the final draft.");
+            require(!IsWindowVisible(window) && !IsWindowVisible(app.window),"Wheel fixture became visible.");SendMessageW(window,WM_COMMAND,IDCANCEL,0);
+        };
+        editSkip();require(skipValues(app.settings.timeSkip)==accepted && lapse::configurationCalls==configurationCount && !app.customDialog && !lapse::recordCalls,"Wheel navigation committed settings, started capture or left a modal.");
+        app.status={};
+    }
+    std::cout<<"PASS compression page/closed-combo wheel, native list ownership, nested range isolation, read-only scrolling and safe Ctrl/open-dropdown yield\n";
 }
-int main(){try{transactionalRanges();boundsAndFreeze();modalLayoutAndInactiveDraft();strictPolicy();nativeCompressionInsertion();statusAndNestedClose();personModesAndManagement();personLayoutAndStatus();nativeModalButtons();fineTuning();nativeScheduleMnemonicsAndReadOnlyEnter();std::cout<<"All eleven time-compression UI groups passed using owned synthetic windows only.\n";return 0;}
+}
+int main(){try{transactionalRanges();boundsAndFreeze();modalLayoutAndInactiveDraft();strictPolicy();nativeCompressionInsertion();statusAndNestedClose();personModesAndManagement();personLayoutAndStatus();nativeModalButtons();fineTuning();nativeScheduleMnemonicsAndReadOnlyEnter();nativePageWheelOwnership();std::cout<<"All twelve time-compression UI groups passed using owned synthetic windows only.\n";return 0;}
 catch(const std::exception& error){std::cerr<<"TIME COMPRESSION UI FAILURE: "<<error.what()<<'\n';return 1;}}

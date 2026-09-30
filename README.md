@@ -88,6 +88,8 @@ In the collage preview, Space cycles between sources, arrow keys move the select
 
 On smaller work areas, scroll to reach the preview and controls. The wheel scrolls vertically, Shift + wheel scrolls horizontally, and keyboard navigation brings focused controls into view.
 
+Custom-value, Time compression and Watermark dialogs also support these wheel gestures. Closed dropdowns retain their values while you scroll an overflowing dialog; open dropdowns and the scheduled-ranges list keep their own scrolling. Wheel amount follows your Windows settings.
+
 The quality selector offers Smaller file, Balanced, and More detail. Balanced is the default. More detail prioritizes image detail; its file size depends on the scene and can grow substantially with motion, texture, or frequent cuts.
 
 Expand Advanced to choose an encoding mode separately from resolution and quality:

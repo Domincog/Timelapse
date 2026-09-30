@@ -9,16 +9,22 @@ struct ModalOutcome {HWND window{};INT_PTR value=0;};
 std::vector<ModalOutcome> modalOutcomes;
 int skipDialogCalls=0;
 bool skipDialogFailure=false;
+BOOL WINAPI watermarkWheelSettings(UINT action,UINT parameter,PVOID value,UINT flags){
+    if(action==SPI_GETWHEELSCROLLLINES || action==SPI_GETWHEELSCROLLCHARS){*static_cast<UINT*>(value)=3;return TRUE;}
+    return SystemParametersInfoW(action,parameter,value,flags);
+}
 INT_PTR WINAPI skipOwnedDialog(HINSTANCE,LPCDLGTEMPLATEW,HWND,DLGPROC,LPARAM);
 BOOL WINAPI skipOwnedEndDialog(HWND window,INT_PTR value){for(auto& modal:modalOutcomes)if(modal.window==window)modal.value=value;return TRUE;}
 }
 #define DialogBoxIndirectParamW skipOwnedDialog
 #define EndDialog skipOwnedEndDialog
+#define SystemParametersInfoW watermarkWheelSettings
 #define main sourceFixtureMain
 #include "ui_source_tests.cpp"
 #undef main
 #undef EndDialog
 #undef DialogBoxIndirectParamW
+#undef SystemParametersInfoW
 namespace {
 INT_PTR WINAPI skipOwnedDialog(HINSTANCE instance,LPCDLGTEMPLATEW resource,HWND owner,DLGPROC procedure,LPARAM parameter){
     ++skipDialogCalls;if(skipDialogFailure)return -1;
@@ -115,5 +121,66 @@ void nativeNavigationAndLifecycle(){
     require(!IsWindow(app.window)&&!app.customDialog,"Exit left watermark dialog or owner behind.");
     std::cout<<"PASS native focus/Space/click/Escape at constrained DPIs, dialog creation error and owned-modal Exit\n";
 }
+void nativeWheelNavigation(){
+    HiddenFixture owned;setupWatermark();app.settings.watermark.enabled=true;configure();
+    const auto accepted=app.settings.watermark;const int configurations=lapse::configurationCalls;
+    const auto wheel=[](HWND target,UINT message,short delta){RECT bounds{};GetWindowRect(target,&bounds);
+        SendMessageW(target,message,MAKEWPARAM(0,static_cast<WORD>(delta)),MAKELPARAM(bounds.left+4,bounds.top+4));};
+    const auto reach=[&](HWND window,HWND target){
+        for(int attempt=0;attempt<64;++attempt){RECT rect{},client{};GetWindowRect(target,&rect);MapWindowPoints(nullptr,window,reinterpret_cast<POINT*>(&rect),2);GetClientRect(window,&client);
+            // Coarse wheel steps need not land in the narrow range that fully
+            // fits a wide control. Its usable center must be reachable; the
+            // keyboard tests separately prove exact full-fit focus reveal.
+            const int centerX=(rect.left+rect.right)/2,centerY=(rect.top+rect.bottom)/2;
+            if(centerX>=0 && centerX<client.right && centerY>=0 && centerY<client.bottom)return;
+            if(centerX<0 || centerX>=client.right)wheel(window,WM_MOUSEHWHEEL,centerX<0?-WHEEL_DELTA:WHEEL_DELTA);
+            if(centerY<0 || centerY>=client.bottom)wheel(window,WM_MOUSEWHEEL,centerY<0?WHEEL_DELTA:-WHEEL_DELTA);
+        }
+        require(false,"Watermark wheel navigation failed to reach a control's usable center.");
+    };
+    for(int dpi:{96,192,288}){
+        skipScript=[&](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<WatermarkDraft*>(parameter);
+            markSelect(window,draft.timeKind,MarkTimeKind,1);markSelect(window,draft.position,MarkPosition,4);markSelect(window,draft.size,MarkSize,2);
+            SetWindowTextW(draft.x,L"12.34");SetWindowTextW(draft.y,L"56.78");
+            RECT proposed{0,0,360,250};SendMessageW(window,WM_DPICHANGED,MAKELONG(dpi,dpi),reinterpret_cast<LPARAM>(&proposed));
+            SetWindowPos(window,nullptr,0,0,360,250,SWP_NOZORDER|SWP_NOACTIVATE);watermarkLayout(window,draft);
+            require((GetWindowLongPtrW(window,GWL_STYLE)&(WS_HSCROLL|WS_VSCROLL))==(WS_HSCROLL|WS_VSCROLL),"Watermark wheel fixture lacks two-axis overflow.");
+            const auto pixels=draft.illustration.pixels;const auto previousObserved=observedStatus;observedStatus=draft.error;
+            SetFocus(draft.x);const auto focused=GetFocus();require(focused==draft.x,"Watermark wheel fixture lost native edit focus.");
+            statusWrites=0;
+            for(HWND target:{window,draft.help,draft.enabled,draft.x,draft.preview,draft.timeKind,draft.position,draft.size}){
+                SendMessageW(window,WM_VSCROLL,SB_TOP,0);const int before=draft.scrollY;
+                wheel(target,WM_MOUSEWHEEL,-WHEEL_DELTA);
+                require(draft.scrollY>before && GetFocus()==focused && !outcome(),"Native watermark wheel did not scroll the page without moving focus or closing it.");
+                require(choice(draft.timeKind)==1 && choice(draft.position)==4 && choice(draft.size)==2 && caption(draft.x)==L"12.34" && caption(draft.y)==L"56.78",
+                    "Page wheel changed watermark time, placement, text size or exact coordinate text.");
+            }
+            reach(window,draft.position);reach(window,draft.x);reach(window,draft.y);reach(window,draft.okay);
+            require(statusWrites==0 && draft.illustration.pixels==pixels && GetFocus()==focused,"Scrolling regenerated the illustration, changed its pixels or snapped back to focused content.");
+            // Every illustration rebuild writes draft.error through the existing text seam.
+            observedStatus=previousObserved;watermarkProc(window,WM_COMMAND,IDCANCEL,0);
+        };editWatermark();
+        require(sameWatermarkSettings(accepted,app.settings.watermark)&&lapse::configurationCalls==configurations,"Wheel/Cancel committed watermark changes.");
+    }
+    app.status.state=State::Recording;
+    skipScript=[&](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<WatermarkDraft*>(parameter);
+        RECT proposed{0,0,360,250};SendMessageW(window,WM_DPICHANGED,MAKELONG(192,192),reinterpret_cast<LPARAM>(&proposed));
+        SetWindowPos(window,nullptr,0,0,360,250,SWP_NOZORDER|SWP_NOACTIVATE);watermarkLayout(window,draft);SendMessageW(window,WM_VSCROLL,SB_TOP,0);
+        const auto pixels=draft.illustration.pixels;const int before=draft.scrollY;wheel(draft.help,WM_MOUSEWHEEL,-WHEEL_DELTA);
+        require(draft.readOnly && draft.scrollY>before && !IsWindowEnabled(draft.position) && !markVisible(draft.okay),"Read-only watermark inspection did not scroll while preserving recording locks.");
+        reach(window,draft.cancel);require(draft.illustration.pixels==pixels&&!outcome(),"Read-only wheel altered illustration or closed inspection.");
+        watermarkProc(window,WM_COMMAND,IDCANCEL,0);
+    };editWatermark();app.status={};
+    require(sameWatermarkSettings(accepted,app.settings.watermark)&&lapse::configurationCalls==configurations,"Read-only wheel changed the recording policy.");
+    skipScript=[&](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<WatermarkDraft*>(parameter);
+        SetWindowPos(window,nullptr,0,0,1200,1600,SWP_NOZORDER|SWP_NOACTIVATE);watermarkLayout(window,draft);
+        SCROLLINFO info{sizeof(info),SIF_ALL};GetScrollInfo(window,SB_VERT,&info);require(info.nMax<int(info.nPage),"Native combo control needs a page without vertical overflow.");
+        SetFocus(draft.size);choose(draft.size,0);wheel(draft.size,WM_MOUSEWHEEL,-WHEEL_DELTA);
+        require(choice(draft.size)==1 && draft.scrollY==0 && !outcome(),"Non-overflow watermark combo lost its native wheel behavior.");
+        watermarkProc(window,WM_COMMAND,IDCANCEL,0);
+    };editWatermark();
+    require(sameWatermarkSettings(accepted,app.settings.watermark)&&lapse::configurationCalls==configurations,"Native combo/Cancel changed accepted watermark settings.");
+    std::cout<<"PASS native watermark page wheel across controls and DPIs, stable draft/illustration, coordinate/Apply reachability, read-only scrolling and native non-overflow combo behavior\n";
 }
-int main(){try{draftTransactions();fieldsPositionsAndOff();preflightAndFreeze();nativeNavigationAndLifecycle();std::cout<<"All four watermark UI groups passed with owned synthetic fixtures.\n";return 0;}catch(const std::exception& error){std::cerr<<"WATERMARK UI FAILURE: "<<error.what()<<'\n';return 1;}}
+}
+int main(){try{draftTransactions();fieldsPositionsAndOff();preflightAndFreeze();nativeNavigationAndLifecycle();nativeWheelNavigation();std::cout<<"All five watermark UI groups passed with owned synthetic fixtures.\n";return 0;}catch(const std::exception& error){std::cerr<<"WATERMARK UI FAILURE: "<<error.what()<<'\n';return 1;}}

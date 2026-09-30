@@ -3,6 +3,7 @@
 // No user input, device, normal app, actual tray icon or settings I/O is used.
 #include <windows.h>
 #include <shellapi.h>
+#include <commctrl.h>
 #include <functional>
 namespace {
 std::function<void(HWND,LPARAM)> dialogScript;
@@ -10,6 +11,25 @@ INT_PTR dialogOutcome=0;
 int dialogCalls=0;
 bool failDialog=false;
 bool allowTray=true;
+bool wheelParameters=false;
+UINT wheelLines=1,wheelCharacters=1;
+HWND openWheelCombo=nullptr;
+bool failWheelSubclass=false;
+int wheelSubclassFailures=0;
+BOOL WINAPI customSubclass(HWND window,SUBCLASSPROC procedure,UINT_PTR id,DWORD_PTR data){
+    if(failWheelSubclass){++wheelSubclassFailures;SetLastError(ERROR_NOT_ENOUGH_MEMORY);return FALSE;}
+    return SetWindowSubclass(window,procedure,id,data);
+}
+BOOL WINAPI customParameters(UINT action,UINT parameter,PVOID value,UINT flags){
+    if(wheelParameters && (action==SPI_GETWHEELSCROLLLINES || action==SPI_GETWHEELSCROLLCHARS)){
+        *static_cast<UINT*>(value)=action==SPI_GETWHEELSCROLLLINES?wheelLines:wheelCharacters;return TRUE;
+    }
+    return SystemParametersInfoW(action,parameter,value,flags);
+}
+LRESULT WINAPI customMessage(HWND window,UINT message,WPARAM wp,LPARAM lp){
+    if(message==CB_GETDROPPEDSTATE && window==openWheelCombo)return TRUE;
+    return SendMessageW(window,message,wp,lp);
+}
 BOOL WINAPI customTray(DWORD message,PNOTIFYICONDATAW){return message!=NIM_ADD || allowTray;}
 BOOL WINAPI customForeground(HWND){return TRUE;}
 BOOL WINAPI customShow(HWND window,int mode){return ShowWindow(window,mode==SW_RESTORE?SW_SHOWNOACTIVATE:mode);}
@@ -21,6 +41,9 @@ BOOL WINAPI ownedEndDialog(HWND,INT_PTR value){dialogOutcome=value;return TRUE;}
 #define Shell_NotifyIconW customTray
 #define SetForegroundWindow customForeground
 #define ShowWindow customShow
+#define SystemParametersInfoW customParameters
+#define SendMessageW customMessage
+#define SetWindowSubclass customSubclass
 #define main sourceFixtureMain
 #include "ui_source_tests.cpp"
 #undef main
@@ -29,6 +52,9 @@ BOOL WINAPI ownedEndDialog(HWND,INT_PTR value){dialogOutcome=value;return TRUE;}
 #undef Shell_NotifyIconW
 #undef SetForegroundWindow
 #undef ShowWindow
+#undef SystemParametersInfoW
+#undef SendMessageW
+#undef SetWindowSubclass
 
 namespace {
 INT_PTR WINAPI ownedDialog(HINSTANCE instance,LPCDLGTEMPLATEW resource,HWND owner,DLGPROC procedure,LPARAM parameter){
@@ -208,6 +234,60 @@ void canceledDialogFocus(){
     }
     std::cout<<"PASS native custom focus after Cancel/Hide/rejected Hide/Exit/session end for all four custom kinds, with canceled drafts unchanged\n";
 }
+void nativeDialogWheel(){
+    HiddenFixture owned;setupCustom();app.hiddenToTray=false;app.closeWhenDone=false;wheelParameters=true;wheelLines=wheelCharacters=1;
+    struct Reset{~Reset(){wheelParameters=false;openWheelCombo=nullptr;failWheelSubclass=false;}} reset;
+    const auto position=[](HWND window,int bar){SCROLLINFO info{sizeof(info),SIF_POS};GetScrollInfo(window,bar,&info);return info.nPos;};
+    const auto wheel=[](HWND target,int delta,UINT message=WM_MOUSEWHEEL,WORD keys=0){SendMessageW(target,message,MAKEWPARAM(keys,static_cast<WORD>(delta)),0);};
+    const auto prior=app.settings;const int configurations=lapse::configurationCalls;
+    for(int dpi:{96,192}){
+        dialogScript=[&](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<CustomDraft*>(parameter);
+            RECT constrained{0,0,320,230};SendMessageW(window,WM_DPICHANGED,MAKELONG(dpi,dpi),reinterpret_cast<LPARAM>(&constrained));
+            require((GetWindowLongPtrW(window,GWL_STYLE)&(WS_VSCROLL|WS_HSCROLL))==(WS_VSCROLL|WS_HSCROLL),"Wheel fixture lacks both overflow axes.");
+            const auto top=[&]{SendMessageW(window,WM_VSCROLL,SB_TOP,0);SendMessageW(window,WM_HSCROLL,SB_LEFT,0);};
+            SetFocus(draft.first);const HWND focused=GetFocus();int singleStep=0;
+            for(HWND target:{window,draft.help,draft.cancel,draft.first,draft.units}){
+                top();choose(draft.units,0);wheel(target,-WHEEL_DELTA);const int after=position(window,SB_VERT);
+                require(after>0 && choice(draft.units)==0 && GetFocus()==focused,"Wheel failed to scroll or changed draft selection/focus.");
+                if(!singleStep)singleStep=after;else require(after==singleStep,"Native child propagation scrolled a different number of times.");
+            }
+            top();wheel(window,-WHEEL_DELTA/2);wheel(window,WHEEL_DELTA/2,WM_MOUSEHWHEEL);
+            require(position(window,SB_VERT)==0 && position(window,SB_HORZ)==0,"Partial detent moved the page too early.");
+            wheel(window,-WHEEL_DELTA/2);require(position(window,SB_VERT)>0 && position(window,SB_HORZ)==0,"Wheel axes mixed partial deltas.");
+            wheel(window,WHEEL_DELTA/2,WM_MOUSEHWHEEL);require(position(window,SB_HORZ)>0,"Horizontal partial deltas did not accumulate.");
+            top();wheel(window,-WHEEL_DELTA,WM_MOUSEWHEEL,MK_SHIFT);require(position(window,SB_HORZ)>0 && position(window,SB_VERT)==0,"Shift-wheel did not stay on the horizontal axis.");
+            top();wheel(window,-WHEEL_DELTA,WM_MOUSEWHEEL,MK_CONTROL);require(position(window,SB_HORZ)==0 && position(window,SB_VERT)==0,"Ctrl-wheel scrolled the settings page.");
+            wheelLines=2;top();wheel(window,-WHEEL_DELTA);require(position(window,SB_VERT)>singleStep,"System wheel line count was ignored.");
+            wheelLines=WHEEL_PAGESCROLL;top();wheel(window,-WHEEL_DELTA);SCROLLINFO info{sizeof(info),SIF_ALL};GetScrollInfo(window,SB_VERT,&info);
+            require(position(window,SB_VERT)>singleStep && position(window,SB_VERT)<=static_cast<int>(info.nPage),"Page wheel setting was not bounded to a page.");
+            wheelLines=0;top();choose(draft.units,0);wheel(draft.units,-WHEEL_DELTA);require(position(window,SB_VERT)==0 && choice(draft.units)==0,"Zero wheel setting changed page or closed combo.");
+            wheel(draft.units,-WHEEL_DELTA/2);wheelLines=1;wheel(draft.units,-WHEEL_DELTA/2);
+            require(position(window,SB_VERT)==0 && choice(draft.units)==0,"Disabled wheel input leaked a partial detent after re-enabling.");
+            wheel(draft.units,-WHEEL_DELTA/2);require(position(window,SB_VERT)>0,"Re-enabled wheel input failed to accumulate fresh detents.");
+            SendMessageW(window,WM_VSCROLL,SB_BOTTOM,0);const int bottom=position(window,SB_VERT);wheel(draft.units,-WHEEL_DELTA);
+            require(position(window,SB_VERT)==bottom && choice(draft.units)==0,"Wheel at page edge changed a closed combo.");
+            top();openWheelCombo=draft.units;wheel(draft.units,-WHEEL_DELTA);openWheelCombo=nullptr;
+            require(position(window,SB_VERT)==0 && choice(draft.units)==1 && !SendMessageW(draft.units,CB_GETDROPPEDSTATE,0,0),"Open-dropdown route failed to yield to native control without a popup.");
+            top();wheel(window,-WHEEL_DELTA/2);wheel(window,WHEEL_DELTA/2,WM_MOUSEHWHEEL);
+            SetWindowPos(window,nullptr,0,0,1200,900,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);SendMessageW(window,WM_SIZE,0,0);
+            require(!(GetWindowLongPtrW(window,GWL_STYLE)&(WS_VSCROLL|WS_HSCROLL)),"No-overflow wheel control still has scrollbars.");
+            choose(draft.units,0);wheel(draft.units,-WHEEL_DELTA);require(choice(draft.units)==1,"Nonoverflowing dialog stole native combo wheel behavior.");
+            SendMessageW(window,WM_DPICHANGED,MAKELONG(dpi,dpi),reinterpret_cast<LPARAM>(&constrained));top();
+            wheel(window,-WHEEL_DELTA/2);wheel(window,WHEEL_DELTA/2,WM_MOUSEHWHEEL);
+            require(position(window,SB_VERT)==0 && position(window,SB_HORZ)==0,"Retired overflow carried partial input into the new viewport.");
+            wheel(window,-WHEEL_DELTA/2);wheel(window,WHEEL_DELTA/2,WM_MOUSEHWHEEL);
+            require(position(window,SB_VERT)>0 && position(window,SB_HORZ)>0,"New viewport failed to accumulate fresh input per axis.");
+            require(!IsWindowVisible(window)&&!IsWindowVisible(app.window),"Native wheel fixture became visible.");customProc(window,WM_COMMAND,IDCANCEL,0);
+        };invoke(CustomKind::Interval);
+    }
+    failWheelSubclass=true;const int failures=wheelSubclassFailures;
+    dialogScript=[](HWND,LPARAM){require(dialogOutcome==-1,"Failed wheel routing installation left an editable partial dialog.");};
+    invoke(CustomKind::Interval);failWheelSubclass=false;
+    require(wheelSubclassFailures==failures+1 && startupMessage.find(L"could not be opened")!=std::wstring::npos && !app.customDialog,
+        "Wheel subclass failure did not clean up and report a recoverable dialog error.");
+    require(app.settings.intervalMs==prior.intervalMs && lapse::configurationCalls==configurations,"Canceled wheel inspection changed configured settings.");
+    std::cout<<"PASS native dialog/child wheel routing at two DPIs, independent partial axes, modifiers/system amounts, closed-combo protection and native ownership\n";
+}
 void nativeNumericInsertion(){
     HiddenFixture owned;setupCustom();
     for(int field=0;field<4;++field){
@@ -324,7 +404,7 @@ void sourceSizeSnapshots(){
 }
 }
 int main(){
-    try{intervalAndCancellation();dimensionsAndLimit();activeAndNight();segmentDurations();nativeNumericInsertion();nativeButtonNavigation();dialogDpiAndLifecycle();canceledDialogFocus();sourceSizeSnapshots();
+    try{intervalAndCancellation();dimensionsAndLimit();activeAndNight();segmentDurations();nativeNumericInsertion();nativeButtonNavigation();dialogDpiAndLifecycle();canceledDialogFocus();nativeDialogWheel();sourceSizeSnapshots();
         std::cout<<"All custom UI cases passed with owned controls and synthetic engine.\n";return 0;
     }catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
 }

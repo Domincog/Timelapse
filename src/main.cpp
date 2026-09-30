@@ -20,6 +20,7 @@
 #include <fstream>
 #include <climits>
 #include <system_error>
+#include <initializer_list>
 
 using namespace lapse;
 namespace {
@@ -996,7 +997,7 @@ enum CustomId { CustomFirst=5001, CustomSecond, CustomUnits, CustomHelp, CustomE
 struct CustomDraft {
     CustomKind kind=CustomKind::Interval;
     int64_t durationMs=5000;
-    int width=1280,height=720,dpi=96,scrollX=0,scrollY=0;
+    int width=1280,height=720,dpi=96,scrollX=0,scrollY=0,wheelX=0,wheelY=0;
     int startSeconds=0,endSeconds=60;
     HWND previousDialog{};
     HFONT font{};
@@ -1012,6 +1013,50 @@ struct CustomTemplate {
         dialog.dwExtendedStyle=WS_EX_CONTROLPARENT;dialog.cx=260;dialog.cy=160;
     }
 };
+enum class DialogWheel { Pass, Consumed, Scrolled };
+int dialogWheelAxis(UINT message,WPARAM wp) {
+    return message==WM_MOUSEHWHEEL || (GET_KEYSTATE_WPARAM(wp)&MK_SHIFT)?SB_HORZ:SB_VERT;
+}
+int64_t dialogScrollMaximum(const SCROLLINFO& info) {
+    return std::max<int64_t>(info.nMin,int64_t(info.nMax)-std::max<int64_t>(0,int64_t(info.nPage)-1));
+}
+bool dialogWheelRange(HWND window,UINT message,WPARAM wp,SCROLLINFO& info) {
+    if(GET_KEYSTATE_WPARAM(wp)&MK_CONTROL)return false;
+    return GetScrollInfo(window,dialogWheelAxis(message,wp),&info) && dialogScrollMaximum(info)>info.nMin;
+}
+DialogWheel dialogWheel(HWND window,CustomDraft& draft,UINT message,WPARAM wp) {
+    SCROLLINFO info{sizeof(info),SIF_RANGE|SIF_PAGE|SIF_POS};
+    if(!dialogWheelRange(window,message,wp,info))return DialogWheel::Pass;
+    const bool horizontal=dialogWheelAxis(message,wp)==SB_HORZ;
+    int& remainder=horizontal?draft.wheelX:draft.wheelY;
+    UINT lines=3;SystemParametersInfoW(horizontal?SPI_GETWHEELSCROLLCHARS:SPI_GETWHEELSCROLLLINES,0,&lines,0);
+    if(!lines){remainder=0;return DialogWheel::Consumed;}
+    remainder+=GET_WHEEL_DELTA_WPARAM(wp)*(message==WM_MOUSEHWHEEL?1:-1);
+    const int steps=remainder/WHEEL_DELTA;remainder%=WHEEL_DELTA;
+    if(!steps)return DialogWheel::Consumed;
+    const int64_t page=std::max<int64_t>(1,int64_t(info.nPage)-draft.scale(24));
+    const int64_t amount=lines==WHEEL_PAGESCROLL?page:std::min<int64_t>(int64_t(lines)*draft.scale(24),page);
+    const int position=static_cast<int>(std::clamp<int64_t>(int64_t(info.nPos)+int64_t(steps)*amount,info.nMin,dialogScrollMaximum(info)));
+    if(position==info.nPos)return DialogWheel::Consumed;
+    (horizontal?draft.scrollX:draft.scrollY)=position;
+    return DialogWheel::Scrolled;
+}
+LRESULT CALLBACK dialogComboWheelProc(HWND window,UINT message,WPARAM wp,LPARAM lp,UINT_PTR id,DWORD_PTR) {
+    if((message==WM_MOUSEWHEEL || message==WM_MOUSEHWHEEL) && !SendMessageW(window,CB_GETDROPPEDSTATE,0,0)){
+        const HWND parent=GetParent(window);SCROLLINFO info{sizeof(info),SIF_RANGE|SIF_PAGE|SIF_POS};
+        if(dialogWheelRange(parent,message,wp,info)){
+            // Closed choices scroll the overflowing page, as in the main UI.
+            // Open dropdowns keep their native wheel handling.
+            SendMessageW(parent,message,wp,lp);return 0;
+        }
+    }
+    if(message==WM_NCDESTROY)RemoveWindowSubclass(window,dialogComboWheelProc,id);
+    return DefSubclassProc(window,message,wp,lp);
+}
+bool dialogWheelCombos(std::initializer_list<HWND> boxes) {
+    for(HWND box:boxes)if(!SetWindowSubclass(box,dialogComboWheelProc,1,0))return false;
+    return true;
+}
 std::wstring secondsInput(int64_t milliseconds) {
     std::wstring value=std::to_wstring(milliseconds/1000);
     if(milliseconds%1000){std::wstring fraction=std::to_wstring(1000+milliseconds%1000).substr(1);
@@ -1041,6 +1086,7 @@ void customLayout(HWND window,CustomDraft& draft) {
         measure(std::max(availableW-(vertical?barW:0),draft.scale(320)));vertical=availableH-(horizontal?barH:0)<minimumHeight;}
     ShowScrollBar(window,SB_HORZ,horizontal);ShowScrollBar(window,SB_VERT,vertical);GetClientRect(window,&client);
     const int width=std::max(int(client.right),draft.scale(320));measure(width);const int height=std::max(int(client.bottom),minimumHeight);
+    if(width<=client.right)draft.wheelX=0;if(height<=client.bottom)draft.wheelY=0;
     draft.scrollX=std::clamp(draft.scrollX,0,width-int(std::max(1L,client.right)));
     draft.scrollY=std::clamp(draft.scrollY,0,height-int(std::max(1L,client.bottom)));
     SCROLLINFO info{sizeof(info),SIF_RANGE|SIF_PAGE|SIF_POS};info.nMax=width-1;info.nPage=std::max(1L,client.right);info.nPos=draft.scrollX;SetScrollInfo(window,SB_HORZ,&info,TRUE);
@@ -1211,6 +1257,7 @@ INT_PTR CALLBACK customProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             draft->error=child(L"STATIC",L"",SS_NOPREFIX,CustomError);
             draft->okay=child(L"BUTTON",L"OK",WS_TABSTOP|BS_DEFPUSHBUTTON|BS_NOTIFY,IDOK);draft->cancel=child(L"BUTTON",L"Cancel",WS_TABSTOP|BS_PUSHBUTTON|BS_NOTIFY,IDCANCEL);
             if(!draft->firstLabel || !draft->secondLabel || !draft->first || !((size || range)?draft->second:draft->units) || !draft->help || !draft->error || !draft->okay || !draft->cancel){EndDialog(window,-1);return TRUE;}
+            if(draft->units && !dialogWheelCombos({draft->units})){EndDialog(window,-1);return TRUE;}
             // Native paste must reach the rejection threshold, never truncate
             // below it into a different valid numeric prefix.
             SendMessageW(draft->first,EM_SETLIMITTEXT,96,0);if(draft->second)SendMessageW(draft->second,EM_SETLIMITTEXT,96,0);
@@ -1226,6 +1273,10 @@ INT_PTR CALLBACK customProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
         if(!draft)return FALSE;
         switch(message){
         case WM_SIZE:customLayout(window,*draft);return TRUE;
+        case WM_MOUSEWHEEL:case WM_MOUSEHWHEEL:{
+            const auto result=dialogWheel(window,*draft,message,wp);
+            if(result==DialogWheel::Scrolled)customLayout(window,*draft);
+            if(result!=DialogWheel::Pass)return TRUE;break;}
         case WM_DPICHANGED:{draft->dpi=HIWORD(wp);customFont(window,*draft);RECT rect=*reinterpret_cast<RECT*>(lp);rect=fitWindow(rect,workArea(MonitorFromRect(&rect,MONITOR_DEFAULTTONEAREST)));
             SetWindowPos(window,nullptr,rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top,SWP_NOZORDER|SWP_NOACTIVATE);customLayout(window,*draft);customReveal(window,*draft,GetFocus());return TRUE;}
         case WM_HSCROLL:case WM_VSCROLL:{const int bar=message==WM_HSCROLL?SB_HORZ:SB_VERT;SCROLLINFO info{sizeof(info),SIF_ALL};GetScrollInfo(window,bar,&info);int position=info.nPos;
@@ -1334,6 +1385,7 @@ void skipLayout(HWND window,SkipDraft& draft) {
     for(int i=0;i<3;++i){horizontal=availableW-(vertical?bw:0)<minimumWidth;measure(std::max(minimumWidth,availableW-(vertical?bw:0)));vertical=availableH-(horizontal?bh:0)<minHeight;}
     ShowScrollBar(window,SB_HORZ,horizontal);ShowScrollBar(window,SB_VERT,vertical);GetClientRect(window,&client);
     const int width=std::max(minimumWidth,int(client.right));measure(width);const int height=std::max(minHeight,int(client.bottom));draft.naturalHeight=minHeight;
+    if(width<=client.right)draft.wheelX=0;if(height<=client.bottom)draft.wheelY=0;
     draft.scrollX=std::clamp(draft.scrollX,0,width-int(std::max(1L,client.right)));draft.scrollY=std::clamp(draft.scrollY,0,height-int(std::max(1L,client.bottom)));
     SCROLLINFO info{sizeof(info),SIF_RANGE|SIF_PAGE|SIF_POS};info.nMax=width-1;info.nPage=std::max(1L,client.right);info.nPos=draft.scrollX;SetScrollInfo(window,SB_HORZ,&info,TRUE);
     info.nMax=height-1;info.nPage=std::max(1L,client.bottom);info.nPos=draft.scrollY;SetScrollInfo(window,SB_VERT,&info,TRUE);
@@ -1487,6 +1539,7 @@ INT_PTR CALLBACK skipProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             draft->okay=skipChild(window,L"BUTTON",L"OK",WS_TABSTOP|BS_DEFPUSHBUTTON|BS_NOTIFY,IDOK);draft->cancel=button(draft->readOnly?L"Close":L"Cancel",IDCANCEL);
             bool okay=true;for(HWND child:{draft->mode,draft->speed,draft->ramp,draft->quiet,draft->quietUnits,draft->ranges,draft->add,draft->edit,draft->remove,draft->repeat,draft->repeatUnits,draft->packInfo,draft->packManage,draft->fine,draft->sensitivityLabel,draft->sensitivity,draft->help,draft->error,draft->okay,draft->cancel})if(!child)okay=false;
             for(HWND child:draft->labels)if(!child)okay=false;if(!okay){EndDialog(window,-1);return TRUE;}
+            if(!dialogWheelCombos({draft->mode,draft->speed,draft->ramp,draft->quietUnits,draft->repeatUnits,draft->sensitivity})){EndDialog(window,-1);return TRUE;}
             for(HWND child:{draft->quiet,draft->repeat})SendMessageW(child,EM_SETLIMITTEXT,96,0);
             for(HWND child:{draft->mode,draft->speed,draft->ramp,draft->quiet,draft->quietUnits,draft->repeat,draft->repeatUnits,draft->packManage,draft->sensitivity,draft->okay})EnableWindow(child,!draft->readOnly);
             if(draft->readOnly){ShowWindow(draft->okay,SW_HIDE);SendMessageW(window,DM_SETDEFID,IDCANCEL,0);}
@@ -1500,6 +1553,10 @@ INT_PTR CALLBACK skipProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
         if(!draft)return FALSE;
         switch(message){
         case WM_SIZE:skipLayout(window,*draft);return TRUE;
+        case WM_MOUSEWHEEL:case WM_MOUSEHWHEEL:{
+            const auto result=dialogWheel(window,*draft,message,wp);
+            if(result==DialogWheel::Scrolled)skipLayout(window,*draft);
+            if(result!=DialogWheel::Pass)return TRUE;break;}
         case WM_DPICHANGED:{draft->dpi=HIWORD(wp);customFont(window,*draft);RECT rect=*reinterpret_cast<RECT*>(lp);rect=fitWindow(rect,workArea(MonitorFromRect(&rect,MONITOR_DEFAULTTONEAREST)));
             SetWindowPos(window,nullptr,rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top,SWP_NOZORDER|SWP_NOACTIVATE);skipLayout(window,*draft);skipReveal(window,*draft,GetFocus());return TRUE;}
         case WM_HSCROLL:case WM_VSCROLL:{const int bar=message==WM_HSCROLL?SB_HORZ:SB_VERT;SCROLLINFO info{sizeof(info),SIF_ALL};GetScrollInfo(window,bar,&info);int position=info.nPos;
@@ -1613,6 +1670,7 @@ void watermarkLayout(HWND window,WatermarkDraft& draft) {
     for(int i=0;i<3;++i){horizontal=availableW-(vertical?bw:0)<minimumWidth;measure(std::max(minimumWidth,availableW-(vertical?bw:0)));vertical=availableH-(horizontal?bh:0)<minHeight;}
     ShowScrollBar(window,SB_HORZ,horizontal);ShowScrollBar(window,SB_VERT,vertical);GetClientRect(window,&client);
     const int width=std::max(minimumWidth,int(client.right));measure(width);const int height=std::max(minHeight,int(client.bottom));draft.naturalHeight=minHeight;
+    if(width<=client.right)draft.wheelX=0;if(height<=client.bottom)draft.wheelY=0;
     draft.scrollX=std::clamp(draft.scrollX,0,width-int(std::max(1L,client.right)));draft.scrollY=std::clamp(draft.scrollY,0,height-int(std::max(1L,client.bottom)));
     SCROLLINFO info{sizeof(info),SIF_RANGE|SIF_PAGE|SIF_POS};info.nMax=width-1;info.nPage=std::max(1L,client.right);info.nPos=draft.scrollX;SetScrollInfo(window,SB_HORZ,&info,TRUE);
     info.nMax=height-1;info.nPage=std::max(1L,client.bottom);info.nPos=draft.scrollY;SetScrollInfo(window,SB_VERT,&info,TRUE);
@@ -1689,6 +1747,7 @@ INT_PTR CALLBACK watermarkProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             draft->cancel=skipChild(window,L"BUTTON",draft->readOnly?L"Close":L"Cancel",WS_TABSTOP|BS_PUSHBUTTON|BS_NOTIFY,IDCANCEL);
             for(HWND child:{draft->enabled,draft->time,draft->speed,draft->timeKind,draft->position,draft->x,draft->y,draft->size,draft->preview,draft->previewLabel,draft->help,draft->error,draft->okay,draft->cancel})if(!child){EndDialog(window,-1);return TRUE;}
             for(HWND child:draft->labels)if(!child){EndDialog(window,-1);return TRUE;}
+            if(!dialogWheelCombos({draft->timeKind,draft->position,draft->size})){EndDialog(window,-1);return TRUE;}
             std::wstring help=draft->readOnly?L"Options are frozen for this recording. ":L"";
             help+=L"Target speed is total planned playback acceleration, not extra compression or achieved speed. Recorded time is the local clock when a frame is accepted for saving; it may differ from camera exposure time. Clock/time-zone changes can affect it.\n\nBoth files use the same watermark. X/Y place the whole box inside the video; 0% is left/top, 100% right/bottom. Text scales with video size and may increase file size.";
             SetWindowTextW(draft->help,help.c_str());if(draft->readOnly){ShowWindow(draft->okay,SW_HIDE);SendMessageW(window,DM_SETDEFID,IDCANCEL,0);}
@@ -1702,6 +1761,10 @@ INT_PTR CALLBACK watermarkProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
         if(!draft || !draft->ready)return FALSE;
         switch(message){
         case WM_SIZE:watermarkLayout(window,*draft);return TRUE;
+        case WM_MOUSEWHEEL:case WM_MOUSEHWHEEL:{
+            const auto result=dialogWheel(window,*draft,message,wp);
+            if(result==DialogWheel::Scrolled)watermarkLayout(window,*draft);
+            if(result!=DialogWheel::Pass)return TRUE;break;}
         case WM_DPICHANGED:{draft->dpi=HIWORD(wp);customFont(window,*draft);RECT rect=*reinterpret_cast<RECT*>(lp);rect=fitWindow(rect,workArea(MonitorFromRect(&rect,MONITOR_DEFAULTTONEAREST)));
             SetWindowPos(window,nullptr,rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top,SWP_NOZORDER|SWP_NOACTIVATE);watermarkLayout(window,*draft);watermarkReveal(window,*draft,GetFocus());return TRUE;}
         case WM_DRAWITEM:if(wp==MarkPreview){watermarkPaint(*reinterpret_cast<DRAWITEMSTRUCT*>(lp),*draft);return TRUE;}break;
