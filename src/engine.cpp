@@ -1,4 +1,5 @@
 #include "engine.h"
+#include "config.h"
 #include "capture.h"
 #include "camera_host.h"
 #include "encoder.h"
@@ -20,8 +21,19 @@ bool usesNightCamera(const Settings& settings) {
         [](const Layer& layer) { return layer.source == Source::Camera; }));
 }
 int nightWindowDuration(const Settings& settings, int suggested) {
-    const int maximum = std::min(NightMaxDurationMs, std::clamp(settings.interval, 1, 3600) * 1000);
+    const int maximum = std::min(NightMaxDurationMs, settings.intervalMs);
     return settings.night.durationMs > 0 ? settings.night.durationMs : std::clamp(suggested, NightMinDurationMs, maximum);
+}
+bool validateNightCapture(const Settings& settings, std::wstring& error) {
+    if (settings.intervalMs < NightMinDurationMs) {
+        error = L"Night camera needs a capture interval of at least 1 second, including Auto blend duration.";
+        return false;
+    }
+    if (!validNightSettings(settings.night) || settings.night.durationMs > settings.intervalMs) {
+        error = L"Night camera needs a valid brightness and a blend duration no longer than Capture every.";
+        return false;
+    }
+    return true;
 }
 // Leave room for buffered samples and MP4 finalization instead of waiting for
 // the writer to fail on a full volume. This is a conservative policy, not a
@@ -86,7 +98,8 @@ void Engine::configure(const Settings& s) {
     { std::lock_guard<std::mutex> lock(mutex_);
       auto sources = [](const Settings& config) { int mask = config.separateFiles ? 3 : 0; for (const auto& layer : config.layers) mask |= layer.source == Source::Desktop ? 1 : 2; return mask; };
       const int mask = sources(s);
-      if (!s.preview || mask != sources(settings_) || ((mask & 2) && s.cameraId != settings_.cameraId) ||
+      if (!s.preview || (status_.state == State::Idle && (s.width != settings_.width || s.height != settings_.height)) ||
+          mask != sources(settings_) || ((mask & 2) && s.cameraId != settings_.cameraId) ||
           ((mask & 1) && (CompareStringOrdinal(s.monitorId.c_str(), -1, settings_.monitorId.c_str(), -1, TRUE) != CSTR_EQUAL ||
               !EqualRect(&s.monitor, &settings_.monitor)))) retirePreview();
       settings_ = s;
@@ -412,9 +425,11 @@ void Engine::run() {
                     cancelNight(); nightMode = usesNightCamera(cfg);
                     suggestedNightDurationMs = NightInitialDurationMs;
                     nightStartAt = now;
-                    if (nightMode && (!validNightSettings(cfg.night) ||
-                        cfg.night.durationMs > std::clamp(cfg.interval, 1, 3600) * 1000)) {
-                        closeRecording(L"Night camera needs a valid brightness and a blend duration no longer than Capture every."); continue;
+                    std::wstring validationError;
+                    if (!validateCaptureInterval(cfg.intervalMs, validationError) ||
+                        !validateVideoSize(cfg.width, cfg.height, validationError) ||
+                        (nightMode && !validateNightCapture(cfg, validationError))) {
+                        closeRecording(validationError); continue;
                     }
                     if (cfg.separateFiles) { desktopLayers = preset(Mode::Desktop); cameraLayers = preset(Mode::Camera); }
                     nextFrame = now;
@@ -456,10 +471,10 @@ void Engine::run() {
                 const bool useNight = (pending || writing) && cfg.night.enabled && needCamera;
                 if (useNight != nightMode) {
                     cancelNight(); nightMode = useNight; nightStartAt = now;
-                    if (useNight && (!validNightSettings(cfg.night) ||
-                        cfg.night.durationMs > std::clamp(cfg.interval, 1, 3600) * 1000)) {
+                    std::wstring validationError;
+                    if (useNight && !validateNightCapture(cfg, validationError)) {
                         previewOnlyWork = false;
-                        closeRecording(L"Night camera needs a valid brightness and a blend duration no longer than Capture every."); continue;
+                        closeRecording(validationError); continue;
                     }
                     std::lock_guard<std::mutex> lock(mutex_); status_.nightEnabled = useNight; status_.nightWaiting = useNight && !paused;
                 }
@@ -503,7 +518,7 @@ void Engine::run() {
                     else sourceError = L"No camera found. Connect a camera and refresh sources.";
                 }
                 const bool previewDue = cfg.preview && (lastPreview == Clock::time_point::min() || now - lastPreview >= std::chrono::milliseconds(writing ? 1000 : 500));
-                bool nightCompleted = false;
+                bool nightCompleted = false, firstNightPreview = false;
                 if (nightMode && !paused) {
                     // The helper owns the integration window and intermediate
                     // pixels. Parent wakes only for commands, preview, the
@@ -532,6 +547,7 @@ void Engine::run() {
                         advanceElapsed(Clock::now());
                         if (limitExpired()) { recordingLimitReached = true; closeRecording(L""); continue; }
                         if (complete) {
+                            firstNightPreview = !nightFrameReady;
                             nightQueued = false; nightFrameReady = nightCompleted = true;
                             retryFrameAt = Clock::time_point::min();
                         } else if (!nightError.empty()) { closeRecording(L"Night camera stopped: " + nightError); continue; }
@@ -548,7 +564,11 @@ void Engine::run() {
                     continue;
                 }
                 previewOnlyWork = !captureDue;
-                lastPreview = now;
+                // Recording cadence can be much faster than preview cadence.
+                // Only a requested preview attempt advances its clock. The
+                // first processed Night window must promptly replace raw video.
+                const bool refreshPreview = previewDue || (cfg.preview && firstNightPreview);
+                if (refreshPreview) lastPreview = now;
                 std::wstring error;
                 bool ready = true, cameraWaiting = false;
                 if (needCamera && !(nightMode && nightFrameReady)) {
@@ -565,7 +585,8 @@ void Engine::run() {
                         sourceError = error;
                     }
                 }
-                int width = captureDue ? cfg.width : 640, height = captureDue ? cfg.height : 360;
+                const auto previewSize = previewDimensions(cfg.width, cfg.height);
+                const int width = captureDue ? cfg.width : previewSize.first, height = captureDue ? cfg.height : previewSize.second;
                 if (needDesktop && ready) ready = captureMonitor(cfg.monitorId, width, height, true, desktop, error);
                 if (ready && captureDue && cfg.separateFiles) {
                     ready = compose(&desktop, nullptr, desktopLayers, width, height, composed, error) &&
@@ -680,7 +701,7 @@ void Engine::run() {
                     if (cfg.separateFiles && !cameraEncoder->write(cameraComposed, error)) {
                         closeRecording(L"Camera recording stopped: " + error); continue;
                     }
-                    const auto interval = std::chrono::seconds(std::clamp(cfg.interval, 1, 3600));
+                    const auto interval = std::chrono::milliseconds(cfg.intervalMs);
                     if (nightMode) {
                         suggestedNightDurationMs = completedNight.exposure.suggestedDurationMs;
                         const auto duration = std::chrono::milliseconds(nightWindowDuration(cfg, suggestedNightDurationMs));
@@ -688,7 +709,14 @@ void Engine::run() {
                         // No catch-up burst or millisecond-late whole-slot skip.
                         nextFrame = std::max(nextFrame + interval, Clock::now() + duration);
                         nightStartAt = nextFrame - duration;
-                    } else do { nextFrame += interval; } while (nextFrame <= Clock::now());
+                    } else {
+                        nextFrame += interval;
+                        const auto completedAt = Clock::now();
+                        // Skip elapsed slots in constant time even for a short
+                        // cadence after a slow operation or long system sleep.
+                        if (nextFrame <= completedAt)
+                            nextFrame += interval * ((completedAt - nextFrame) / interval + 1);
+                    }
                     std::lock_guard<std::mutex> lock(mutex_);
                     status_.frames = encoder->frames(); status_.elapsed = elapsed;
                     if (nightMode) {
@@ -697,18 +725,21 @@ void Engine::run() {
                         status_.nightWaiting = false;
                     }
                 }
-                if (cfg.preview) {
+                if (refreshPreview) {
                     // Encoding uses the full-size composition; the UI needs
                     // only a small preview, even on a recording sample. Once
                     // the video frame is written, failures here are disposable
                     // preview failures and must not truncate that recording.
                     previewOnlyWork = true;
                     if (captureDue && !compose(needDesktop ? &desktop : nullptr, needCamera ? &webcam : nullptr,
-                            cfg.layers, 640, 360, preparePreviewBuffer(), error)) {
+                            cfg.layers, previewSize.first, previewSize.second, preparePreviewBuffer(), error)) {
                         publishPreviewError(error);
                         continue;
                     }
                 }
+                // A successful video admission is not evidence that a failed
+                // disposable preview recovered, nor does it own a new buffer.
+                if (!refreshPreview) continue;
                 { std::lock_guard<std::mutex> lock(mutex_);
                   // A selection change, Refresh, or Record may have retired
                   // this disposable preview while capture was in flight.

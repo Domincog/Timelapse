@@ -123,7 +123,7 @@ void failuresAndLimits() {
     const auto original = output.pixels;
     std::wstring error;
     const auto layers = preset(Mode::Desktop);
-    for (auto dimensions : {std::pair<int, int>{0, 4}, {-2, 4}, {3, 4}, {4, 3}, {1922, 1080}, {1920, 1082}}) {
+    for (auto dimensions : {std::pair<int, int>{0, 4}, {-2, 4}, {3, 4}, {4, 3}, {4098, 1080}, {1920, 4098}, {4096, 2162}}) {
         check(!compose(&desktop, nullptr, layers, dimensions.first, dimensions.second, output, error) &&
               !error.empty(), "invalid dimensions fail with an explanation");
         check(output.pixels == original && output.width == 2 && output.height == 2,
@@ -142,8 +142,11 @@ void failuresAndLimits() {
     check(!compose(&desktop, nullptr, {}, 4, 4, output, error), "empty layout is rejected");
     check(!compose(&desktop, nullptr, {{static_cast<Source>(100), {}}}, 4, 4, output, error),
           "unknown source is rejected");
-    check(compose(&desktop, nullptr, layers, 1920, 1080, output, error) && output.valid(),
+    check(compose(&desktop, nullptr, layers, 4096, 2160, output, error) && output.valid(),
           "maximum supported video dimensions compose successfully");
+    check(compose(&desktop, nullptr, layers, 1080, 1920, output, error) && output.valid() &&
+          pixel(output, 540, 960, 0, 230, 0) && darkPixel(output, 540, 0),
+          "portrait composition fits the complete square source without stretching");
     check(errorText(E_ACCESSDENIED).find(L"80070005") != std::wstring::npos,
           "HRESULT diagnostics include a searchable hexadecimal code");
     check(errorText(static_cast<HRESULT>(0xA1234567)).find(L"A1234567") != std::wstring::npos,

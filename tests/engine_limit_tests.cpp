@@ -73,7 +73,7 @@ template<class Predicate> lapse::Status await(lapse::Engine& engine, Predicate p
 lapse::Settings settings(const std::filesystem::path& directory, lapse::Mode mode = lapse::Mode::Desktop, bool separate = false) {
     lapse::Settings result;
     result.monitorId = L"synthetic-display"; result.cameraId = L"synthetic-camera";
-    result.width = 320; result.height = 240; result.interval = 1;
+    result.width = 320; result.height = 240; result.intervalMs = 1000;
     result.preview = false; result.folder = directory.wstring();
     result.layers = lapse::preset(mode); result.separateFiles = separate; result.recordingLimitSeconds = 1;
     return result;
@@ -118,7 +118,7 @@ void verifySaved(const lapse::Status& status, uint64_t expectedFrames, size_t fi
 void sourceMode(const std::filesystem::path& root, lapse::Mode mode, bool separate) {
     const auto name = L"source-" + std::to_wstring(static_cast<int>(mode)) + (separate ? L"-separate" : L"");
     auto config = settings(root / name, mode, separate);
-    if (mode == lapse::Mode::Camera) config.interval = 60; // Deadline must wake a hidden sparse session.
+    if (mode == lapse::Mode::Camera) config.intervalMs = 60000; // Deadline must wake a hidden sparse session.
     if (mode == lapse::Mode::Overlay) config.preview = true;
     const auto stopsBefore = cameraStops.load();
     lapse::Engine engine; engine.configure(config); engine.record();
@@ -138,7 +138,7 @@ void sourceMode(const std::filesystem::path& root, lapse::Mode mode, bool separa
 }
 void startupExcluded(const std::filesystem::path& root, bool encoderDelay) {
     auto config = settings(root / (encoderDelay ? L"writer-startup" : L"camera-warmup"), lapse::Mode::Camera, encoderDelay);
-    config.interval = 60;
+    config.intervalMs = 60000;
     cameraWarmup = !encoderDelay; cameraOpenDelayMs = encoderDelay ? 1200 : 0;
     const unsigned startsBefore = cameraStarts;
     lapse::Engine engine; engine.configure(config); engine.record();
@@ -159,7 +159,7 @@ void startupExcluded(const std::filesystem::path& root, bool encoderDelay) {
     std::cout << "PASS startup excluded, encoder_delay=" << encoderDelay << ".\n";
 }
 void pauseExcluded(const std::filesystem::path& root) {
-    auto config = settings(root / L"pause", lapse::Mode::Camera, true); config.interval = 60;
+    auto config = settings(root / L"pause", lapse::Mode::Camera, true); config.intervalMs = 60000;
     lapse::Engine engine; engine.configure(config); engine.record();
     await(engine, [](const auto& s) { return s.state == lapse::State::Recording && s.frames == 1; });
     std::this_thread::sleep_for(200ms); engine.setPaused(true);
@@ -184,7 +184,7 @@ void slowCapture(const std::filesystem::path& root) {
 }
 void unlimitedAndManualFinish(const std::filesystem::path& root, int limit) {
     auto config = settings(root / (limit ? L"negative-unlimited" : L"zero-unlimited"), lapse::Mode::Camera);
-    config.recordingLimitSeconds = limit; config.interval = 60;
+    config.recordingLimitSeconds = limit; config.intervalMs = 60000;
     const unsigned stopsBefore = cameraStops;
     lapse::Engine engine; engine.configure(config); engine.record();
     await(engine, [](const auto& s) { return s.state == lapse::State::Recording && s.frames == 1; });
@@ -200,7 +200,7 @@ void unlimitedAndManualFinish(const std::filesystem::path& root, int limit) {
 }
 void collision(const std::filesystem::path& root, bool separate = true) {
     const auto directory = root / (separate ? L"collision-separate" : L"collision-single");
-    auto config = settings(directory, lapse::Mode::Desktop, separate); config.interval = 60;
+    auto config = settings(directory, lapse::Mode::Desktop, separate); config.intervalMs = 60000;
     lapse::Engine engine; engine.configure(config); engine.record();
     await(engine, [](const auto& s) { return s.state == lapse::State::Recording && s.frames == 1; });
     std::wstring temporary;
@@ -223,7 +223,7 @@ void collision(const std::filesystem::path& root, bool separate = true) {
 }
 void singleFinalizationFailure(const std::filesystem::path& root) {
     const auto directory = root / L"finalization-single";
-    auto config = settings(directory); config.interval = 60;
+    auto config = settings(directory); config.intervalMs = 60000;
     lapse::Engine engine; engine.configure(config); engine.record();
     await(engine, [](const auto& s) { return s.state == lapse::State::Recording && s.frames == 1; });
     std::wstring temporary;
@@ -245,7 +245,7 @@ void singleFinalizationFailure(const std::filesystem::path& root) {
     std::cout << "PASS single-file finalization error preserves stop reason, diagnostic and retained path.\n";
 }
 void previewFailureDeadline(const std::filesystem::path& root) {
-    auto config = settings(root / L"preview-allocation"); config.interval = 60; config.preview = true; config.recordingLimitSeconds = 2;
+    auto config = settings(root / L"preview-allocation"); config.intervalMs = 60000; config.preview = true; config.recordingLimitSeconds = 2;
     lapse::Engine engine; engine.configure(config); engine.record();
     await(engine, [](const auto& s) { return s.state == lapse::State::Recording && s.frames == 1; });
     previewAllocationDelayMs = 800;
@@ -255,7 +255,7 @@ void previewFailureDeadline(const std::filesystem::path& root) {
     std::cout << "PASS preview allocation cooldown respects the earlier recording deadline.\n";
 }
 void finalizationExcluded(const std::filesystem::path& root) {
-    auto config = settings(root / L"slow-finalization"); config.interval = 60; config.preview = true;
+    auto config = settings(root / L"slow-finalization"); config.intervalMs = 60000; config.preview = true;
     lapse::Engine engine; engine.configure(config); engine.record();
     await(engine, [](const auto& s) { return s.state == lapse::State::Recording && s.frames == 1; });
     const auto activeAt = std::chrono::steady_clock::now(); finalizeDelayMs = 800;
@@ -292,7 +292,7 @@ bool CameraClient::latest(Frame& output, std::wstring& error) {
 }
 bool captureMonitor(const std::wstring& id, int width, int height, bool, Frame& output, std::wstring& error) {
     if (id != L"synthetic-display") { error = L"Invalid synthetic display."; return false; }
-    if (width == 640) if (const int delay = previewAllocationDelayMs.exchange(0)) {
+    if (width == 480 && height == 360) if (const int delay = previewAllocationDelayMs.exchange(0)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(delay)); ++previewAllocationFaults; throw std::bad_alloc();
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(desktopDelayMs.exchange(0)));

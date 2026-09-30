@@ -13,7 +13,8 @@ struct Settings {
     std::wstring monitorId;
     std::wstring cameraId;
     std::vector<Layer> layers = preset(Mode::Desktop);
-    int interval = 5;
+    // Exact capture cadence; slower capture/encoding skips elapsed slots.
+    int intervalMs = 5000;
     int width = 1280, height = 720;
     EncodingQuality encodingQuality = EncodingQuality::Balanced;
     EncodingMode encodingMode = EncodingMode::Compatible;

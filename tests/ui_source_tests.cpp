@@ -417,12 +417,12 @@ void indexLoads() {
         {static_cast<UINT>(-1),static_cast<UINT>(-1),static_cast<UINT>(-1),1,1280,EncodingQuality::Compact}};
     seed(false);
     overrideIndexes=false; preferences(false); configure();
-    require(app.settings.interval==5&&app.settings.width==1280&&app.settings.encodingQuality==EncodingQuality::Balanced&&choice(app.mode)==0,
+    require(app.settings.intervalMs==5000&&app.settings.width==1280&&app.settings.encodingQuality==EncodingQuality::Balanced&&choice(app.mode)==0,
             "Default persisted option mapping failed.");
     for(const auto& input:cases) {
         overrideIndexes=true; savedInterval=input.interval; savedSize=input.size; savedEncoding=input.quality;
         preferences(false); configure();
-        require(app.settings.interval==input.seconds&&app.settings.width==input.width&&app.settings.encodingQuality==input.expected&&choice(app.mode)==0,
+        require(app.settings.intervalMs==input.seconds*1000&&app.settings.width==input.width&&app.settings.encodingQuality==input.expected&&choice(app.mode)==0,
                 "Persisted option index mapping/clamping failed.");
     }
     for(UINT mode:{0u,1u,2u,3u,4u,5u,999u,static_cast<UINT>(-1)}){

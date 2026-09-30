@@ -233,7 +233,7 @@ void newUnicodeFile(){
 }
 void existingUnicodeRewrite(){
     PreferencesFixture fixture;
-    const std::wstring initial=L"[Settings]\r\nFolder="+unicodeFolder+L"\r\nInterval=5\r\nQuality=1\r\nEncodingQuality=2\r\nEncodingMode=0\r\nRecordingLimit=0\r\nStopOnLowDiskSpace=1\r\nNightEnabled=0\r\nNightDurationMs=0\r\nNightTargetBrightness=96\r\n";
+    const std::wstring initial=L"[Settings]\r\nFolder="+unicodeFolder+L"\r\nInterval=5\r\nQuality=1\r\nEncodingQuality=2\r\nEncodingMode=0\r\nRecordingLimit=0\r\nStopOnLowDiskSpace=1\r\nNightEnabled=0\r\nNightDurationMs=0\r\nNightTargetBrightness=96\r\nCaptureIntervalMs=5000\r\nVideoWidth=1280\r\nVideoHeight=720\r\nRecordingLimitSeconds=900\r\n";
     fixture.seed(utf16(initial));reload();expectOptions(unicodeFolder,5,1,2);
     const auto initialBytes=fixture.bytes();
     const std::wstring changed=L"C:\\Synthetic videos\\\u65e5\u672c\u8a9e-\U0001f3a5";
@@ -270,7 +270,7 @@ void recordingLimits(){
         choose(app.stopAfter,limit);preferences(true);choose(app.stopAfter,(limit+1)%6);reload();
         require(choice(app.stopAfter)==limit,"Recording time limit did not survive atomic preference roundtrip.");
     }
-    for(const wchar_t* invalid:{L"-1",L"6",L"999"}){
+    for(const wchar_t* invalid:{L"-1",L"7",L"999"}){
         require(WritePrivateProfileStringW(L"Settings",L"RecordingLimit",invalid,app.preferences.c_str())!=FALSE,"Cannot seed invalid recording limit.");
         reload();require(choice(app.stopAfter)==0,"Invalid recording limit enabled automatic stop.");
     }
@@ -289,6 +289,36 @@ void diskSafety(){
         reload();require(SendMessageW(app.lowDisk,BM_GETCHECK,0,0)==BST_CHECKED,"Invalid low disk option disabled protection.");
     }
     fixture.onlySettingsRemain();std::cout<<"PASS low disk protection roundtrip; old and malformed settings keep protection enabled\n";
+}
+void customOptions(){
+    PreferencesFixture fixture;fixture.seed(legacy);reload();
+    for(int interval:{100,125,1234567,86400000}){
+        app.customIntervalMs=interval;app.customWidth=1080;app.customHeight=1920;app.customLimitSeconds=INT_MAX;
+        app.hasCustomInterval=app.hasCustomSize=app.hasCustomLimit=true;
+        app.committedInterval=6;app.committedSize=2;app.committedLimit=6;customItems();preferences(true);reload();configure();
+        require(app.settings.intervalMs==interval && app.settings.width==1080 && app.settings.height==1920 && app.settings.recordingLimitSeconds==INT_MAX,
+            "Exact custom values failed their atomic preference roundtrip.");
+        require(choice(app.interval)==6 && choice(app.videoSize)==2 && choice(app.stopAfter)==6 && choice(app.mode)==0,"Custom selectors or Desktop startup were lost.");
+    }
+    choose(app.interval,1);choose(app.videoSize,0);choose(app.stopAfter,0);preferences(true);reload();configure();
+    require(app.settings.intervalMs==2000 && app.settings.width==1280 && app.settings.height==720 && !app.settings.recordingLimitSeconds,
+        "Stale custom keys overrode a newer preset selection.");
+    const auto seedCustom=[&](const wchar_t* interval,const wchar_t* width,const wchar_t* height,const wchar_t* stop){
+        const std::wstring settings=L"[Settings]\r\nInterval=6\r\nQuality=2\r\nRecordingLimit=6\r\nCaptureIntervalMs="+std::wstring(interval)+
+            L"\r\nVideoWidth="+width+L"\r\nVideoHeight="+height+L"\r\nRecordingLimitSeconds="+stop+L"\r\n";
+        fixture.seed(utf16(settings));reload();configure();
+    };
+    for(const wchar_t* invalid:{L"",L"-1",L"125junk",L"1.5",L"99999999999999999999999999999999999999999999999999999999"}){
+        seedCustom(invalid,invalid,invalid,invalid);
+        require(app.settings.intervalMs==5000 && app.settings.width==1280 && app.settings.height==720 && !app.settings.recordingLimitSeconds,
+            "Malformed custom values enabled a partial or unintended policy.");
+    }
+    seedCustom(L"99",L"49",L"720",L"0");require(app.settings.intervalMs==5000 && app.settings.width==1280 && !app.settings.recordingLimitSeconds,"Out-of-range custom values were admitted.");
+    seedCustom(L"86400001",L"4096",L"4096",L"2147483648");require(app.settings.intervalMs==5000 && app.settings.width==1280 && !app.settings.recordingLimitSeconds,"Custom area/integer bounds overflowed.");
+    seedCustom(L"2000",L"1280",L"720",L"900");
+    require(choice(app.interval)==1 && choice(app.videoSize)==0 && choice(app.stopAfter)==1 && !app.hasCustomInterval && !app.hasCustomSize && !app.hasCustomLimit,
+        "Saved custom values equal to presets retained duplicate custom rows.");
+    fixture.onlySettingsRemain();std::cout<<"PASS exact custom interval/size/stop roundtrips, malformed fallback and newer preset precedence\n";
 }
 void nightOptions(){
     PreferencesFixture fixture;fixture.seed(legacy);reload();
@@ -417,10 +447,10 @@ int main(){
     try{
         std::cout<<std::unitbuf;std::cout<<"ACP="<<GetACP()<<'\n';
         HiddenControls controls;
-        newUnicodeFile();existingUnicodeRewrite();migrateAnsi();encodingModes();recordingLimits();diskSafety();nightOptions();readFailure();replacementFailure();
+        newUnicodeFile();existingUnicodeRewrite();migrateAnsi();encodingModes();recordingLimits();diskSafety();nightOptions();customOptions();readFailure();replacementFailure();
         preparationAllocationFailure();partialKeyWriteFailure();stagedExceptionCleanup();
         preferencePathBoundary(248);preferencePathBoundary(278);
         require(!IsWindowVisible(app.window),"Fixture became visible.");
-        std::cout<<"All 14 preference cases passed; only owned hidden controls/settings were used.\n";return 0;
+        std::cout<<"All 15 preference cases passed; only owned hidden controls/settings were used.\n";return 0;
     }catch(const std::exception& error){std::cerr<<"PREFERENCES TEST FAILURE: "<<error.what()<<'\n';return 1;}
 }

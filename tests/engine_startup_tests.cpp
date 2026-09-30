@@ -71,7 +71,7 @@ template<class Predicate> lapse::Status await(lapse::Engine& engine, Predicate p
 lapse::Settings settings(const std::filesystem::path& directory, bool camera = false) {
     // Keep this test ID inline so Settings faults still reach the layer allocation.
     lapse::Settings s; s.monitorId = L"test";
-    s.monitor = {0, 0, 320, 240}; s.width = 320; s.height = 240; s.interval = 1;
+    s.monitor = {0, 0, 320, 240}; s.width = 320; s.height = 240; s.intervalMs = 1000;
     s.layers = lapse::preset(camera ? lapse::Mode::Camera : lapse::Mode::Desktop);
     // A real CameraClient rejects this invalid ID before IPC or a helper launch.
     // Constructor allocation remains actual and unchanged.

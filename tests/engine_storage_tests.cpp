@@ -250,7 +250,7 @@ void publicationCase(const std::filesystem::path& directory,SaveFault fault) {
     afterRenamePending=commitAcknowledged=allocationFreeCommit=false;
     lapse::Engine engine;
     lapse::Settings settings; settings.monitorId = L"synthetic-display";
-    settings.width=320; settings.height=180; settings.interval=60;
+    settings.width=320; settings.height=180; settings.intervalMs = 60000;
     settings.folder=directory.wstring(); settings.preview=false;
     engine.configure(settings); engine.record();
     await(engine,[](const auto& s){return s.state==lapse::State::Recording&&s.frames==1;});
@@ -291,7 +291,7 @@ void publicationCase(const std::filesystem::path& directory,SaveFault fault) {
 void activeOutputOwnership(const std::filesystem::path& directory) {
     const auto folder = directory / L"active-output-ownership";
     lapse::Settings settings; settings.monitorId = L"synthetic-display";
-    settings.width = 320; settings.height = 180; settings.interval = 60;
+    settings.width = 320; settings.height = 180; settings.intervalMs = 60000;
     settings.folder = folder.wstring(); settings.preview = false;
     lapse::Engine engine;
     engine.configure(settings); engine.record();
@@ -332,7 +332,7 @@ void temporarySuffixBoundary(const std::filesystem::path& directory) {
     const std::filesystem::path folder(prefix + std::wstring(folderLength - prefix.size(), L'x'));
     require(!std::filesystem::exists(folder), "Boundary folder must be created by the worker");
     lapse::Settings settings; settings.monitorId = L"synthetic-display";
-    settings.width = 320; settings.height = 180; settings.interval = 60;
+    settings.width = 320; settings.height = 180; settings.intervalMs = 60000;
     settings.folder = folder.wstring(); settings.preview = false;
     lapse::Engine engine;
     engine.configure(settings); engine.record();
@@ -402,7 +402,7 @@ void workerCase(const std::filesystem::path& root,int kind) {
     {
         lapse::Engine engine;ReleaseGate release;
         lapse::Settings settings;settings.monitorId=L"synthetic-display";settings.width=320;settings.height=180;
-        settings.interval=60;settings.preview=false;settings.folder=folder.wstring();
+        settings.intervalMs = 60000;settings.preview=false;settings.folder=folder.wstring();
         engine.configure(settings);engine.record();
         await(engine,[](const auto& s){return s.state==lapse::State::Recording&&s.frames==1;});
         temporary=recordingPath(folder);original=identity(temporary);
@@ -499,7 +499,7 @@ int main() {
         {
             lapse::Settings settings; settings.monitorId = L"synthetic-display";
             settings.layers = lapse::preset(lapse::Mode::Desktop);
-            settings.width = 320; settings.height = 180; settings.interval = 60;
+            settings.width = 320; settings.height = 180; settings.intervalMs = 60000;
             settings.folder = directory.wstring(); settings.preview = false;
             lapse::Engine engine;
             engine.configure(settings); engine.record();

@@ -106,7 +106,7 @@ lapse::Settings settings(const std::filesystem::path& folder) {
     // sources and must not encode this camera-only preview into the desktop.
     result.layers = lapse::preset(lapse::Mode::Camera);
     result.monitorId = L"synthetic-display"; result.cameraId = L"synthetic-camera";
-    result.width = 320; result.height = 240; result.interval = 60;
+    result.width = 320; result.height = 240; result.intervalMs = 60000;
     result.preview = false; result.folder = folder.wstring();
     return result;
 }
@@ -291,7 +291,7 @@ void shutdown(const std::filesystem::path& root) {
     std::cout << "PASS shutdown finalizes and publishes both streams.\n";
 }
 void intervalAndCommit(const std::filesystem::path& root) {
-    resetFaults(); const auto folder = root / L"interval"; auto config = settings(folder); config.interval = 1;
+    resetFaults(); const auto folder = root / L"interval"; auto config = settings(folder); config.intervalMs = 1000;
     lapse::Engine engine; engine.configure(config); engine.record();
     await(engine, [](const auto& s) { return s.state == lapse::State::Recording && s.frames == 3; });
     fault = Fault::LastPublicationAllocation; engine.finish();

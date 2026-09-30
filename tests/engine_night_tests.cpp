@@ -78,7 +78,7 @@ template<class Predicate> Status await(Engine& engine,Predicate predicate,int ti
 }
 Settings config(const std::filesystem::path& folder,bool separate=false) {
     Settings s;s.cameraId=L"synthetic-night";s.monitorId=L"synthetic-desktop";
-    s.layers=preset(Mode::Camera);s.width=320;s.height=240;s.interval=1;
+    s.layers=preset(Mode::Camera);s.width=320;s.height=240;s.intervalMs = 1000;
     s.folder=folder.wstring();s.preview=false;s.separateFiles=separate;
     s.night.enabled=true;s.night.durationMs=1000;return s;
 }
@@ -143,12 +143,24 @@ void preparingPreview(const std::filesystem::path& root) {
 }
 void singleSource(const std::filesystem::path& root,Mode mode) {
     reset();auto s=config(root/(mode==Mode::Camera?L"camera-only":L"overlay"));
-    s.layers=preset(mode);s.interval=60;Engine engine;engine.configure(s);engine.record();
+    s.layers=preset(mode);s.intervalMs = 60000;Engine engine;engine.configure(s);engine.record();
     await(engine,[](const auto& value){return value.frames==1;});const auto result=finish(engine);
     require(!result.recordingFailed&&result.savedPaths.size()==1&&result.frames==1&&result.night.samples==5,
         "Single-source night output lost its completed camera window");
     decode(result.savedPath,1,mode==Mode::Camera?180:40);
     std::cout<<"PASS single camera/overlay recording, mode="<<int(mode)<<".\n";
+}
+void firstProcessedPreview(const std::filesystem::path& root) {
+    reset();auto s=config(root/L"first-processed-preview");s.preview=true;holdResult=true;
+    Engine engine;engine.configure(s);engine.record();
+    // Hold an already-complete window until a fresh raw preview was just
+    // published. Its clock must not delay the first processed camera image.
+    await(engine,[](const auto& value){return value.state==State::Starting&&value.preview&&previews>=3;});
+    holdResult=false;
+    const auto shown=await(engine,[](const auto& value){return value.frames==1&&value.preview&&value.preview->pixels[0]==180;},800);
+    require(shown.night.samples==5,"First processed preview lost its admitted window facts");
+    verify(finish(engine),1,false);
+    std::cout<<"PASS first processed Night window promptly replaces a recent raw preview.\n";
 }
 void pairedCadence(const std::filesystem::path& root,bool automatic) {
     reset();auto s=config(root/(automatic?L"auto-clamp":L"paired-cadence"),true);s.preview=true;
@@ -157,7 +169,7 @@ void pairedCadence(const std::filesystem::path& root,bool automatic) {
     auto first=await(engine,[](const auto& value){return value.frames==1&&value.preview;});
     const auto rawCalls=previews.load();
     require(first.elapsed<.2&&first.night.samples==5&&first.nightDurationMs==1000,"Initial blend counted as active time or wrong facts");
-    s.night.enabled=false;s.night.durationMs=30000;s.night.targetBrightness=128;s.interval=60;
+    s.night.enabled=false;s.night.durationMs=30000;s.night.targetBrightness=128;s.intervalMs = 60000;
     engine.configure(s);writeDelayMs=80;
     const auto third=await(engine,[](const auto& value){return value.frames>=3;});
     const auto result=finish(engine);verify(result,third.frames,true);
@@ -172,7 +184,7 @@ void pairedCadence(const std::filesystem::path& root,bool automatic) {
     std::cout<<"PASS paired full windows, frozen policy, decoded sources, cadence and auto clamp="<<automatic<<".\n";
 }
 void limitWindow(const std::filesystem::path& root) {
-    reset();auto s=config(root/L"limit-window",true);s.night.durationMs=0;s.interval=5;s.recordingLimitSeconds=2;suggestedMs=5000;
+    reset();auto s=config(root/L"limit-window",true);s.night.durationMs=0;s.intervalMs = 5000;s.recordingLimitSeconds=2;suggestedMs=5000;
     Engine engine;engine.configure(s);const auto started=GetTickCount64();engine.record();
     const auto first=await(engine,[](const auto& value){return value.frames==1;});
     require(GetTickCount64()-started>=3000&&first.elapsed<.2,"Auto initial window missing or included in active limit");
@@ -212,7 +224,7 @@ void retainedFailure(const std::filesystem::path& root,bool disk) {
     std::cout<<"PASS prior paired frames retained after "<<(disk?"low space":"helper error")<<".\n";
 }
 void beginFailure(const std::filesystem::path& root) {
-    reset();auto s=config(root/L"begin-failure",true);s.interval=2;
+    reset();auto s=config(root/L"begin-failure",true);s.intervalMs = 2000;
     Engine engine;engine.configure(s);engine.record();await(engine,[](const auto& value){return value.frames==1;});
     failBegin=true;
     const auto result=await(engine,[](const auto& value){return value.state==State::Idle;});verify(result,1,true,true);
@@ -267,7 +279,7 @@ int main() {
     const auto root=std::filesystem::current_path()/(L"engine-night-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64()));
     int result=0;
     try {
-        validation(root);preparingPreview(root);singleSource(root,Mode::Camera);singleSource(root,Mode::Overlay);
+        validation(root);preparingPreview(root);firstProcessedPreview(root);singleSource(root,Mode::Camera);singleSource(root,Mode::Overlay);
         pairedCadence(root,false);pairedCadence(root,true);
         limitWindow(root);pauseWindow(root);lateResult(root,false);lateResult(root,true);
         retainedFailure(root,false);retainedFailure(root,true);beginFailure(root);shutdownPending(root);

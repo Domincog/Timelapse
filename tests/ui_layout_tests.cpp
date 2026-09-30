@@ -163,6 +163,8 @@ struct HiddenWindow {
         app.contentWidth=app.contentHeight=0;app.layingOut=app.dragging=app.advancedExpanded=false;app.advancedLimitIndex=app.advancedVisibility=-1;
         app.visibleDirty=true;app.controlsUpdated=false;app.hiddenToTray=false;
         app.settings={};app.status={};app.nightValidation.clear();app.advancedNightState=app.nightVisibility=-1;
+        app.hasCustomInterval=app.hasCustomSize=app.hasCustomLimit=false;app.advancedCaption.clear();app.advancedTooltip.clear();
+        app.committedInterval=2;app.committedSize=app.committedLimit=0;
         ownedFocus=ownedCapture=nullptr;
         app.window=CreateWindowExW(0,L"STATIC",L"Owned hidden scrolling fixture",WS_POPUP|WS_CLIPCHILDREN,0,0,width,height,nullptr,nullptr,nullptr,nullptr);
         require(app.window && !IsWindowVisible(app.window),"Hidden parent creation failed.");
@@ -174,6 +176,7 @@ struct HiddenWindow {
         auto button=[&](const wchar_t* name,int id){return child(L"BUTTON",name,WS_TABSTOP|BS_PUSHBUTTON,id);};
         app.advanced=child(L"BUTTON",L"&Advanced",WS_TABSTOP|BS_AUTOCHECKBOX|BS_PUSHLIKE,AdvancedToggle);app.refresh=button(L"Re&fresh",Refresh);
         app.encodingMode=combo(6,L"Encodin&g",EncodingModeBox);app.stopAfter=combo(7,L"S&top after",StopAfterBox);
+        SendMessageW(app.encodingMode,CB_RESETCONTENT,0,0);for(auto name:EncodingModeLabels)add(app.encodingMode,name);choose(app.encodingMode,0);
         SendMessageW(app.stopAfter,CB_RESETCONTENT,0,0);for(auto name:RecordingLimitLabels)add(app.stopAfter,name);choose(app.stopAfter,0);
         app.lowDisk=child(L"BUTTON",L"Stop on &low disk space",WS_TABSTOP|BS_AUTOCHECKBOX,LowDiskBox);SendMessageW(app.lowDisk,BM_SETCHECK,BST_CHECKED,0);
         app.nightEnabled=child(L"BUTTON",L"&Night camera (software blend)",WS_TABSTOP|BS_AUTOCHECKBOX,NightBox);
@@ -389,11 +392,36 @@ void originalScenarios(){
     }
     syntheticWork={0,0,10000,10000};
 }
+void customGeometry(int dpi){
+    HiddenWindow owned(MulDiv(830,dpi,96),MulDiv(700,dpi,96),dpi);
+    SendMessageW(app.interval,CB_RESETCONTENT,0,0);for(int value:CaptureIntervals)add(app.interval,formatDuration(value));
+    SendMessageW(app.videoSize,CB_RESETCONTENT,0,0);add(app.videoSize,L"720p");add(app.videoSize,L"1080p");
+    app.customIntervalMs=86399999;app.customWidth=4096;app.customHeight=2160;app.customLimitSeconds=INT_MAX;
+    app.hasCustomInterval=app.hasCustomSize=app.hasCustomLimit=true;app.committedInterval=6;app.committedSize=2;app.committedLimit=6;
+    customItems();configure();app.advancedExpanded=true;updateControls();layout();
+    const auto fits=[&](HWND child,int padding){wchar_t label[256]{};GetWindowTextW(child,label,256);HDC dc=GetDC(child);const auto previous=SelectObject(dc,app.font);SIZE extent{};
+        GetTextExtentPoint32W(dc,label,static_cast<int>(std::wcslen(label)),&extent);SelectObject(dc,previous);ReleaseDC(child,dc);
+        require(extent.cx+app.scale(padding)<=bounds(child).right-bounds(child).left,"Custom value or explanatory encoding label truncates at minimum width/DPI.");};
+    for(HWND child:{app.interval,app.videoSize,app.stopAfter})fits(child,30);
+    for(int i=0;i<5;++i){choose(app.encodingMode,i);fits(app.encodingMode,30);}
+    fits(app.advanced,18);require(app.advancedTooltip.find(formatDuration(int64_t(INT_MAX)*1000))!=std::wstring::npos,"Collapsed finite-stop tooltip lost the exact maximum value.");
+    for(const auto& size: {std::pair<int,int>{1000,1000},{1080,1920},{3840,2160},{48,4096},{4096,48}}){
+        app.settings.width=size.first;app.settings.height=size.second;app.settings.layers=preset(Mode::Overlay);app.selected=1;
+        layout();RECT canvas{};GetClientRect(app.preview,&canvas);const auto video=app.videoRect;
+        require(video.left>=0 && video.top>=0 && video.right<=canvas.right && video.bottom<=canvas.bottom && video.right>video.left && video.bottom>video.top,
+            "Custom aspect produced an empty or out-of-preview canvas.");
+        const double actual=double(video.right-video.left)/std::max(1L,video.bottom-video.top),target=double(size.first)/size.second;
+        require(std::abs(actual-target)<=std::max(0.02,2.0*target/std::max(1L,video.bottom-video.top)),"Custom preview kept the old aspect.");
+        const auto layer=layerRect(app.settings.layers[1]);require(layer.left>=video.left && layer.top>=video.top && layer.right<=video.right && layer.bottom<=video.bottom,
+            "Custom aspect moved layer handles outside their video canvas.");
+    }
+    std::cout<<"PASS exact custom summaries, encoder explanations and square/portrait/wide canvas dpi="<<dpi<<'\n';
+}
 }
 int main(){
     try{
         std::cout<<std::unitbuf;SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        for(int dpi:{96,144,192,288}){scenario(dpi,false);scenario(dpi,true);advancedDisclosure(dpi);nightDisclosure(dpi);}
-        dragChecks();barDependency();dpiAndRouting();originalScenarios();std::cout<<"PASS 22 hidden scrolling and disclosure cases\n";return 0;
+        for(int dpi:{96,144,192,288}){scenario(dpi,false);scenario(dpi,true);advancedDisclosure(dpi);nightDisclosure(dpi);customGeometry(dpi);}
+        dragChecks();barDependency();dpiAndRouting();originalScenarios();std::cout<<"PASS 26 hidden scrolling, custom geometry and disclosure cases\n";return 0;
     }catch(const std::exception& e){std::cerr<<"FIXTURE FAILURE: "<<e.what()<<'\n';return 1;}
 }

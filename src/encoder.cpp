@@ -1,5 +1,6 @@
 #include "encoder.h"
 #include "encoder_conversion.h"
+#include "config.h"
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
@@ -157,10 +158,7 @@ bool Encoder::open(const std::wstring& path, int width, int height, int fps, std
         error = L"Choose a valid output filename.";
         return false;
     }
-    if (width < 16 || height < 16 || width > 4096 || height > 4096 || (width & 1) || (height & 1)) {
-        error = L"Video dimensions must be even numbers between 16 and 4096 pixels.";
-        return false;
-    }
+    if (!validateVideoSize(width, height, error)) return false;
     const uint64_t pixels = static_cast<uint64_t>(width) * height;
     if (pixels > std::numeric_limits<DWORD>::max() / 4) {
         error = L"The output dimensions are too large.";
@@ -207,6 +205,13 @@ bool Encoder::open(const std::wstring& path, int width, int height, int fps, std
         appendCleanupError(error, candidate->path, cleanup);
         return false;
     };
+    auto abandonConfiguration = [&](const wchar_t* stage, HRESULT result) {
+        abandon(stage, result);
+        error += L" Requested video size: " + std::to_wstring(width) + L" x " + std::to_wstring(height) + L".";
+        error += hardware ? L" Try a smaller video size, or choose Compatible or Efficient." :
+                            L" Try a smaller video size or another encoding mode.";
+        return false;
+    };
     HRESULT hr = MFCreateFile(MF_ACCESSMODE_READWRITE, MF_OPENMODE_FAIL_IF_NOT_EXIST,
                              MF_FILEFLAGS_NONE, candidate->path.c_str(), &candidate->bytes);
     if (FAILED(hr)) return abandon(L"Cannot access the new output file", hr);
@@ -236,7 +241,7 @@ bool Encoder::open(const std::wstring& path, int width, int height, int fps, std
     // that short clips retain their frame count and start at timestamp zero.
     if (SUCCEEDED(hr)) hr = output->SetUINT32(MF_MT_MPEG2_PROFILE, hevc ? eAVEncH265VProfile_Main_420_8 : eAVEncH264VProfile_Main);
     if (SUCCEEDED(hr)) hr = candidate->writer->AddStream(output.Get(), &candidate->stream);
-    if (FAILED(hr)) return abandon(hevc ? L"Cannot configure H.265/HEVC output" : L"Cannot configure H.264 output", hr);
+    if (FAILED(hr)) return abandonConfiguration(hevc ? L"Cannot configure H.265/HEVC output" : L"Cannot configure H.264 output", hr);
 
     ComPtr<IMFMediaType> input;
     hr = MFCreateMediaType(&input);
@@ -269,11 +274,11 @@ bool Encoder::open(const std::wstring& path, int width, int height, int fps, std
         efficient || qualitySoftware ? 66 : 100);
     if (SUCCEEDED(hr) && !compatible) hr = encoding->SetUINT32(CODECAPI_AVEncMPVGOPSize, 5 * fps);
     if (SUCCEEDED(hr)) hr = candidate->writer->SetInputMediaType(candidate->stream, input.Get(), encoding.Get());
-    if (FAILED(hr)) return abandon(hardware ?
-        L"Cannot initialize the requested hardware encoder; choose Compatible or Efficient" : L"Cannot initialize the H.264 encoder", hr);
+    if (FAILED(hr)) return abandonConfiguration(hardware ?
+        L"Cannot initialize the requested hardware encoder" : L"Cannot initialize the H.264 encoder", hr);
     hr = verifyEncoder(candidate->writer.Get(), candidate->stream, subtype, hardware);
-    if (FAILED(hr)) return abandon(hardware ?
-        L"The requested hardware encoder is unavailable; choose Compatible or Efficient" : L"Cannot verify the software H.264 encoder", hr);
+    if (FAILED(hr)) return abandonConfiguration(hardware ?
+        L"The requested hardware encoder is unavailable" : L"Cannot verify the software H.264 encoder", hr);
     hr = candidate->writer->BeginWriting();
     if (FAILED(hr)) return abandon(L"Cannot start the MP4 recording", hr);
     candidate->writing = true;

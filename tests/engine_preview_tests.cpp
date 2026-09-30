@@ -321,7 +321,7 @@ void healthyReaderThenCurrentFailure() {
     controls.release(Operation::Read);
     require(await([&] { const auto s = engine.status(); return s.error && !s.preview &&
             s.message.find(readError) != std::wstring::npos; }), "Current read failure was not reported.");
-    auto geometryOnly = initial; geometryOnly.layers[0].rect = {.1, .1, .8, .8}; geometryOnly.interval = 7;
+    auto geometryOnly = initial; geometryOnly.layers[0].rect = {.1, .1, .8, .8}; geometryOnly.intervalMs = 7000;
     engine.configure(geometryOnly); engine.configure(initial);
     require(controls.noNewOpen(before.opens), "Current-generation failure reopened without an explicit retry.");
     require(controls.snapshot().closes == before.closes + 1 && engine.status().error,

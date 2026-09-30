@@ -67,10 +67,10 @@ bool CameraClient::latest(Frame& output, std::wstring& error) {
     if (impl_->warmup > 0) { --impl_->warmup; return false; }
     output = pixels(); return true;
 }
-bool captureMonitor(const std::wstring& id, int width, int, bool, Frame& output, std::wstring& error) {
+bool captureMonitor(const std::wstring& id, int width, int height, bool, Frame& output, std::wstring& error) {
     if (id != L"synthetic-display") { error = L"Unknown synthetic display."; return false; }
     error.clear();
-    if (width == 640) {
+    if (width == 480 && height == 360) {
         if (throwDesktopPreview.exchange(false)) throw std::bad_alloc();
         if (failDesktopPreview) { error = L"Injected desktop preview failure."; return false; }
     } else if (failDesktopCapture) { error = L"Injected desktop sample failure."; return false; }
@@ -90,7 +90,7 @@ int main() {
             lapse::Settings settings; settings.monitorId = L"synthetic-display";
             settings.layers = lapse::preset(lapse::Mode::Camera);
             settings.cameraId = L"controlled-test-camera";
-            settings.width = 320; settings.height = 240; settings.interval = 1;
+            settings.width = 320; settings.height = 240; settings.intervalMs = 1000;
             settings.folder = directory.wstring(); settings.preview = false;
             lapse::Engine engine;
             engine.configure(settings); engine.record();
@@ -171,7 +171,7 @@ int main() {
             lapse::Settings settings; settings.monitorId = L"synthetic-display";
             settings.layers = lapse::preset(lapse::Mode::Overlay);
             settings.cameraId = L"controlled-test-camera";
-            settings.width = 320; settings.height = 240; settings.interval = 30;
+            settings.width = 320; settings.height = 240; settings.intervalMs = 30000;
             settings.folder = directory.wstring(); settings.preview = true;
             lapse::Engine engine;
             engine.configure(settings); engine.record();
@@ -199,12 +199,14 @@ int main() {
             failDesktopPreview = true;
             await(engine, [](const auto& s) { return s.state == lapse::State::Paused && s.error && !s.preview; });
             engine.pause();
-            // The full-size resume sample succeeds even while the deliberately
-            // broken low-resolution preview would still fail.
-            recovered = await(engine, [&](const auto& s) { return s.state == lapse::State::Recording && s.frames > initial.frames && !s.error; });
-            require(!recovered.error && recovered.message.find(L"Recording.") == 0,
-                    "Successful resume sample did not clear the preview error");
+            // A full-size resume sample succeeds independently of the broken
+            // low-resolution preview; admission alone must not clear its error.
+            recovered = await(engine, [&](const auto& s) { return s.state == lapse::State::Recording && s.frames > initial.frames; });
+            require(recovered.error, "Successful resume sample falsely cleared the preview error without refreshing it");
             failDesktopPreview = false;
+            recovered = await(engine, [](const auto& s) { return s.state == lapse::State::Recording && !s.error && bool(s.preview); });
+            require(recovered.message.find(L"Recording.") == 0,
+                    "Successful preview refresh did not restore the recording message");
 
             throwDesktopPreview = true;
             await(engine, [](const auto& s) { return s.state == lapse::State::Recording && s.error && !s.preview; });

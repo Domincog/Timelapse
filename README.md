@@ -10,21 +10,23 @@ A small native Windows timelapse recorder. Record a display, a camera, or both i
 4. In a collage, click and drag a source to move it. Drag its lower-right corner to resize it. Use Bring forward to change overlap. Changes during recording appear in subsequent frames.
 5. Press Record. Pause skips recording until resumed; Finish finalizes the MP4 file or pair of files. Open folder shows the saved files. The default destination is Videos/Timelapse.
 
+**Custom values:** Capture every and Video size keep their presets and offer Custom. Capture intervals can be from 0.1 seconds to 24 hours, in exact milliseconds. Video dimensions can be even numbers from 48 to 4096 pixels per side, with at most 8,847,360 pixels (4096 x 2160); portrait and square outputs are supported. The preview follows the chosen aspect ratio. Installed encoders may reject some sizes; try a smaller size or another encoding mode if this happens. Large outputs need more memory and encoding time. The actual capture rate can be lower than requested when processing is slow; missed slots are skipped without a catch-up burst. Custom dialogs keep the previous value until you accept valid input.
+
 **Separate files:** Desktop + camera (2 files) saves a `-desktop.mp4` and a `-camera.mp4` with a shared capture interval, playback rate, quality, and pause/resume controls. Each file shows the complete source at the selected output size, preserving its aspect ratio. The side-by-side preview helps position the camera; it is not burned into either output. Collage editing is disabled in this mode. If a source or encoder fails, both recordings stop and the app attempts to save each file, reporting each outcome.
 
 **System tray:** Closing the window hides Timelapse while recording continues. Reopen it from its tray icon or the Start menu. Right-click the tray icon for Show, Pause/Resume, Finish, or Exit. Exit finishes an active recording before closing; a saving failure brings the window back with the recovery information. Hidden windows stop preview processing. If Windows cannot add the tray icon, the app stays accessible in its window.
 
-**Advanced options:** Expand Advanced (Alt + A) for the encoder selector and optional Stop after limit. Choose 15 minutes, 1 hour, 4 hours, 8 hours, or 24 hours of active recording. Initial startup and paused time do not count. Timelapse automatically finishes and saves the video or pair of videos at the limit, including while hidden in the tray. Finishing may wait for a capture or encoding operation already in progress and for the files to save. The default is Never. The selected limit is remembered and stays visible in the collapsed Advanced label; recording settings remain locked while recording. Finishing a hidden recording also releases the camera.
+**Advanced options:** Expand Advanced (Alt + A) for the encoder selector and optional Stop after limit. Choose a preset or Custom for a positive active duration in seconds, minutes, hours, or days. Custom limits must equal a whole number of seconds, up to 2,147,483,647 seconds. Initial startup and paused time do not count. Timelapse automatically finishes and saves the video or pair of videos at the limit, including while hidden in the tray. Finishing may wait for a capture or encoding operation already in progress and for the files to save. The default is Never. The selected limit is remembered and stays visible in the collapsed Advanced label; recording settings remain locked while recording. Finishing a hidden recording also releases the camera.
 
 **Low disk space:** Advanced also contains Stop on low disk space, enabled by default. Before opening a recording and before each captured frame is admitted, Timelapse checks the space available to your account in the save folder. It stops and attempts to save when 64 MiB or less remains for one output, or 128 MiB for two outputs. If Windows cannot report available space, recording is refused or stopped with a diagnostic. The option is remembered and locked during a recording; turn it off for a folder that cannot provide space information. Checks do not run for preview, idle time, or paused recordings.
 
+This is a best-effort headroom check, not reserved disk space: another program, encoder buffering, large video indexes, or drive failure can still prevent saving. A slow network-folder query can delay recording or Finish. The original stop reason remains visible if saving or renaming also fails.
+
 **Night camera:** For camera recordings, Advanced offers an optional Night camera (software blend) mode. It combines distinct camera frames over a period of time and adjusts brightness automatically. This can reduce random noise and blur movement; the camera's shutter settings remain unchanged. It uses an approximate linear-light blend of the camera's processed video, rather than raw sensor exposures, and cannot recover detail that the camera did not capture. Night mode is off by default.
 
-Leave Blend duration on Auto, or choose 1, 2, 5, 10, or 30 seconds. Auto starts with up to three seconds, then adjusts the blend duration using brightness correction and the observed number of camera frames. Every window stays within Capture every and the 30-second maximum. A manual duration must not exceed Capture every; the app keeps an invalid selection visible and disables Record until corrected. Automatic brightness remains active with a manual duration. Dark, Balanced, and Bright choose the desired average brightness; Balanced is the default. Bounded digital gain and approximate highlight protection can prevent the target from being reached, which the last-blend status reports.
+Leave Blend duration on Auto, or choose 1, 2, 5, 10, or 30 seconds. Auto starts with up to three seconds, then adjusts the blend duration using brightness correction and the observed number of camera frames. Every window stays within Capture every and the 30-second maximum. Night camera requires a capture interval of at least one second, including with Auto. A manual duration must not exceed Capture every; the app keeps an invalid selection visible and disables Record until corrected. Automatic brightness remains active with a manual duration. Dark, Balanced, and Bright choose the desired average brightness; Balanced is the default. Bounded digital gain and approximate highlight protection can prevent the target from being reached, which the last-blend status reports.
 
 The initial full blend is preparation and does not consume a Stop after limit. Pause, Finish, or a time limit discards an unfinished blend; Resume starts a fresh one. Idle preview remains ordinary camera video. During recording, preview holds the most recently completed blend while the next one is prepared. Last-blend duration, camera-frame count, and digital gain describe that completed result. In collages, only the camera is blended; in two-file mode, the desktop is captured near the end of the camera window. The files share playback timestamps, but their physical exposure periods differ. Slow cameras or processing can reduce the actual capture rate; full windows are never shortened to catch up. If no distinct camera frame arrives within a window, choose a longer blend and capture interval.
-
-This is a best-effort headroom check, not reserved disk space: another program, encoder buffering, large video indexes, or drive failure can still prevent saving. A slow network-folder query can delay recording or Finish. The original stop reason remains visible if saving or renaming also fails.
 
 The installer keeps Timelapse in your user account's `LocalAppData\Programs\Timelapse` directory and adds Start menu and uninstall entries. Start with Windows is optional and starts the app in the tray without recording. Exit Timelapse from its tray menu before upgrading or uninstalling. Uninstalling preserves your recordings and settings.
 
@@ -42,7 +44,7 @@ Expand Advanced to choose an encoding mode separately from resolution and qualit
 | Efficient H.264 | Tuned software encoding with a bitrate target and longer keyframe spacing. A useful starting point for long recordings. |
 | Hardware H.264 | Uses an available hardware encoder to reduce CPU work, with broad H.264 playback support. |
 | Hardware HEVC | Uses an available hardware HEVC encoder. Playback requires a compatible player or installed HEVC decoder. |
-| Quality H.264 | Software encoding that prioritizes consistent detail. Static screens can produce small files; frequent changes can produce much larger files. |
+| Quality H.264 | Software encoding that prioritizes detail. Static screens can produce small files; frequent changes can produce much larger files. |
 
 Hardware support depends on the computer and driver. If a hardware mode is unavailable, choose Compatible H.264 or Efficient H.264. The app verifies that hardware modes actually use a hardware encoder. Encoding and quality choices are saved and remain locked during a recording.
 
@@ -84,7 +86,7 @@ The executable is then in `build/release/Timelapse.exe`. Developers can launch i
 
 ## Current limits
 
-- One display and one camera at a time; 720p or 1080p output, preserving source aspect ratios. Camera input is capped at 720p to limit processing; 1080p preserves additional desktop detail.
+- One display and one camera at a time; 720p, 1080p, or custom output within the size limits above, preserving source aspect ratios. Camera input is capped at 720p to limit processing; larger output does not add camera detail. Desktop output can retain more detail when the selected display provides it.
 - The desktop must remain unlocked and awake. Protected content may appear black. A removed display or unavailable camera stops recording and attempts to save captured frames.
 - MP4 is finalized by Finish, Exit, or an automatic time limit. Closing the window keeps recording. A power loss or forced termination can leave an unplayable `.recording.mp4` file; crash recovery is not implemented yet.
 - Windows N requires the Media Feature Pack. The app and installer are currently unsigned.
@@ -153,7 +155,7 @@ This also checks BT.709 limited-range color metadata. FFmpeg is used only by the
 
 After building and testing, run `./package.ps1` to create both archives in `packages/`. The release ZIP is intended for GitHub Releases. Extract the source ZIP into an empty folder, then run the build commands from that folder; build outputs, test recordings, and local settings are excluded.
 
-To also create `Timelapse-v0.5.0-windows-x64-setup.exe`, supply an installed or portable Inno Setup 7 compiler:
+To also create `Timelapse-v0.7.0-windows-x64-setup.exe`, supply an installed or portable Inno Setup 7 compiler:
 
 ```powershell
 .\package.ps1 -InstallerCompiler 'C:\Path\To\Inno Setup 7\ISCC.exe'

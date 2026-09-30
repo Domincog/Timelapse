@@ -31,7 +31,8 @@ std::vector<Layer> preset(Mode mode);
 Rect constrain(Rect rect);
 // Fits the complete source within the layer; uncovered space is dark.
 // Later layers cover earlier layers. On failure, output is unchanged.
-// Output uses even dimensions, up to 1920 x 1080.
+// Primitive output uses even dimensions 2..4096 with at most 8,847,360 pixels.
+// Recording has a separate 48-pixel minimum for ordinary codec playback.
 bool compose(const Frame* desktop, const Frame* camera, const std::vector<Layer>& layers,
              int width, int height, Frame& output, std::wstring& error);
 std::wstring errorText(HRESULT hr);

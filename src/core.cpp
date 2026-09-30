@@ -1,4 +1,5 @@
 #include "core.h"
+#include "config.h"
 #include <filesystem>
 #include <algorithm>
 #include <cmath>
@@ -9,8 +10,6 @@
 namespace lapse {
 namespace {
 constexpr uint8_t background = 20;
-constexpr int maxWidth = 1920;
-constexpr int maxHeight = 1080;
 
 struct PixelRect { int left, top, right, bottom; };
 struct Sample { int first, second; unsigned weight; };
@@ -117,8 +116,9 @@ Rect constrain(Rect rect) {
 bool compose(const Frame* desktop, const Frame* camera, const std::vector<Layer>& layers,
              int width, int height, Frame& output, std::wstring& error) {
     error.clear();
-    if (width < 2 || height < 2 || width > maxWidth || height > maxHeight || width % 2 || height % 2) {
-        error = L"Video dimensions must be even numbers from 2 to 1920 wide and 2 to 1080 high.";
+    if (width < 2 || height < 2 || width > MaxVideoDimension || height > MaxVideoDimension ||
+        width % 2 || height % 2 || int64_t(width) * height > MaxVideoPixels) {
+        error = L"Composition needs even dimensions from 2 to 4096 with at most 8,847,360 pixels.";
         return false;
     }
     if (layers.empty()) {

@@ -36,7 +36,7 @@ int wmain() {
     auto folder=std::filesystem::current_path()/(L"engine-test-"+std::to_wstring(GetCurrentProcessId()));
     try {
         auto displays=enumerateMonitors();check(!displays.empty(),"A desktop session is required for engine tests");
-        Settings cfg;cfg.monitor=displays.front().bounds;cfg.monitorId=displays.front().id;cfg.interval=1;cfg.width=320;cfg.height=180;cfg.folder=folder.wstring();cfg.preview=false;
+        Settings cfg;cfg.monitor=displays.front().bounds;cfg.monitorId=displays.front().id;cfg.intervalMs = 1000;cfg.width=320;cfg.height=180;cfg.folder=folder.wstring();cfg.preview=false;
         Engine engine;engine.configure(cfg);engine.record();
         await(engine,[](const Status& s){return s.state==State::Recording && s.frames>=2;});
         engine.pause();auto paused=await(engine,[](const Status& s){return s.state==State::Paused;});

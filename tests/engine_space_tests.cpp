@@ -163,7 +163,7 @@ lapse::Settings settings(const std::filesystem::path& folder, bool separate = fa
                          lapse::Mode mode = lapse::Mode::Desktop) {
     lapse::Settings result;
     result.monitorId = L"synthetic-display"; result.cameraId = L"synthetic-camera";
-    result.width = 320; result.height = 240; result.interval = 60;
+    result.width = 320; result.height = 240; result.intervalMs = 60000;
     result.folder = folder.wstring(); result.preview = false;
     result.layers = lapse::preset(mode); result.separateFiles = separate;
     return result;

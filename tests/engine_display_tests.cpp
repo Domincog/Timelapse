@@ -151,7 +151,7 @@ void activeCase(bool moved, bool outsideControl, bool pinning = false) {
     topology({originalA,originalB});
     const auto monitor=selected(outsideControl?L"monitor:interface-B":L"monitor:interface-A");
     lapse::Settings cfg; cfg.monitor=monitor.bounds; cfg.monitorId=monitor.id;
-    cfg.width=tile; cfg.height=height; cfg.interval=1; cfg.preview=false; cfg.folder=outputRoot.wstring();
+    cfg.width=tile*2; cfg.height=height*2; cfg.intervalMs = 1000; cfg.preview=false; cfg.folder=outputRoot.wstring();
     { std::lock_guard<std::mutex> lock(frameMutex); recordedFrames=0; blockFirstWrite=true; releaseFirstWrite=barrierTimeout=false; recordedMarkers.fill(0); }
     {
         lapse::Engine engine; ReleaseWrite unblock;

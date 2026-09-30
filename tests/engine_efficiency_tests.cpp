@@ -83,7 +83,7 @@ int main() {
         {
             lapse::Settings settings; settings.monitorId = L"synthetic-display";
             settings.width = 1920; settings.height = 1080;
-            settings.interval = 1; settings.folder = directory.wstring();
+            settings.intervalMs = 1000; settings.folder = directory.wstring();
             lapse::Engine engine;
             engine.configure(settings);
             auto first = await(engine, [](const auto& s) { return bool(s.preview); });
@@ -132,7 +132,7 @@ int main() {
             // A long interval and hidden preview must not delay commands until
             // the next sample. Pause and Finish also need the fractional time
             // since the last displayed clock refresh, without counting Pause.
-            settings.preview = false; settings.interval = 60;
+            settings.preview = false; settings.intervalMs = 60000;
             settings.width = 320; settings.height = 180;
             engine.configure(settings);
             engine.record();

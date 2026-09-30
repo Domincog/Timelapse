@@ -68,7 +68,7 @@ template<class Predicate> lapse::Status await(lapse::Engine& engine,Predicate pr
 #include "engine_power_video.h"
 lapse::Settings config(const std::filesystem::path& folder,bool preview=false) {
     lapse::Settings cfg; cfg.monitorId=L"test"; cfg.monitor={0,0,320,240}; cfg.width=320; cfg.height=240;
-    cfg.interval=60; cfg.preview=preview; cfg.folder=folder.wstring(); return cfg;
+    cfg.intervalMs = 60000; cfg.preview=preview; cfg.folder=folder.wstring(); return cfg;
 }
 void start(lapse::Engine& engine,const lapse::Settings& cfg) {
     engine.configure(cfg); engine.record();

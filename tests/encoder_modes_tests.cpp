@@ -167,6 +167,7 @@ void rejection(const std::filesystem::path& directory) {
         lapse::EncodingQuality::Balanced, lapse::EncodingMode::HardwareH264);
     forceSoftware = false;
     require(!opened && error.find(L"hardware encoder is unavailable") != std::wstring::npos &&
+        error.find(L"320 x 240") != std::wstring::npos && error.find(L"smaller video size") != std::wstring::npos &&
         !std::filesystem::exists(path), "Explicit hardware silently fell back or leaked output");
     encoded(encoder.open(path.wstring(), width, height, fps, error, lapse::EncodingQuality::Balanced,
         lapse::EncodingMode::Efficient), error);
