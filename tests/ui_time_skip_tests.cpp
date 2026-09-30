@@ -1,5 +1,6 @@
-// Owned hidden native dialogs and inert engine. Nested modal calls are scripted;
-// no device capture, ordinary application launch, persistent UI or settings I/O.
+// Owned native dialogs and inert engine. Mnemonic checks temporarily show a
+// nonactivating tool window wholly offscreen; other dialogs remain hidden.
+// No device capture, ordinary application launch, persistent UI or settings I/O.
 #include <windows.h>
 #include <functional>
 #include <vector>
@@ -358,6 +359,41 @@ void fineTuning(){
     app.status={};require(app.settings.timeSkip.quietSensitivity==QuietSensitivity::High && lapse::configurationCalls==initial+1,"Read-only inspection reconfigured tuning.");
     std::cout<<"PASS Fine tuning default/nondefault disclosure, native keyboard/DPI, hidden validation, Off, cancellation and read-only inspection\n";
 }
+void nativeScheduleMnemonicsAndReadOnlyEnter(){
+    HiddenFixture owned;setupSkip();
+    const auto key=[](HWND window,UINT message,WPARAM value){MSG input{};input.hwnd=GetFocus();input.message=message;input.wParam=value;
+        if(message==WM_SYSCHAR)input.lParam=1L<<29;require(IsDialogMessageW(window,&input),"Native schedule key was not handled.");};
+    for(auto policyMode:{TimeSkipMode::Manual,TimeSkipMode::QuietWithinSchedule,TimeSkipMode::NoPersonWithinSchedule}){
+        app.settings.timeSkip.mode=policyMode;app.settings.timeSkip.rangeCount=1;app.settings.timeSkip.ranges[0]={0,60};
+        const int configurations=lapse::configurationCalls;
+        skipScript=[&](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);
+            require(IsWindowEnabled(draft.remove),"Selected schedule did not enable Remove.");
+            RECT screen{GetSystemMetrics(SM_XVIRTUALSCREEN),GetSystemMetrics(SM_YVIRTUALSCREEN),0,0};
+            screen.right=screen.left+GetSystemMetrics(SM_CXVIRTUALSCREEN);screen.bottom=screen.top+GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            SetWindowLongPtrW(window,GWL_EXSTYLE,GetWindowLongPtrW(window,GWL_EXSTYLE)|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE);
+            SetWindowPos(window,nullptr,screen.right+20000,screen.bottom+20000,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);
+            RECT placed{},overlap{};GetWindowRect(window,&placed);require(!IntersectRect(&overlap,&placed,&screen),"Schedule mnemonic fixture must remain offscreen.");
+            ShowWindow(window,SW_SHOWNOACTIVATE);
+            for(HWND start:{draft.mode,draft.ranges,draft.add,draft.edit,draft.remove,draft.cancel}){
+                SendMessageW(window,WM_NEXTDLGCTL,reinterpret_cast<WPARAM>(start),TRUE);key(window,WM_SYSCHAR,L'r');
+                require(GetFocus()==draft.ranges && draft.policy.rangeCount==1 && !outcome(),"Alt+R must focus ranges without removing a selected range.");
+            }
+            key(window,WM_SYSCHAR,L'm');require(draft.policy.rangeCount==0 && !IsWindowEnabled(draft.remove) && !outcome(),"Alt+M failed to remove only the selected draft range.");
+            GetWindowRect(window,&placed);require(!IntersectRect(&overlap,&placed,&screen),"Schedule mnemonic fixture moved onto the desktop.");
+            ShowWindow(window,SW_HIDE);skipProc(window,WM_COMMAND,IDCANCEL,0);
+        };editSkip();
+        require(app.settings.timeSkip.rangeCount==1 && lapse::configurationCalls==configurations,"Cancelled mnemonic edit changed persistent policy.");
+    }
+    for(auto state:{State::Starting,State::Recording,State::Paused,State::Finishing}){
+        app.status.state=state;const int configurations=lapse::configurationCalls;
+        skipScript=[&](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);
+            require(draft.readOnly && IsWindowEnabled(draft.ranges) && !IsWindowEnabled(draft.remove),"Read-only schedule inspection locks changed.");
+            SendMessageW(window,WM_NEXTDLGCTL,reinterpret_cast<WPARAM>(draft.ranges),TRUE);require(GetFocus()==draft.ranges,"Read-only range focus failed.");
+            key(window,WM_KEYDOWN,VK_RETURN);require(outcome()==IDCANCEL,"Native Enter from the inspected schedule did not close the read-only dialog.");
+        };editSkip();require(app.settings.timeSkip.rangeCount==1 && lapse::configurationCalls==configurations,"Read-only Enter changed recording policy.");
+    }
+    app.status={};std::cout<<"PASS unambiguous native range/Remove mnemonics, canceled drafts and Enter-to-close across active states\n";
 }
-int main(){try{transactionalRanges();boundsAndFreeze();modalLayoutAndInactiveDraft();strictPolicy();nativeCompressionInsertion();statusAndNestedClose();personModesAndManagement();personLayoutAndStatus();nativeModalButtons();fineTuning();std::cout<<"All ten time-compression UI groups passed using owned hidden windows only.\n";return 0;}
+}
+int main(){try{transactionalRanges();boundsAndFreeze();modalLayoutAndInactiveDraft();strictPolicy();nativeCompressionInsertion();statusAndNestedClose();personModesAndManagement();personLayoutAndStatus();nativeModalButtons();fineTuning();nativeScheduleMnemonicsAndReadOnlyEnter();std::cout<<"All eleven time-compression UI groups passed using owned synthetic windows only.\n";return 0;}
 catch(const std::exception& error){std::cerr<<"TIME COMPRESSION UI FAILURE: "<<error.what()<<'\n';return 1;}}

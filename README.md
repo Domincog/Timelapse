@@ -80,7 +80,9 @@ The detector can miss people, especially when small, obscured, unusual or poorly
 
 The installer keeps Timelapse in your user account's `LocalAppData\Programs\Timelapse` directory and adds Start menu and uninstall entries. Start with Windows is optional and starts the app in the tray without recording. Exit Timelapse from its tray menu before upgrading or uninstalling. Uninstalling preserves your recordings and settings.
 
-Tab moves between controls, and Alt + O opens the save folder. In the collage preview, Space cycles between sources, arrow keys move the selected source, and Shift + arrow keys resize it. Using these keys while dragging ends the current drag and preserves the keyboard edit. Reset layout restores the preset.
+Tab moves between controls. Alt + H changes the save folder while idle, and Alt + O opens it. Alt + C opens Time compression, including when Advanced is collapsed. In its schedule editor, Alt + R focuses the ranges list and Alt + M removes the selected range; changes take effect only after OK. During recording, compression settings are read-only and Enter from the ranges list closes the view.
+
+In the collage preview, Space cycles between sources, arrow keys move the selected source, and Shift + arrow keys resize it. Using these keys while dragging ends the current drag and preserves the keyboard edit. Reset layout restores the preset.
 
 On smaller work areas, scroll to reach the preview and controls. The wheel scrolls vertically, Shift + wheel scrolls horizontally, and keyboard navigation brings focused controls into view.
 

@@ -1467,7 +1467,7 @@ INT_PTR CALLBACK skipProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             label(7,L"Wait u&nits");draft->quietUnits=combo(SkipQuietUnits);
             draft->packInfo=skipChild(window,L"STATIC",L"",SS_NOPREFIX,SkipPackInfo);draft->packManage=button(L"Manage &detector...",SkipPackManage);
             label(4,L"Active-time &ranges (start \u2192 end, up to 16)");draft->ranges=skipChild(window,L"LISTBOX",L"",WS_TABSTOP|LBS_NOTIFY|LBS_NOINTEGRALHEIGHT|WS_VSCROLL,SkipRanges);
-            draft->add=button(L"&Add...",SkipAdd);draft->edit=button(L"&Edit...",SkipEdit);draft->remove=button(L"&Remove",SkipRemove);
+            draft->add=button(L"&Add...",SkipAdd);draft->edit=button(L"&Edit...",SkipEdit);draft->remove=button(L"Re&move",SkipRemove);
             label(5,L"Repeat e&very (0 = never)");draft->repeat=skipChild(window,L"EDIT",std::to_wstring(draft->policy.repeatSeconds).c_str(),WS_TABSTOP|ES_AUTOHSCROLL,SkipRepeat);
             label(6,L"&Units");draft->repeatUnits=combo(SkipRepeatUnits);
             for(HWND box:{draft->quietUnits,draft->repeatUnits}){for(auto value:{L"Seconds",L"Minutes",L"Hours",L"Days"})add(box,value);choose(box,0);}
@@ -1489,7 +1489,8 @@ INT_PTR CALLBACK skipProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             for(HWND child:draft->labels)if(!child)okay=false;if(!okay){EndDialog(window,-1);return TRUE;}
             for(HWND child:{draft->quiet,draft->repeat})SendMessageW(child,EM_SETLIMITTEXT,96,0);
             for(HWND child:{draft->mode,draft->speed,draft->ramp,draft->quiet,draft->quietUnits,draft->repeat,draft->repeatUnits,draft->packManage,draft->sensitivity,draft->okay})EnableWindow(child,!draft->readOnly);
-            if(draft->readOnly)ShowWindow(draft->okay,SW_HIDE);skipList(*draft);skipPackInfo(*draft);skipHelp(*draft);customFont(window,*draft);
+            if(draft->readOnly){ShowWindow(draft->okay,SW_HIDE);SendMessageW(window,DM_SETDEFID,IDCANCEL,0);}
+            skipList(*draft);skipPackInfo(*draft);skipHelp(*draft);customFont(window,*draft);
             RECT rect{0,0,draft->scale(540),draft->scale(skipScheduled(draft->policy.mode)?680:460)};
             AdjustWindowRectExForDpi(&rect,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_STYLE)),FALSE,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_EXSTYLE)),draft->dpi);
             RECT owner{};GetWindowRect(app.window,&owner);OffsetRect(&rect,(owner.left+owner.right-(rect.right-rect.left))/2-rect.left,(owner.top+owner.bottom-(rect.bottom-rect.top))/2-rect.top);
@@ -2134,7 +2135,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         app.nightTarget=combo(9,L"Auto &brightness",NightTargetBox);for(auto label:{L"Dark",L"Balanced",L"Bright"})add(app.nightTarget,label);
         app.nightHint=requiredControl(L"STATIC",L"",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX,NightHint);
         app.nightDetail=requiredControl(L"STATIC",L"",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX,NightDetail);
-        app.record=button(L"●  &Record",Record);app.pause=button(L"&Pause",Pause);app.finish=button(L"&Finish",Finish);app.folder=button(L"&Change...",Folder);app.openFolder=button(L"&Open folder",OpenFolder);app.reset=button(L"Reset layout",Reset);app.forward=button(L"Bring forward",Forward);
+        app.record=button(L"●  &Record",Record);app.pause=button(L"&Pause",Pause);app.finish=button(L"&Finish",Finish);app.folder=button(L"C&hange...",Folder);app.openFolder=button(L"&Open folder",OpenFolder);app.reset=button(L"Reset layout",Reset);app.forward=button(L"Bring forward",Forward);
         app.preview=requiredControl(L"LapsePreview",L"Collage preview. Space selects a layer. Arrow keys move it. Shift and arrow keys resize it.",WS_TABSTOP,Preview);
         app.statusText=requiredControl(L"STATIC",app.status.message.c_str(),SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX,210);
         app.statusDetails=button(L"Deta&ils...",StatusDetails);

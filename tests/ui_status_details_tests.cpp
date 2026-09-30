@@ -28,6 +28,7 @@ size_t allocations=0;
 int allocationFailures=0,dialogs=0,notices=0,records=0,finishes=0,pauses=0;
 int statusQueries=0,configures=0,enumerations=0,textWrites=0,focusCalls=0,invalidFocus=0;
 int trayCalls=0,shows=0,hides=0,foregrounds=0,quits=0,profileReads=0;
+int folderCalls=0,shellCalls=0;
 lapse::Status current;
 lapse::Settings configured;
 std::wstring notice;
@@ -69,6 +70,14 @@ DWORD WINAPI profileString(LPCWSTR,LPCWSTR,LPCWSTR fallback,LPWSTR output,DWORD 
     std::wmemcpy(output,fallback,size);output[size]=0;return static_cast<DWORD>(size);
 }
 BOOL WINAPI profileWrite(LPCWSTR,LPCWSTR,LPCWSTR,LPCWSTR){throw std::runtime_error("Unexpected preference write.");}
+HRESULT WINAPI folderFactory(REFCLSID id,LPUNKNOWN,DWORD,REFIID,LPVOID* output){
+    *output=nullptr;require(id==CLSID_FileOpenDialog,"Unexpected COM activation.");++folderCalls;
+    return HRESULT_FROM_WIN32(ERROR_CANCELLED); // Count dispatch; never display a picker.
+}
+HINSTANCE WINAPI shell(HWND,LPCWSTR verb,LPCWSTR file,LPCWSTR parameters,LPCWSTR directory,INT showMode){
+    require(verb&&std::wcscmp(verb,L"open")==0&&file&&std::filesystem::path(file)==std::filesystem::current_path()&&!parameters&&!directory&&showMode==SW_SHOWNORMAL,"Unexpected shell invocation.");
+    ++shellCalls;return reinterpret_cast<HINSTANCE>(33); // No Explorer process/window.
+}
 }
 void* operator new(size_t size){
     if(detailsProbe::countAllocations)++detailsProbe::allocations;
@@ -116,6 +125,8 @@ int runCameraHost(const wchar_t*){throw std::runtime_error("Unexpected normal ap
 #define GetPrivateProfileIntW detailsProbe::profileInt
 #define GetPrivateProfileStringW detailsProbe::profileString
 #define WritePrivateProfileStringW detailsProbe::profileWrite
+#define CoCreateInstance detailsProbe::folderFactory
+#define ShellExecuteW detailsProbe::shell
 #pragma warning(push)
 #pragma warning(disable: 4702) // Deliberate normal-entry sentinel above.
 #include "ui_person_pack_stub.h"
@@ -142,6 +153,8 @@ int runCameraHost(const wchar_t*){throw std::runtime_error("Unexpected normal ap
 #undef GetPrivateProfileIntW
 #undef GetPrivateProfileStringW
 #undef WritePrivateProfileStringW
+#undef CoCreateInstance
+#undef ShellExecuteW
 
 INT_PTR WINAPI detailsProbe::modal(HINSTANCE instance,LPCDLGTEMPLATEW resource,HWND owner,DLGPROC procedure,LPARAM parameter){
     ++dialogs;if(failDialog)return -1;
@@ -176,6 +189,7 @@ struct Fixture {
         app.scrollX=app.scrollY=0;app.settings.folder=L"C:\\Owned synthetic reports";app.preferences=L"inert";
         detailsProbe::failAllocation=detailsProbe::countAllocations=detailsProbe::failDialog=detailsProbe::routeFailed=false;
         detailsProbe::dialogs=detailsProbe::notices=detailsProbe::records=detailsProbe::finishes=detailsProbe::pauses=0;
+        detailsProbe::folderCalls=detailsProbe::shellCalls=0;
         detailsProbe::focusCalls=detailsProbe::invalidFocus=detailsProbe::quits=detailsProbe::allocationFailures=0;
         detailsProbe::script={};detailsProbe::scriptFailure={};detailsProbe::notice.clear();detailsProbe::workArea={0,0,1920,1080};detailsProbe::mainWindow=nullptr;detailsProbe::mainVisible=true;detailsProbe::iconic=false;
         WNDCLASSEXW cls{sizeof(cls)};cls.lpfnWndProc=ownedMain;cls.hInstance=GetModuleHandleW(nullptr);cls.lpszClassName=L"OwnedStatusDetailsMain";
@@ -206,6 +220,18 @@ Status retainedReport(bool paired){
 }
 std::wstring nativeLines(const std::wstring& value){std::wstring result;for(wchar_t c:value){if(c==L'\n')result+=L'\r';result+=c;}return result;}
 void closeDetails(HWND window){SendMessageW(window,WM_COMMAND,IDCANCEL,0);}
+void showOffscreen(Fixture& fixture){
+    SetWindowPos(fixture.window,nullptr,-30000,-30000,920,720,SWP_NOZORDER|SWP_NOACTIVATE);
+    RECT screen{GetSystemMetrics(SM_XVIRTUALSCREEN),GetSystemMetrics(SM_YVIRTUALSCREEN),0,0};
+    screen.right+=GetSystemMetrics(SM_CXVIRTUALSCREEN);screen.bottom+=GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    RECT placed{},intersect{};GetWindowRect(fixture.window,&placed);
+    require(!IntersectRect(&intersect,&placed,&screen),"Keyboard fixture must remain entirely outside the desktop.");
+    ShowWindow(fixture.window,SW_SHOWNOACTIVATE);
+}
+void nativeMnemonic(HWND start,wchar_t character){
+    SetFocus(start);MSG message{};message.hwnd=start;message.message=WM_SYSCHAR;message.wParam=character;message.lParam=1L<<29;
+    dispatchAppMessage(app.window,message);checkCallback();
+}
 void exactSelectableReports(){
     for(bool paired:{false,true}){
         Fixture fixture;auto report=retainedReport(paired);
@@ -356,10 +382,39 @@ void failuresAndUnchangedTicks(){
     require(detailsProbe::records==0&&detailsProbe::finishes==0&&detailsProbe::invalidFocus==0,"Failure handling changed recording or focused dead UI.");
     std::cout<<"PASS snapshot/dialog failures preserve report; 100 unchanged ticks add no text, enumeration, modal or allocations beyond Status copies\n";
 }
+void distinctMainMnemonics(){
+    Fixture fixture;showOffscreen(fixture);app.settings.folder=std::filesystem::current_path().wstring();
+    int compressionDialogs=0,detailDialogs=0;bool expectReadOnly=false;
+    detailsProbe::script=[&](HWND window){
+        const auto title=textOf(window);
+        if(title==L"Time compression"){
+            ++compressionDialogs;require((IsWindowEnabled(GetDlgItem(window,SkipMode))==FALSE)==expectReadOnly,"Compression shortcut lost active read-only state.");
+            require(ownVisible(GetDlgItem(window,IDOK))!=expectReadOnly,"Compression shortcut exposed Apply while active or hid it while idle.");
+        }else{require(title==L"Status details","Shortcut dispatched an unrelated dialog.");++detailDialogs;}
+        closeDetails(window);
+    };
+    for(State state:{State::Idle,State::Recording,State::Paused})for(bool expanded:{false,true}){
+        if(app.advancedExpanded!=expanded)fixture.command(AdvancedToggle);
+        Status report;report.state=state;report.message=L"Saved synthetic part: owned-camera.mp4";report.savedPath=L"owned-camera.mp4";report.savedPaths={report.savedPath};fixture.publish(report);
+        require(ownVisible(app.skipConfigure)==expanded,"Advanced visibility state is inconsistent.");expectReadOnly=state!=State::Idle;const auto settings=app.settings;const int configurations=detailsProbe::configures;
+        std::vector<HWND> starts{app.openFolder,app.advanced,app.statusDetails};if(expanded)starts.push_back(app.skipConfigure);if(state==State::Idle)starts.push_back(app.folder);
+        for(HWND start:starts){
+            const int folders=detailsProbe::folderCalls,compressed=compressionDialogs,shells=detailsProbe::shellCalls,details=detailDialogs;
+            nativeMnemonic(start,L'h');require(detailsProbe::folderCalls==folders+(state==State::Idle?1:0)&&compressionDialogs==compressed&&detailDialogs==details,"Alt+H failed to route only to the enabled Change action.");
+            // IsDialogMessage also activates unique mnemonics of collapsed advanced buttons.
+            nativeMnemonic(start,L'c');require(compressionDialogs==compressed+1&&detailsProbe::folderCalls==folders+(state==State::Idle?1:0)&&detailDialogs==details,"Alt+C changed folder or failed to invoke compression.");
+            nativeMnemonic(start,L'o');require(detailsProbe::shellCalls==shells+1,"Alt+O no longer opens the configured folder through its existing command.");
+            nativeMnemonic(start,L'i');require(detailDialogs==details+1,"Alt+I no longer invokes Details.");
+        }
+        require(detailsProbe::configures==configurations&&app.settings.folder==settings.folder&&app.settings.intervalMs==settings.intervalMs&&skipValues(app.settings.timeSkip)==skipValues(settings.timeSkip),"Canceled keyboard inspection changed accepted settings/configuration.");
+    }
+    require(detailsProbe::records==0&&detailsProbe::finishes==0&&detailsProbe::pauses==0&&detailsProbe::notices==0&&!app.customDialog,"Main shortcuts dispatched recording, notices or left a modal owner.");
+    std::cout<<"PASS distinct native Alt+H/Alt+C plus preserved Alt+O/Alt+I from multiple controls, collapsed/expanded and idle/recording/paused locks\n";
+}
 }
 
 int main(){try{
     INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_WIN95_CLASSES};require(InitCommonControlsEx(&controls)!=FALSE,"Common controls unavailable.");
-    exactSelectableReports();outcomeAndPrimaryPrecedence();keyboardAndCompactLayout();stableSnapshot();modalLifecycle();failuresAndUnchangedTicks();
-    std::cout<<"All six status Details groups passed with inert engine and owned native windows.\n";return 0;
+    exactSelectableReports();outcomeAndPrimaryPrecedence();keyboardAndCompactLayout();stableSnapshot();modalLifecycle();failuresAndUnchangedTicks();distinctMainMnemonics();
+    std::cout<<"All seven status/keyboard groups passed with inert engine and owned native windows.\n";return 0;
 }catch(const std::exception& error){std::cerr<<"STATUS DETAILS FAILURE: "<<error.what()<<'\n';return 1;}}
