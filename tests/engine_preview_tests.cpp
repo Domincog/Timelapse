@@ -255,9 +255,9 @@ struct Controls {
     Counts snapshot() { std::lock_guard<std::mutex> lock(mutex); return counts; }
     bool noNewOpen(int expected) {
         std::unique_lock<std::mutex> lock(mutex);
-        // Open decisions run before the 500ms preview cadence, on 50ms worker
-        // ticks. Wait on the open event across several ticks without a sleep.
-        return !changed.wait_for(lock, 350ms, [&] { return counts.opens != expected || timedOut; });
+        // Include a complete idle preview deadline, so this observes both an
+        // immediate configuration wake and the next scheduled source decision.
+        return !changed.wait_for(lock, 750ms, [&] { return counts.opens != expected || timedOut; });
     }
     bool healthyGates() { std::lock_guard<std::mutex> lock(mutex); return !timedOut; }
 } controls;

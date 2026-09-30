@@ -15,7 +15,8 @@ public:
     // access for owned-file cleanup and denies rename/deletion until ordinary
     // finish(), or until the explicit publication sequence below releases it.
     bool open(const std::wstring& path, int width, int height, int fps, std::wstring& error,
-              EncodingQuality quality = EncodingQuality::Balanced);
+              EncodingQuality quality = EncodingQuality::Balanced,
+              EncodingMode mode = EncodingMode::Compatible);
     bool write(const Frame& frame, std::wstring& error);
     bool finish(std::wstring& error);
     // Worker publication keeps the original object protected through status

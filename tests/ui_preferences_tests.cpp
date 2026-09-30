@@ -115,7 +115,7 @@ struct HiddenControls {
             require(window!=nullptr,"Cannot create owned option control.");
             for(int i=0;i<count;++i)add(window,std::to_wstring(i));choose(window,0);return window;
         };
-        app.mode=combo(5);app.interval=combo(6);app.videoSize=combo(2);app.encodingQuality=combo(3);
+        app.mode=combo(5);app.interval=combo(6);app.videoSize=combo(2);app.encodingQuality=combo(3);app.encodingMode=combo(5);
     }
     ~HiddenControls(){DestroyWindow(app.window);app.window=nullptr;}
 };
@@ -228,7 +228,7 @@ void newUnicodeFile(){
 }
 void existingUnicodeRewrite(){
     PreferencesFixture fixture;
-    const std::wstring initial=L"[Settings]\r\nFolder="+unicodeFolder+L"\r\nInterval=5\r\nQuality=1\r\nEncodingQuality=2\r\n";
+    const std::wstring initial=L"[Settings]\r\nFolder="+unicodeFolder+L"\r\nInterval=5\r\nQuality=1\r\nEncodingQuality=2\r\nEncodingMode=0\r\n";
     fixture.seed(utf16(initial));reload();expectOptions(unicodeFolder,5,1,2);
     const auto initialBytes=fixture.bytes();
     const std::wstring changed=L"C:\\Synthetic videos\\\u65e5\u672c\u8a9e-\U0001f3a5";
@@ -243,6 +243,20 @@ void migrateAnsi(){
     app.settings.folder=unicodeFolder;preferences(true);reload();expectOptions(unicodeFolder,4,1,0);
     expectUtf16(fixture);expectUnknownContent(fixture);fixture.onlySettingsRemain();
     std::cout<<"PASS ANSI migration preserves options, comments, unknown key and unrelated section\n";
+}
+void encodingModes(){
+    PreferencesFixture fixture;fixture.seed(legacy);reload();
+    require(choice(app.encodingMode)==0,"Old preferences changed the encoder without an explicit selection.");
+    for(int mode=0;mode<5;++mode){
+        choose(app.encodingMode,mode);preferences(true);choose(app.encodingMode,(mode+1)%5);reload();
+        require(choice(app.encodingMode)==mode,"Encoding mode did not survive a real preference roundtrip.");
+    }
+    for(const wchar_t* invalid:{L"-1",L"5",L"999"}){
+        require(WritePrivateProfileStringW(L"Settings",L"EncodingMode",invalid,app.preferences.c_str())!=FALSE,"Cannot seed invalid mode.");
+        reload();require(choice(app.encodingMode)==0,"Invalid encoder setting selected a different codec.");
+    }
+    fixture.onlySettingsRemain();
+    std::cout<<"PASS encoding modes roundtrip; old or invalid settings preserve compatible H.264\n";
 }
 struct OwnedFile {
     HANDLE value=INVALID_HANDLE_VALUE;
@@ -354,10 +368,10 @@ int main(){
     try{
         std::cout<<std::unitbuf;std::cout<<"ACP="<<GetACP()<<'\n';
         HiddenControls controls;
-        newUnicodeFile();existingUnicodeRewrite();migrateAnsi();readFailure();replacementFailure();
+        newUnicodeFile();existingUnicodeRewrite();migrateAnsi();encodingModes();readFailure();replacementFailure();
         preparationAllocationFailure();partialKeyWriteFailure();stagedExceptionCleanup();
         preferencePathBoundary(248);preferencePathBoundary(278);
         require(!IsWindowVisible(app.window),"Fixture became visible.");
-        std::cout<<"All 10 preference cases passed; only owned hidden controls/settings were used.\n";return 0;
+        std::cout<<"All 11 preference cases passed; only owned hidden controls/settings were used.\n";return 0;
     }catch(const std::exception& error){std::cerr<<"PREFERENCES TEST FAILURE: "<<error.what()<<'\n';return 1;}
 }

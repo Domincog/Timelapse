@@ -43,7 +43,7 @@ INT_PTR shellResult=33;
 std::wstring lastMessage,shellPath;
 PWSTR taskString=nullptr;
 LRESULT WINAPI message(HWND window,UINT message,WPARAM,LPARAM){
-    require(reinterpret_cast<UINT_PTR>(window)>=1 && reinterpret_cast<UINT_PTR>(window)<=5,"Unexpected control handle.");
+    require(reinterpret_cast<UINT_PTR>(window)>=1 && reinterpret_cast<UINT_PTR>(window)<=6,"Unexpected control handle.");
     if(message!=CB_GETCURSEL){forbidden();return 0;}return 0;
 }
 void WINAPI taskFree(void* memory){
@@ -219,6 +219,7 @@ struct HiddenWindow {
         app.window=CreateWindowExW(0,cls,L"Owned native folder picker fixture",WS_POPUP,0,0,50,50,nullptr,nullptr,info.hInstance,nullptr);
         require(app.window && !IsWindowVisible(app.window),"Cannot create hidden window.");
         app.interval=reinterpret_cast<HWND>(1);app.videoSize=reinterpret_cast<HWND>(2);app.encodingQuality=reinterpret_cast<HWND>(3);
+        app.encodingMode=reinterpret_cast<HWND>(6);
         app.monitor=reinterpret_cast<HWND>(4);app.camera=reinterpret_cast<HWND>(5);
         app.engine=std::make_unique<lapse::FixtureEngine>();
     }

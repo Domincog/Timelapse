@@ -1,4 +1,4 @@
-param([string]$Version = '0.1.1', [string]$BuildDirectory = 'build')
+param([string]$Version = '0.2.0', [string]$BuildDirectory = 'build')
 $ErrorActionPreference = 'Stop'
 if ($Version -notmatch '^\d+\.\d+\.\d+([-.][A-Za-z0-9.-]+)?$') { throw 'Use a version such as 0.1.0 or 0.1.0-beta.1.' }
 $projectRoot = $PSScriptRoot
@@ -51,7 +51,7 @@ try {
     # An allowlist keeps recordings, build outputs, settings and internal notes
     # out of the source archive. Freeze every selected input before publishing.
     $sourceFiles = @()
-    foreach ($name in @('.gitignore', 'README.md', 'CMakeLists.txt', 'build.ps1', 'package.ps1')) {
+    foreach ($name in @('.gitignore', 'README.md', 'CMakeLists.txt', 'build.ps1', 'package.ps1', 'tools/verify-encoding-quality.ps1')) {
         $sourceFiles += @{ Path = (Join-Path $projectRoot $name); Name = $name }
     }
     foreach ($directory in @('src', 'tests')) {

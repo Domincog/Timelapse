@@ -1,6 +1,6 @@
 # Timelapse
 
-A small native Windows timelapse recorder. Record a display, a camera, or both into an H.264 MP4. No installer, bundled browser, external encoder, or .NET runtime is required.
+A small native Windows timelapse recorder. Record a display, a camera, or both into an H.264 or HEVC MP4. No installer, bundled browser, external encoder, or .NET runtime is required.
 
 ## Use
 
@@ -15,6 +15,20 @@ Tab moves between controls, and Alt + O opens the save folder. In the collage pr
 On smaller work areas, scroll to reach the preview and controls. The wheel scrolls vertically, Shift + wheel scrolls horizontally, and keyboard navigation brings focused controls into view.
 
 The quality selector offers Smaller file, Balanced, and More detail. Balanced is the default. More detail prioritizes image detail; its file size depends on the scene and can grow substantially with motion, texture, or frequent cuts.
+
+Choose an encoding mode separately from resolution and quality:
+
+| Encoding | Use |
+| --- | --- |
+| Compatible H.264 | Original software encoding settings and broad playback support. This remains the default. |
+| Efficient H.264 | Tuned software encoding with a bitrate target and longer keyframe spacing. A useful starting point for long recordings. |
+| Hardware H.264 | Uses an available hardware encoder to reduce CPU work, with broad H.264 playback support. |
+| Hardware HEVC | Uses an available hardware HEVC encoder. Playback requires a compatible player or installed HEVC decoder. |
+| Quality H.264 | Software encoding that prioritizes consistent detail. Static screens can produce small files; frequent changes can produce much larger files. |
+
+Hardware support depends on the computer and driver. If a hardware mode is unavailable, choose Compatible H.264 or Efficient H.264. The app verifies that hardware modes actually use a hardware encoder. Encoding and quality choices are saved and remain locked during a recording.
+
+Efficient uses variable bitrate at all three quality levels. Its bitrate is a target, not a strict file-size cap. Quality H.264 and the hardware modes use fixed quantization settings: detailed scenes, noise and frequent changes can need substantially more data. A long capture interval reduces the number of frames but can also make consecutive frames less alike. The quality labels describe a tradeoff within each mode and do not promise identical image quality or file size across different codecs. Hardware encoding can reduce CPU use while keeping a dedicated GPU awake, so lower CPU use does not establish better battery life.
 
 Desktop capture excludes this app's window on supported Windows versions. Minimize the app to stop preview updates while recording continues. Camera modes activate the camera for preview and recording. The app starts in Desktop mode so opening it does not silently activate a camera.
 
@@ -63,12 +77,54 @@ The app retains the latest preview and camera frame, and writes samples incremen
 
 Camera access runs in a private helper process launched from the same executable. A stuck camera driver can be stopped without trapping the app in shutdown. The helper exits with its parent and uses only local shared memory; there are no network services.
 
+The recording worker sleeps until a capture, preview, clock update or command is due. Hidden idle and paused sessions have no periodic worker tick. The camera helper converts and copies pixels only when requested; its camera reader continues receiving current samples. This reduces unnecessary work between captures without making an old frame appear fresh.
+
 Media implementation references: [Microsoft's sink writer tutorial](https://learn.microsoft.com/en-us/windows/win32/medfound/tutorial--using-the-sink-writer-to-encode-video) and [asynchronous source reader](https://learn.microsoft.com/en-us/windows/win32/medfound/using-the-source-reader-in-asynchronous-mode).
+
+## Reproduce encoding measurements
+
+In the release validation, Efficient H.264 reduced file size by 7–60% and encoding CPU time by 13–61% versus Compatible H.264 in the same build. Both used Balanced quality. These were four synthetic 180-frame, 1920×1080 clips at 30 fps on an AMD Ryzen 7 5800H; CPU times are the mean of two alternating runs:
+
+| Scene | Compatible / Efficient file size (MB) | Compatible / Efficient encoding CPU (seconds) |
+| --- | --- | --- |
+| Mostly static desktop text | 0.878 / 0.349 | 3.70 / 3.23 |
+| Scrolling and cuts | 3.105 / 2.875 | 4.97 / 3.73 |
+| Textured motion and noise | 6.385 / 5.110 | 23.01 / 9.05 |
+| Large changes every frame | 7.042 / 5.213 | 30.55 / 15.74 |
+
+MB means 1,000,000 bytes. Encoding CPU is accumulated process CPU time, including conversion and finalization, and excludes capture and input generation. It is not elapsed recording time or a battery measurement. Repeated runs produced identical compressed packets and timestamps. Results depend on scene, hardware and Windows encoder implementation; a bitrate target is not a strict cap.
+
+Independent decoding found a modest fidelity tradeoff: Efficient's pooled luma PSNR was 0.86 dB lower on the static scene and 0.31 dB lower on frequent cuts, but 1.08 dB higher on scrolling and 0.54 dB higher on motion. Motion's worst-frame block SSIM improved from 0.896 to 0.919; frequent cuts stayed close at 0.731 versus 0.730. All frames, timestamps, durations, dimensions and color tags passed verification. These metrics describe the test clips, not perceptual quality for every source.
+
+Optional tools generate synthetic desktop text, scrolling/cuts, camera-like motion/noise, and large changes between captures. They do not capture a display or camera. Build them separately:
+
+```powershell
+cmake -S . -B build-benchmark -G "Visual Studio 16 2019" -A x64 -DTIMELAPSE_BUILD_BENCHMARKS=ON
+cmake --build build-benchmark --config Release --target encoding_benchmark encoding_quality_verifier
+.\build-benchmark\Release\encoding_quality_verifier.exe --self-test
+.\build-benchmark\Release\encoding_benchmark.exe efficient balanced 0 1920 1080 180 screen.mp4
+.\build-benchmark\Release\encoding_quality_verifier.exe screen.mp4 0 1920 1080 180
+```
+
+Use a new output filename for every run. Modes are `compatible`, `efficient`, `hardware-h264`, `hardware-hevc`, and `quality-h264`; qualities are `compact`, `balanced`, and `detail`. Scenes `0`, `1`, and `2` exercise a mostly static screen, scrolling/cuts, and textured motion/noise. Scene `3` stresses large changes and frequent cuts between captures. A 180-frame clip crosses the new modes' five-second keyframe boundary.
+
+The benchmark pre-renders its input outside the encoding measurement. At 180 frames of 1080p this requires about 1.4 GiB of temporary benchmark memory; the recorder itself streams frames. CSV output reports total encoding CPU time, wall time, setup/submission/finalization CPU time, and sampled additional process-private memory. GPU memory and energy are not included. Repeat modes in alternating order without other benchmark or build jobs running.
+
+The independent verifier checks frame count, every timestamp, duration, luma/chroma fidelity, block SSIM, and small-text edges. PSNR is pooled across frames; whole-image averages can conceal local damage, so inspect text and the worst frames too. Color differences from NV12's 4:2:0 subsampling are included in the RGB text metric. These are synthetic measurements, not a guarantee for every recording.
+
+If Windows has no decoder for a tested codec, use the independent FFmpeg verifier. Install `ffmpeg` and `ffprobe` on PATH, then run:
+
+```powershell
+.\tools\verify-encoding-quality.ps1 -InputVideo screen.mp4 -Scene 0 -Width 1920 -Height 1080 -Frames 180 -Verifier .\build-benchmark\Release\encoding_quality_verifier.exe
+```
+
+This also checks BT.709 limited-range color metadata. FFmpeg is used only by the optional verification script and is not required by Timelapse. The script writes metadata and quality reports next to the benchmark video and removes its temporary decoded frames.
 
 ## Repository contents
 
 - `src/`: the native Windows app, capture worker, compositor, and MP4 encoder.
 - `tests/`: media roundtrips, recording recovery, file collision protection, camera helper isolation, and a 600-frame 1080p resource check.
+- `tools/verify-encoding-quality.ps1`: optional independent FFmpeg decoding and quality checks for synthetic benchmark videos.
 - `CMakeLists.txt` and `build.ps1`: build and test the app.
 - `package.ps1`: create a portable release ZIP and a source ZIP from a Release build.
 

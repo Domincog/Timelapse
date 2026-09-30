@@ -54,8 +54,8 @@ void operator delete(void* p,std::size_t) noexcept { std::free(p); }
 namespace lapse {
 class StorageEncoder {
 public:
-    bool open(const std::wstring& path,int width,int height,int fps,std::wstring& error,EncodingQuality quality) {
-        return real_.open(path,width,height,fps,error,quality);
+    bool open(const std::wstring& path,int width,int height,int fps,std::wstring& error,EncodingQuality quality,EncodingMode mode) {
+        return real_.open(path,width,height,fps,error,quality,mode);
     }
     bool write(const Frame& frame,std::wstring& error) { return real_.write(frame,error); }
     bool finish(std::wstring& error) {

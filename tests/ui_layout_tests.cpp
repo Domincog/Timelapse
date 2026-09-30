@@ -147,7 +147,7 @@ LRESULT WINAPI fixtureDispatchMessage(const MSG* message){
     if(message->hwnd==app.preview)return previewProc(app.preview,message->message,message->wParam,message->lParam);
     return windowProc(app.window,message->message,message->wParam,message->lParam);
 }
-std::vector<HWND> tabControls(){return {app.mode,app.interval,app.videoSize,app.encodingQuality,app.monitor,app.camera,app.refresh,app.record,app.pause,app.finish,app.folder,app.openFolder,app.reset,app.forward,app.preview};}
+std::vector<HWND> tabControls(){return {app.mode,app.interval,app.videoSize,app.encodingQuality,app.monitor,app.camera,app.encodingMode,app.refresh,app.record,app.pause,app.finish,app.folder,app.openFolder,app.reset,app.forward,app.preview};}
 struct HiddenWindow {
     HiddenWindow(int width,int height,int dpi){
         app.dpi=dpi;app.scrollX=app.scrollY=app.wheelVertical=app.wheelHorizontal=0;
@@ -160,6 +160,7 @@ struct HiddenWindow {
         app.mode=combo(0,L"&Source",ModeBox);app.interval=combo(1,L"Capture &every",IntervalBox);
         app.videoSize=combo(2,L"Video si&ze",SizeBox);app.encodingQuality=combo(3,L"Video &quality",EncodingQualityBox);
         app.monitor=combo(4,L"&Display",MonitorBox);app.camera=combo(5,L"Ca&mera",CameraBox);
+        app.encodingMode=combo(6,L"Encodin&g",EncodingModeBox);
         auto button=[&](const wchar_t* name,int id){return child(L"BUTTON",name,WS_TABSTOP|BS_PUSHBUTTON,id);};
         app.refresh=button(L"Re&fresh",Refresh);app.record=button(L"&Record",Record);app.pause=button(L"&Pause",Pause);app.finish=button(L"&Finish",Finish);
         app.folder=button(L"&Change...",Folder);app.openFolder=button(L"&Open folder",OpenFolder);app.reset=button(L"Reset layout",Reset);app.forward=button(L"Bring forward",Forward);
@@ -179,6 +180,8 @@ void checkLayout(){
     require(app.scrollX>=0 && app.scrollX<=app.contentWidth-view.right && app.scrollY>=0 && app.scrollY<=app.contentHeight-view.bottom,"Offsets exceed viewport range.");
     require(!intersects(bounds(app.forward),bounds(app.folder)),"Bring forward overlaps Change folder.");
     require(!intersects(bounds(app.finish),bounds(app.openFolder)),"Finish overlaps Open folder.");
+    require(!intersects(bounds(app.monitor),bounds(app.camera)) && !intersects(bounds(app.camera),bounds(app.encodingMode)) &&
+            !intersects(bounds(app.encodingMode),bounds(app.refresh)),"Source or encoding controls overlap.");
     const auto preview=bounds(app.preview);
     require(preview.bottom-preview.top>=app.scale(160),"Preview is unusably short.");
     RECT local{};GetClientRect(app.preview,&local);require(equal(app.videoRect,previewVideoRect(local)),"Hit-test geometry was left waiting for paint.");

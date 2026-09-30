@@ -121,6 +121,47 @@ int main() {
             auto restored = await(engine, [](const auto& s) { return bool(s.preview); });
             boundedPreview(restored);
             require(first.preview->pixels == original, "Restoring preview mutated an older UI snapshot");
+
+            // A long interval and hidden preview must not delay commands until
+            // the next sample. Pause and Finish also need the fractional time
+            // since the last displayed clock refresh, without counting Pause.
+            settings.preview = false; settings.interval = 60;
+            settings.width = 320; settings.height = 180;
+            engine.configure(settings);
+            engine.record();
+            await(engine, [](const auto& s) { return s.state == lapse::State::Recording && s.frames == 1; });
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            auto commandAt = std::chrono::steady_clock::now();
+            engine.setPaused(true);
+            const auto paused = await(engine, [](const auto& s) { return s.state == lapse::State::Paused; }, 1000);
+            require(std::chrono::steady_clock::now() - commandAt < std::chrono::seconds(1),
+                    "Long-interval Pause waited for the next recording sample");
+            require(paused.elapsed >= .2 && paused.frames == 1,
+                    "Pause lost the elapsed fraction since the last clock refresh");
+            const auto pausedCaptures = desktopCaptures.load();
+            std::this_thread::sleep_for(std::chrono::milliseconds(650));
+            const auto stillPaused = engine.status();
+            require(stillPaused.elapsed == paused.elapsed && stillPaused.frames == paused.frames &&
+                    desktopCaptures == pausedCaptures,
+                    "Hidden Pause accumulated time or captured frames");
+            engine.setPaused(false);
+            await(engine, [](const auto& s) { return s.state == lapse::State::Recording && s.frames == 2; }, 1000);
+            settings.preview = true;
+            engine.configure(settings);
+            const double beforePreview = engine.status().elapsed;
+            const auto clockedPreview = await(engine, [&](const auto& s) {
+                return s.preview && s.elapsed >= beforePreview + 1.5;
+            }, 3000);
+            require(clockedPreview.frames == 2,
+                    "Shown preview did not advance the recording clock between long-interval samples");
+            settings.preview = false;
+            engine.configure(settings);
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            engine.finish();
+            const auto saved = await(engine, [](const auto& s) { return s.state == lapse::State::Idle; }, 2000);
+            require(!saved.error && saved.frames == 2 && saved.elapsed >= paused.elapsed + .2 &&
+                    !saved.preview && !saved.savedPath.empty(),
+                    "Finish lost active time, resumed late, or counted paused time");
         }
         std::filesystem::remove_all(directory);
         std::cout << "Bounded previews, immutable snapshots, reusable capture buffers and hidden recording checks passed.\n";

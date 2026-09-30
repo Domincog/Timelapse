@@ -1,4 +1,5 @@
 #include "encoder.h"
+#include "encoder_conversion.h"
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
@@ -7,6 +8,8 @@
 #include <algorithm>
 #include <cstring>
 #include <codecapi.h>
+#include <mftransform.h>
+#include <mferror.h>
 
 namespace lapse {
 namespace {
@@ -36,37 +39,34 @@ HRESULT setVideoType(IMFMediaType* type, REFGUID subtype, int width, int height,
     return hr;
 }
 
-// NV12 is always top-down. Use an explicit BT.709 limited-range conversion,
-// averaging all four source pixels for each 2x2 chroma sample. The fixed-point
-// coefficients retain the full black/white range and avoid RGB32 orientation
-// differences among Media Foundation color converters.
-void toNv12(const Frame& frame, BYTE* target) {
-    const size_t width = static_cast<size_t>(frame.width);
-    const size_t height = static_cast<size_t>(frame.height);
-    BYTE* uv = target + width * height;
-    for (size_t y = 0; y < height; y += 2) {
-        for (size_t x = 0; x < width; x += 2) {
-            int red = 0, green = 0, blue = 0;
-            for (size_t dy = 0; dy < 2; ++dy) {
-                for (size_t dx = 0; dx < 2; ++dx) {
-                    const size_t index = (y + dy) * width + x + dx;
-                    const BYTE* pixel = frame.pixels.data() + index * 4;
-                    const int b = pixel[0], g = pixel[1], r = pixel[2];
-                    target[index] = static_cast<BYTE>(16 +
-                        (11966 * r + 40254 * g + 4064 * b + 32768) / 65536);
-                    red += r;
-                    green += g;
-                    blue += b;
-                }
-            }
-            const size_t chroma = (y / 2) * width + x;
-            uv[chroma] = static_cast<BYTE>((128 * 262144 - 6596 * red -
-                22189 * green + 28784 * blue + 131072) / 262144);
-            uv[chroma + 1] = static_cast<BYTE>((128 * 262144 + 28784 * red -
-                26145 * green - 2639 * blue + 131072) / 262144);
-        }
+// Enabling hardware in the sink writer is only a preference: it can silently
+// fall back to software. Explicit modes must describe the encoder actually
+// negotiated. Inspect the selected MFT before accepting any video frames.
+HRESULT verifyEncoder(IMFSinkWriter* writer, DWORD stream, REFGUID subtype, bool hardware) {
+    ComPtr<IMFSinkWriterEx> extended;
+    HRESULT hr = writer->QueryInterface(IID_PPV_ARGS(&extended));
+    if (FAILED(hr)) return hr;
+    for (DWORD index = 0; ; ++index) {
+        GUID category{};
+        ComPtr<IMFTransform> transform;
+        hr = extended->GetTransformForStream(stream, index, &category, &transform);
+        if (FAILED(hr)) return MF_E_TOPO_CODEC_NOT_FOUND;
+        if (category != MFT_CATEGORY_VIDEO_ENCODER) continue;
+        ComPtr<IMFMediaType> output;
+        hr = transform->GetOutputCurrentType(0, &output);
+        GUID actualSubtype{};
+        if (SUCCEEDED(hr)) hr = output->GetGUID(MF_MT_SUBTYPE, &actualSubtype);
+        if (FAILED(hr)) return hr;
+        if (actualSubtype != subtype) return MF_E_INVALIDMEDIATYPE;
+        ComPtr<IMFAttributes> attributes;
+        UINT32 length = 0;
+        const bool actualHardware = SUCCEEDED(transform->GetAttributes(&attributes)) &&
+            SUCCEEDED(attributes->GetStringLength(MFT_ENUM_HARDWARE_URL_Attribute, &length)) && length != 0;
+        return actualHardware == hardware ? S_OK : MF_E_TOPO_CODEC_NOT_FOUND;
     }
 }
+
+using encoding_detail::toNv12;
 }
 
 struct Encoder::Impl {
@@ -147,7 +147,7 @@ Encoder::Encoder() : impl_(std::make_unique<Impl>()) {}
 Encoder::~Encoder() { impl_->finalize(); }
 
 bool Encoder::open(const std::wstring& path, int width, int height, int fps, std::wstring& error,
-                   EncodingQuality quality) {
+                   EncodingQuality quality, EncodingMode mode) {
     error.clear();
     if (impl_->writer || impl_->file != INVALID_HANDLE_VALUE) {
         error = L"Finish the current recording before opening another output file.";
@@ -175,6 +175,17 @@ bool Encoder::open(const std::wstring& path, int width, int height, int fps, std
         return false;
     }
 
+    if (mode != EncodingMode::Compatible && mode != EncodingMode::Efficient &&
+        mode != EncodingMode::HardwareH264 && mode != EncodingMode::HardwareHEVC && mode != EncodingMode::QualityH264) {
+        error = L"Choose a valid encoding mode.";
+        return false;
+    }
+    const bool hardware = mode == EncodingMode::HardwareH264 || mode == EncodingMode::HardwareHEVC;
+    const bool hevc = mode == EncodingMode::HardwareHEVC;
+    const bool compatible = mode == EncodingMode::Compatible;
+    const bool efficient = mode == EncodingMode::Efficient;
+    const bool qualitySoftware = mode == EncodingMode::QualityH264;
+    const GUID subtype = hevc ? MFVideoFormat_HEVC : MFVideoFormat_H264;
     auto candidate = std::make_unique<Impl>();
     candidate->path = fileIOPath(path);
     candidate->width = width;
@@ -201,8 +212,9 @@ bool Encoder::open(const std::wstring& path, int width, int height, int fps, std
     if (FAILED(hr)) return abandon(L"Cannot access the new output file", hr);
 
     ComPtr<IMFAttributes> attributes;
-    hr = MFCreateAttributes(&attributes, 1);
+    hr = MFCreateAttributes(&attributes, 2);
     if (SUCCEEDED(hr)) hr = attributes->SetGUID(MF_TRANSCODE_CONTAINERTYPE, MFTranscodeContainerType_MPEG4);
+    if (SUCCEEDED(hr)) hr = attributes->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, hardware);
     // Keep default back-pressure; the encoder cannot accumulate an unbounded
     // queue when the disk is slow or frames are submitted faster than encoding.
     if (SUCCEEDED(hr)) hr = MFCreateSinkWriterFromURL(nullptr, candidate->bytes.Get(),
@@ -211,15 +223,20 @@ bool Encoder::open(const std::wstring& path, int width, int height, int fps, std
 
     ComPtr<IMFMediaType> output;
     hr = MFCreateMediaType(&output);
-    if (SUCCEEDED(hr)) hr = setVideoType(output.Get(), MFVideoFormat_H264, width, height, fps);
+    if (SUCCEEDED(hr)) hr = setVideoType(output.Get(), subtype, width, height, fps);
     const int divisor = quality == EncodingQuality::Compact ? 10 : quality == EncodingQuality::Detail ? 4 : 7;
-    const UINT32 bitrate = UINT32(std::clamp<int64_t>(int64_t(width) * height * fps / divisor, 500000, 28000000));
+    const int64_t nominal = int64_t(width) * height * fps;
+    // Scale before the original bounds: very small and very large resolutions
+    // retain the same 0.5–28 Mbps guardrails. Compatible arithmetic is unchanged.
+    const UINT32 bitrate = UINT32(std::clamp<int64_t>(efficient ? nominal * 3 / (divisor * 4) :
+        nominal / divisor, 500000, 28000000));
     if (SUCCEEDED(hr)) hr = output->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
-    // Main profile enables more efficient entropy coding. Explicitly disable
-    // B frames below so even a one-frame timelapse starts at timestamp zero.
-    if (SUCCEEDED(hr)) hr = output->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main);
+    // Main profile enables more efficient entropy coding. Software B frames
+    // are disabled below; hardware uses low-latency operation. Mode tests check
+    // that short clips retain their frame count and start at timestamp zero.
+    if (SUCCEEDED(hr)) hr = output->SetUINT32(MF_MT_MPEG2_PROFILE, hevc ? eAVEncH265VProfile_Main_420_8 : eAVEncH264VProfile_Main);
     if (SUCCEEDED(hr)) hr = candidate->writer->AddStream(output.Get(), &candidate->stream);
-    if (FAILED(hr)) return abandon(L"Cannot configure H.264 output", hr);
+    if (FAILED(hr)) return abandon(hevc ? L"Cannot configure H.265/HEVC output" : L"Cannot configure H.264 output", hr);
 
     ComPtr<IMFMediaType> input;
     hr = MFCreateMediaType(&input);
@@ -229,23 +246,34 @@ bool Encoder::open(const std::wstring& path, int width, int height, int fps, std
     if (SUCCEEDED(hr)) hr = input->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
     if (SUCCEEDED(hr)) hr = input->SetUINT32(MF_MT_SAMPLE_SIZE, candidate->bufferSize);
     // Configure before media-type negotiation allocates encoder buffers.
-    // Timelapse needs only a few workers, with no multi-frame batching.
+    // The software path uses two slice workers. Hardware MFTs need not support
+    // worker count or B-picture count, so do not send those optional settings.
     ComPtr<IMFAttributes> encoding;
-    if (SUCCEEDED(hr)) hr = MFCreateAttributes(&encoding, 7);
-    if (SUCCEEDED(hr)) hr = encoding->SetUINT32(CODECAPI_AVEncNumWorkerThreads, 2);
+    if (SUCCEEDED(hr)) hr = MFCreateAttributes(&encoding, 9);
+    if (SUCCEEDED(hr) && !hardware) hr = encoding->SetUINT32(CODECAPI_AVEncNumWorkerThreads, 2);
     if (SUCCEEDED(hr)) hr = encoding->SetUINT32(CODECAPI_AVLowLatencyMode, TRUE);
-    if (SUCCEEDED(hr)) hr = encoding->SetUINT32(CODECAPI_AVEncH264CABACEnable, TRUE);
-    if (SUCCEEDED(hr)) hr = encoding->SetUINT32(CODECAPI_AVEncMPVDefaultBPictureCount, 0);
-    // Detail prioritizes retained image information instead of a target size.
-    // The other presets retain their target-bitrate policy.
-    const auto rateControl = quality == EncodingQuality::Detail
-        ? eAVEncCommonRateControlMode_Quality : eAVEncCommonRateControlMode_UnconstrainedVBR;
+    if (SUCCEEDED(hr) && !hevc) hr = encoding->SetUINT32(CODECAPI_AVEncH264CABACEnable, TRUE);
+    if (SUCCEEDED(hr) && !hardware) hr = encoding->SetUINT32(CODECAPI_AVEncMPVDefaultBPictureCount, 0);
+    // Efficient keeps a bitrate target at every quality level, including
+    // wholesale scene changes. This is a target, not a file-size cap. Quality H.264
+    // and hardware modes retain detail using content-dependent file sizes.
+    // Five playback seconds between keyframes improves static compression.
+    const bool constantQuality = hardware || qualitySoftware || (compatible && quality == EncodingQuality::Detail);
+    const auto rateControl = constantQuality ? eAVEncCommonRateControlMode_Quality :
+        eAVEncCommonRateControlMode_UnconstrainedVBR;
     if (SUCCEEDED(hr)) hr = encoding->SetUINT32(CODECAPI_AVEncCommonRateControlMode, rateControl);
-    if (SUCCEEDED(hr) && quality == EncodingQuality::Detail)
-        hr = encoding->SetUINT64(CODECAPI_AVEncVideoEncodeQP, 18);
-    if (SUCCEEDED(hr)) hr = encoding->SetUINT32(CODECAPI_AVEncCommonQualityVsSpeed, 100);
+    const UINT64 qp = compatible ? 18 :
+        (quality == EncodingQuality::Compact ? 28 : quality == EncodingQuality::Detail ? 20 : 24) + (hevc ? 2 : 0);
+    if (SUCCEEDED(hr) && constantQuality) hr = encoding->SetUINT64(CODECAPI_AVEncVideoEncodeQP, qp);
+    if (SUCCEEDED(hr)) hr = encoding->SetUINT32(CODECAPI_AVEncCommonQualityVsSpeed,
+        efficient || qualitySoftware ? 66 : 100);
+    if (SUCCEEDED(hr) && !compatible) hr = encoding->SetUINT32(CODECAPI_AVEncMPVGOPSize, 5 * fps);
     if (SUCCEEDED(hr)) hr = candidate->writer->SetInputMediaType(candidate->stream, input.Get(), encoding.Get());
-    if (FAILED(hr)) return abandon(L"Cannot initialize the H.264 encoder", hr);
+    if (FAILED(hr)) return abandon(hardware ?
+        L"Cannot initialize the requested hardware encoder; choose Compatible or Efficient" : L"Cannot initialize the H.264 encoder", hr);
+    hr = verifyEncoder(candidate->writer.Get(), candidate->stream, subtype, hardware);
+    if (FAILED(hr)) return abandon(hardware ?
+        L"The requested hardware encoder is unavailable; choose Compatible or Efficient" : L"Cannot verify the software H.264 encoder", hr);
     hr = candidate->writer->BeginWriting();
     if (FAILED(hr)) return abandon(L"Cannot start the MP4 recording", hr);
     candidate->writing = true;

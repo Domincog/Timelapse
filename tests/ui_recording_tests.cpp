@@ -84,7 +84,7 @@ bool CameraClient::latest(Frame&,std::wstring&) { throw std::runtime_error("Phys
 struct Encoder::Impl { HANDLE file=INVALID_HANDLE_VALUE;uint64_t count=0; };
 Encoder::Encoder():impl_(std::make_unique<Impl>()){}
 Encoder::~Encoder(){if(impl_->file!=INVALID_HANDLE_VALUE)CloseHandle(impl_->file);}
-bool Encoder::open(const std::wstring& path,int,int,int,std::wstring& error,EncodingQuality) {
+bool Encoder::open(const std::wstring& path,int,int,int,std::wstring& error,EncodingQuality,EncodingMode) {
     if(impl_->file!=INVALID_HANDLE_VALUE)CloseHandle(impl_->file);
     impl_->count=0;error.clear();
     impl_->file=CreateFileW(path.c_str(),GENERIC_WRITE|DELETE,0,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
@@ -144,7 +144,7 @@ struct HiddenFixture {
         require(app.window&&!IsWindowVisible(app.window),"Hidden parent creation failed");
         auto child=[&](const wchar_t* cls,DWORD style){auto w=CreateWindowExW(0,cls,L"",WS_CHILD|style,0,0,100,100,app.window,nullptr,nullptr,nullptr);require(w!=nullptr,"Hidden child failed");return w;};
         auto combo=[&](int count){auto w=child(L"COMBOBOX",CBS_DROPDOWNLIST);for(int i=0;i<count;++i)add(w,std::to_wstring(i));choose(w,0);return w;};
-        app.mode=combo(5);app.interval=combo(6);choose(app.interval,5);app.videoSize=combo(2);app.encodingQuality=combo(3);
+        app.mode=combo(5);app.interval=combo(6);choose(app.interval,5);app.videoSize=combo(2);app.encodingQuality=combo(3);app.encodingMode=combo(5);
         app.monitor=combo(1);app.camera=combo(0);app.monitors={{L"Synthetic",{0,0,640,360},L"owned-display"}};app.cameras.clear();
         app.preview=child(L"STATIC",0);app.statusText=child(L"STATIC",0);
         for(auto p:{&app.refresh,&app.record,&app.pause,&app.finish,&app.folder,&app.openFolder,&app.reset,&app.forward})*p=child(L"BUTTON",BS_PUSHBUTTON);

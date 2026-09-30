@@ -46,7 +46,8 @@ void Engine::configure(const Settings& s) {
       if (!s.preview || mask != sources(settings_) || ((mask & 2) && s.cameraId != settings_.cameraId) ||
           ((mask & 1) && (CompareStringOrdinal(s.monitorId.c_str(), -1, settings_.monitorId.c_str(), -1, TRUE) != CSTR_EQUAL ||
               !EqualRect(&s.monitor, &settings_.monitor)))) retirePreview();
-      settings_ = s; }
+      settings_ = s;
+      ++settingsRevision_; }
     wake_.notify_one();
 }
 void Engine::retirePreview() {
@@ -118,7 +119,9 @@ void Engine::run() {
         std::wstring activeCamera, temporary, finalPath, temporaryIO, finalPathIO, sourceError;
         bool cameraRunning = false, pending = false, writing = false, paused = false;
         uint64_t previewGeneration = 0, cameraAttemptGeneration = 0;
+        uint64_t settingsRevision = UINT64_MAX;
         auto lastPreview = Clock::time_point::min(), nextFrame = Clock::now();
+        auto retryFrameAt = Clock::time_point::min();
         auto lastTick = Clock::now();
         double elapsed = 0;
         auto publishError = [&](const std::wstring& message, bool reset) {
@@ -168,6 +171,7 @@ void Engine::run() {
             std::lock_guard<std::mutex> lock(mutex_);
             stop_ = pauseRequested_ = pauseTarget_ = false;
             status_.state = State::Idle;
+            status_.elapsed = elapsed;
             status_.error = !reason.empty() || !ok;
             status_.recordingFailed = status_.error;
             // Finalize and rename remain separate outcomes: a failed rename
@@ -183,9 +187,10 @@ void Engine::run() {
             // Commands already queued at failure remain pending, but must not
             // turn persistent allocation failure into an immediate retry loop.
             const auto generation = previewGeneration_;
+            const auto revision = settingsRevision_;
             const bool start = start_, stop = stop_, pauseRequested = pauseRequested_, pauseTarget = pauseTarget_, retry = retrySources_;
             wake_.wait_for(lock, std::chrono::seconds(1), [&] {
-                return quit_ || previewGeneration_ != generation || start_ != start ||
+                return quit_ || previewGeneration_ != generation || settingsRevision_ != revision || start_ != start ||
                     stop_ != stop || pauseRequested_ != pauseRequested || pauseTarget_ != pauseTarget || retrySources_ != retry;
             });
         };
@@ -195,7 +200,25 @@ void Engine::run() {
                 std::optional<Settings> snapshot;
                 bool quit, start = false, stop = false, pauseRequested = false, pauseTarget = false, retry = false;
                 { std::unique_lock<std::mutex> lock(mutex_);
-                  wake_.wait_for(lock, std::chrono::milliseconds(50));
+                  // Sleep until useful work is due. Configuration revisions
+                  // also catch notifications sent while capture was in flight.
+                  // Hidden idle/paused sessions need no periodic worker tick.
+                  auto deadline = Clock::time_point::max();
+                  if (settings_.preview) {
+                      deadline = lastPreview == Clock::time_point::min() ? Clock::now()
+                          : lastPreview + std::chrono::milliseconds(writing ? 1000 : 500);
+                  }
+                  if (pending || (writing && !paused))
+                      deadline = std::min(deadline, std::max(nextFrame, retryFrameAt));
+                  // The displayed recording clock uses whole seconds. Commands
+                  // wake immediately and publish their precise elapsed time.
+                  if (writing && !paused) deadline = std::min(deadline, lastTick + std::chrono::seconds(1));
+                  if (FAILED(com)) deadline = Clock::now() + std::chrono::seconds(1);
+                  auto commanded = [&] {
+                      return quit_ || start_ || stop_ || pauseRequested_ || retrySources_ || settingsRevision_ != settingsRevision;
+                  };
+                  if (deadline == Clock::time_point::max()) wake_.wait(lock, commanded);
+                  else wake_.wait_until(lock, deadline, commanded);
                   // Shutdown needs no settings allocation. Capture operation
                   // ownership before copying, and consume commands only after
                   // their settings snapshot has succeeded.
@@ -205,12 +228,16 @@ void Engine::run() {
                       (!writing || paused || Clock::now() < nextFrame);
                   if (!quit) {
                       snapshot.emplace(settings_);
+                      settingsRevision = settingsRevision_;
                       start = start_; stop = stop_; pauseRequested = pauseRequested_; pauseTarget = pauseTarget_; retry = retrySources_;
                       start_ = stop_ = pauseRequested_ = retrySources_ = false;
                   } }
                 const auto now = Clock::now();
                 if (writing && !paused) elapsed += std::chrono::duration<double>(now - lastTick).count();
                 lastTick = now;
+                // Preview deadlines can coincide with every clock deadline.
+                // Publish time even when this wake also refreshes the image.
+                if (writing) { std::lock_guard<std::mutex> lock(mutex_); status_.elapsed = elapsed; }
                 if (quit) { if (writing || pending) { previewOnlyWork = false; closeRecording(L""); } break; }
                 Settings& cfg = *snapshot;
                 if (retry) { if (camera) camera->stop(); cameraRunning = false; activeCamera.clear(); }
@@ -219,6 +246,7 @@ void Engine::run() {
                     previewOnlyWork = false;
                     session.emplace(cfg); pending = true; elapsed = 0;
                     nextFrame = now;
+                    retryFrameAt = Clock::time_point::min();
                 }
                 if (stop && (pending || writing)) { previewOnlyWork = false; closeRecording(L""); continue; }
                 if (pauseRequested && writing && paused != pauseTarget) {
@@ -226,9 +254,10 @@ void Engine::run() {
                     const bool desktopNeeded = std::any_of(cfg.layers.begin(), cfg.layers.end(),
                         [](const Layer& layer) { return layer.source == Source::Desktop; });
                     power.update(!paused, desktopNeeded);
-                    if (!paused) nextFrame = now;
+                    if (!paused) { nextFrame = now; retryFrameAt = Clock::time_point::min(); }
                     std::lock_guard<std::mutex> lock(mutex_);
                     status_.state = paused ? State::Paused : State::Recording;
+                    status_.elapsed = elapsed;
                     if (!previewProblem_)
                         status_.message = paused ? L"Paused. Resume when you are ready." : L"Recording. You can adjust the collage live.";
                 }
@@ -280,7 +309,6 @@ void Engine::run() {
                 }
                 const bool previewDue = cfg.preview && (lastPreview == Clock::time_point::min() || now - lastPreview >= std::chrono::milliseconds(writing ? 1000 : 500));
                 if (!captureDue && !previewDue) {
-                    if (writing) { std::lock_guard<std::mutex> lock(mutex_); status_.elapsed = elapsed; }
                     continue;
                 }
                 lastPreview = now;
@@ -310,7 +338,12 @@ void Engine::run() {
                     // An empty result is a transient wait (including shared
                     // frame contention). The client owns activation/staleness
                     // deadlines and returns a concrete error when they expire.
-                    if (cameraWaiting) continue;
+                    if (cameraWaiting) {
+                        // Only a requested recording sample needs a prompt
+                        // retry. Ordinary preview warmup keeps its own cadence.
+                        if (captureDue) retryFrameAt = Clock::now() + std::chrono::milliseconds(50);
+                        continue;
+                    }
                     if (error.empty()) error = L"The capture source did not provide a frame. Check its connection or select another source.";
                     // A preview refresh is not a requested video frame. Keep
                     // the encoder open through transient preview failures,
@@ -333,7 +366,7 @@ void Engine::run() {
                     // publication must not allocate after the file is renamed.
                     temporaryIO = fileIOPath(temporary); finalPathIO = fileIOPath(finalPath);
                     if (!encoder) encoder.emplace();
-                    if (!encoder->open(temporaryIO, cfg.width, cfg.height, 30, error, cfg.encodingQuality)) { closeRecording(L"Cannot start recording: " + error); continue; }
+                    if (!encoder->open(temporaryIO, cfg.width, cfg.height, 30, error, cfg.encodingQuality, cfg.encodingMode)) { closeRecording(L"Cannot start recording: " + error); continue; }
                     writing = true; pending = false;
                     power.update(true, needDesktop);
                     std::lock_guard<std::mutex> lock(mutex_);

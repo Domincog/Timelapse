@@ -15,6 +15,7 @@ struct Settings {
     int interval = 5;
     int width = 1280, height = 720;
     EncodingQuality encodingQuality = EncodingQuality::Balanced;
+    EncodingMode encodingMode = EncodingMode::Compatible;
     std::wstring folder;
     bool preview = true;
 };
@@ -49,6 +50,7 @@ private:
     Settings settings_;
     Status status_;
     uint64_t previewGeneration_ = 0;
+    uint64_t settingsRevision_ = 0;
     bool previewProblem_ = false;
     bool quit_ = false, start_ = false, stop_ = false, pauseRequested_ = false, pauseTarget_ = false, retrySources_ = false;
     std::thread worker_;

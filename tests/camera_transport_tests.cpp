@@ -3,10 +3,31 @@
 #include <objbase.h>
 #include <shellapi.h>
 #include <chrono>
+#include <cstdlib>
 #include <cwchar>
 #include <iostream>
+#include <new>
 #include <stdexcept>
 #include <thread>
+
+namespace {
+thread_local bool failFrameAllocation = false;
+thread_local std::size_t failedFrameBytes = 0;
+}
+void* operator new(std::size_t bytes) {
+    if (failFrameAllocation) {
+        failFrameAllocation = false;
+        failedFrameBytes = bytes;
+        throw std::bad_alloc();
+    }
+    if (void* memory = std::malloc(bytes ? bytes : 1)) return memory;
+    throw std::bad_alloc();
+}
+void* operator new[](std::size_t bytes) { return ::operator new(bytes); }
+void operator delete(void* memory) noexcept { std::free(memory); }
+void operator delete[](void* memory) noexcept { std::free(memory); }
+void operator delete(void* memory, std::size_t) noexcept { std::free(memory); }
+void operator delete[](void* memory, std::size_t) noexcept { std::free(memory); }
 
 namespace {
 constexpr wchar_t controlEnvironment[] = L"TIMELAPSE_TEST_TRANSPORT_CONTROL";
@@ -21,19 +42,18 @@ struct TestView {
     void* value = nullptr;
     ~TestView() { if (value) UnmapViewOfFile(value); }
 };
-struct TestControl { volatile LONG ready; DWORD processId; wchar_t transportName[128]; };
+struct TestControl { volatile LONG ready, latestCalls; DWORD processId; wchar_t transportName[128]; };
 // Inspect only the header of this fixture's own mapping; actual transport code
 // performs all publication and CameraClient consumption.
 struct SharedHeader {
     uint32_t magic, version, state, width, height, bytes;
     uint64_t generation, receivedTick;
+    uint64_t requested, completed;
 };
-bool exposeTransport(std::wstring& error) {
+bool exposeTransport(std::wstring& error, TestHandle& mapping, TestView& view) {
     wchar_t controlName[256]{};
     if (!GetEnvironmentVariableW(controlEnvironment, controlName, 256)) return true;
-    TestHandle mapping;
     mapping.value = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, controlName);
-    TestView view;
     if (mapping.value) view.value = MapViewOfFile(mapping.value, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(TestControl));
     int count = 0;
     wchar_t** args = CommandLineToArgvW(GetCommandLineW(), &count);
@@ -54,6 +74,8 @@ bool exposeTransport(std::wstring& error) {
 // process, shared memory, frame validation, and lifecycle code remain in use.
 namespace lapse {
 struct Camera::Impl {
+    TestHandle controlMapping;
+    TestView controlView;
     std::wstring mode;
     bool running = false;
     uint64_t started = 0;
@@ -63,10 +85,11 @@ Camera::Camera() : impl_(std::make_unique<Impl>()) {}
 Camera::~Camera() { stop(); }
 bool Camera::start(const std::wstring& id, std::wstring& error) {
     stop(); error.clear();
-    if (id != L"transport-live" && id != L"transport-frozen" && id != L"transport-disconnect" && id != L"transport-starting") {
+    if (id != L"transport-live" && id != L"transport-large" && id != L"transport-frozen" && id != L"transport-disconnect" &&
+        id != L"transport-starting" && id != L"transport-hang-read" && id != L"transport-warm-live" && id != L"transport-warm-stall") {
         error = L"Unknown synthetic camera."; return false;
     }
-    if (!exposeTransport(error)) return false;
+    if (!exposeTransport(error, impl_->controlMapping, impl_->controlView)) return false;
     impl_->mode = id; impl_->running = true; impl_->started = GetTickCount64(); impl_->sequence = 0;
     return true;
 }
@@ -76,14 +99,21 @@ bool Camera::latest(Frame& output, std::wstring& error) {
     return latest(output, error, tick);
 }
 bool Camera::latest(Frame& output, std::wstring& error, uint64_t& tick) {
+    if (impl_->controlView.value) InterlockedIncrement(&static_cast<TestControl*>(impl_->controlView.value)->latestCalls);
     error.clear();
     if (!impl_->running) { error = L"Synthetic camera is closed."; return false; }
     if (impl_->mode == L"transport-starting") return false;
+    if (impl_->mode == L"transport-warm-live" || impl_->mode == L"transport-warm-stall") {
+        if (!impl_->sequence) { ++impl_->sequence; return false; }
+        if (impl_->mode == L"transport-warm-stall") Sleep(INFINITE);
+    }
+    if (impl_->mode == L"transport-hang-read" && impl_->sequence) Sleep(INFINITE);
     if (impl_->mode == L"transport-disconnect" && GetTickCount64() - impl_->started >= 500) {
         error = L"Synthetic camera disconnected."; return false;
     }
     tick = impl_->mode == L"transport-frozen" ? impl_->started : GetTickCount64();
-    output.width = 64; output.height = 36;
+    output.width = impl_->mode == L"transport-large" ? 1280 : 64;
+    output.height = impl_->mode == L"transport-large" ? 720 : 36;
     output.pixels.resize(size_t(output.width) * output.height * 4);
     const uint8_t sequence = static_cast<uint8_t>(++impl_->sequence);
     for (int y = 0; y < output.height; ++y) {
@@ -163,10 +193,10 @@ public:
         const auto began = Clock::now();
         while (!InterlockedCompareExchange(&control.ready, 0, 0) && elapsed(began) < 3000) Sleep(10);
         require(InterlockedCompareExchange(&control.ready, 0, 0) != 0, "synthetic helper exposes its owned token");
-        process.value = OpenProcess(SYNCHRONIZE, FALSE, control.processId);
+        process.value = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, control.processId);
         require(process.value != nullptr, "observe only this synthetic helper process");
         const std::wstring transportName = control.transportName;
-        mapping_.value = OpenFileMappingW(FILE_MAP_READ, FALSE, transportName.c_str());
+        mapping_.value = OpenFileMappingW(FILE_MAP_READ | FILE_MAP_WRITE, FALSE, transportName.c_str());
         mutex.value = OpenMutexW(SYNCHRONIZE | MUTEX_MODIFY_STATE, FALSE, (transportName + L".mutex").c_str());
         stopEvent.value = OpenEventW(EVENT_MODIFY_STATE, FALSE, (transportName + L".stop").c_str());
         require(mapping_.value && mutex.value && stopEvent.value, "open only owned transport objects");
@@ -177,8 +207,19 @@ public:
         require(WaitForSingleObject(mutex.value, 1000) == WAIT_OBJECT_0, "inspect shared header under actual mutex");
         const SharedHeader result = *static_cast<const SharedHeader*>(view_.value);
         ReleaseMutex(mutex.value);
-        require(result.magic == 0x4C43414D && result.version == 1, "expected shared protocol");
+        require(result.magic == 0x4C43414D && result.version == 2, "expected shared protocol");
         return result;
+    }
+    LONG copies() {
+        return InterlockedCompareExchange(&static_cast<TestControl*>(controlView_.value)->latestCalls, 0, 0);
+    }
+    void corruptDimensions() {
+        TestView writable;
+        writable.value = MapViewOfFile(mapping_.value, FILE_MAP_WRITE, 0, 0, sizeof(SharedHeader));
+        require(writable.value != nullptr, "map only owned synthetic frame for corruption");
+        require(WaitForSingleObject(mutex.value, 1000) == WAIT_OBJECT_0, "corrupt owned frame under sharing mutex");
+        static_cast<SharedHeader*>(writable.value)->width = 1281;
+        ReleaseMutex(mutex.value);
     }
     SharedHeader waitFresh() {
         const auto began = Clock::now();
@@ -188,6 +229,15 @@ public:
             Sleep(10);
         }
         throw std::runtime_error("producer did not publish a fresh shared frame");
+    }
+    void waitWarmupResponse() {
+        const auto began = Clock::now();
+        while (elapsed(began) < 1500) {
+            const auto response = observe();
+            if (response.state == 1 && response.requested == 1 && response.completed == 1 && !response.generation) return;
+            Sleep(10);
+        }
+        throw std::runtime_error("eager empty warmup response was not completed");
     }
     TestHandle mutex, process, stopEvent;
 private:
@@ -229,15 +279,16 @@ void freshProducerContention() {
     TransportObserver observer(camera);
     verifyPixels(firstFrame(camera));
     const uint64_t firstGeneration = observer.waitFresh().generation;
-    const auto began = Clock::now();
-    while (elapsed(began) < 3300) {
-        observer.waitFresh(); Sleep(100);
-    }
-    require(observer.waitFresh().generation > firstGeneration, "producer stays fresh during skipped client reads");
+    const LONG firstCopies = observer.copies();
+    Sleep(4100);
+    require(observer.observe().generation == firstGeneration, "helper copied pixels without a consumer request");
+    require(observer.copies() == firstCopies, "helper called Camera::latest without a consumer request");
     MutexHold hold(observer.mutex.value); hold.wait();
     expectTransientContention(camera);
     hold.release();
     verifyPixels(firstFrame(camera));
+    require(observer.waitFresh().generation > firstGeneration, "fresh on-demand frame did not replace the old publication");
+    require(observer.copies() == firstCopies + 1, "one demand performed more than one camera pixel copy");
     stopBounded(camera);
     std::cout << "fresh_producer_contention passed\n";
 }
@@ -270,11 +321,11 @@ void contentionEpisodeReset() {
     require(error.find(L"sharing") != std::wstring::npos, "persistent contention reports unavailable sharing");
     require(elapsed(secondBegan) >= 2900 && elapsed(secondBegan) < 3800, "delivered contention episode bounded at three seconds");
     hold.release();
-    // The producer was blocked for three seconds: acquisition must now enforce
-    // the real shared-frame age or deliver an already refreshed frame.
+    // The producer needs a new request after contention, rather than treating
+    // an intentionally unrefreshed shared image as a stale capture source.
     const bool ready = camera.latest(frame, error);
-    require(ready || error.find(L"3 seconds") != std::wstring::npos, "acquisition preserves authoritative stale-frame validation");
-    observer.waitFresh(); verifyPixels(firstFrame(camera));
+    require(ready || error.empty(), "healthy demand request inherited an old shared-frame age");
+    verifyPixels(firstFrame(camera)); observer.waitFresh();
     stopBounded(camera);
     std::cout << "contention_episode_reset passed\n";
 }
@@ -301,7 +352,7 @@ void initialContentionBound() {
         require(elapsed(began) >= 7900 && elapsed(began) < 8800, "initial contention bounded at eight seconds");
         require(!starting.latest(frame, error) && error.find(L"8 seconds") != std::wstring::npos,
                 "acquired Starting state preserves original activation deadline");
-        unconsumed.waitFresh();
+        require(unconsumed.observe().generation != 0, "initial unconsumed publication remains available");
         { MutexHold late(unconsumed.mutex.value); late.wait(); expectTransientContention(delayed); }
         verifyPixels(firstFrame(delayed));
         hold.release();
@@ -397,6 +448,111 @@ void delayedConsumer() {
     std::cout << "delayed_consumer passed\n";
 }
 
+void unresponsiveRequest() {
+    lapse::CameraClient camera;
+    std::wstring error;
+    require(camera.start(L"transport-hang-read", error), "start owned request-stall helper");
+    auto frame = firstFrame(camera);
+    verifyPixels(frame);
+    const auto original = frame.pixels;
+    const auto began = Clock::now();
+    long long slowest = 0;
+    do {
+        const auto reading = Clock::now();
+        require(!camera.latest(frame, error), "stuck request returned a frame");
+        require(frame.width == 64 && frame.height == 36 && frame.pixels == original,
+                "transient or failed request overwrote the caller's frame");
+        slowest = std::max(slowest, elapsed(reading));
+        if (!error.empty()) break;
+        Sleep(20);
+    } while (elapsed(began) < 4500);
+    require(error.find(L"frame request") != std::wstring::npos && elapsed(began) >= 2900 && elapsed(began) < 4000,
+            "delivered camera request did not fail at its three-second bound");
+    require(slowest < 250, "request wait blocked the parent on its stuck helper");
+    stopBounded(camera);
+    std::cout << "unresponsive_request passed\n";
+}
+
+void failedDeliveryKeepsPreviousFrame(bool allocationFailure) {
+    lapse::CameraClient camera;
+    TransportObserver observer(camera, allocationFailure ? L"transport-large" : L"transport-live");
+    observer.waitFresh(); // Keep its initial response unconsumed by the client.
+    lapse::Frame frame;
+    frame.width = 64; frame.height = 36;
+    frame.pixels.assign(64 * 36 * 4, 83);
+    const auto original = frame.pixels;
+    if (!allocationFailure) observer.corruptDimensions();
+    std::wstring error;
+    failedFrameBytes = 0;
+    failFrameAllocation = allocationFailure;
+    const bool delivered = camera.latest(frame, error);
+    failFrameAllocation = false;
+    require(!delivered && error.find(allocationFailure ? L"memory" : L"invalid frame") != std::wstring::npos,
+            "owned malformed/allocation fixture did not hit the actual client delivery failure");
+    // MSVC's vector allocator includes alignment bookkeeping for large buffers.
+    require(!allocationFailure || (failedFrameBytes >= 1280 * 720 * 4 && failedFrameBytes <= 1280 * 720 * 4 + 64),
+            "allocation fault did not target the actual delivered pixel buffer");
+    require(frame.width == 64 && frame.height == 36 && frame.pixels == original,
+            "failed client delivery changed its previous frame");
+    require(firstFrame(camera).valid(), "client did not recover on a new demand after delivery failure");
+    stopBounded(camera);
+    std::cout << (allocationFailure ? "allocation_keeps_frame" : "malformed_keeps_frame") << " passed\n";
+}
+
+void warmupActivationDeadline() {
+    lapse::CameraClient stalled, lateHealthy, lateStalled, lateEmpty;
+    const auto began = Clock::now();
+    TransportObserver original(stalled, L"transport-warm-stall");
+    TransportObserver healthy(lateHealthy, L"transport-warm-live");
+    TransportObserver delayed(lateStalled, L"transport-warm-stall");
+    TransportObserver empty(lateEmpty, L"transport-starting");
+    original.waitWarmupResponse(); healthy.waitWarmupResponse(); delayed.waitWarmupResponse(); empty.waitWarmupResponse();
+    const auto warmed = Clock::now();
+    // Start a new request well after activation. Its stall must not reset the
+    // original eight-second deadline, even though the eager read completed.
+    Sleep(3000);
+    lapse::Frame frame;
+    std::wstring error;
+    require(!stalled.latest(frame, error) && error.empty(), "warmup response was not transient");
+    const auto requested = Clock::now();
+    do {
+        require(!stalled.latest(frame, error), "stalled warmup request returned a frame");
+        if (!error.empty()) break;
+        Sleep(20);
+    } while (elapsed(began) < 10000);
+    require(error.find(L"8 seconds") != std::wstring::npos && elapsed(began) >= 7800 && elapsed(began) < 9300 &&
+            elapsed(requested) < 6300,
+            "warmup request reset the original eight-second activation deadline");
+    std::cout << "warmup_stall_keeps_activation_deadline passed\n";
+
+    // Neither late consumer has inspected its empty startup response. A healthy
+    // source now answers one fresh request; a stuck source gets only bounded
+    // response grace and cannot acquire another eight seconds of activation.
+    while (elapsed(warmed) < 8100) Sleep(10);
+    const auto healthyStart = Clock::now();
+    require(lateHealthy.latest(frame, error) && error.empty(), "late empty startup response hid a now-healthy source");
+    require(elapsed(healthyStart) < 250 && healthy.copies() == 2, "late warmup refresh was not one bounded fresh request");
+    verifyPixels(frame);
+    std::cout << "late_warmup_refreshes_once passed\n";
+    const auto lateStart = Clock::now();
+    require(!lateStalled.latest(frame, error) && error.find(L"8 seconds") != std::wstring::npos && elapsed(lateStart) < 250,
+            "late stalled warmup received a new activation deadline");
+    require(!lateStalled.latest(frame, error) && error.find(L"8 seconds") != std::wstring::npos,
+            "repeated late warmup request erased the terminal deadline");
+    require(delayed.copies() <= 2, "expired warmup repeatedly refreshed its stalled helper");
+    std::cout << "late_warmup_stall_is_bounded passed\n";
+    require(!lateEmpty.latest(frame, error) && error.find(L"8 seconds") != std::wstring::npos,
+            "late empty response received a new activation deadline");
+    const auto emptyCopies = empty.copies();
+    require(emptyCopies == 2, "late empty response was not refreshed exactly once");
+    for (int i = 0; i < 3; ++i)
+        require(!lateEmpty.latest(frame, error) && error.find(L"8 seconds") != std::wstring::npos,
+                "repeated late empty response erased its terminal deadline");
+    require(empty.copies() == emptyCopies, "expired empty responses kept requesting camera copies");
+    std::cout << "late_empty_warmup_refreshes_once passed\n";
+    stopBounded(stalled); stopBounded(lateHealthy); stopBounded(lateStalled); stopBounded(lateEmpty);
+}
+
 void handlesReleased() {
     DWORD before = 0, after = 0;
     require(GetProcessHandleCount(GetCurrentProcess(), &before) != FALSE, "count baseline handles");
@@ -411,6 +567,32 @@ void handlesReleased() {
     require(after == before, "mapping, mutex, event, process and job handles released");
     std::cout << "handles_released passed count=" << before << "\n";
 }
+
+void demandBenchmark() {
+    lapse::CameraClient camera;
+    TransportObserver observer(camera, L"transport-large");
+    require(firstFrame(camera).valid(), "large owned camera frame missing");
+    std::cout << "consumer_period_ms,wall_seconds,helper_cpu_ms,helper_cycles,pixel_reads,bytes_per_read\n";
+    auto cpu = [&] {
+        FILETIME created{}, exited{}, kernel{}, user{};
+        require(GetProcessTimes(observer.process.value, &created, &exited, &kernel, &user) != FALSE, "read owned helper CPU");
+        ULARGE_INTEGER k{}, u{}; k.LowPart = kernel.dwLowDateTime; k.HighPart = kernel.dwHighDateTime;
+        u.LowPart = user.dwLowDateTime; u.HighPart = user.dwHighDateTime; return k.QuadPart + u.QuadPart;
+    };
+    auto cycles = [&] { ULONG64 count = 0; require(QueryProcessCycleTime(observer.process.value, &count) != FALSE,
+        "read owned helper CPU cycles"); return count; };
+    for (const DWORD period : {0u, 1000u, 5000u}) {
+        const auto beforeCpu = cpu(), beforeCycles = cycles();
+        const auto beforeCopies = observer.copies();
+        const auto began = Clock::now();
+        const int duration = period == 5000 ? 11000 : 8000;
+        if (!period) Sleep(duration);
+        else while (elapsed(began) < duration) { Sleep(period); require(firstFrame(camera).valid(), "large demand response missing"); }
+        std::cout << period << ',' << elapsed(began) / 1000.0 << ',' << (cpu() - beforeCpu) / 10000.0 << ','
+            << cycles() - beforeCycles << ',' << observer.copies() - beforeCopies << ',' << 1280 * 720 * 4 << '\n';
+    }
+    stopBounded(camera);
+}
 }
 
 int wmain(int argc, wchar_t** argv) {
@@ -418,8 +600,14 @@ int wmain(int argc, wchar_t** argv) {
     const int hostResult = lapse::runCameraHost(nullptr);
     if (hostResult >= 0) return hostResult;
     try {
+        if (argc == 2 && std::wcscmp(argv[1], L"--demand-benchmark") == 0) { demandBenchmark(); return 0; }
+        if (argc == 2 && std::wcscmp(argv[1], L"--warmup-only") == 0) { warmupActivationDeadline(); return 0; }
         const bool contentionOnly = argc == 2 && std::wcscmp(argv[1], L"--contention-only") == 0;
-        if (!contentionOnly) { frameTransfer(); staleFrame(); driverError(); delayedConsumer(); handlesReleased(); }
+        if (!contentionOnly) {
+            frameTransfer(); staleFrame(); driverError(); delayedConsumer(); handlesReleased(); unresponsiveRequest();
+            failedDeliveryKeepsPreviousFrame(false); failedDeliveryKeepsPreviousFrame(true);
+            warmupActivationDeadline();
+        }
         freshProducerContention(); contentionEpisodeReset(); initialContentionBound(); exitedHelperContention();
         return 0;
     } catch (const std::exception& error) {

@@ -51,7 +51,7 @@ Set-Item -Path Function:Get-FileHash -Value (${function:Get-FileHash}.GetNewClos
 function New-Fixture([string]$Name, [string]$Script = $PackageScript) {
     $root = Join-Path $workRoot $Name
     New-Item -ItemType Directory -Path $root | Out-Null
-    foreach ($dir in @('build/release', 'src', 'tests')) { New-Item -ItemType Directory -Path (Join-Path $root $dir) | Out-Null }
+    foreach ($dir in @('build/release', 'src', 'tests', 'tools')) { New-Item -ItemType Directory -Path (Join-Path $root $dir) | Out-Null }
     Copy-Item -LiteralPath $Script -Destination (Join-Path $root 'package.ps1')
     Write-Text (Join-Path $root '.gitignore') "build/`npackages/`n"
     Write-Text (Join-Path $root 'README.md') "Owned synthetic package $Name.`n"
@@ -63,6 +63,7 @@ function New-Fixture([string]$Name, [string]$Script = $PackageScript) {
     Write-Text (Join-Path $root 'tests/fixture.cmake') "# Owned synthetic CMake test fixture.`n"
     Write-Text (Join-Path $root 'tests/package_tests.ps1') "# Selected packaging regression sentinel.`n"
     Write-Text (Join-Path $root 'tests/build_tests.ps1') "# Selected build distribution regression sentinel.`n"
+    Write-Text (Join-Path $root 'tools/verify-encoding-quality.ps1') "# Selected encoding verification sentinel.`n"
     Write-Text (Join-Path $root 'tests/internal.ps1') "# Unselected internal script sentinel.`n"
     Write-Text (Join-Path $root 'src/local.txt') "Unselected local text sentinel.`n"
     Write-Text (Join-Path $root 'private-note.txt') "Unselected root note sentinel.`n"
@@ -139,7 +140,7 @@ function Assert-Package([string]$Root, [string]$UseVersion = $version) {
         $parts = $line -split '  ', 2
         Assert ($parts.Count -eq 2 -and (File-Sha (Join-Path $packages $parts[1])) -eq $parts[0]) 'External archive checksum mismatch.'
     }
-    $expected = @('.gitignore', 'README.md', 'CMakeLists.txt', 'build.ps1', 'package.ps1', 'src/app.cpp', 'src/helper.h', 'tests/probe.cpp', 'tests/fixture.cmake', 'tests/package_tests.ps1', 'tests/build_tests.ps1')
+    $expected = @('.gitignore', 'README.md', 'CMakeLists.txt', 'build.ps1', 'package.ps1', 'src/app.cpp', 'src/helper.h', 'tests/probe.cpp', 'tests/fixture.cmake', 'tests/package_tests.ps1', 'tests/build_tests.ps1', 'tools/verify-encoding-quality.ps1')
     $zip = [System.IO.Compression.ZipFile]::OpenRead((Join-Path $packages "Timelapse-v$UseVersion-source.zip"))
     try {
         Assert ($zip.Entries.Count -eq $expected.Count) 'Source allowlist entry count changed.'

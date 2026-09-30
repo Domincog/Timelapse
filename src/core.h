@@ -25,6 +25,7 @@ struct Rect { double x = 0, y = 0, w = 1, h = 1; };
 enum class Source { Desktop, Camera };
 enum class Mode { Desktop, Camera, Overlay, SideBySide, Custom };
 enum class EncodingQuality { Compact, Balanced, Detail };
+enum class EncodingMode { Compatible, Efficient, HardwareH264, HardwareHEVC, QualityH264 };
 struct Layer { Source source; Rect rect; };
 std::vector<Layer> preset(Mode mode);
 Rect constrain(Rect rect);
