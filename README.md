@@ -118,6 +118,8 @@ Recording follows the selected display's identity and current bounds. If the dis
 
 Saving keeps ownership of the original recording through finalization and the final filename change. An existing destination is never overwritten. If the filename change fails, the status message identifies the finished video retained at its `.recording.mp4` path. If finalization itself fails, any retained partial file may be incomplete. Save folders and preference files support long local Windows paths and Unicode names.
 
+Frame and video-time statistics describe samples accepted by the encoder, including a sample accepted just before an MP4 recovery-section error. They remain session totals across file splits; two-file mode uses the common count, with any difference described in the final report. These statistics do not guarantee that every accepted sample remains playable after a finalization failure or interruption.
+
 ## Build and verify
 
 Install CMake 3.20 or later (3.21 or later for Visual Studio 2022) and Visual Studio 2019 or 2022 Build Tools with the Desktop development with C++ workload and Windows 10 SDK. Run from PowerShell:

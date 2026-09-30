@@ -12,6 +12,8 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <chrono>
+#include <thread>
 
 HRESULT WINAPI recoveryCreateSink(IMFByteStream*, IMFMediaType*, IMFMediaType*, IMFMediaSink**);
 HRESULT WINAPI recoveryCreateWriter(IMFMediaSink*, IMFAttributes*, IMFSinkWriter**);
@@ -21,10 +23,17 @@ HRESULT WINAPI recoveryCreateWriter(IMFMediaSink*, IMFAttributes*, IMFSinkWriter
 #undef MFCreateSinkWriterFromMediaSink
 #undef MFCreateFMPEG4MediaSink
 
+EXECUTION_STATE WINAPI recoveryExecutionState(EXECUTION_STATE value) { return value; }
+#define SetThreadExecutionState recoveryExecutionState
+#include "../src/engine.cpp"
+#undef SetThreadExecutionState
+
 using Microsoft::WRL::ComPtr;
 namespace {
 bool failSink = false, failWriter = false, failMarker = false, failFinalize = false;
 unsigned sinkCreations = 0, markerCalls = 0, flushCalls = 0;
+unsigned engineFailMarkerAt = 0, engineFailWriteAt = 0, engineWriteCalls = 0;
+std::atomic<unsigned> engineCaptures{0};
 class Writer final : public IMFSinkWriter {
     std::atomic<ULONG> refs_{1};
     ComPtr<IMFSinkWriter> real_;
@@ -42,10 +51,16 @@ public:
     STDMETHODIMP AddStream(IMFMediaType* a, DWORD* b) override { return real_->AddStream(a,b); }
     STDMETHODIMP SetInputMediaType(DWORD a, IMFMediaType* b, IMFAttributes* c) override { return real_->SetInputMediaType(a,b,c); }
     STDMETHODIMP BeginWriting() override { return real_->BeginWriting(); }
-    STDMETHODIMP WriteSample(DWORD a, IMFSample* b) override { return real_->WriteSample(a,b); }
+    STDMETHODIMP WriteSample(DWORD a, IMFSample* b) override {
+        ++engineWriteCalls;
+        return engineFailWriteAt && engineWriteCalls==engineFailWriteAt ? E_FAIL : real_->WriteSample(a,b);
+    }
     STDMETHODIMP SendStreamTick(DWORD a, LONGLONG b) override { return real_->SendStreamTick(a,b); }
     STDMETHODIMP PlaceMarker(DWORD a, LPVOID b) override { return real_->PlaceMarker(a,b); }
-    STDMETHODIMP NotifyEndOfSegment(DWORD a) override { ++markerCalls; return failMarker ? E_FAIL : real_->NotifyEndOfSegment(a); }
+    STDMETHODIMP NotifyEndOfSegment(DWORD a) override {
+        ++markerCalls;
+        return failMarker || (engineFailMarkerAt && markerCalls==engineFailMarkerAt) ? E_FAIL : real_->NotifyEndOfSegment(a);
+    }
     STDMETHODIMP Flush(DWORD a) override { ++flushCalls; return real_->Flush(a); }
     STDMETHODIMP Finalize() override { return failFinalize ? E_FAIL : real_->Finalize(); }
     STDMETHODIMP GetServiceForStream(DWORD a, REFGUID b, REFIID c, LPVOID* d) override { return real_->GetServiceForStream(a,b,c,d); }
@@ -223,6 +238,54 @@ void failurePaths(const std::filesystem::path& directory) {
     failFinalize=true; const bool finished=encoder.finish(error); failFinalize=false;
     require(!finished && !error.empty() && std::filesystem::exists(partial),"Finalization failure deleted accepted output");
 }
+bool engineFailure(const std::filesystem::path& directory,unsigned failureAt,bool beforeAcceptance) {
+    const unsigned expected=beforeAcceptance?failureAt-1:failureAt;
+    const auto folder=directory/(std::wstring(beforeAcceptance?L"engine-write-":L"engine-marker-")+std::to_wstring(failureAt));
+    require(std::filesystem::create_directory(folder),"Create owned engine output folder");
+    engineFailMarkerAt=beforeAcceptance?0:failureAt;
+    engineFailWriteAt=beforeAcceptance?failureAt:0;
+    markerCalls=engineWriteCalls=0;engineCaptures=0;
+    lapse::Status saved;
+    {
+        lapse::Engine engine;lapse::Settings settings;
+        settings.monitorId=L"recovery-owned-desktop";settings.width=width;settings.height=height;
+        settings.folder=folder.wstring();settings.preview=false;settings.intervalMs=100;
+        settings.encodingMode=lapse::EncodingMode::Efficient;settings.recoveryMode=true;
+        engine.configure(settings);engine.record();
+        const auto until=std::chrono::steady_clock::now()+std::chrono::seconds(8);
+        do {
+            saved=engine.status();
+            if(saved.state==lapse::State::Idle)break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        } while(std::chrono::steady_clock::now()<until);
+        require(saved.state==lapse::State::Idle&&saved.error&&saved.recordingFailed,
+                "Engine did not preserve the injected writer failure");
+        require(saved.message.find(beforeAcceptance?L"Cannot encode the video frame":L"recovery section")!=std::wstring::npos&&
+                saved.savedPaths.size()==1&&saved.savedPaths[0]==saved.savedPath&&
+                std::filesystem::path(saved.savedPath).parent_path()==folder&&std::filesystem::exists(saved.savedPath),
+                "Engine lost failure context or the actual finalized path");
+        const auto decoded=decode(saved.savedPath,int(expected));
+        require(decoded.size()==expected&&engineWriteCalls==failureAt&&
+                markerCalls==(beforeAcceptance?expected:failureAt),"Injected engine write boundary changed");
+        settings.preview=true;engine.configure(settings);
+        const auto previewUntil=std::chrono::steady_clock::now()+std::chrono::seconds(3);
+        lapse::Status idle;
+        do {
+            idle=engine.status();if(idle.preview)break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        } while(std::chrono::steady_clock::now()<previewUntil);
+        require(idle.preview&&idle.state==lapse::State::Idle&&idle.frames==saved.frames&&
+                idle.savedPath==saved.savedPath&&idle.savedPaths==saved.savedPaths&&
+                idle.message==saved.message&&idle.error&&idle.recordingFailed,
+                "Later idle preview changed the retained recording outcome");
+    }
+    engineFailMarkerAt=engineFailWriteAt=0;
+    const bool correct=saved.frames==expected;
+    std::cout<<(correct?"PASS ":"FAIL ")<<"actual Engine "<<(beforeAcceptance?"pre-accept write":"accepted marker")
+        <<" failure at "<<failureAt<<": decoded="<<expected<<" reported="<<saved.frames
+        <<" error/path/idle retained\n";
+    return correct;
+}
 struct Child {
     HANDLE process=nullptr,thread=nullptr,job=nullptr;
     ~Child() { if (job) CloseHandle(job); if (process) { if (WaitForSingleObject(process,0)==WAIT_TIMEOUT) { TerminateProcess(process,99); WaitForSingleObject(process,5000); } CloseHandle(process); } if (thread) CloseHandle(thread); }
@@ -283,6 +346,25 @@ HRESULT WINAPI recoveryCreateWriter(IMFMediaSink* sink,IMFAttributes* attributes
     ComPtr<IMFSinkWriter> real;const auto hr=MFCreateSinkWriterFromMediaSink(sink,attributes,&real);
     if(FAILED(hr))return hr;*writer=new Writer(real.Get());return S_OK;
 }
+namespace lapse {
+struct CameraClient::Impl {};
+CameraClient::CameraClient():impl_(std::make_unique<Impl>()){}
+CameraClient::~CameraClient()=default;
+bool CameraClient::start(const std::wstring&,std::wstring&,CameraResolution){throw std::runtime_error("Unexpected camera activation");}
+void CameraClient::stop(){}
+bool CameraClient::latest(Frame&,std::wstring&){throw std::runtime_error("Unexpected camera read");}
+bool CameraClient::beginNight(uint64_t,uint32_t,const NightSettings&,std::wstring&){throw std::runtime_error("Unexpected Night request");}
+bool CameraClient::nightResult(uint64_t,Frame&,NightWindowResult&,std::wstring&){throw std::runtime_error("Unexpected Night result");}
+void CameraClient::cancelNight()noexcept{}
+bool CameraClient::observeActivity(uint64_t,CameraObservation&,std::wstring&){throw std::runtime_error("Unexpected activity observation");}
+void CameraClient::cancelActivityObservation()noexcept{}
+bool CameraClient::personInput(uint64_t,CameraPersonInput&,std::wstring&,bool){throw std::runtime_error("Unexpected person input");}
+bool captureMonitor(const std::wstring& id,int,int,bool,Frame& output,std::wstring& error){
+    if(id!=L"recovery-owned-desktop"){error=L"Synthetic source not configured.";return false;}
+    error.clear();output=pattern(int(engineCaptures++));return true;
+}
+void releaseDesktopCaptureCache()noexcept{}
+}
 int wmain(int argc,wchar_t** argv) {
     if(FAILED(CoInitializeEx(nullptr,COINIT_MULTITHREADED)))return 1;
     if(FAILED(MFStartup(MF_VERSION))){CoUninitialize();return 1;}
@@ -293,6 +375,10 @@ int wmain(int argc,wchar_t** argv) {
         require(argc==1,"Unexpected recovery fixture arguments");
         require(std::filesystem::create_directory(directory),"Create owned recovery directory");
         lifecycle(directory); failurePaths(directory);
+        const bool first=engineFailure(directory,1,false);
+        const bool later=engineFailure(directory,3,false);
+        const bool rejected=engineFailure(directory,2,true);
+        require(first&&later&&rejected,"Engine terminal frame count differs from real accepted samples");
         const auto ordinary=directory/L"ordinary.mp4"; const auto markers=markerCalls;
         encodeFile(ordinary,crashFrames,lapse::EncodingMode::Efficient,false);
         require(markerCalls==markers && fragments(read(ordinary)).empty(),"Off changed ordinary container path");

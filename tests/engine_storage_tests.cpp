@@ -38,8 +38,10 @@ void publicationCandidateGate(int phase) {
 }
 
 namespace {
-enum class SaveFault { None, PathPreparation, MessagePreparation, AfterRename };
+enum class SaveFault { None, PathPreparation, MessagePreparation, AfterRename, RepeatedPreparation };
 std::atomic<SaveFault> saveFault{SaveFault::None};
+std::atomic<bool> failAfterAcceptedWrite{false};
+std::atomic<int> repeatedReportAttempts{0};
 thread_local int allocationCountdown=0;
 std::atomic<int> saveAllocationFailures{0}, saveMoves{0}, savedMoves{0};
 std::atomic<bool> afterRenamePending{false}, commitAcknowledged{false}, allocationFreeCommit{false};
@@ -57,7 +59,13 @@ public:
     bool open(const std::wstring& path,int width,int height,int fps,std::wstring& error,EncodingQuality quality,EncodingMode mode, bool recoveryMode) {
         return real_.open(path,width,height,fps,error,quality,mode, recoveryMode);
     }
-    bool write(const Frame& frame,std::wstring& error) { return real_.write(frame,error); }
+    bool write(const Frame& frame,std::wstring& error) {
+        const bool result=real_.write(frame,error);
+        if(result && failAfterAcceptedWrite.exchange(false)) {
+            error=L"Injected failure after accepted sample.";return false;
+        }
+        return result;
+    }
     bool finish(std::wstring& error) {
         const bool result=real_.finish(error);
         if(result) {
@@ -73,6 +81,10 @@ public:
         const bool result=real_.finishForPublication(error);
         if(result) {
             const auto fault=saveFault.load();
+            if(fault==SaveFault::RepeatedPreparation) {
+                if(++repeatedReportAttempts==2)saveFault=SaveFault::None;
+                allocationCountdown=1;
+            }
             if(fault==SaveFault::PathPreparation || fault==SaveFault::MessagePreparation) {
                 saveFault=SaveFault::None;
                 allocationCountdown=fault==SaveFault::PathPreparation?1:2;
@@ -448,6 +460,50 @@ void workerCase(const std::filesystem::path& root,int kind) {
     if(afterRename)verifySentinel(temporary);
     if(collision)verifySentinel(finalPath);
 }
+void acceptedFrameOutcomes(const std::filesystem::path& root) {
+    for(const auto selected : {SaveFault::PathPreparation,SaveFault::MessagePreparation,SaveFault::AfterRename,SaveFault::RepeatedPreparation}) {
+        const auto folder=root/(L"accepted-report-"+std::to_wstring(int(selected)));
+        saveAllocationFailures=saveMoves=savedMoves=repeatedReportAttempts=0;
+        afterRenamePending=commitAcknowledged=allocationFreeCommit=false;saveFault=selected;failAfterAcceptedWrite=true;
+        lapse::Engine engine;
+        lapse::Settings settings;settings.monitorId=L"synthetic-display";settings.width=320;settings.height=180;
+        settings.intervalMs=60000;settings.preview=false;settings.folder=folder.wstring();
+        engine.configure(settings);engine.record();
+        const auto saved=await(engine,[](const auto& status){return status.state==lapse::State::Idle && status.recordingFailed;});
+        require(saved.error && saved.frames==1,"Accepted sample count was lost or its write failure hidden during reporting.");
+        if(selected==SaveFault::RepeatedPreparation) {
+            require(repeatedReportAttempts==2 && saveAllocationFailures==2 && saved.savedPaths.empty() && saveMoves==0,
+                    "Repeated report failure did not use the terminal fallback without publication.");
+            verifyVideo(recordingPath(folder),1);
+        } else {
+            require(saved.savedPaths.size()==1 && saveMoves==1 && savedMoves==1,"Report retry lost or republished the finalized accepted sample.");
+            verifyVideo(saved.savedPath,1);
+            if(selected==SaveFault::AfterRename) {
+                require(commitAcknowledged && allocationFreeCommit && saveAllocationFailures==0 &&
+                    saved.message.find(L"Injected failure after accepted sample.")!=std::wstring::npos,
+                    "Accepted-failure status commit allocated after rename or hid its cause.");
+            } else require(saveAllocationFailures==1,"Preparation retry did not inject exactly one allocation failure.");
+        }
+    }
+    const auto folder=root/L"accepted-collision";
+    candidateGateReached=candidateGateReleased=candidateGateTimeout=false;candidateGateCalls=0;
+    saveAllocationFailures=saveMoves=savedMoves=0;saveFault=SaveFault::None;failAfterAcceptedWrite=true;candidateGatePhase=1;
+    lapse::Engine engine;ReleaseGate release;
+    lapse::Settings settings;settings.monitorId=L"synthetic-display";settings.width=320;settings.height=180;
+    settings.intervalMs=60000;settings.preview=false;settings.folder=folder.wstring();
+    engine.configure(settings);engine.record();
+    const auto finishing=await(engine,[](const auto&){return candidateGateReached.load();});
+    require(finishing.state==lapse::State::Finishing && finishing.frames==1,"Finishing did not publish the accepted count before report/publication.");
+    const auto temporary=recordingPath(folder);auto name=temporary.wstring();name.replace(name.rfind(L".recording.mp4"),14,L".mp4");
+    const std::filesystem::path destination=name;writeSentinel(destination);candidateGateReleased=true;
+    const auto saved=await(engine,[](const auto& status){return status.state==lapse::State::Idle;});
+    require(saved.error && saved.recordingFailed && saved.frames==1 && saved.savedPath==temporary.wstring() &&
+        saved.message.find(L"Injected failure after accepted sample.")!=std::wstring::npos,
+        "Publication collision changed accepted count, failure context or retained identity.");
+    verifyVideo(temporary,1);verifySentinel(destination);
+    require(!candidateGateTimeout && candidateGateCalls==1,"Accepted-frame publication gate repeated or timed out.");
+    std::cout<<"PASS accepted sample survives report retries, repeated-allocation fallback and allocation-free/colliding publication with truthful Finishing/terminal counts.\n";
+}
 void apiCases(const std::filesystem::path& root) {
     const auto folder=root/L"api \u65e5";require(std::filesystem::create_directory(folder),"API folder create failed");
     const auto path=folder/L"temporary.mp4",finalPath=folder/L"final.mp4",moved=folder/L"moved.mp4";
@@ -578,6 +634,7 @@ int main() {
         temporarySuffixBoundary(directory);
         activeOutputOwnership(directory);
         for (int kind=0;kind<5;++kind) workerCase(directory,kind);
+        acceptedFrameOutcomes(directory);
         apiCases(directory);
         std::filesystem::remove_all(directory);
         std::cout << "Engine storage: real rename collision, retained MP4 decoding, protected destination, sticky error, retry, cancellation and allocation-safe publication passed.\n";

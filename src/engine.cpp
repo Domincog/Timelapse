@@ -821,6 +821,11 @@ void Engine::run() {
             bool keepCamera;
             { std::lock_guard<std::mutex> lock(mutex_);
               status_.state = State::Finishing; status_.nightWaiting = false;
+              // A recovery marker can fail after the writer accepted a sample.
+              // Publish its count before reporting can allocate or retry; a
+              // writerless new attempt must not reuse the prior encoder count.
+              if (!session || (!session->separateFiles && session->segmentDurationSeconds <= 0))
+                  status_.frames = writing && encoder ? encoder->frames() : 0;
               if (!segmentFailed) status_.message = L"Finishing MP4...";
               keepCamera = settings_.preview; }
             if (!keepCamera && cameraRunning) { clearCameraInput(); camera->stop(); cameraRunning = false; activeCamera.clear(); }
