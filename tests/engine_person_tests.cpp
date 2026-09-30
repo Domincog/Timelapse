@@ -46,9 +46,9 @@ namespace lapse {
 class PersonTestEncoder {
     Encoder real_;bool secondary_=false;
 public:
-    bool open(const std::wstring& path,int width,int height,int fps,std::wstring& error,EncodingQuality quality,EncodingMode mode) {
+    bool open(const std::wstring& path,int width,int height,int fps,std::wstring& error,EncodingQuality quality,EncodingMode mode, bool recoveryMode) {
         secondary_=path.find(L"-camera.recording.mp4")!=std::wstring::npos;
-        return real_.open(path,width,height,fps,error,quality,mode);
+        return real_.open(path,width,height,fps,error,quality,mode, recoveryMode);
     }
     bool write(const Frame& frame,std::wstring& error) {
         {std::lock_guard<std::mutex> lock(evidenceMutex);writes.push_back({std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count(),secondary_});}
@@ -242,3 +242,6 @@ int main(){
     }catch(const std::exception& e){std::cerr<<e.what()<<'\n';std::wcerr<<L"Retained artifacts: "<<root.wstring()<<L'\n';code=1;}
     MFShutdown();CoUninitialize();return code;
 }
+
+// This fixture owns no native desktop capture surface.
+namespace lapse { void releaseDesktopCaptureCache() noexcept {} }

@@ -32,6 +32,8 @@ struct Settings {
     // Camera-only software exposure; all policy is frozen with the session.
     NightSettings night;
     TimeSkipSettings timeSkip;
+    // Optional fragmented H.264 MP4; ordinary MP4 remains the default.
+    bool recoveryMode = false;
 };
 struct TimeSkipStatus {
     bool enabled = false;

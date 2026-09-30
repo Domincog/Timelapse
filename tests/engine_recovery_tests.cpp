@@ -248,3 +248,6 @@ int main() {
 }
 
 #include "engine_person_camera_stub.h"
+
+// This fixture owns no native desktop capture surface.
+namespace lapse { void releaseDesktopCaptureCache() noexcept {} }

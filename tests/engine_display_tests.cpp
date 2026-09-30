@@ -288,7 +288,7 @@ bool CameraClient::latest(Frame&,std::wstring&) { throw std::runtime_error("Unex
 struct Encoder::Impl { uint64_t frames=0; };
 Encoder::Encoder():impl_(std::make_unique<Impl>()){}
 Encoder::~Encoder()=default;
-bool Encoder::open(const std::wstring& path,int,int,int,std::wstring& error,EncodingQuality,EncodingMode) {
+bool Encoder::open(const std::wstring& path,int,int,int,std::wstring& error,EncodingQuality,EncodingMode,bool) {
     require(std::filesystem::path(path).parent_path()==std::filesystem::path(fileIOPath(outputRoot.wstring())),"Synthetic encoder escaped fixture output.");
     impl_->frames=0; error.clear(); return true;
 }

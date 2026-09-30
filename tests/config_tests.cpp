@@ -1,4 +1,5 @@
 #include "config.h"
+#include "core.h"
 #include <cmath>
 #include <iostream>
 #include <limits>
@@ -104,9 +105,24 @@ void previewGeometry() {
               "preview shape differs by at most one pixel on rounded shorter edge");
     }
 }
+void recordingFormats() {
+    using namespace lapse;
+    std::wstring error;
+    for (auto mode : {EncodingMode::Compatible, EncodingMode::Efficient,
+                      EncodingMode::HardwareH264, EncodingMode::QualityH264}) {
+        check(validateEncodingMode(mode,false,error) && error.empty(), "ordinary H.264 remains valid");
+        check(validateEncodingMode(mode,true,error) && error.empty(), "recovery supports each H.264 encoder");
+    }
+    check(validateEncodingMode(EncodingMode::HardwareHEVC,false,error) && error.empty(), "ordinary HEVC remains valid");
+    check(!validateEncodingMode(EncodingMode::HardwareHEVC,true,error) && error.find(L"H.264")!=std::wstring::npos,
+          "recovery rejects HEVC with an actionable message, without fallback");
+    for (auto mode : {static_cast<EncodingMode>(-1),static_cast<EncodingMode>(5)})
+        for (bool recovery : {false,true})
+            check(!validateEncodingMode(mode,recovery,error) && !error.empty(), "invalid encoder rejected before file creation");
+}
 }
 int main() {
-    durationParsing(); formatsAndBounds(); previewGeometry();
+    durationParsing(); formatsAndBounds(); previewGeometry(); recordingFormats();
     if (failures) return 1;
     std::cout << "Exact custom settings and bounded geometry checks passed\n";
     return 0;

@@ -51,9 +51,9 @@ class SkipEncoder {
     Encoder real_;
     bool secondary_=false;
 public:
-    bool open(const std::wstring& path,int width,int height,int fps,std::wstring& error,EncodingQuality quality,EncodingMode mode) {
+    bool open(const std::wstring& path,int width,int height,int fps,std::wstring& error,EncodingQuality quality,EncodingMode mode, bool recoveryMode) {
         ++opens;secondary_=path.find(L"-camera.recording.mp4")!=std::wstring::npos;
-        return real_.open(path,width,height,fps,error,quality,mode);
+        return real_.open(path,width,height,fps,error,quality,mode, recoveryMode);
     }
     bool write(const Frame& frame,std::wstring& error) {
         { std::lock_guard<std::mutex> lock(evidenceMutex); writes.push_back({GetTickCount64(),
@@ -335,3 +335,6 @@ int main(){
 }
 
 #include "engine_person_camera_stub.h"
+
+// This fixture owns no native desktop capture surface.
+namespace lapse { void releaseDesktopCaptureCache() noexcept {} }

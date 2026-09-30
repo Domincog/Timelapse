@@ -1,4 +1,5 @@
 #include "config.h"
+#include "core.h"
 #include <algorithm>
 #include <limits>
 
@@ -134,6 +135,19 @@ bool validateVideoSize(int width, int height, std::wstring& error) {
     error.clear();
     if (!videoSizeValid(width, height)) {
         error = L"Video size needs even dimensions from 48 to 4096 pixels, with at most 8,847,360 pixels (4096 x 2160).";
+        return false;
+    }
+    return true;
+}
+bool validateEncodingMode(EncodingMode mode, bool recoveryMode, std::wstring& error) {
+    error.clear();
+    if (mode != EncodingMode::Compatible && mode != EncodingMode::Efficient &&
+        mode != EncodingMode::HardwareH264 && mode != EncodingMode::HardwareHEVC && mode != EncodingMode::QualityH264) {
+        error = L"Choose a valid encoding mode.";
+        return false;
+    }
+    if (recoveryMode && mode == EncodingMode::HardwareHEVC) {
+        error = L"MP4 recovery mode requires H.264. Choose an H.264 encoder or turn recovery mode off.";
         return false;
     }
     return true;

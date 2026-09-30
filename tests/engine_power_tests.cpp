@@ -221,3 +221,6 @@ int main(){
     std::cout<<passed<<"/"<<(passed+failed)<<" passed; no actual power API, physical capture or helper process.\n";
     MFShutdown();CoUninitialize();SetEvent(completed);watchdog.join();for(auto ptr:handles)CloseHandle(*ptr);return failed?1:0;
 }
+
+// This fixture owns no native desktop capture surface.
+namespace lapse { void releaseDesktopCaptureCache() noexcept {} }

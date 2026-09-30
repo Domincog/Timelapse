@@ -17,6 +17,7 @@ std::atomic<unsigned> shade{72};
 std::atomic<unsigned> desktopCaptures{0};
 std::atomic<unsigned> fullCaptures{0};
 std::atomic<unsigned> reusedFullBuffers{0};
+std::atomic<unsigned> captureCacheReleases{0};
 void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
@@ -107,6 +108,7 @@ int main() {
             boundedPreview(recording);
             require(fullCaptures >= 2 && reusedFullBuffers >= 1,
                     "Recording reallocated the desktop capture buffer between samples");
+            require(captureCacheReleases == 0, "Live desktop capture discarded its reusable native cache");
             require(first.preview->pixels == original, "Recording mutated a retained idle preview snapshot");
 
             // Configure clears the published preview immediately. Future due
@@ -124,8 +126,11 @@ int main() {
                     std::filesystem::file_size(finished.savedPath) > 0,
                     "Hidden recording did not save successfully without a preview");
             const auto capturesAtRest = desktopCaptures.load();
+            const auto releasesAtRest = captureCacheReleases.load();
+            require(releasesAtRest > 0, "Hidden Finish did not release the native desktop cache before idle wait");
             std::this_thread::sleep_for(std::chrono::milliseconds(650));
             require(desktopCaptures == capturesAtRest, "Idle engine captured frames while preview was disabled");
+            require(captureCacheReleases == releasesAtRest, "Hidden idle polled desktop cache cleanup");
 
             settings.preview = true;
             engine.configure(settings);
@@ -143,6 +148,7 @@ int main() {
             await(engine, [](const auto& s) { return s.state == lapse::State::Recording && s.frames == 1; });
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
             auto commandAt = std::chrono::steady_clock::now();
+            const auto releasesBeforePause = captureCacheReleases.load();
             engine.setPaused(true);
             const auto paused = await(engine, [](const auto& s) { return s.state == lapse::State::Paused; }, 1000);
             require(std::chrono::steady_clock::now() - commandAt < std::chrono::seconds(1),
@@ -155,6 +161,7 @@ int main() {
             require(stillPaused.elapsed == paused.elapsed && stillPaused.frames == paused.frames &&
                     desktopCaptures == pausedCaptures,
                     "Hidden Pause accumulated time or captured frames");
+            require(captureCacheReleases > releasesBeforePause, "Hidden Pause retained the native desktop cache");
             engine.setPaused(false);
             await(engine, [](const auto& s) { return s.state == lapse::State::Recording && s.frames == 2; }, 1000);
             settings.preview = true;
@@ -186,3 +193,6 @@ int main() {
 }
 
 #include "engine_person_camera_stub.h"
+
+// This fixture owns no native desktop capture surface.
+namespace lapse { void releaseDesktopCaptureCache() noexcept { ++captureCacheReleases; } }

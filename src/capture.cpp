@@ -90,7 +90,7 @@ struct DesktopSurface {
     void* pixels = nullptr;
     int width = 0, height = 0;
     ~DesktopSurface() { clear(); }
-    void clear() {
+    void clear() noexcept {
         if (dc && previous) SelectObject(dc, previous);
         if (bitmap) DeleteObject(bitmap);
         if (dc) DeleteDC(dc);
@@ -117,6 +117,18 @@ struct DesktopSurface {
         return true;
     }
 };
+
+struct DesktopSurfaceCache {
+    DesktopSurface normal, observation;
+};
+// Keep cold cleanup from initializing a destructor-bearing thread-local cache.
+// In particular, finishing a camera-only recording needs no desktop resources.
+thread_local DesktopSurfaceCache* existingDesktopCache = nullptr;
+DesktopSurfaceCache& desktopSurfaceCache() {
+    thread_local DesktopSurfaceCache cache;
+    existingDesktopCache = &cache;
+    return cache;
+}
 
 void drawCursor(HDC dc, const RECT& bounds, int width, int height) {
     CURSORINFO cursor{sizeof(CURSORINFO)};
@@ -438,6 +450,13 @@ std::vector<CameraDevice> enumerateCameras(std::wstring& error) {
     return result;
 }
 
+void releaseDesktopCaptureCache() noexcept {
+    if (auto* cache = existingDesktopCache) {
+        cache->normal.clear();
+        cache->observation.clear();
+    }
+}
+
 bool captureDesktop(const RECT& bounds, int maxWidth, int maxHeight, bool cursor, Frame& output, std::wstring& error) {
     output.width = output.height = 0;
     error.clear();
@@ -461,8 +480,8 @@ bool captureDesktop(const RECT& bounds, int maxWidth, int maxHeight, bool cursor
     // Small activity checks must not retire/recreate the much larger recording
     // or preview DIB. This second cache can retain at most 9 KiB of pixel data
     // and acquires no GDI objects until a small capture is actually requested.
-    thread_local DesktopSurface normalSurface, smallSurface;
-    auto& surface = width <= 64 && height <= 36 ? smallSurface : normalSurface;
+    auto& cache = desktopSurfaceCache();
+    auto& surface = width <= 64 && height <= 36 ? cache.observation : cache.normal;
     if (!screen.value || !surface.prepare(screen.value, width, height)) {
         error = L"Windows could not prepare the desktop capture."; return false;
     }

@@ -1,4 +1,4 @@
-// Actual UI handlers, synthetic source lists and inert recording engine.
+﻿// Actual UI handlers, synthetic source lists and inert recording engine.
 // Own hidden controls only; no device enumeration, capture, user input or INI I/O.
 #include "engine.h"
 #include "capture.h"
@@ -187,6 +187,7 @@ struct HiddenFixture {
         };
         app.mode=combo(6); app.interval=combo(6); app.videoSize=combo(2); app.encodingQuality=combo(3); app.encodingMode=combo(5);app.stopAfter=combo(6);
         app.lowDisk=child(L"BUTTON",BS_AUTOCHECKBOX);SendMessageW(app.lowDisk,BM_SETCHECK,BST_CHECKED,0);
+        app.recoveryMode=child(L"BUTTON",BS_AUTOCHECKBOX);
         app.nightEnabled=child(L"BUTTON",BS_AUTOCHECKBOX);app.nightDuration=combo(6);app.nightTarget=combo(3);choose(app.nightTarget,1);
         app.monitor=combo(0); app.camera=combo(0);
         app.skipConfigure=child(L"BUTTON",BS_PUSHBUTTON);app.skipSummary=child(L"STATIC",0);app.skipDetail=child(L"STATIC",0);
@@ -488,6 +489,41 @@ void nightSettings(){
     SendMessageW(app.nightEnabled,BM_SETCHECK,BST_UNCHECKED,0);windowProc(app.window,WM_COMMAND,NightBox,0);sourceMode(Mode::Desktop);
     std::cout<<"PASS night Auto/manual/target mapping, equality, validation/error priority, active locks and camera-only scope\n";
 }
+void recoverySettings(){
+    seed(false);choose(app.encodingMode,0);SendMessageW(app.recoveryMode,BM_SETCHECK,BST_UNCHECKED,0);
+    windowProc(app.window,WM_COMMAND,RecoveryBox,0);
+    require(!app.settings.recoveryMode&&app.encodingValidation.empty()&&IsWindowEnabled(app.record),"Recovery default changed ordinary recording.");
+    SendMessageW(app.recoveryMode,BM_SETCHECK,BST_CHECKED,0);windowProc(app.window,WM_COMMAND,RecoveryBox,0);
+    for(int mode:{0,1,2,4}){
+        choose(app.encodingMode,mode);windowProc(app.window,WM_COMMAND,MAKEWPARAM(EncodingModeBox,CBN_SELCHANGE),0);
+        require(app.settings.recoveryMode&&lapse::configured.recoveryMode&&app.encodingValidation.empty()&&IsWindowEnabled(app.record),"An H.264 mode was rejected or silently disabled recovery.");
+    }
+    choose(app.encodingMode,3);windowProc(app.window,WM_COMMAND,MAKEWPARAM(EncodingModeBox,CBN_SELCHANGE),0);
+    require(app.settings.recoveryMode&&app.settings.encodingMode==EncodingMode::HardwareHEVC&&!app.encodingValidation.empty()&&!IsWindowEnabled(app.record)&&caption(app.statusText)==app.encodingValidation,
+        "HEVC/recovery incompatibility was hidden or a chosen option was coerced.");
+    const auto calls=lapse::recordCalls;windowProc(app.window,WM_COMMAND,Record,0);require(lapse::recordCalls==calls,"Forged Record admitted HEVC recovery.");
+    lapse::fixtureStatus.error=true;lapse::fixtureStatus.recordingFailed=true;lapse::fixtureStatus.message=L"Synthetic save failed; retained owned file";
+    windowProc(app.window,WM_TIMER,1,0);require(caption(app.statusText)==lapse::fixtureStatus.message,"Encoding validation hid a save failure.");
+    app.status=lapse::fixtureStatus={};updateControls();
+    SendMessageW(app.recoveryMode,BM_SETCHECK,BST_UNCHECKED,0);windowProc(app.window,WM_COMMAND,RecoveryBox,0);
+    require(app.settings.encodingMode==EncodingMode::HardwareHEVC&&app.encodingValidation.empty()&&IsWindowEnabled(app.record),"Turning recovery off did not restore HEVC eligibility.");
+    SendMessageW(app.recoveryMode,BM_SETCHECK,BST_CHECKED,0);windowProc(app.window,WM_COMMAND,RecoveryBox,0);
+    choose(app.encodingMode,0);windowProc(app.window,WM_COMMAND,MAKEWPARAM(EncodingModeBox,CBN_SELCHANGE),0);
+    choose(app.mode,SeparateFilesMode);changeLayout(false);choose(app.interval,2);choose(app.nightDuration,2);
+    SendMessageW(app.nightEnabled,BM_SETCHECK,BST_CHECKED,0);windowProc(app.window,WM_COMMAND,NightBox,0);record();
+    require(lapse::recorded.recoveryMode&&lapse::recorded.separateFiles&&lapse::recorded.night.enabled&&lapse::recorded.night.durationMs==2000,
+        "Accepted paired/Night recording lost recovery or its independent settings.");
+    for(State state:{State::Starting,State::Recording,State::Paused,State::Finishing}){
+        app.status.state=state;updateControls();const auto configurations=lapse::configurationCalls;
+        require(!IsWindowEnabled(app.recoveryMode)&&!IsWindowEnabled(app.encodingMode),"Active session exposed encoding/recovery edits.");
+        SendMessageW(app.recoveryMode,BM_SETCHECK,BST_UNCHECKED,0);windowProc(app.window,WM_COMMAND,RecoveryBox,0);
+        choose(app.encodingMode,3);windowProc(app.window,WM_COMMAND,MAKEWPARAM(EncodingModeBox,CBN_SELCHANGE),0);
+        require(lapse::configurationCalls==configurations&&SendMessageW(app.recoveryMode,BM_GETCHECK,0,0)==BST_CHECKED&&choice(app.encodingMode)==0,
+            "Forged active recovery/encoder command changed the session or displayed a false selection.");
+    }
+    app.status=lapse::fixtureStatus={};SendMessageW(app.recoveryMode,BM_SETCHECK,BST_UNCHECKED,0);SendMessageW(app.nightEnabled,BM_SETCHECK,BST_UNCHECKED,0);sourceMode(Mode::Desktop);
+    std::cout<<"PASS recovery H.264 modes, HEVC validation/error priority, actual Record guard, paired/Night settings and active command locks\n";
+}
 }
 int main() {
     std::cout<<std::unitbuf; std::wcout<<std::unitbuf;
@@ -504,9 +540,10 @@ int main() {
             unavailableSelection(camera);emptyListRecovery(camera);explicitReplacement(camera);
             modeSwitchPreservesMissingChoice(camera);changedMetadata(camera);
         }
-        activeControls();indexLoads();separateSources();nightSettings();
+        activeControls();indexLoads();separateSources();nightSettings();recoverySettings();
         require(!IsWindowVisible(app.window)&&!IsWindowVisible(app.preview),"Fixture became visible.");
         std::cout<<"All source selection and settings assertions passed with hidden controls. No actual source was opened.\n";
         return 0;
     }catch(const std::exception& error){std::cerr<<"PROBE FAILURE: "<<error.what()<<'\n';return 1;}
 }
+

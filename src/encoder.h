@@ -14,9 +14,12 @@ public:
     // Creates a new file; existing files are never overwritten. Requires delete
     // access for owned-file cleanup and denies rename/deletion until ordinary
     // finish(), or until the explicit publication sequence below releases it.
+    // Recovery mode uses fragmented H.264 with an end-of-segment marker per
+    // accepted sample. Completed sections may survive process termination;
+    // pending samples and uninitialized files are not guaranteed recoverable.
     bool open(const std::wstring& path, int width, int height, int fps, std::wstring& error,
               EncodingQuality quality = EncodingQuality::Balanced,
-              EncodingMode mode = EncodingMode::Compatible);
+              EncodingMode mode = EncodingMode::Compatible, bool recoveryMode = false);
     bool write(const Frame& frame, std::wstring& error);
     bool finish(std::wstring& error);
     // Worker publication keeps the original object protected through status

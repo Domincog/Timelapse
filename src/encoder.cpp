@@ -72,6 +72,7 @@ using encoding_detail::toNv12;
 
 struct Encoder::Impl {
     ComPtr<IMFSinkWriter> writer;
+    ComPtr<IMFMediaSink> sink;
     ComPtr<IMFByteStream> bytes;
     HANDLE file = INVALID_HANDLE_VALUE;
     std::wstring path;
@@ -95,6 +96,10 @@ struct Encoder::Impl {
 
     void release() {
         writer.Reset();
+        // A writer created from a supplied sink does not shut that sink down.
+        // Release the writer first, including on configuration failures.
+        if (sink) sink->Shutdown();
+        sink.Reset();
         if (bytes) bytes->Close();
         bytes.Reset();
         writing = false;
@@ -148,7 +153,7 @@ Encoder::Encoder() : impl_(std::make_unique<Impl>()) {}
 Encoder::~Encoder() { impl_->finalize(); }
 
 bool Encoder::open(const std::wstring& path, int width, int height, int fps, std::wstring& error,
-                   EncodingQuality quality, EncodingMode mode) {
+                   EncodingQuality quality, EncodingMode mode, bool recoveryMode) {
     error.clear();
     if (impl_->writer || impl_->file != INVALID_HANDLE_VALUE) {
         error = L"Finish the current recording before opening another output file.";
@@ -173,11 +178,7 @@ bool Encoder::open(const std::wstring& path, int width, int height, int fps, std
         return false;
     }
 
-    if (mode != EncodingMode::Compatible && mode != EncodingMode::Efficient &&
-        mode != EncodingMode::HardwareH264 && mode != EncodingMode::HardwareHEVC && mode != EncodingMode::QualityH264) {
-        error = L"Choose a valid encoding mode.";
-        return false;
-    }
+    if (!validateEncodingMode(mode, recoveryMode, error)) return false;
     const bool hardware = mode == EncodingMode::HardwareH264 || mode == EncodingMode::HardwareHEVC;
     const bool hevc = mode == EncodingMode::HardwareHEVC;
     const bool compatible = mode == EncodingMode::Compatible;
@@ -222,7 +223,7 @@ bool Encoder::open(const std::wstring& path, int width, int height, int fps, std
     if (SUCCEEDED(hr)) hr = attributes->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, hardware);
     // Keep default back-pressure; the encoder cannot accumulate an unbounded
     // queue when the disk is slow or frames are submitted faster than encoding.
-    if (SUCCEEDED(hr)) hr = MFCreateSinkWriterFromURL(nullptr, candidate->bytes.Get(),
+    if (SUCCEEDED(hr) && !recoveryMode) hr = MFCreateSinkWriterFromURL(nullptr, candidate->bytes.Get(),
                                                      attributes.Get(), &candidate->writer);
     if (FAILED(hr)) return abandon(L"Cannot create the MP4 writer", hr);
 
@@ -240,7 +241,14 @@ bool Encoder::open(const std::wstring& path, int width, int height, int fps, std
     // are disabled below; hardware uses low-latency operation. Mode tests check
     // that short clips retain their frame count and start at timestamp zero.
     if (SUCCEEDED(hr)) hr = output->SetUINT32(MF_MT_MPEG2_PROFILE, hevc ? eAVEncH265VProfile_Main_420_8 : eAVEncH264VProfile_Main);
-    if (SUCCEEDED(hr)) hr = candidate->writer->AddStream(output.Get(), &candidate->stream);
+    if (SUCCEEDED(hr) && recoveryMode) {
+        hr = MFCreateFMPEG4MediaSink(candidate->bytes.Get(), output.Get(), nullptr, &candidate->sink);
+        if (SUCCEEDED(hr)) hr = MFCreateSinkWriterFromMediaSink(candidate->sink.Get(), attributes.Get(),
+                                                              &candidate->writer);
+        // This video-only sink already contains its stream. Sink-writer APIs
+        // use the zero-based stream index, not the sink's stream identifier.
+        candidate->stream = 0;
+    } else if (SUCCEEDED(hr)) hr = candidate->writer->AddStream(output.Get(), &candidate->stream);
     if (FAILED(hr)) return abandonConfiguration(hevc ? L"Cannot configure H.265/HEVC output" : L"Cannot configure H.264 output", hr);
 
     ComPtr<IMFMediaType> input;
@@ -321,6 +329,14 @@ bool Encoder::write(const Frame& frame, std::wstring& error) {
     if (SUCCEEDED(hr)) hr = impl_->writer->WriteSample(impl_->stream, sample.Get());
     if (FAILED(hr)) return fail(error, L"Cannot encode the video frame", hr);
     ++impl_->frames;
+    // Account for the accepted sample before a marker failure, so finalization
+    // preserves it instead of treating this as an empty recording. The marker
+    // closes a small fragment without changing keyframes or discarding samples.
+    // It is not a synchronous disk-durability barrier.
+    if (impl_->sink) {
+        hr = impl_->writer->NotifyEndOfSegment(impl_->stream);
+        if (FAILED(hr)) return fail(error, L"Cannot complete the MP4 recovery section", hr);
+    }
     return true;
 }
 

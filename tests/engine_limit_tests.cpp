@@ -28,10 +28,10 @@ namespace lapse {
 class LimitEncoder {
     Encoder real_;
 public:
-    bool open(const std::wstring& path, int width, int height, int fps, std::wstring& error, EncodingQuality quality, EncodingMode mode) {
+    bool open(const std::wstring& path, int width, int height, int fps, std::wstring& error, EncodingQuality quality, EncodingMode mode, bool recoveryMode) {
         if (path.find(L"-camera.recording.mp4") != std::wstring::npos)
             std::this_thread::sleep_for(std::chrono::milliseconds(cameraOpenDelayMs.exchange(0)));
-        return real_.open(path, width, height, fps, error, quality, mode);
+        return real_.open(path, width, height, fps, error, quality, mode, recoveryMode);
     }
     bool write(const Frame& frame, std::wstring& error) { return real_.write(frame, error); }
     bool finish(std::wstring& error) { return real_.finish(error); }
@@ -327,3 +327,6 @@ int main(int argc, char** argv) {
 }
 
 #include "engine_person_camera_stub.h"
+
+// This fixture owns no native desktop capture surface.
+namespace lapse { void releaseDesktopCaptureCache() noexcept {} }

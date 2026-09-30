@@ -25,6 +25,7 @@ std::atomic<Fault> fault{Fault::None};
 std::atomic<bool> disconnectCamera{false}, disconnectDesktop{false};
 std::atomic<bool> cameraWarming{false}, allocationFreeCommit{false};
 std::atomic<unsigned> cameraStarts{0}, cameraStops{0}, captures{0}, allocationFailures{0};
+std::atomic<unsigned> recoveryOpens{0};
 thread_local bool failAllocation = false;
 }
 void* operator new(std::size_t size) {
@@ -39,10 +40,11 @@ class SeparateEncoder {
     Encoder real_;
     bool camera_ = false;
 public:
-    bool open(const std::wstring& path, int width, int height, int fps, std::wstring& error, EncodingQuality quality, EncodingMode mode) {
+    bool open(const std::wstring& path, int width, int height, int fps, std::wstring& error, EncodingQuality quality, EncodingMode mode, bool recoveryMode) {
+        if (recoveryMode) ++recoveryOpens;
         camera_ = path.find(L"-camera.recording.mp4") != std::wstring::npos;
         if (fault == (camera_ ? Fault::OpenCamera : Fault::OpenDesktop)) { error = L"Injected open failure."; return false; }
-        return real_.open(path, width, height, fps, error, quality, mode);
+        return real_.open(path, width, height, fps, error, quality, mode, recoveryMode);
     }
     bool write(const Frame& frame, std::wstring& error) {
         if (fault == (camera_ ? Fault::WriteCamera : Fault::WriteDesktop)) { error = L"Injected write failure."; return false; }
@@ -136,7 +138,8 @@ void protectedFile(const std::filesystem::path& file) {
     const auto stolen = file.wstring() + L".stolen";
     require(!MoveFileExW(file.c_str(), stolen.c_str(), 0) && GetLastError() == ERROR_SHARING_VIOLATION, "Active output could be replaced");
 }
-void verify(const std::filesystem::path& path, unsigned frames, bool camera) {
+void verify(const std::filesystem::path& path, unsigned frames, bool camera,
+            bool recoveryMode = false, std::vector<LONGLONG>* timestamps = nullptr) {
     constexpr DWORD stream = static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM);
     ComPtr<IMFSourceReader> reader;
     checked(MFCreateSourceReaderFromURL(path.c_str(), nullptr, &reader), "Cannot reopen output MP4");
@@ -159,7 +162,11 @@ void verify(const std::filesystem::path& path, unsigned frames, bool camera) {
         checked(reader->ReadSample(stream, 0, nullptr, &flags, &timestamp, &sample), "Cannot decode output");
         require(!(flags & MF_SOURCE_READERF_ERROR), "Decoded output contains an error");
         if (sample) {
-            require(decoded < frames && std::llabs(timestamp - decoded * 10000000LL / 30) <= 1, "Streams lost frame synchronization");
+            // The native fragmented sink uses a different media timescale.
+            // Keep the ordinary MP4 tolerance unchanged, and compare paired
+            // recovery timestamps exactly in verifyPaths below.
+            require(decoded < frames && std::llabs(timestamp - decoded * 10000000LL / 30) <= (recoveryMode ? 334 : 1), "Streams lost frame synchronization");
+            if (timestamps) timestamps->push_back(timestamp);
             ComPtr<IMFMediaBuffer> buffer; ComPtr<IMF2DBuffer> plane;
             checked(sample->ConvertToContiguousBuffer(&buffer), "No decoded pixels");
             BYTE* pixels = nullptr; LONG stride = 320; DWORD length = 0;
@@ -182,18 +189,27 @@ void verify(const std::filesystem::path& path, unsigned frames, bool camera) {
     }
     require(ended && decoded == frames, "Separate output lost frames");
 }
-void verifyPaths(const lapse::Status& status, unsigned desktopFrames, unsigned cameraFrames) {
+void verifyPaths(const lapse::Status& status, unsigned desktopFrames, unsigned cameraFrames, bool recoveryMode = false) {
     require(!status.savedPaths.empty() && status.savedPath == status.savedPaths.front(), "Compatibility path is not first saved path");
+    std::vector<LONGLONG> firstTimestamps;
     for (const auto& path : status.savedPaths) {
         const bool camera = path.find(L"-camera") != std::wstring::npos;
-        verify(path, camera ? cameraFrames : desktopFrames, camera);
+        std::vector<LONGLONG> timestamps;
+        verify(path, camera ? cameraFrames : desktopFrames, camera, recoveryMode, &timestamps);
+        if (desktopFrames == cameraFrames) {
+            if (firstTimestamps.empty()) firstTimestamps = timestamps;
+            else require(timestamps == firstTimestamps, "Paired output timestamps differ");
+        }
         require(status.message.find(path) != std::wstring::npos, "Outcome did not name each playable video");
     }
 }
-void lifecycle(const std::filesystem::path& root) {
-    resetFaults(); const auto folder = root / L"lifecycle"; auto config = settings(folder);
+void lifecycle(const std::filesystem::path& root, bool recoveryMode = false) {
+    resetFaults(); const auto folder = root / (recoveryMode ? L"recovery-lifecycle" : L"lifecycle"); auto config = settings(folder);
+    config.recoveryMode = recoveryMode;
+    const unsigned recoveryBefore = recoveryOpens;
     lapse::Engine engine; engine.configure(config); engine.record();
     await(engine, [](const auto& s) { return s.state == lapse::State::Recording && s.frames == 1; });
+    require(recoveryOpens == recoveryBefore + (recoveryMode ? 2u : 0u), "Recovery option did not reach both writers");
     const auto desktop = temporary(folder, false), camera = temporary(folder, true);
     const uint64_t desktopIdentity = identity(desktop), cameraIdentity = identity(camera);
     protectedFile(desktop); protectedFile(camera);
@@ -211,15 +227,36 @@ void lifecycle(const std::filesystem::path& root) {
     // resolution belong to the active session; only visibility remains live.
     config.separateFiles = false; config.cameraId = L"invalid"; config.monitorId = L"invalid";
     config.width = 640; config.height = 360; config.layers = lapse::preset(lapse::Mode::Desktop);
-    config.encodingMode = lapse::EncodingMode::HardwareHEVC; engine.configure(config);
+    config.encodingMode = lapse::EncodingMode::HardwareHEVC; config.recoveryMode = !recoveryMode; engine.configure(config);
     engine.setPaused(false);
     await(engine, [](const auto& s) { return s.state == lapse::State::Recording && s.frames == 2; });
     engine.finish(); const auto saved = await(engine, [](const auto& s) { return s.state == lapse::State::Idle; });
     require(!saved.error && !saved.recordingFailed && saved.frames == 2 && saved.savedPaths.size() == 2, "Paired recording did not complete");
     require(identity(saved.savedPaths[0]) == desktopIdentity && identity(saved.savedPaths[1]) == cameraIdentity, "Paired publication lost file ownership");
-    verifyPaths(saved, 2, 2);
+    verifyPaths(saved, 2, 2, recoveryMode);
     for (const auto& path : saved.savedPaths) require(MoveFileExW(path.c_str(), (path + L".moved").c_str(), 0) != FALSE, "Publication guard was not released");
-    std::cout << "PASS paired sources, matching timestamps, full-frame content, pause/resume, frozen session, owned publication.\n";
+    std::cout << "PASS recovery=" << recoveryMode << " paired sources, matching timestamps, full-frame content, pause/resume, frozen session, owned publication.\n";
+}
+void singleRecoveryAndInvalidMode(const std::filesystem::path& root) {
+    resetFaults(); const auto folder = root / L"single-recovery"; auto config = settings(folder);
+    config.separateFiles = false; config.layers = lapse::preset(lapse::Mode::Desktop);
+    config.recoveryMode = true; config.encodingMode = lapse::EncodingMode::Efficient;
+    const unsigned recoveryBefore = recoveryOpens;
+    lapse::Engine engine; engine.configure(config); engine.record();
+    await(engine, [](const auto& s) { return s.state == lapse::State::Recording && s.frames == 1; });
+    engine.finish(); const auto saved = await(engine, [](const auto& s) { return s.state == lapse::State::Idle; });
+    require(!saved.error && saved.savedPaths.size() == 1 && recoveryOpens == recoveryBefore + 1,
+        "Single-stream recovery mode did not reach its writer");
+    verify(saved.savedPath, 1, false, true);
+    config.folder = (root / L"invalid-recovery-hevc").wstring(); config.encodingMode = lapse::EncodingMode::HardwareHEVC;
+    const unsigned capturesBefore = captures, opensBefore = recoveryOpens;
+    engine.configure(config); engine.record();
+    const auto rejected = await(engine, [](const auto& s) { return s.state == lapse::State::Idle && s.error; });
+    require(rejected.recordingFailed && rejected.frames == 0 && rejected.savedPaths.empty() &&
+        rejected.message.find(L"H.264") != std::wstring::npos && !std::filesystem::exists(config.folder) &&
+        captures == capturesBefore && recoveryOpens == opensBefore,
+        "Unsupported recovery encoder was not rejected before capture or output creation");
+    std::cout << "PASS single recovery and explicit HEVC admission rejection before side effects.\n";
 }
 void failure(const std::filesystem::path& root, Fault selected, bool failFirstWrite = false) {
     resetFaults(); const auto folder = root / (L"fault-" + std::to_wstring(static_cast<int>(selected)) + (failFirstWrite ? L"-first" : L""));
@@ -377,15 +414,19 @@ int main(int argc, char** argv) {
             MFShutdown(); CoUninitialize(); return 0;
         }
         lifecycle(root);
+        lifecycle(root, true); singleRecoveryAndInvalidMode(root);
         for (const auto selected : {Fault::OpenDesktop, Fault::OpenCamera, Fault::WriteDesktop, Fault::WriteCamera,
             Fault::FinishDesktop, Fault::FinishCamera, Fault::SecondPublicationAllocation}) failure(root, selected);
         failure(root, Fault::WriteDesktop, true); failure(root, Fault::WriteCamera, true);
         collision(root, false); collision(root, true); sourceFailure(root, false); sourceFailure(root, true); shutdown(root);
         intervalAndCommit(root); warmupAndInvalidSource(root);
         std::filesystem::remove_all(root);
-        std::cout << "Separate engine: 17 synthetic real-encoder cases passed.\n";
+        std::cout << "Separate engine: 19 synthetic real-encoder case groups passed.\n";
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; std::wcerr << L"Artifacts kept at " << root.wstring() << L'\n'; result = 1; }
     MFShutdown(); CoUninitialize(); return result;
 }
 
 #include "engine_person_camera_stub.h"
+
+// This fixture owns no native desktop capture surface.
+namespace lapse { void releaseDesktopCaptureCache() noexcept {} }

@@ -39,8 +39,8 @@ namespace lapse {
 class NightTestEncoder {
     Encoder real_;
 public:
-    bool open(const std::wstring& path,int width,int height,int fps,std::wstring& error,EncodingQuality q,EncodingMode mode) {
-        ++opens;return real_.open(path,width,height,fps,error,q,mode);
+    bool open(const std::wstring& path,int width,int height,int fps,std::wstring& error,EncodingQuality q,EncodingMode mode, bool recoveryMode) {
+        ++opens;return real_.open(path,width,height,fps,error,q,mode, recoveryMode);
     }
     bool write(const Frame& f,std::wstring& error) {
         std::this_thread::sleep_for(std::chrono::milliseconds(writeDelayMs.exchange(0)));
@@ -293,3 +293,6 @@ int main() {
 }
 
 #include "engine_person_camera_stub.h"
+
+// This fixture owns no native desktop capture surface.
+namespace lapse { void releaseDesktopCaptureCache() noexcept {} }

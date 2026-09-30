@@ -314,3 +314,6 @@ int main() {
     for (HANDLE handle : {startupEntered, startupRelease, faultEntered, faultRelease, completed}) CloseHandle(handle);
     return result;
 }
+
+// This fixture owns no native desktop capture surface.
+namespace lapse { void releaseDesktopCaptureCache() noexcept {} }

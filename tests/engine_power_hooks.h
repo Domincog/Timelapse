@@ -14,7 +14,7 @@ class PowerEncoder {
     Encoder real_;
 public:
     bool open(const std::wstring& path, int width, int height, int fps,
-              std::wstring& error, EncodingQuality quality, EncodingMode mode) { return real_.open(path,width,height,fps,error,quality,mode); }
+              std::wstring& error, EncodingQuality quality, EncodingMode mode, bool recoveryMode) { return real_.open(path,width,height,fps,error,quality,mode, recoveryMode); }
     bool write(const Frame& frame,std::wstring& error) { return real_.write(frame,error); }
     bool finish(std::wstring& error) { probe::beforeFinish(); return probe::afterFinish(real_.finish(error),error); }
     bool finishForPublication(std::wstring& error) { probe::beforeFinish(); return probe::afterFinish(real_.finishForPublication(error),error); }

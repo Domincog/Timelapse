@@ -531,6 +531,7 @@ void Engine::run() {
             // Hidden idle workers have no next tick on which to release the
             // device. Finish/cancel must stop it before returning to that wait.
             if (!keepCamera && cameraRunning) { camera->stop(); cameraRunning = false; activeCamera.clear(); }
+            if (!keepCamera) releaseDesktopCaptureCache();
             if (session && session->separateFiles) {
                 std::array<std::wstring, 2> errors;
                 const std::array<bool, 2> opened{writing, cameraWriting};
@@ -727,6 +728,7 @@ void Engine::run() {
                     std::wstring validationError;
                     if (!validateCaptureInterval(cfg.intervalMs, validationError) ||
                         !validateVideoSize(cfg.width, cfg.height, validationError) ||
+                        !validateEncodingMode(cfg.encodingMode, cfg.recoveryMode, validationError) ||
                         (nightMode && !validateNightCapture(cfg, validationError)) ||
                         !normalizeTimeSkipSettings(cfg.timeSkip, validationError)) {
                         closeRecording(validationError); continue;
@@ -804,6 +806,7 @@ void Engine::run() {
                 power.update(writing && !paused, needDesktop);
                 const bool active = pending || (writing && !paused) || cfg.preview;
                 if (!cfg.preview) previewBuffer.reset();
+                if (!active || !needDesktop) releaseDesktopCaptureCache();
                 if (!active) { desktop = {}; webcam = {}; composed = {}; cameraComposed = {}; }
                 else {
                     if (!needDesktop) desktop = {};
@@ -988,13 +991,13 @@ void Engine::run() {
                         cameraTemporaryIO = ioBase + L"-camera.recording.mp4"; cameraFinalPathIO = ioBase + L"-camera.mp4";
                     }
                     if (!encoder) encoder.emplace();
-                    if (!encoder->open(temporaryIO, cfg.width, cfg.height, 30, error, cfg.encodingQuality, cfg.encodingMode)) {
+                    if (!encoder->open(temporaryIO, cfg.width, cfg.height, 30, error, cfg.encodingQuality, cfg.encodingMode, cfg.recoveryMode)) {
                         closeRecording((cfg.separateFiles ? L"Cannot start desktop recording: " : L"Cannot start recording: ") + error); continue;
                     }
                     writing = true;
                     if (cfg.separateFiles) {
                         if (!cameraEncoder) cameraEncoder.emplace();
-                        if (!cameraEncoder->open(cameraTemporaryIO, cfg.width, cfg.height, 30, error, cfg.encodingQuality, cfg.encodingMode)) {
+                        if (!cameraEncoder->open(cameraTemporaryIO, cfg.width, cfg.height, 30, error, cfg.encodingQuality, cfg.encodingMode, cfg.recoveryMode)) {
                             closeRecording(L"Cannot start camera recording: " + error); continue;
                         }
                         cameraWriting = true;

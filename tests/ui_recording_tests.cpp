@@ -44,6 +44,8 @@ std::atomic<uint64_t> captureCalls{0};
 std::atomic<bool> failCapture{false}, failFinish{false}, failRename{false};
 std::atomic<int> captureWidth{0};
 std::atomic<int> captureGateWidth{0};
+std::atomic<unsigned> encoderOpens{0};
+std::atomic<bool> encoderRecovery{false};
 int confirmations=0, errorDialogs=0, foregroundCalls=0, destroyCalls=0;
 std::wstring dialogMessage;
 int WINAPI messageBox(HWND,LPCWSTR message,LPCWSTR title,UINT flags) {
@@ -71,6 +73,7 @@ namespace lapse {
 std::vector<Monitor> enumerateMonitors() { throw std::runtime_error("Unexpected enumeration"); }
 std::vector<CameraDevice> enumerateCameras(std::wstring&) { throw std::runtime_error("Unexpected camera enumeration"); }
 int runCameraHost(const wchar_t*) { throw std::runtime_error("Unexpected application entry"); }
+void releaseDesktopCaptureCache() noexcept {}
 bool captureMonitor(const std::wstring& id,int width,int,bool,Frame& output,std::wstring& error) {
     error.clear();
     if(id!=L"owned-display"){error=L"Synthetic display unavailable.";return false;}
@@ -99,7 +102,8 @@ bool CameraClient::latest(Frame&,std::wstring&) { throw std::runtime_error("Phys
 struct Encoder::Impl { HANDLE file=INVALID_HANDLE_VALUE;uint64_t count=0; };
 Encoder::Encoder():impl_(std::make_unique<Impl>()){}
 Encoder::~Encoder(){if(impl_->file!=INVALID_HANDLE_VALUE)CloseHandle(impl_->file);}
-bool Encoder::open(const std::wstring& path,int,int,int,std::wstring& error,EncodingQuality,EncodingMode) {
+bool Encoder::open(const std::wstring& path,int,int,int,std::wstring& error,EncodingQuality,EncodingMode,bool recoveryMode) {
+    ++probe::encoderOpens;probe::encoderRecovery=recoveryMode;
     if(impl_->file!=INVALID_HANDLE_VALUE)CloseHandle(impl_->file);
     impl_->count=0;error.clear();
     impl_->file=CreateFileW(path.c_str(),GENERIC_WRITE|DELETE,0,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
@@ -161,6 +165,7 @@ struct HiddenFixture {
         probe::dialogMessage.clear();
         app.settings={};app.status={};app.selected=-1;app.closeWhenDone=false;app.modeIndex=0;
         app.visibleDirty=true;app.controlsUpdated=app.trayStateValid=false;
+        app.encodingValidation.clear();
         app.hiddenToTray=app.trayRegistered=app.trayVersion4=app.trayNoticeShown=false;app.trayTooltip.clear();
         app.settings.folder=(ownedRoot/name).wstring();
         app.window=CreateWindowExW(0,L"STATIC",L"Owned pause review",WS_OVERLAPPED,0,0,920,720,nullptr,nullptr,nullptr,nullptr);
@@ -168,6 +173,7 @@ struct HiddenFixture {
         auto child=[&](const wchar_t* cls,DWORD style){auto w=CreateWindowExW(0,cls,L"",WS_CHILD|style,0,0,100,100,app.window,nullptr,nullptr,nullptr);require(w!=nullptr,"Hidden child failed");return w;};
         auto combo=[&](int count){auto w=child(L"COMBOBOX",CBS_DROPDOWNLIST);for(int i=0;i<count;++i)add(w,std::to_wstring(i));choose(w,0);return w;};
         app.mode=combo(6);app.interval=combo(6);choose(app.interval,5);app.videoSize=combo(2);app.encodingQuality=combo(3);app.encodingMode=combo(5);
+        app.recoveryMode=child(L"BUTTON",BS_AUTOCHECKBOX);
         app.monitor=combo(1);app.camera=combo(0);app.monitors={{L"Synthetic",{0,0,640,360},L"owned-display"}};app.cameras.clear();
         app.preview=child(L"STATIC",0);app.statusText=child(L"STATIC",0);
         for(auto p:{&app.refresh,&app.record,&app.pause,&app.finish,&app.folder,&app.openFolder,&app.reset,&app.forward})*p=child(L"BUTTON",BS_PUSHBUTTON);
@@ -252,6 +258,22 @@ void recordingWhileHidden(){
     require(app.hiddenToTray&&probe::destroyCalls==0,"Finish unexpectedly exited tray application");
     std::cout<<"PASS actual worker continues due captures with preview disabled after Close and finishes in tray.\n";
 }
+void recoveryRecording(){
+    HiddenFixture f(L"recovery");const auto opened=probe::encoderOpens.load();
+    SendMessageW(app.recoveryMode,BM_SETCHECK,BST_CHECKED,0);windowProc(app.window,WM_COMMAND,RecoveryBox,0);
+    choose(app.encodingMode,3);windowProc(app.window,WM_COMMAND,MAKEWPARAM(EncodingModeBox,CBN_SELCHANGE),0);
+    require(!IsWindowEnabled(app.record)&&!app.encodingValidation.empty(),"HEVC/recovery did not visibly block Record.");
+    windowProc(app.window,WM_COMMAND,Record,0);
+    require(app.engine->status().state==State::Idle&&probe::encoderOpens==opened,"Invalid UI command started the encoder.");
+    choose(app.encodingMode,0);windowProc(app.window,WM_COMMAND,MAKEWPARAM(EncodingModeBox,CBN_SELCHANGE),0);f.start();
+    require(probe::encoderOpens==opened+1&&probe::encoderRecovery,"Actual Record/worker path did not pass the recovery choice to its encoder.");
+    click(Finish,app.finish);auto saved=waitState(State::Idle);tick();
+    require(!saved.recordingFailed&&!saved.savedPath.empty()&&saved.frames==1,"Recovery option disrupted normal synthetic finalization.");
+    SendMessageW(app.recoveryMode,BM_SETCHECK,BST_UNCHECKED,0);windowProc(app.window,WM_COMMAND,RecoveryBox,0);f.start();
+    require(probe::encoderOpens==opened+2&&!probe::encoderRecovery,"Later ordinary recording retained recovery mode.");
+    click(Finish,app.finish);waitState(State::Idle);tick();
+    std::cout<<"PASS actual Record/worker rejects HEVC recovery, passes enabled H.264 policy, finishes and restores ordinary subsequent recording\n";
+}
 void requestClose() {
     windowProc(app.window,WM_COMMAND,TrayExit,0);
     require(probe::confirmations==1 && app.closeWhenDone && !IsWindowEnabled(app.window),
@@ -331,7 +353,7 @@ int main(){
         require(ownedRoot.is_absolute()&&ownedRoot.parent_path()==std::filesystem::current_path()/L"fixtures","Fixture path escaped review");
         require(!std::filesystem::exists(ownedRoot),"Owned fixture directory already exists");
         repeatedPause();repeatedResume();finishThenRecord(false,false);finishThenRecord(false,true);finishThenRecord(true,false);
-        recordingWhileHidden();
+        recordingWhileHidden();recoveryRecording();
         int closePassed=0;
         closePassed+=successfulClose(false);closePassed+=successfulClose(true);
         closePassed+=terminalFailure(0);closePassed+=terminalFailure(1);closePassed+=terminalFailure(2);
@@ -347,7 +369,7 @@ int main(){
             require(std::filesystem::remove(directory.path()),"Synthetic folder cleanup failed");
         }
         require(std::filesystem::remove(ownedRoot),"Owned fixture root cleanup failed");
-        std::cout<<"PASS all eleven actual-handler/worker command and exit/tray cases; no visible UI, input, hardware or real encoding.\n";
+        std::cout<<"PASS all twelve actual-handler/worker command and exit/tray cases; no visible UI, input, hardware or real encoding.\n";
         return 0;
     }catch(const std::exception& error){std::cerr<<"FIXTURE_FAILURE: "<<error.what()<<'\n';return 1;}
 }

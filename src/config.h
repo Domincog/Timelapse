@@ -5,6 +5,7 @@
 #include <utility>
 
 namespace lapse {
+enum class EncodingMode;
 inline constexpr int MinCaptureIntervalMs = 100;
 inline constexpr int MaxCaptureIntervalMs = 86400000;
 inline constexpr int MinVideoDimension = 48;
@@ -22,6 +23,8 @@ bool parseDuration(std::wstring_view text, DurationUnit unit, int64_t minMs,
 bool parsePixelDimension(std::wstring_view text, int& result, std::wstring& error);
 bool validateCaptureInterval(int milliseconds, std::wstring& error);
 bool validateVideoSize(int width, int height, std::wstring& error);
+// Recovery mode uses the native fragmented sink, which accepts H.264 only.
+bool validateEncodingMode(EncodingMode mode, bool recoveryMode, std::wstring& error);
 // Largest exact single unit requiring at most three fractional digits.
 std::wstring formatDuration(int64_t milliseconds, bool compact = false);
 // Disposable preview fits 640x360, uses even dimensions and no large allocation.

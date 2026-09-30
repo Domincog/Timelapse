@@ -52,9 +52,9 @@ class CustomEncoder {
     Encoder real_;
     bool secondary_ = false;
 public:
-    bool open(const std::wstring& path, int width, int height, int fps, std::wstring& error, EncodingQuality q, EncodingMode mode) {
+    bool open(const std::wstring& path, int width, int height, int fps, std::wstring& error, EncodingQuality q, EncodingMode mode, bool recoveryMode) {
         ++opens; secondary_ = path.find(L"-camera.recording.mp4") != std::wstring::npos;
-        return real_.open(path, width, height, fps, error, q, mode);
+        return real_.open(path, width, height, fps, error, q, mode, recoveryMode);
     }
     bool write(const Frame& frame, std::wstring& error) {
         { std::lock_guard<std::mutex> lock(observationsMutex); writes.push_back({GetTickCount64(), frame.width, frame.height, secondary_}); }
@@ -313,3 +313,6 @@ int main() {
 }
 
 #include "engine_person_camera_stub.h"
+
+// This fixture owns no native desktop capture surface.
+namespace lapse { void releaseDesktopCaptureCache() noexcept {} }

@@ -20,6 +20,9 @@ bool captureDesktop(const RECT& bounds, int maxWidth, int maxHeight, bool cursor
                     Frame& output, std::wstring& error);
 bool captureMonitor(const std::wstring& id, int maxWidth, int maxHeight, bool cursor,
                     Frame& output, std::wstring& error);
+// Release only this thread's existing desktop surfaces when capture is idle.
+// A cold/repeated call does no allocation; the next demand recreates the cache.
+void releaseDesktopCaptureCache() noexcept;
 // Own and use on one worker thread. False + empty error from latest means
 // the camera is warming up; latest never waits for a new camera sample.
 class Camera {

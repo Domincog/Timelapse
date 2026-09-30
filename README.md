@@ -16,11 +16,17 @@ A small native Windows timelapse recorder. Record a display, a camera, or both i
 
 **System tray:** Closing the window hides Timelapse while recording continues. Reopen it from its tray icon or the Start menu. Right-click the tray icon for Show, Pause/Resume, Finish, or Exit. Exit finishes an active recording before closing; a saving failure brings the window back with the recovery information. Hidden windows stop preview processing. If Windows cannot add the tray icon, the app stays accessible in its window.
 
-**Advanced options:** Expand Advanced (Alt + A) for the encoder selector and optional Stop after limit. Choose a preset or Custom for a positive active duration in seconds, minutes, hours, or days. Custom limits must equal a whole number of seconds, up to 2,147,483,647 seconds. Initial startup and paused time do not count. Timelapse automatically finishes and saves the video or pair of videos at the limit, including while hidden in the tray. Finishing may wait for a capture or encoding operation already in progress and for the files to save. The default is Never. The selected limit is remembered. The collapsed Advanced label shows active options, or a warning when Night blend settings need correction; recording settings remain locked while recording. Finishing a hidden recording also releases the camera.
+**Advanced options:** Expand Advanced (Alt + A) for the encoder selector and optional Stop after limit. Choose a preset or Custom for a positive active duration in seconds, minutes, hours, or days. Custom limits must equal a whole number of seconds, up to 2,147,483,647 seconds. Initial startup and paused time do not count. Timelapse automatically finishes and saves the video or pair of videos at the limit, including while hidden in the tray. Finishing may wait for a capture or encoding operation already in progress and for the files to save. The default is Never. The selected limit is remembered. The collapsed Advanced label shows active options, or a warning when Night blend or MP4 recovery settings need correction; recording settings remain locked while recording. Finishing a hidden recording also releases the camera.
 
 **Low disk space:** Advanced also contains Stop on low disk space, enabled by default. Before opening a recording and before each captured frame is admitted, Timelapse checks the space available to your account in the save folder. It stops and attempts to save when 64 MiB or less remains for one output, or 128 MiB for two outputs. If Windows cannot report available space, recording is refused or stopped with a diagnostic. The option is remembered and locked during a recording; turn it off for a folder that cannot provide space information. Checks do not run for preview, idle time, or paused recordings.
 
 This is a best-effort headroom check, not reserved disk space: another program, encoder buffering, large video indexes, or drive failure can still prevent saving. A slow network-folder query can delay recording or Finish. The original stop reason remains visible if saving or renaming also fails.
+
+**MP4 recovery mode:** Advanced offers an optional H.264 recording format that writes small completed sections as recording proceeds. After a forced app termination, completed sections in the retained `.recording.mp4` file may play in a compatible player without first pressing Finish. Recent frames and files interrupted before initialization may still be lost. This does not guarantee recovery after power loss, drive failure or every type of interruption, and it does not repair existing recordings.
+
+Recovery mode is off by default. It adds container bytes and processing work without changing the selected H.264 compression settings. Some players and editors may not accept fragmented MP4; use ordinary MP4 for the widest compatibility. Recovery works with any available H.264 encoder and with single or separate files, Night blending and time compression. Hardware HEVC requires recovery mode to be off; an incompatible selection stays visible and blocks Record until corrected. Finish still saves the file normally. The option is remembered and locked during a recording.
+
+Accepted settings are saved before a new recording starts as well as on normal exit. A preferences-write failure does not prevent recording and leaves the previous saved settings intact.
 
 **Night camera:** For camera recordings, Advanced offers an optional Night camera (software blend) mode. It combines distinct camera frames over a period of time and adjusts brightness automatically. This can reduce random noise and blur movement; the camera's shutter settings remain unchanged. It uses an approximate linear-light blend of the camera's processed video, rather than raw sensor exposures, and cannot recover detail that the camera did not capture. Night mode is off by default.
 
@@ -106,12 +112,14 @@ The executable is then in `build/release/Timelapse.exe`. Developers can launch i
 
 - One display and one camera at a time; 720p, 1080p, or custom output within the size limits above, preserving source aspect ratios. Camera input is capped at 720p to limit processing; larger output does not add camera detail. Desktop output can retain more detail when the selected display provides it.
 - The desktop must remain unlocked and awake. Protected content may appear black. A removed display or unavailable camera stops recording and attempts to save captured frames.
-- MP4 is finalized by Finish, Exit, or an automatic time limit. Closing the window keeps recording. A power loss or forced termination can leave an unplayable `.recording.mp4` file; crash recovery is not implemented yet.
+- MP4 is finalized by Finish, Exit, or an automatic time limit. Closing the window keeps recording. Ordinary MP4 can be unplayable after forced termination or power loss. Optional H.264 recovery mode improves the chance of playing completed sections after interruption, with the limits described above.
 - Windows N requires the Media Feature Pack. The app and installer are currently unsigned.
 - Camera compatibility and performance vary by device; automated media tests use generated frames and do not establish physical-camera compatibility.
 - Display identity uses a Windows monitor interface when available, with a GDI display-name fallback. The fallback cannot distinguish a replacement using the same name; changes that disappear and return entirely within one capture can escape detection.
 
 The app retains the latest preview and camera frame, and writes samples incrementally. Preview runs at two frames per second when idle and one while recording; minimized windows do not generate preview frames. There is no growing in-memory recording buffer. The app requests that Windows stay awake while recording or saving. It releases the request while paused and after saving finishes. Manual locking is still respected.
+
+Desktop capture reuses its native image buffers while needed, and releases them when hidden and idle or paused, after hidden Finish, or when switching away from desktop capture. Capture recreates those buffers on the next request.
 
 While a night window is active, its camera helper blends up to five distinct contributions per second, at up to 720p, using fixed-size accumulation buffers. Intermediate frames stay in the helper; only the completed blend crosses to the recorder. These optional buffers are released when night recording is cancelled or finished. Hardware camera capture/conversion can still consume resources independently of the blend processing.
 
@@ -174,7 +182,7 @@ This also checks BT.709 limited-range color metadata. FFmpeg is used only by the
 
 After building and testing, run `./package.ps1` to create both archives in `packages/`. The release ZIP is intended for GitHub Releases. Extract the source ZIP into an empty folder, then run the build commands from that folder; build outputs, test recordings, and local settings are excluded.
 
-To also create `Timelapse-v0.9.0-windows-x64-setup.exe`, supply an installed or portable Inno Setup 7 compiler:
+To also create `Timelapse-v0.10.0-windows-x64-setup.exe`, supply an installed or portable Inno Setup 7 compiler:
 
 ```powershell
 .\package.ps1 -InstallerCompiler 'C:\Path\To\Inno Setup 7\ISCC.exe'

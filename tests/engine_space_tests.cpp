@@ -86,10 +86,10 @@ class SpaceEncoder {
     bool secondary_ = false;
 public:
     bool open(const std::wstring& path, int width, int height, int fps, std::wstring& error,
-              EncodingQuality quality, EncodingMode mode) {
+              EncodingQuality quality, EncodingMode mode, bool recoveryMode) {
         secondary_ = path.find(L"-camera.recording.mp4") != std::wstring::npos;
         if (expectQueries && !queryCalls) orderingFailed = true;
-        const bool result = real_.open(path, width, height, fps, error, quality, mode);
+        const bool result = real_.open(path, width, height, fps, error, quality, mode, recoveryMode);
         if (result) {
             ++openedWriters;
             if (!paired || secondary_) openGate.enter();
@@ -568,3 +568,6 @@ int main(int argc, char** argv) {
 }
 
 #include "engine_person_camera_stub.h"
+
+// This fixture owns no native desktop capture surface.
+namespace lapse { void releaseDesktopCaptureCache() noexcept {} }
