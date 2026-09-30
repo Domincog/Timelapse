@@ -88,6 +88,8 @@ struct App {
     std::wstring sizeTooltip;
     int customSegmentSeconds=900, committedSegment=0;
     bool hasCustomSegment=false;
+    int customNightDurationMs=NightInitialDurationMs, committedNightDuration=0;
+    bool hasCustomNightDuration=false;
     std::wstring advancedCaption, advancedTooltip;
     std::wstring skipSummaryCaption,skipDetailCaption;
     int skipRevision=0,advancedSkipRevision=-1,skipSummaryRevision=-1,skipVisibility=-1;
@@ -215,6 +217,12 @@ int selectedSegment() {
     const int selected=app.splitEvery?choice(app.splitEvery):0;
     return app.hasCustomSegment && selected==5 ? app.customSegmentSeconds : SegmentDurations[std::clamp(selected,0,4)];
 }
+int selectedNightDuration() {
+    if(!app.nightDuration)return 0;
+    const int selected=choice(app.nightDuration);
+    const int committed=selected>=0 && selected<=(app.hasCustomNightDuration?6:5)?selected:app.committedNightDuration;
+    return app.hasCustomNightDuration && committed==6 ? app.customNightDurationMs : NightDurations[std::clamp(committed,0,5)];
+}
 std::wstring sizeText(int width,int height) { return std::to_wstring(width)+L" × "+std::to_wstring(height); }
 void customItems(HWND box,int presets,bool custom,const std::wstring& value,int selected) {
     while(SendMessageW(box,CB_GETCOUNT,0,0)>presets)SendMessageW(box,CB_DELETESTRING,presets,0);
@@ -227,6 +235,7 @@ void customItems() {
     app.sizeSuggestions={};
     customItems(app.stopAfter,6,app.hasCustomLimit,formatDuration(int64_t(app.customLimitSeconds)*1000,true),app.committedLimit);
     customItems(app.splitEvery,5,app.hasCustomSegment,formatDuration(int64_t(app.customSegmentSeconds)*1000,true),app.committedSegment);
+    customItems(app.nightDuration,6,app.hasCustomNightDuration,formatDuration(app.customNightDurationMs),app.committedNightDuration);
 }
 void normalizeCustomSelections() {
     if(app.hasCustomInterval)for(int i=0;i<6;++i)if(CaptureIntervals[i]==app.customIntervalMs){app.hasCustomInterval=false;app.committedInterval=i;break;}
@@ -235,6 +244,7 @@ void normalizeCustomSelections() {
     }
     if(app.hasCustomLimit)for(int i=1;i<6;++i)if(RecordingLimits[i]==app.customLimitSeconds){app.hasCustomLimit=false;app.committedLimit=i;break;}
     if(app.hasCustomSegment)for(int i=0;i<5;++i)if(SegmentDurations[i]==app.customSegmentSeconds){app.hasCustomSegment=false;app.committedSegment=i;break;}
+    if(app.hasCustomNightDuration)for(int i=0;i<6;++i)if(NightDurations[i]==app.customNightDurationMs){app.hasCustomNightDuration=false;app.committedNightDuration=i;break;}
 }
 bool hasSource(Source source) { if(app.settings.separateFiles)return true;for (auto& l : app.settings.layers) if (l.source == source) return true; return false; }
 bool sameSourceId(const std::wstring& a, const std::wstring& b) {
@@ -589,7 +599,8 @@ void configure() {
     app.settings.stopOnLowDiskSpace = !app.lowDisk || SendMessageW(app.lowDisk,BM_GETCHECK,0,0)!=BST_UNCHECKED;
     app.settings.captureCursor = !app.captureCursor || SendMessageW(app.captureCursor,BM_GETCHECK,0,0)!=BST_UNCHECKED;
     app.settings.night.enabled = app.nightEnabled && SendMessageW(app.nightEnabled,BM_GETCHECK,0,0)==BST_CHECKED && hasSource(Source::Camera);
-    app.settings.night.durationMs = NightDurations[app.nightDuration?std::clamp(choice(app.nightDuration),0,5):0];
+    app.settings.night.durationMs = selectedNightDuration();
+    app.committedNightDuration=app.nightDuration?std::clamp(choice(app.nightDuration),0,app.hasCustomNightDuration?6:5):0;
     app.settings.night.targetBrightness = NightTargets[app.nightTarget?std::clamp(choice(app.nightTarget),0,2):1];
     app.nightValidation.clear();
     if(app.settings.night.enabled && app.settings.intervalMs<NightMinDurationMs)
@@ -1003,7 +1014,7 @@ void fonts() {
     for(HWND child:{app.statusText,app.statusDetails,app.nightHint,app.nightDetail,app.skipDetail})if(child)SendMessageW(child,WM_SETFONT,reinterpret_cast<WPARAM>(app.smallFont),TRUE);
 }
 
-enum class CustomKind { Interval, Size, Limit, Range, Segment };
+enum class CustomKind { Interval, Size, Limit, Range, Segment, Night };
 enum CustomId { CustomFirst=5001, CustomSecond, CustomUnits, CustomHelp, CustomError, CustomFirstLabel, CustomSecondLabel };
 struct CustomDraft {
     CustomKind kind=CustomKind::Interval;
@@ -1419,10 +1430,11 @@ bool validateCustom(CustomDraft& draft,std::wstring& message,HWND& invalid) {
         if(!validateVideoSize(width,height,message))return false;
         draft.width=width;draft.height=height;return true;
     }
-    const bool interval=draft.kind==CustomKind::Interval;
-    int64_t duration=0;const auto unit=static_cast<DurationUnit>(std::clamp(choice(draft.units),0,interval?2:3));
-    if(!parseDuration(first,unit,interval?MinCaptureIntervalMs:1000,interval?int64_t(MaxCaptureIntervalMs):int64_t(INT_MAX)*1000,
-                      interval?1:1000,duration,message))return false;
+    const bool interval=draft.kind==CustomKind::Interval,night=draft.kind==CustomKind::Night;
+    int64_t duration=0;const auto unit=static_cast<DurationUnit>(std::clamp(choice(draft.units),0,night?0:interval?2:3));
+    if(!parseDuration(first,unit,night?NightMinDurationMs:interval?MinCaptureIntervalMs:1000,
+                      night?int64_t(NightMaxDurationMs):interval?int64_t(MaxCaptureIntervalMs):int64_t(INT_MAX)*1000,
+                      (interval || night)?1:1000,duration,message))return false;
     draft.durationMs=duration;return true;
 }
 INT_PTR CALLBACK customProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
@@ -1431,8 +1443,8 @@ INT_PTR CALLBACK customProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
         if(message==WM_INITDIALOG){
             draft=reinterpret_cast<CustomDraft*>(lp);SetWindowLongPtrW(window,DWLP_USER,lp);draft->previousDialog=app.customDialog;app.customDialog=window;
             draft->dpi=static_cast<int>(GetDpiForWindow(window));if(draft->dpi<=0)draft->dpi=app.dpi;
-            const bool range=draft->kind==CustomKind::Range,size=draft->kind==CustomKind::Size,interval=draft->kind==CustomKind::Interval;
-            SetWindowTextW(window,range?L"Compression range":size?L"Custom video size":interval?L"Custom capture interval":draft->kind==CustomKind::Segment?L"Custom file split":L"Custom stop time");
+            const bool range=draft->kind==CustomKind::Range,size=draft->kind==CustomKind::Size,interval=draft->kind==CustomKind::Interval,night=draft->kind==CustomKind::Night;
+            SetWindowTextW(window,range?L"Compression range":size?L"Custom video size":interval?L"Custom capture interval":night?L"Custom Night blend":draft->kind==CustomKind::Segment?L"Custom file split":L"Custom stop time");
             const auto child=[&](const wchar_t* type,const wchar_t* text,DWORD style,int id){return CreateWindowExW(std::wcscmp(type,L"EDIT")==0?WS_EX_CLIENTEDGE:0,
                 type,text,WS_CHILD|WS_VISIBLE|style,0,0,1,1,window,reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),GetModuleHandleW(nullptr),nullptr);};
             draft->firstLabel=child(L"STATIC",range?L"&Start after (seconds)":size?L"&Width (pixels)":L"&Value",0,CustomFirstLabel);
@@ -1440,9 +1452,10 @@ INT_PTR CALLBACK customProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             draft->secondLabel=child(L"STATIC",range?L"&End after (seconds)":size?L"&Height (pixels)":L"&Units",0,CustomSecondLabel);
             if(size || range)draft->second=child(L"EDIT",L"",WS_TABSTOP|ES_AUTOHSCROLL,CustomSecond);
             else {draft->units=child(L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL,CustomUnits);
-                for(const auto* unit:{L"Seconds",L"Minutes",L"Hours"})add(draft->units,unit);if(!interval)add(draft->units,L"Days");choose(draft->units,0);}
+                add(draft->units,L"Seconds");if(!night){add(draft->units,L"Minutes");add(draft->units,L"Hours");if(!interval)add(draft->units,L"Days");}choose(draft->units,0);}
             draft->help=child(L"STATIC",range?L"Use whole active seconds from 0 to 2,147,483,647. Pauses and initial preparation do not count. Start is included; end is excluded. Overlapping or touching ranges merge when you return to the schedule.":size?L"Use even dimensions from 48 to 4096 pixels, at most 8,847,360 pixels total. Sources fit inside the video without stretching.":
                 interval?L"Choose 0.1 seconds to 24 hours. Decimals use a point and must resolve to whole milliseconds. Playback stays at 30 fps.":
+                night?L"Request a software blend window from 1 to 30 seconds, in whole milliseconds (for example, 1.25). Automatic brightness continues; camera timing can vary. This does not change shutter settings. The duration must not exceed Capture every.":
                 draft->kind==CustomKind::Segment?L"Choose 1 to 2,147,483,647 whole seconds of active recording per part. Pauses and initial preparation do not count; automatic saving does. Empty periods create no files. Shorter parts add processing and file overhead.":
                 L"Choose 1 to 2,147,483,647 seconds of active recording. Pauses and initial preparation do not count. Decimals must resolve to whole seconds.",SS_NOPREFIX,CustomHelp);
             draft->error=child(L"STATIC",L"",SS_NOPREFIX,CustomError);
@@ -1499,16 +1512,18 @@ void commitCustom(const CustomDraft& draft) {
     else if(draft.kind==CustomKind::Size){app.customWidth=draft.width;app.customHeight=draft.height;app.hasCustomSize=true;
         app.committedSize=draft.width==1280 && draft.height==720?0:draft.width==1920 && draft.height==1080?1:2;}
     else if(draft.kind==CustomKind::Segment){app.customSegmentSeconds=static_cast<int>(draft.durationMs/1000);app.hasCustomSegment=true;app.committedSegment=5;}
+    else if(draft.kind==CustomKind::Night){app.customNightDurationMs=static_cast<int>(draft.durationMs);app.hasCustomNightDuration=true;app.committedNightDuration=6;}
     else {app.customLimitSeconds=static_cast<int>(draft.durationMs/1000);app.hasCustomLimit=true;app.committedLimit=6;
         for(int i=1;i<6;++i)if(RecordingLimits[i]==app.customLimitSeconds)app.committedLimit=i;}
     normalizeCustomSelections();customItems();configure();updateControls();layout();InvalidateRect(app.preview,nullptr,FALSE);InvalidateRect(app.window,nullptr,FALSE);
 }
 void editCustom(CustomKind kind) {
     if(app.active() || app.customDialog)return;
-    HWND box=kind==CustomKind::Interval?app.interval:kind==CustomKind::Size?app.videoSize:kind==CustomKind::Segment?app.splitEvery:app.stopAfter;
-    choose(box,kind==CustomKind::Interval?app.committedInterval:kind==CustomKind::Size?app.committedSize:kind==CustomKind::Segment?app.committedSegment:app.committedLimit);
+    HWND box=kind==CustomKind::Interval?app.interval:kind==CustomKind::Size?app.videoSize:kind==CustomKind::Segment?app.splitEvery:kind==CustomKind::Night?app.nightDuration:app.stopAfter;
+    choose(box,kind==CustomKind::Interval?app.committedInterval:kind==CustomKind::Size?app.committedSize:kind==CustomKind::Segment?app.committedSegment:kind==CustomKind::Night?app.committedNightDuration:app.committedLimit);
     const int duration=kind==CustomKind::Segment?app.settings.segmentDurationSeconds:app.settings.recordingLimitSeconds;
-    CustomDraft draft;draft.kind=kind;draft.durationMs=kind==CustomKind::Interval?app.settings.intervalMs:int64_t(duration?duration:900)*1000;
+    CustomDraft draft;draft.kind=kind;draft.durationMs=kind==CustomKind::Interval?app.settings.intervalMs:kind==CustomKind::Night?
+        (app.settings.night.durationMs?app.settings.night.durationMs:NightInitialDurationMs):int64_t(duration?duration:900)*1000;
     draft.width=app.settings.width;draft.height=app.settings.height;CustomTemplate resource;
     const auto outcome=DialogBoxIndirectParamW(GetModuleHandleW(nullptr),&resource.dialog,app.window,customProc,reinterpret_cast<LPARAM>(&draft));
     if(!IsWindow(app.window))return;
@@ -2115,7 +2130,7 @@ bool savePreferences() {
         const auto skip=skipValues(skipPolicy);
         if(!validateWatermarkSettings(app.settings.watermark,skipError))return false;
         const auto watermark=watermarkValues(app.settings.watermark);
-        const auto nightDuration=std::to_wstring(NightDurations[app.nightDuration?std::clamp(choice(app.nightDuration),0,5):0]);
+        const auto nightDuration=std::to_wstring(selectedNightDuration());
         const auto nightTarget=std::to_wstring(NightTargets[app.nightTarget?std::clamp(choice(app.nightTarget),0,2):1]);
         struct TemporaryFile {
             const wchar_t* path;
@@ -2192,6 +2207,11 @@ void preferences(bool save) {
         app.hasCustomInterval=app.hasCustomSize=app.hasCustomLimit=false;
         app.customIntervalMs=5000;app.customWidth=1280;app.customHeight=720;app.customLimitSeconds=900;
         app.customSegmentSeconds=900;app.committedSegment=0;app.hasCustomSegment=false;
+        app.customNightDurationMs=NightInitialDurationMs;app.committedNightDuration=0;app.hasCustomNightDuration=false;
+        int nightDuration=0;
+        if(exactInteger(L"NightDurationMs",NightMinDurationMs,NightMaxDurationMs,nightDuration)){
+            app.customNightDurationMs=nightDuration;app.committedNightDuration=6;app.hasCustomNightDuration=true;
+        }
         int segment=0;
         if(exactInteger(L"SegmentDurationSeconds",0,INT_MAX,segment) && segment){app.customSegmentSeconds=segment;app.committedSegment=5;app.hasCustomSegment=true;}
         int exactSelector=0;
@@ -2222,7 +2242,6 @@ void preferences(bool save) {
             for(size_t i=0;i<std::size(values);++i)if(std::to_wstring(values[i])==value){selected=static_cast<int>(i);break;}
             choose(box,selected);
         };
-        loadNightChoice(L"NightDurationMs",app.nightDuration,NightDurations,0);
         loadNightChoice(L"NightTargetBrightness",app.nightTarget,NightTargets,1);
         app.settings.timeSkip=loadSkip(path);++app.skipRevision;
         app.settings.watermark=loadWatermark(path);app.watermarkCheckValid=false;++app.watermarkRevision;
@@ -2354,6 +2373,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         app.customIntervalMs=5000;app.customWidth=1280;app.customHeight=720;app.customLimitSeconds=900;
         app.committedInterval=2;app.committedSize=app.committedLimit=0;
         app.committedSegment=0;app.customSegmentSeconds=900;app.hasCustomSegment=false;
+        app.committedNightDuration=0;app.customNightDurationMs=NightInitialDurationMs;app.hasCustomNightDuration=false;
         app.visibleDirty=true;app.controlsUpdated=false;app.trayStateValid=false;
         try {
         app.window=w;app.dpi=static_cast<int>(GetDpiForWindow(w));fonts();
@@ -2440,7 +2460,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         tip.lpszText=const_cast<LPWSTR>(L"Optional software blending and automatic digital brightness for camera recordings. It does not change camera shutter settings. Motion can blur; clipped or missing detail cannot be recovered. Idle preview is unchanged; the effect appears during recording.");
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
         tip.uId=reinterpret_cast<UINT_PTR>(app.nightDuration);
-        tip.lpszText=const_cast<LPWSTR>(L"Auto chooses a blend duration within the capture interval, up to 30 seconds. A manual duration keeps automatic brightness and must not exceed Capture every. Late blends retain their full duration and delay later captures instead of catching up.");
+        tip.lpszText=const_cast<LPWSTR>(L"Auto chooses a blend duration within the capture interval, up to 30 seconds. Custom accepts 1 to 30 seconds in whole milliseconds. A manual duration keeps automatic brightness and must not exceed Capture every. Late blends retain their full duration and delay later captures instead of catching up.");
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
         tip.uId=reinterpret_cast<UINT_PTR>(app.nightTarget);
         tip.lpszText=const_cast<LPWSTR>(L"Automatic camera brightness uses 8-bit brightness references: Dark 64/255, Balanced 96/255, Bright 128/255. This is processed image brightness, not sensor exposure. Gain and highlight limits can leave the target unmet.");
@@ -2541,6 +2561,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
                 if(id==SizeBox)choose(app.videoSize,app.committedSize);
                 if(id==StopAfterBox)choose(app.stopAfter,app.committedLimit);
                 if(id==SegmentBox)choose(app.splitEvery,app.committedSegment);
+                if(id==NightDurationBox)choose(app.nightDuration,app.committedNightDuration);
                 return 0;
             }
             if(id==SizeBox)for(size_t source=0;source<app.sizeSuggestions.size();++source){const auto& suggestion=app.sizeSuggestions[source];if(suggestion.item>=0 && choice(app.videoSize)==suggestion.item){
@@ -2549,10 +2570,10 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
                 else choose(app.videoSize,app.committedSize);
                 return 0;
             }}
-            const HWND customBox=id==IntervalBox?app.interval:id==SizeBox?app.videoSize:id==StopAfterBox?app.stopAfter:id==SegmentBox?app.splitEvery:nullptr;
-            const int customAction=id==IntervalBox?6+int(app.hasCustomInterval):id==SizeBox?2+int(app.hasCustomSize):id==SegmentBox?5+int(app.hasCustomSegment):6+int(app.hasCustomLimit);
+            const HWND customBox=id==IntervalBox?app.interval:id==SizeBox?app.videoSize:id==StopAfterBox?app.stopAfter:id==SegmentBox?app.splitEvery:id==NightDurationBox?app.nightDuration:nullptr;
+            const int customAction=id==IntervalBox?6+int(app.hasCustomInterval):id==SizeBox?2+int(app.hasCustomSize):id==SegmentBox?5+int(app.hasCustomSegment):id==NightDurationBox?6+int(app.hasCustomNightDuration):6+int(app.hasCustomLimit);
             if(customBox && choice(customBox)==customAction && SendMessageW(customBox,CB_GETCOUNT,0,0)>customAction){
-                SendMessageW(customBox,CB_SHOWDROPDOWN,FALSE,0);editCustom(id==IntervalBox?CustomKind::Interval:id==SizeBox?CustomKind::Size:id==SegmentBox?CustomKind::Segment:CustomKind::Limit);return 0;
+                SendMessageW(customBox,CB_SHOWDROPDOWN,FALSE,0);editCustom(id==IntervalBox?CustomKind::Interval:id==SizeBox?CustomKind::Size:id==SegmentBox?CustomKind::Segment:id==NightDurationBox?CustomKind::Night:CustomKind::Limit);return 0;
             }
             if(id==ModeBox)changeLayout(false);
             else {

@@ -38,9 +38,11 @@ void publicationCandidateGate(int phase) {
 }
 
 namespace {
-enum class SaveFault { None, PathPreparation, MessagePreparation, AfterRename, RepeatedPreparation };
+enum class SaveFault { None, PathPreparation, MessagePreparation, AfterRename, RepeatedPreparation, Finalization };
 std::atomic<SaveFault> saveFault{SaveFault::None};
 std::atomic<bool> failAfterAcceptedWrite{false};
+std::atomic<bool> failDesktopPreview{false};
+std::atomic<unsigned> failedDesktopPreviews{0};
 std::atomic<int> repeatedReportAttempts{0};
 thread_local int allocationCountdown=0;
 std::atomic<int> saveAllocationFailures{0}, saveMoves{0}, savedMoves{0};
@@ -81,6 +83,11 @@ public:
         const bool result=real_.finishForPublication(error);
         if(result) {
             const auto fault=saveFault.load();
+            if(fault==SaveFault::Finalization) {
+                saveFault=SaveFault::None;
+                error=L"Injected finalization failure; retain the owned file.";
+                return false;
+            }
             if(fault==SaveFault::RepeatedPreparation) {
                 if(++repeatedReportAttempts==2)saveFault=SaveFault::None;
                 allocationCountdown=1;
@@ -255,10 +262,98 @@ bool CameraClient::latest(Frame&, std::wstring& error) {
 }
 bool captureMonitor(const std::wstring& id, int width, int height, bool, Frame& output, std::wstring& error) {
     if (id != L"synthetic-display") { error = L"Unknown synthetic display."; return false; }
+    if (failDesktopPreview) { ++failedDesktopPreviews; error = L"Injected independent preview failure."; return false; }
     error.clear();
     output = {width, height, std::vector<uint8_t>(static_cast<size_t>(width) * height * 4, 96)};
     return true;
 }
+}
+
+void requireSameOutcome(const lapse::Status& actual, const lapse::Status& expected) {
+    require(actual.state == lapse::State::Idle && actual.error == expected.error &&
+        actual.recordingFailed == expected.recordingFailed && actual.message == expected.message &&
+        actual.savedPath == expected.savedPath && actual.savedPaths == expected.savedPaths &&
+        actual.frames == expected.frames && actual.elapsed == expected.elapsed &&
+        actual.completedSegments == expected.completedSegments,
+        "Source/preview retry changed the terminal recording report, paths or statistics.");
+}
+void refreshOutcomes(const std::filesystem::path& directory) {
+    // The finalization-result seam closes a real generated movie before
+    // returning failure. This tests reporting, not a native MF failure mode.
+    for (int kind = 0; kind < 3; ++kind) {
+        const bool failed = kind == 1, split = kind == 2;
+        const auto folder = directory / (L"refresh-outcome-" + std::to_wstring(kind));
+        lapse::Settings settings; settings.monitorId = L"synthetic-display";
+        settings.width = 320; settings.height = 180; settings.intervalMs = 60000;
+        settings.folder = folder.wstring(); settings.preview = false;
+        settings.segmentDurationSeconds = split ? 60 : 0;
+        lapse::Engine engine;
+        engine.configure(settings); engine.record();
+        await(engine, [](const auto& s) { return s.state == lapse::State::Recording && s.frames == 1; });
+        saveFault = failed ? SaveFault::Finalization : SaveFault::None;
+        engine.finish();
+        const auto outcome = await(engine, [](const auto& s) { return s.state == lapse::State::Idle; });
+        const auto owned = failed ? recordingPath(folder) : std::filesystem::path(outcome.savedPath);
+        require(outcome.error == failed && outcome.recordingFailed == failed && outcome.frames == 1 &&
+            outcome.message.find(owned.wstring()) != std::wstring::npos && outcome.completedSegments == (split ? 1u : 0u),
+            "Refresh fixture did not produce the intended recording outcome.");
+        if (failed) require(outcome.savedPath.empty() && outcome.savedPaths.empty() &&
+            outcome.message.find(L"Partial file:") != std::wstring::npos,
+            "Failed finalization must retain its recovery location only in the diagnostic.");
+        verifyVideo(owned, 1);
+        engine.refreshSources(); requireSameOutcome(engine.status(), outcome);
+        settings.preview = true; engine.configure(settings);
+        await(engine, [](const auto& s) { return bool(s.preview); });
+        requireSameOutcome(engine.status(), outcome);
+        const auto preview = engine.status().preview;
+        settings.captureCursor = false; engine.configure(settings);
+        await(engine, [&](const auto& s) { return s.preview && s.preview != preview; });
+        requireSameOutcome(engine.status(), outcome);
+
+        if (!split) {
+            const auto failuresBefore = failedDesktopPreviews.load();
+            failDesktopPreview = true;
+            settings.preview = false; engine.configure(settings);
+            settings.preview = true; engine.configure(settings);
+            await(engine, [&](const auto&) { return failedDesktopPreviews > failuresBefore; });
+            if (failed) requireSameOutcome(engine.status(), outcome);
+            else {
+                const auto diagnostic = await(engine, [](const auto& s) {
+                    return s.error && s.message == L"Injected independent preview failure.";
+                });
+                require(!diagnostic.recordingFailed && diagnostic.savedPaths == outcome.savedPaths,
+                    "Independent preview failure was hidden or changed the successful recording outcome.");
+            }
+            failDesktopPreview = false;
+            engine.refreshSources();
+            if (failed) requireSameOutcome(engine.status(), outcome);
+            else {
+                const auto retried = engine.status();
+                require(!retried.error && !retried.recordingFailed && retried.message == L"Ready to record." &&
+                    retried.savedPaths == outcome.savedPaths && retried.frames == outcome.frames,
+                    "Refresh did not clear a transient preview error with prior saved paths.");
+            }
+            await(engine, [](const auto& s) { return bool(s.preview); });
+            if (failed) requireSameOutcome(engine.status(), outcome);
+        }
+
+        // A new accepted Record, unlike source retry, owns a fresh result.
+        settings.preview = false; settings.layers = lapse::preset(lapse::Mode::Camera);
+        settings.cameraId = L"controlled-warmup-camera"; engine.configure(settings);
+        const int pollsBefore = cameraPolls;
+        engine.record();
+        const auto started = engine.status();
+        require(started.state == lapse::State::Starting && !started.error && !started.recordingFailed &&
+            started.savedPath.empty() && started.savedPaths.empty() && started.frames == 0 && started.completedSegments == 0,
+            "New Record retained a terminal recording outcome.");
+        await(engine, [&](const auto&) { return cameraPolls > pollsBefore; });
+        engine.finish();
+        const auto cancelled = await(engine, [](const auto& s) { return s.state == lapse::State::Idle; });
+        require(!cancelled.error && !cancelled.recordingFailed && cancelled.savedPaths.empty() && cancelled.frames == 0,
+            "Cancelling new source warmup restored an earlier recording outcome.");
+        verifyVideo(owned, 1);
+        std::cout << "PASS Refresh outcome kind=" << kind << " retained report/path/statistics; preview diagnostics and new Record remain independent.\n";
+    }
 }
 
 void publicationCase(const std::filesystem::path& directory,SaveFault fault) {
@@ -591,8 +686,7 @@ int main() {
                     "Successful idle preview erased the save error or retained path");
             engine.refreshSources();
             const auto refreshed = engine.status();
-            require(refreshed.recordingFailed && !refreshed.error && refreshed.savedPath == failure.savedPath,
-                    "Refreshing sources changed the previous recording outcome or retained path");
+            requireSameOutcome(refreshed, failure);
 
             settings.preview = false; engine.configure(settings); engine.record();
             require(!engine.status().recordingFailed, "Accepted retry retained the failed rename outcome");
@@ -635,6 +729,7 @@ int main() {
         activeOutputOwnership(directory);
         for (int kind=0;kind<5;++kind) workerCase(directory,kind);
         acceptedFrameOutcomes(directory);
+        refreshOutcomes(directory);
         apiCases(directory);
         std::filesystem::remove_all(directory);
         std::cout << "Engine storage: real rename collision, retained MP4 decoding, protected destination, sticky error, retry, cancellation and allocation-safe publication passed.\n";

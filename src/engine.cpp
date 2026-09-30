@@ -155,10 +155,15 @@ void Engine::retirePreview(bool visualOnly) {
 void Engine::refreshSources() {
     { std::lock_guard<std::mutex> lock(mutex_);
       if (status_.state != State::Idle) return;
+      // Source retry must not discard a recording's result or recovery path.
+      // A later preview error remains independently retryable, even when the
+      // prior recording still has saved paths.
+      const bool retainOutcome = !previewProblem_ && (status_.recordingFailed ||
+          !status_.savedPath.empty() || !status_.savedPaths.empty());
       retireCameraInput();
       retirePreview();
       retrySources_ = true; previewProblem_ = false;
-      status_.error = false; status_.message = L"Ready to record."; }
+      if (!retainOutcome) { status_.error = false; status_.message = L"Ready to record."; } }
     wake_.notify_one();
 }
 void Engine::record() {

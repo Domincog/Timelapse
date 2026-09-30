@@ -58,7 +58,7 @@ namespace {
 std::function<void()> beforePreferenceReplace;
 int replacementAttempts=0;
 DWORD replacementError=ERROR_SUCCESS;
-enum class WriteFault { None, DenySecond, DenyCompression, DenySegment, DenyWatermark, DenyCursor, ThrowAfterFirst };
+enum class WriteFault { None, DenySecond, DenyCompression, DenySegment, DenyWatermark, DenyCursor, DenyNightDuration, ThrowAfterFirst };
 WriteFault writeFault=WriteFault::None;
 int keyWrites=0, failedKeyWrites=0, syntheticExceptions=0, saveDiagnostics=0;
 DWORD keyWriteError=ERROR_SUCCESS;std::wstring failedPreferenceKey;
@@ -69,7 +69,7 @@ BOOL WINAPI fixtureWriteProfile(LPCWSTR section,LPCWSTR key,LPCWSTR value,LPCWST
     if(section&&key){
         ++keyWrites;
         if(!result){++failedKeyWrites;keyWriteError=error;failedPreferenceKey=key;}
-        const int denyAt=writeFault==WriteFault::DenySecond?2:writeFault==WriteFault::DenyCompression?24:writeFault==WriteFault::DenySegment?11:writeFault==WriteFault::DenyWatermark?31:writeFault==WriteFault::DenyCursor?14:0;
+        const int denyAt=writeFault==WriteFault::DenySecond?2:writeFault==WriteFault::DenyCompression?24:writeFault==WriteFault::DenySegment?11:writeFault==WriteFault::DenyWatermark?31:writeFault==WriteFault::DenyCursor?14:writeFault==WriteFault::DenyNightDuration?16:0;
         if(denyAt && keyWrites==denyAt-1 && result){
             deniedWrite=CreateFileW(path,GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
             if(deniedWrite==INVALID_HANDLE_VALUE)throw std::runtime_error("Cannot deny the next owned staging write.");
@@ -413,7 +413,30 @@ void nightOptions(){
         if(std::wcscmp(key,L"NightEnabled")==0)require(SendMessageW(app.nightEnabled,BM_GETCHECK,0,0)==BST_UNCHECKED,"Malformed night flag enabled capture.");
         else require(choice(std::wcscmp(key,L"NightDurationMs")==0?app.nightDuration:app.nightTarget)==(std::wcscmp(key,L"NightDurationMs")==0?0:1),"Malformed night policy did not restore Auto/Balanced default.");
     }
-    fixture.onlySettingsRemain();std::cout<<"PASS night enabled/duration/target values roundtrip atomically, malformed defaults and Desktop startup\n";
+    for(int duration:{1000,1001,1501,2000,3000,5000,10000,15000,29999,30000}){
+        require(WritePrivateProfileStringW(L"Settings",L"NightDurationMs",std::to_wstring(duration).c_str(),app.preferences.c_str())!=FALSE,"Cannot seed exact custom Night duration.");
+        reload();configure();int preset=-1;for(int i=1;i<6;++i)if(NightDurations[i]==duration)preset=i;
+        require(selectedNightDuration()==duration && app.settings.night.durationMs==duration && choice(app.nightDuration)==(preset<0?6:preset) && app.hasCustomNightDuration==(preset<0),
+            "Night duration load rounded milliseconds or failed preset normalization.");
+        preferences(true);choose(app.nightDuration,0);reload();configure();
+        wchar_t stored[32]{};GetPrivateProfileStringW(L"Settings",L"NightDurationMs",L"missing",stored,32,app.preferences.c_str());
+        require(std::wstring(stored)==std::to_wstring(duration) && selectedNightDuration()==duration && app.settings.night.durationMs==duration && choice(app.mode)==0,
+            "Custom Night duration did not survive exact-value persistence or enabled a camera on startup.");
+    }
+    for(const wchar_t* invalid:{L"999",L"30001",L"1.5",L"1500junk",L"+1500",L"-1500",L"2147483648",L"1500.0",L"1500e0"}){
+        require(WritePrivateProfileStringW(L"Settings",L"NightDurationMs",invalid,app.preferences.c_str())!=FALSE,"Cannot seed invalid custom Night duration.");reload();configure();
+        require(selectedNightDuration()==0 && app.settings.night.durationMs==0 && choice(app.nightDuration)==0 && !app.hasCustomNightDuration && SendMessageW(app.nightDuration,CB_GETCOUNT,0,0)==7,
+            "Invalid custom Night persistence enabled a prefix, retained old custom state or lost Auto.");
+    }
+    require(WritePrivateProfileStringW(L"Settings",L"NightDurationMs",L"1501",app.preferences.c_str())!=FALSE,"Cannot seed custom Night rollback baseline.");reload();
+    const auto before=fixture.bytes();app.customNightDurationMs=15000;app.hasCustomNightDuration=true;app.committedNightDuration=6;customItems();
+    keyWrites=failedKeyWrites=0;failedPreferenceKey.clear();writeFault=WriteFault::DenyNightDuration;preferences(true);writeFault=WriteFault::None;
+    require(keyWrites==16 && failedKeyWrites==1 && failedPreferenceKey==L"NightDurationMs" && fixture.bytes()==before,"Failed Night duration write published a partial settings snapshot.");
+    reload();require(selectedNightDuration()==1501,"Failed custom Night preference save replaced its previous value.");
+    choose(app.nightDuration,0);preferences(true);reload();configure();
+    require(selectedNightDuration()==0 && app.settings.night.durationMs==0 && !app.hasCustomNightDuration && !GetPrivateProfileIntW(L"Settings",L"NightDurationMs",-1,app.preferences.c_str()),
+        "Choosing Auto retained a stale custom Night value in preferences.");
+    fixture.onlySettingsRemain();std::cout<<"PASS Night exact millisecond/preset/Auto roundtrips, strict malformed fallback, Desktop startup and atomic named-key rollback\n";
 }
 struct OwnedFile {
     HANDLE value=INVALID_HANDLE_VALUE;
@@ -614,7 +637,8 @@ void checkpointBeforeRecording(){
     app.settings.layers=preset(Mode::Camera);choose(app.mode,1);app.engine=std::make_unique<lapse::FixtureEngine>();
     app.startupComplete=true;app.status=lapse::fixtureStatus={};app.trayRegistered=false;app.closeWhenDone=false;app.hiddenToTray=false;
     lapse::recordCalls=lapse::configurationCalls=0;lapse::beforeRecording={};
-    SendMessageW(app.nightEnabled,BM_SETCHECK,BST_CHECKED,0);choose(app.nightDuration,2);choose(app.nightTarget,2);
+    SendMessageW(app.nightEnabled,BM_SETCHECK,BST_CHECKED,0);choose(app.nightTarget,2);
+    app.customNightDurationMs=1501;app.hasCustomNightDuration=true;app.committedNightDuration=6;
     SendMessageW(app.recoveryMode,BM_SETCHECK,BST_CHECKED,0);
     app.settings.timeSkip.mode=TimeSkipMode::NoPerson;app.settings.timeSkip.quietAfterMs=90000;app.settings.timeSkip.multiplier=8;
     SendMessageW(app.captureCursor,BM_SETCHECK,BST_UNCHECKED,0);
@@ -625,13 +649,13 @@ void checkpointBeforeRecording(){
     windowProc(app.window,WM_COMMAND,NightBox,0);
     require(replacementAttempts==0 && keyWrites==0 && fixture.bytes()==original,"Idle option changes added unsolicited preference writes.");
     app.cameras.clear();windowProc(app.window,WM_COMMAND,Record,0);app.cameras={{L"Synthetic camera",L"owned-camera"}};
-    choose(app.nightDuration,5);windowProc(app.window,WM_COMMAND,Record,0);choose(app.nightDuration,2);
+    choose(app.nightDuration,5);windowProc(app.window,WM_COMMAND,Record,0);choose(app.nightDuration,6);
     choose(app.encodingMode,3);windowProc(app.window,WM_COMMAND,Record,0);choose(app.encodingMode,0);
     require(!lapse::recordCalls && !replacementAttempts && !keyWrites && fixture.bytes()==original,"Invalid source/Night Record wrote settings or started capture.");
     lapse::beforeRecording=[&]{require(replacementAttempts==1 && fixture.bytes()!=original,"Capture began before its preference checkpoint.");};
     windowProc(app.window,WM_COMMAND,Record,0);
     require(lapse::recordCalls==1 && lapse::recordedSettings.intervalMs==2500 && lapse::recordedSettings.recordingLimitSeconds==3700 && lapse::recordedSettings.segmentDurationSeconds==777 &&
-        !lapse::recordedSettings.captureCursor && lapse::recordedSettings.recoveryMode && lapse::recordedSettings.night.enabled && lapse::recordedSettings.night.durationMs==2000 && lapse::recordedSettings.night.targetBrightness==128 &&
+        !lapse::recordedSettings.captureCursor && lapse::recordedSettings.recoveryMode && lapse::recordedSettings.night.enabled && lapse::recordedSettings.night.durationMs==1501 && lapse::recordedSettings.night.targetBrightness==128 &&
         lapse::recordedSettings.timeSkip.mode==TimeSkipMode::NoPerson && lapse::recordedSettings.timeSkip.quietAfterMs==90000,
         "Accepted Record did not use the exact checkpointed custom/Night/person settings.");
     const auto saved=fixture.bytes();const auto configured=lapse::configurationCalls;const int writes=keyWrites;
@@ -648,7 +672,7 @@ void checkpointBeforeRecording(){
     // Simulate reopening after interruption without WM_DESTROY or another save.
     reload();app.settings.layers=preset(Mode::Desktop);configure();
     require(choice(app.mode)==0 && app.settings.intervalMs==2500 && app.settings.recordingLimitSeconds==3700 && app.settings.segmentDurationSeconds==777 &&
-        SendMessageW(app.nightEnabled,BM_GETCHECK,0,0)==BST_CHECKED && choice(app.nightDuration)==2 && choice(app.nightTarget)==2 &&
+        SendMessageW(app.nightEnabled,BM_GETCHECK,0,0)==BST_CHECKED && choice(app.nightDuration)==6 && selectedNightDuration()==1501 && choice(app.nightTarget)==2 &&
         !app.settings.captureCursor && app.settings.recoveryMode && !app.settings.night.enabled && app.settings.timeSkip.mode==TimeSkipMode::NoPerson && app.settings.timeSkip.quietAfterMs==90000,
         "Interrupted-session restart lost checkpointed settings or silently enabled camera capture.");
     expectUnknownContent(fixture);fixture.onlySettingsRemain();

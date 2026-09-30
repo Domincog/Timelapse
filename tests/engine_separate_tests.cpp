@@ -211,6 +211,15 @@ void verifyPaths(const lapse::Status& status, unsigned desktopFrames, unsigned c
         require(status.message.find(path) != std::wstring::npos, "Outcome did not name each playable video");
     }
 }
+void refreshOutcome(lapse::Engine& engine, const lapse::Status& saved) {
+    engine.refreshSources();
+    const auto refreshed = engine.status();
+    require(refreshed.state == lapse::State::Idle && refreshed.error == saved.error &&
+        refreshed.recordingFailed == saved.recordingFailed && refreshed.message == saved.message &&
+        refreshed.savedPath == saved.savedPath && refreshed.savedPaths == saved.savedPaths &&
+        refreshed.frames == saved.frames && refreshed.elapsed == saved.elapsed,
+        "Refresh changed a paired recording report, including its individual save outcomes.");
+}
 void cursorPolicy(const std::filesystem::path& root) {
     resetFaults(); cursorPattern = true;
     lapse::Engine engine;
@@ -288,6 +297,7 @@ void lifecycle(const std::filesystem::path& root, bool recoveryMode = false) {
     require(!saved.error && !saved.recordingFailed && saved.frames == 2 && saved.savedPaths.size() == 2, "Paired recording did not complete");
     require(identity(saved.savedPaths[0]) == desktopIdentity && identity(saved.savedPaths[1]) == cameraIdentity, "Paired publication lost file ownership");
     verifyPaths(saved, 2, 2, recoveryMode);
+    refreshOutcome(engine, saved);
     for (const auto& path : saved.savedPaths) require(MoveFileExW(path.c_str(), (path + L".moved").c_str(), 0) != FALSE, "Publication guard was not released");
     std::cout << "PASS recovery=" << recoveryMode << " paired sources, matching timestamps, full-frame content, pause/resume, frozen session, owned publication.\n";
 }
@@ -339,6 +349,7 @@ void failure(const std::filesystem::path& root, Fault selected, bool failFirstWr
     } else if (selected == Fault::FinishCamera || selected == Fault::FinishDesktop) {
         require(saved.savedPaths.size() == 1 && saved.message.find(L"Partial file:") != std::wstring::npos, "Finalization failure hid surviving output or partial file");
         verifyPaths(saved, 1, 1);
+        refreshOutcome(engine, saved);
     } else {
         require(allocationFailures == 1 && saved.savedPaths.size() == 2 && saved.savedPaths[1].find(L".recording.mp4") != std::wstring::npos,
             "Second publication allocation failure lost the saved or retained output");

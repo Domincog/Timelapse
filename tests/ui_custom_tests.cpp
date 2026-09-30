@@ -71,28 +71,29 @@ void setupCustom(){
     app.advanced=app.nightHint=app.nightDetail=nullptr;
     app.hasCustomInterval=app.hasCustomSize=app.hasCustomLimit=false;
     app.hasCustomSegment=false;app.committedSegment=0;app.customSegmentSeconds=900;choose(app.splitEvery,0);
+    app.hasCustomNightDuration=false;app.committedNightDuration=0;app.customNightDurationMs=3000;choose(app.nightDuration,0);
     app.customIntervalMs=5000;app.customWidth=1280;app.customHeight=720;app.customLimitSeconds=900;
     app.committedInterval=2;app.committedSize=app.committedLimit=0;
     choose(app.interval,2);choose(app.videoSize,0);choose(app.stopAfter,0);
     customItems();seed(false);dialogCalls=0;failDialog=false;dialogScript={};
 }
 void invoke(CustomKind kind){
-    HWND box=kind==CustomKind::Interval?app.interval:kind==CustomKind::Size?app.videoSize:kind==CustomKind::Segment?app.splitEvery:app.stopAfter;
-    int id=kind==CustomKind::Interval?IntervalBox:kind==CustomKind::Size?SizeBox:kind==CustomKind::Segment?SegmentBox:StopAfterBox;
+    HWND box=kind==CustomKind::Interval?app.interval:kind==CustomKind::Size?app.videoSize:kind==CustomKind::Segment?app.splitEvery:kind==CustomKind::Night?app.nightDuration:app.stopAfter;
+    int id=kind==CustomKind::Interval?IntervalBox:kind==CustomKind::Size?SizeBox:kind==CustomKind::Segment?SegmentBox:kind==CustomKind::Night?NightDurationBox:StopAfterBox;
     const int action=static_cast<int>(SendMessageW(box,CB_GETCOUNT,0,0))-1;
     choose(box,action);windowProc(app.window,WM_COMMAND,MAKEWPARAM(id,CBN_SELCHANGE),reinterpret_cast<LPARAM>(box));
 }
 void accept(HWND window){customProc(window,WM_COMMAND,IDOK,0);}
 void intervalAndCancellation(){
     HiddenFixture owned;setupCustom();const Settings original=app.settings;const int calls=lapse::configurationCalls;
-    for(auto kind:{CustomKind::Interval,CustomKind::Size,CustomKind::Limit,CustomKind::Segment}){
+    for(auto kind:{CustomKind::Interval,CustomKind::Size,CustomKind::Limit,CustomKind::Segment,CustomKind::Night}){
         dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<CustomDraft*>(parameter);
             require(GetNextDlgTabItem(window,draft.first,FALSE)==(draft.second?draft.second:draft.units),"Custom dialog tab order skipped its second field.");
             SetWindowTextW(draft.first,L"invalid draft");customProc(window,WM_CLOSE,0,0);};
         invoke(kind);
     }
     require(app.settings.intervalMs==original.intervalMs && app.settings.width==original.width && app.settings.height==original.height &&
-        app.settings.recordingLimitSeconds==0 && app.settings.segmentDurationSeconds==0 && lapse::configurationCalls==calls && choice(app.interval)==2 && choice(app.videoSize)==0 && choice(app.stopAfter)==0 && choice(app.splitEvery)==0,
+        app.settings.recordingLimitSeconds==0 && app.settings.segmentDurationSeconds==0 && selectedNightDuration()==0 && lapse::configurationCalls==calls && choice(app.interval)==2 && choice(app.videoSize)==0 && choice(app.stopAfter)==0 && choice(app.splitEvery)==0,
         "Cancel changed committed settings, selection or engine configuration.");
     dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<CustomDraft*>(parameter);
         SetWindowTextW(draft.first,(L"1"+std::wstring(110,L' ')+L"junk").c_str());accept(window);
@@ -135,8 +136,8 @@ void activeAndNight(){
     HiddenFixture owned;setupCustom();
     for(auto state:{State::Starting,State::Recording,State::Paused,State::Finishing}){
         app.status.state=state;const int calls=lapse::configurationCalls;
-        for(auto kind:{CustomKind::Interval,CustomKind::Size,CustomKind::Limit,CustomKind::Segment})invoke(kind);
-        require(!dialogCalls && lapse::configurationCalls==calls && app.settings.intervalMs==5000 && app.settings.width==1280 && app.settings.recordingLimitSeconds==0 && app.settings.segmentDurationSeconds==0 && choice(app.splitEvery)==0,
+        for(auto kind:{CustomKind::Interval,CustomKind::Size,CustomKind::Limit,CustomKind::Segment,CustomKind::Night})invoke(kind);
+        require(!dialogCalls && lapse::configurationCalls==calls && app.settings.intervalMs==5000 && app.settings.width==1280 && app.settings.recordingLimitSeconds==0 && app.settings.segmentDurationSeconds==0 && choice(app.splitEvery)==0 && selectedNightDuration()==0,
             "Active session accepted a forged custom command.");
     }
     app.status={};sourceMode(Mode::Camera);SendMessageW(app.nightEnabled,BM_SETCHECK,BST_CHECKED,0);choose(app.nightDuration,0);configure();
@@ -148,6 +149,56 @@ void activeAndNight(){
     failDialog=true;const int interval=app.settings.intervalMs;invoke(CustomKind::Interval);
     require(app.settings.intervalMs==interval && !app.customDialog && startupMessage.find(L"could not be opened")!=std::wstring::npos,"Dialog failure lost committed state or recovery message.");
     std::cout<<"PASS active command guards, camera-only subsecond Night validation and failed dialog recovery\n";
+}
+void customNightDuration(){
+    HiddenFixture owned;setupCustom();sourceMode(Mode::Camera);SendMessageW(app.nightEnabled,BM_SETCHECK,BST_CHECKED,0);configure();
+    require(selectedNightDuration()==0 && SendMessageW(app.nightDuration,CB_GETCOUNT,0,0)==7,"Night did not retain Auto plus its existing presets and Custom action.");
+    dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<CustomDraft*>(parameter);
+        require(draft.kind==CustomKind::Night && caption(draft.first)==L"3","Auto did not seed a bounded manual Night draft.");
+        require(caption(draft.help).find(L"1")!=std::wstring::npos && caption(draft.help).find(L"30")!=std::wstring::npos,"Night help lost its supported bounds.");
+        for(auto invalid:{L"0",L"0.999",L"30.001",L"1.0005",L"1,5",L"1.5junk",L"999999999999999999999999999999999999"}){
+            SetWindowTextW(draft.first,invalid);accept(window);require(!dialogOutcome && !caption(draft.error).empty(),"Invalid or inexact Night duration was accepted.");}
+        const auto pasted=L"1"+std::wstring(110,L' ')+L"junk";SendMessageW(draft.first,EM_SETSEL,0,-1);SendMessageW(draft.first,EM_REPLACESEL,FALSE,reinterpret_cast<LPARAM>(pasted.c_str()));
+        accept(window);require(!dialogOutcome && GetWindowTextLengthW(draft.first)==96,"Native Night paste accepted a truncated numeric prefix.");
+        SendMessageW(draft.first,EM_SETSEL,0,-1);SendMessageW(draft.first,EM_REPLACESEL,FALSE,reinterpret_cast<LPARAM>(L"1.501"));
+        MSG enter{};enter.hwnd=draft.first;enter.message=WM_KEYDOWN;enter.wParam=VK_RETURN;
+        require(IsDialogMessageW(window,&enter) && dialogOutcome==IDOK,"Native Enter rejected exact custom Night milliseconds.");};
+    invoke(CustomKind::Night);
+    require(app.settings.night.durationMs==1501 && lapse::configured.night.durationMs==1501 && selectedNightDuration()==1501 && app.hasCustomNightDuration &&
+        app.committedNightDuration==6 && caption(app.nightDuration)==L"1.501 seconds" && IsWindowEnabled(app.record),"Exact Night duration did not reach the displayed and configured policy.");
+    dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<CustomDraft*>(parameter);SetWindowTextW(draft.first,L"2");accept(window);};
+    invoke(CustomKind::Interval);
+    require(app.settings.intervalMs==2000 && selectedNightDuration()==1501 && app.settings.night.durationMs==1501 && caption(app.nightDuration)==L"1.501 seconds",
+        "Another custom setting rebuilt away the committed Night value or row.");
+    choose(app.interval,2);windowProc(app.window,WM_COMMAND,MAKEWPARAM(IntervalBox,CBN_SELCHANGE),0);
+    require(app.settings.intervalMs==5000 && selectedNightDuration()==1501,"Changing a preset discarded the committed custom Night duration.");
+    const int configurations=lapse::configurationCalls;
+    dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<CustomDraft*>(parameter);
+        require(caption(draft.first)==L"1.501","Custom Night reopening rounded its value.");SetWindowTextW(draft.first,L"12");customProc(window,WM_COMMAND,IDCANCEL,0);};
+    invoke(CustomKind::Night);require(selectedNightDuration()==1501 && app.settings.night.durationMs==1501 && lapse::configurationCalls==configurations,"Canceled Night edit changed its previous custom value.");
+    failDialog=true;invoke(CustomKind::Night);failDialog=false;
+    require(selectedNightDuration()==1501 && app.settings.night.durationMs==1501 && lapse::configurationCalls==configurations && !app.customDialog && startupMessage.find(L"could not be opened")!=std::wstring::npos,
+        "Failed Night dialog discarded its committed value or lacked a diagnostic.");
+    for(auto state:{State::Starting,State::Recording,State::Paused,State::Finishing}){
+        app.status.state=state;const int calls=dialogCalls;
+        invoke(CustomKind::Night);choose(app.nightDuration,0);windowProc(app.window,WM_COMMAND,MAKEWPARAM(NightDurationBox,CBN_SELCHANGE),0);
+        require(dialogCalls==calls && selectedNightDuration()==1501 && app.settings.night.durationMs==1501 && lapse::configurationCalls==configurations,"Active Night command changed or falsely displayed frozen custom duration.");
+    }
+    app.status={};
+    dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<CustomDraft*>(parameter);SetWindowTextW(draft.first,L"15");accept(window);};
+    invoke(CustomKind::Night);
+    require(app.settings.night.durationMs==15000 && app.settings.intervalMs==5000 && !app.nightValidation.empty() && !IsWindowEnabled(app.record),"Night longer than Capture every was clamped or allowed to record.");
+    const int records=lapse::recordCalls;windowProc(app.window,WM_COMMAND,Record,0);require(lapse::recordCalls==records,"Forged Record bypassed custom Night interval validation.");
+    choose(app.interval,5);windowProc(app.window,WM_COMMAND,MAKEWPARAM(IntervalBox,CBN_SELCHANGE),0);
+    require(app.settings.night.durationMs==15000 && app.settings.intervalMs==60000 && app.nightValidation.empty() && IsWindowEnabled(app.record),"Adjusting Capture every did not retain and enable the exact Night duration.");
+    for(int preset=1;preset<6;++preset){
+        dialogScript=[preset](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<CustomDraft*>(parameter);SetWindowTextW(draft.first,secondsInput(NightDurations[preset]).c_str());accept(window);};
+        invoke(CustomKind::Night);require(selectedNightDuration()==NightDurations[preset] && choice(app.nightDuration)==preset && !app.hasCustomNightDuration && SendMessageW(app.nightDuration,CB_GETCOUNT,0,0)==7,
+            "Preset-equivalent Night duration retained a duplicate custom row or lost Custom action.");
+    }
+    choose(app.nightDuration,0);windowProc(app.window,WM_COMMAND,MAKEWPARAM(NightDurationBox,CBN_SELCHANGE),0);
+    require(app.settings.night.durationMs==0 && selectedNightDuration()==0,"Auto selection retained the last manual Night duration.");
+    std::cout<<"PASS custom Night exact milliseconds/native entry, bounds, committed cancellation/failure/active guards, interval validation and preset/Auto normalization\n";
 }
 void segmentDurations(){
     HiddenFixture owned;setupCustom();
@@ -195,17 +246,17 @@ void dialogDpiAndLifecycle(){
             customReveal(window,draft,draft.cancel);RECT bounds{},client{};GetWindowRect(draft.cancel,&bounds);MapWindowPoints(nullptr,window,reinterpret_cast<POINT*>(&bounds),2);GetClientRect(window,&client);
             require(bounds.left>=0 && bounds.top>=0 && bounds.right<=client.right && bounds.bottom<=client.bottom,"Constrained dialog cannot reveal its Cancel button.");
             customProc(window,WM_COMMAND,IDCANCEL,0);};
-        invoke(CustomKind::Interval);invoke(CustomKind::Segment);require(!app.customDialog,"Destroyed custom dialog retained its HWND.");
+        invoke(CustomKind::Interval);invoke(CustomKind::Segment);invoke(CustomKind::Night);require(!app.customDialog,"Destroyed custom dialog retained its HWND.");
     }
     dialogScript=[](HWND,LPARAM){windowProc(app.window,WM_COMMAND,TrayExit,0);};invoke(CustomKind::Interval);
     require(!IsWindow(app.window) && !app.customDialog,"Tray Exit left an owned custom dialog or owner behind.");
     std::cout<<"PASS owned dialog DPI/reflow/scroll reachability, cleanup and explicit tray Exit\n";
 }
 void canceledDialogFocus(){
-    for(auto kind:{CustomKind::Interval,CustomKind::Size,CustomKind::Limit,CustomKind::Segment})for(int action=0;action<5;++action){
+    for(auto kind:{CustomKind::Interval,CustomKind::Size,CustomKind::Limit,CustomKind::Segment,CustomKind::Night})for(int action=0;action<5;++action){
         HiddenFixture owned;setupCustom();app.hiddenToTray=app.closeWhenDone=app.trayRegistered=app.trayNoticeShown=app.startupComplete=false;
         app.failureNotice=FailureNotice::None;app.trayStateValid=false;app.taskbarCreated=0;app.customDialog=nullptr;app.trayTooltip.clear();allowTray=action!=2;
-        const HWND owner=app.window,box=kind==CustomKind::Interval?app.interval:kind==CustomKind::Size?app.videoSize:kind==CustomKind::Segment?app.splitEvery:app.stopAfter;
+        const HWND owner=app.window,box=kind==CustomKind::Interval?app.interval:kind==CustomKind::Size?app.videoSize:kind==CustomKind::Segment?app.splitEvery:kind==CustomKind::Night?app.nightDuration:app.stopAfter;
         RECT screen{GetSystemMetrics(SM_XVIRTUALSCREEN),GetSystemMetrics(SM_YVIRTUALSCREEN),0,0};
         screen.right=screen.left+GetSystemMetrics(SM_CXVIRTUALSCREEN);screen.bottom=screen.top+GetSystemMetrics(SM_CYVIRTUALSCREEN);
         const auto outside=[&]{if(IsWindow(owner)){RECT bounds{},overlap{};GetWindowRect(owner,&bounds);require(!IntersectRect(&overlap,&bounds,&screen),"Custom lifecycle fixture entered the visible desktop.");}};
@@ -224,7 +275,7 @@ void canceledDialogFocus(){
         invoke(kind);const HWND focused=GetFocus();
         require(dialogOutcome==IDCANCEL && !app.customDialog,"Lifecycle cancellation left a dialog or accepted its draft.");
         require(app.settings.intervalMs==prior.intervalMs && app.settings.width==prior.width && app.settings.height==prior.height &&
-            app.settings.recordingLimitSeconds==prior.recordingLimitSeconds && app.settings.segmentDurationSeconds==prior.segmentDurationSeconds,
+            app.settings.recordingLimitSeconds==prior.recordingLimitSeconds && app.settings.segmentDurationSeconds==prior.segmentDurationSeconds && selectedNightDuration()==0,
             "Canceled lifecycle path committed draft settings.");
         require(lapse::recordCalls==0 && lapse::configurationCalls-configurations==(action==1 || action==2?1:0),"Dialog cancellation changed recording or added configuration work.");
         if(action==0 || action==2)require(IsWindow(owner)&&IsWindowVisible(owner)&&!app.hiddenToTray&&focused==box,"Visible Cancel or rejected Hide failed to restore the invoking control.");
@@ -232,7 +283,7 @@ void canceledDialogFocus(){
         else require(!IsWindow(owner),"Exit or session shutdown retained the custom dialog owner.");
         outside();if(IsWindow(owner))ShowWindow(owner,SW_HIDE);app.trayRegistered=false;allowTray=true;
     }
-    std::cout<<"PASS native custom focus after Cancel/Hide/rejected Hide/Exit/session end for all four custom kinds, with canceled drafts unchanged\n";
+    std::cout<<"PASS native custom focus after Cancel/Hide/rejected Hide/Exit/session end for all five custom kinds, with canceled drafts unchanged\n";
 }
 void nativeDialogWheel(){
     HiddenFixture owned;setupCustom();app.hiddenToTray=false;app.closeWhenDone=false;wheelParameters=true;wheelLines=wheelCharacters=1;
@@ -311,7 +362,7 @@ void nativeButtonNavigation(){
         require(GetFocus()==child && bounds.left>=0 && bounds.top>=0 && bounds.right<=client.right && bounds.bottom<=client.bottom,
             "Native modal focus remained outside the viewport.");
     };
-    for(int dpi:{96,192})for(auto kind:{CustomKind::Interval,CustomKind::Size,CustomKind::Limit,CustomKind::Segment}){
+    for(int dpi:{96,192})for(auto kind:{CustomKind::Interval,CustomKind::Size,CustomKind::Limit,CustomKind::Segment,CustomKind::Night}){
         dialogScript=[=](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<CustomDraft*>(parameter);
             RECT suggested{0,0,320,210};customProc(window,WM_DPICHANGED,MAKELONG(dpi,dpi),reinterpret_cast<LPARAM>(&suggested));
             SendMessageW(window,WM_NEXTDLGCTL,reinterpret_cast<WPARAM>(draft.first),TRUE);
@@ -404,7 +455,7 @@ void sourceSizeSnapshots(){
 }
 }
 int main(){
-    try{intervalAndCancellation();dimensionsAndLimit();activeAndNight();segmentDurations();nativeNumericInsertion();nativeButtonNavigation();dialogDpiAndLifecycle();canceledDialogFocus();nativeDialogWheel();sourceSizeSnapshots();
+    try{intervalAndCancellation();dimensionsAndLimit();activeAndNight();customNightDuration();segmentDurations();nativeNumericInsertion();nativeButtonNavigation();dialogDpiAndLifecycle();canceledDialogFocus();nativeDialogWheel();sourceSizeSnapshots();
         std::cout<<"All custom UI cases passed with owned controls and synthetic engine.\n";return 0;
     }catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
 }

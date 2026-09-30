@@ -350,12 +350,16 @@ bool terminalFailure(int kind) {
     std::cout<<(stayed?"PASS ":"FAIL ")<<(kind==0?"genuine due capture failure":kind==1?"finalization failure":"rename failure")
         <<": frames="<<failed.frames<<" saved="<<!failed.savedPath.empty()<<" destroy="<<probe::destroyCalls
         <<" error_dialog="<<probe::errorDialogs<<'\n';
-    if(kind==1) {
-        app.engine->refreshSources();
-        const auto refreshed=app.engine->status();
-        require(!refreshed.error && refreshed.recordingFailed,
-                "Refreshing preview must not erase the last recording failure");
-    }
+    app.engine->refreshSources();
+    const auto refreshed=app.engine->status();
+    require(refreshed.state==failed.state && refreshed.error==failed.error && refreshed.recordingFailed==failed.recordingFailed &&
+            refreshed.message==failed.message && refreshed.savedPath==failed.savedPath && refreshed.savedPaths==failed.savedPaths &&
+            refreshed.frames==failed.frames && refreshed.elapsed==failed.elapsed && refreshed.completedSegments==failed.completedSegments,
+            "Source Refresh changed the terminal recording report, recovery paths or statistics");
+    tick();
+    require(app.status.error && app.status.recordingFailed && app.status.message==failed.message &&
+            probe::destroyCalls==0 && probe::errorDialogs==1 && !app.closeWhenDone,
+            "Refreshed failure report exited the UI or repeated the acknowledged failure notice");
     return stayed;
 }
 
