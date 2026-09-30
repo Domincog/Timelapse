@@ -61,7 +61,8 @@ LRESULT WINAPI fakeSend(HWND hwnd,UINT message,WPARAM value,LPARAM parameter){
     if(message==CB_RESETCONTENT){counts[i]=0;selections[i]=-1;}
     return 0;
 }
-DWORD WINAPI fakeProfileString(LPCWSTR section,LPCWSTR key,LPCWSTR,LPWSTR output,DWORD count,LPCWSTR path){
+DWORD WINAPI fakeProfileString(LPCWSTR section,LPCWSTR key,LPCWSTR fallback,LPWSTR output,DWORD count,LPCWSTR path){
+    if(std::wcscmp(key,L"StopOnLowDiskSpace")==0){require(count>=2,"Low disk buffer too small");wcscpy_s(output,count,fallback);return 1;}
     require(std::wcscmp(section,L"Settings")==0&&std::wcscmp(key,L"Folder")==0&&count>=1025&&path&&*path,"Unexpected profile read");
     ++profileReads;std::wmemset(output,L'x',1024);output[0]=L'C';output[1]=L':';output[2]=L'\\';output[1024]=0;
     if(fault==Fault::ProfileCopy)failNextAllocation=true;
@@ -150,6 +151,7 @@ void run(const wchar_t* name,Fault selectedFault){
     std::wstring{}.swap(app.settings.folder);app.monitors.clear();app.cameras.clear();app.selectedMonitorId.clear();
     app.settings.cameraId.clear();app.settings.monitorId.clear();app.mode=nullptr;app.preview=nullptr;app.window=nullptr;app.layingOut=false;
     app.advancedExpanded=true;app.advancedVisibility=1;app.advancedLimitIndex=5;
+    app.visibleDirty=false;app.controlsUpdated=true;app.controlsState=State::Paused;app.trayStateValid=true;
     ownedCase=ownedRun/name;require(std::filesystem::create_directory(ownedCase),"Owned case already exists");
     const auto path=ownedCase/L"settings.ini";app.preferences=path.native();
     const std::string original="; Owned startup sentinel\r\n[Settings]\r\nFolder=C:\\Prior\r\nInterval=4\r\nQuality=1\r\nEncodingQuality=0\r\n";
@@ -173,8 +175,9 @@ void run(const wchar_t* name,Fault selectedFault){
     if(selectedFault==Fault::AfterEngine)require(failedAllocations==0&&syntheticThrows==1&&engineStarts==1,"Synthetic post-engine exception changed");
     if(selectedFault==Fault::Timer)require(failedAllocations==0&&syntheticThrows==0&&engineStarts==1&&engineStops==1,"Synthetic zero-timer cleanup changed");
     if(failed){require(!escaped&&created==-1,"WM_CREATE did not reject failed startup");require(resizeQueries==0&&resizeConfigures==0,"Failed startup processed resize configuration");require(keyWrites==0&&unchanged&&debugMessages==1&&timerStarts==(selectedFault==Fault::Timer?1:0),"Failed startup changed preferences or timer attempts");}
-    else {require(!escaped&&created==0&&failedAllocations==0&&engineStarts==1&&keyWrites==6&&!unchanged&&timerStarts==1&&debugMessages==0,"Healthy create/destroy changed");
-        require(!app.advancedExpanded&&app.advancedVisibility==0&&app.advancedLimitIndex==0,"Recreated controls inherited stale Advanced caption or expanded state");}
+    else {require(!escaped&&created==0&&failedAllocations==0&&engineStarts==1&&keyWrites==7&&!unchanged&&timerStarts==1&&debugMessages==0,"Healthy create/destroy changed");
+        require(!app.advancedExpanded&&app.advancedVisibility==0&&app.advancedLimitIndex==0,"Recreated controls inherited stale Advanced caption or expanded state");
+        require(app.visibleDirty&&app.controlsUpdated&&app.controlsState==State::Idle&&!app.trayStateValid,"Recreated controls inherited stale visual/tray caches");}
     for(const auto& file:std::filesystem::directory_iterator(ownedCase))require(file.path()==path,"Owned staged preferences leaked");
 }
 }
@@ -220,7 +223,7 @@ void osCase(const wchar_t* className,const wchar_t* name,Fault selectedFault){
     require(routeEscapes==0&&routedCreates==1&&routedDestroys==1&&!app.engine&&timerStops==1&&quits==1,"Unexpected callback escape or missing OS cleanup");
     if(selectedFault==Fault::ProfileCopy)require(!created&&!acceptedAtReturn&&destroysAtReturn==1&&failedAllocations==1&&failedBytes>0&&keyWrites==0&&unchanged&&engineStarts==0&&engineStops==0&&timerStarts==0&&debugMessages==1,"OS failed-creation behavior changed");
     else if(selectedFault==Fault::Timer)require(!created&&!acceptedAtReturn&&!app.mode&&destroysAtReturn==1&&stopsAtReturn==1&&writesAtReturn==0&&failedAllocations==0&&syntheticThrows==0&&keyWrites==0&&unchanged&&engineStarts==1&&engineStops==1&&timerStarts==1&&debugMessages==1,"OS failed-timer cleanup or preference preservation changed");
-    else require(created&&acceptedAtReturn&&destroysAtReturn==0&&stopsAtReturn==0&&writesAtReturn==0&&failedAllocations==0&&keyWrites==6&&!unchanged&&engineStarts==1&&engineStops==1&&timerStarts==1&&debugMessages==0,"OS healthy-creation behavior changed");
+    else require(created&&acceptedAtReturn&&destroysAtReturn==0&&stopsAtReturn==0&&writesAtReturn==0&&failedAllocations==0&&keyWrites==7&&!unchanged&&engineStarts==1&&engineStops==1&&timerStarts==1&&debugMessages==0,"OS healthy-creation behavior changed");
     for(const auto& file:std::filesystem::directory_iterator(ownedCase))require(file.path()==path,"Owned settings stage remained");
 }
 }
@@ -242,7 +245,7 @@ bool childUnchanged(){std::ifstream input(currentIni,std::ios::binary);return st
 void verifyChildCleanup(bool rejected){
     require(!app.engine&&!app.startupComplete&&timerStops==1&&quits==1,"Destruction missed Engine/timer/quit cleanup");
     if(rejected)require(engineStarts==0&&engineStops==0&&engineConfigures==0&&timerStarts==0&&profileReads==0&&monitorEnumerations==0&&cameraEnumerations==0&&tooltipAttempts==0&&keyWrites==0&&debugMessages==1&&childUnchanged(),"Failed required child reached initialization or changed preferences");
-    else require(engineStarts==1&&engineStops==1&&timerStarts==1&&profileReads==1&&monitorEnumerations==1&&cameraEnumerations==1&&tooltipAttempts==1&&keyWrites==6&&debugMessages==0&&lastConfiguredInterval==5&&!childUnchanged(),"Healthy initialization/persistence changed");
+    else require(engineStarts==1&&engineStops==1&&timerStarts==1&&profileReads==1&&monitorEnumerations==1&&cameraEnumerations==1&&tooltipAttempts==1&&keyWrites==7&&debugMessages==0&&lastConfiguredInterval==5&&!childUnchanged(),"Healthy initialization/persistence changed");
     require(GetPrivateProfileIntW(L"Settings",L"Interval",99,currentIni.c_str())==2,"Owned interval preference changed");
     for(const auto& entry:std::filesystem::directory_iterator(ownedCase))require(entry.path()==currentIni,"Owned preference stage leaked");
 }
@@ -295,12 +298,12 @@ struct OwnedFiles {
     }
     ~OwnedFiles(){
         failNextAllocation=false;fault=Fault::None;app.engine.reset();
-        // Only flat files inside the 41 fixed case directories created by
+        // Only flat files inside the 42 fixed case directories created by
         // this fixture are removed; no recursive traversal or user paths.
         std::error_code error;
         if(!ownedRun.is_absolute()||ownedRun.parent_path()!=base)return;
         for(const auto* name:{L"profile-copy",L"post-engine-synthetic",L"healthy",L"zero-timer-synthetic",L"failed-create",L"healthy-create",L"failed-timer-create",
-            L"required-100",L"required-101",L"required-102",L"required-103",L"required-104",L"required-105",L"required-106",L"required-107",L"required-108",L"required-109",L"required-110",L"required-111",L"required-112",L"required-113",L"required-114",L"required-115",L"required-116",L"required-117",
+            L"required-100",L"required-101",L"required-102",L"required-103",L"required-104",L"required-105",L"required-106",L"required-107",L"required-108",L"required-109",L"required-110",L"required-111",L"required-112",L"required-113",L"required-114",L"required-115",L"required-116",L"required-117",L"required-118",
             L"required-label-200",L"required-label-201",L"required-label-202",L"required-label-203",L"required-label-204",L"required-label-205",L"required-label-206",L"required-label-207",L"required-status",L"child-healthy",L"child-tooltip",
             L"os-child-interval",L"os-child-record",L"os-child-preview",L"os-child-healthy",L"os-child-tooltip"}){
             const auto directory=ownedRun/name;
@@ -325,7 +328,7 @@ int main(){
         const auto child=[&](const std::wstring& name,int id,bool tooltip=false){
             try{directChildCase(name,id,tooltip);++passed;}catch(const std::exception& error){failNextAllocation=false;++failed;std::cout<<"FAIL "<<error.what()<<'\n';}
         };
-        for(int id=ModeBox;id<=StopAfterBox;++id)child(L"required-"+std::to_wstring(id),id);
+        for(int id=ModeBox;id<=LowDiskBox;++id)child(L"required-"+std::to_wstring(id),id);
         for(int id=200;id<208;++id)child(L"required-label-"+std::to_wstring(id),id);
         child(L"required-status",210);child(L"child-healthy",-1);child(L"child-tooltip",-1,true);
         const auto className=L"TimelapseOwnedCreateTests-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64());
@@ -341,6 +344,6 @@ int main(){
         childOs(L"os-child-healthy",-1);childOs(L"os-child-tooltip",-1,true);
         require(UnregisterClassW(className.c_str(),cls.hInstance)!=FALSE,"Owned class was not released");
     }catch(const std::exception& error){failNextAllocation=false;++failed;std::cout<<"FAIL "<<error.what()<<'\n';}
-    std::cout<<passed<<"/41 cases passed: seven prior startup cases, 29 required-child direct controls and five hidden OS controls; children/fonts/Engine/timer synthetic, only owned preferences.\n";
-    return failed||passed!=41?1:0;
+    std::cout<<passed<<"/42 cases passed: seven prior startup cases, 30 required-child direct controls and five hidden OS controls; children/fonts/Engine/timer synthetic, only owned preferences.\n";
+    return failed||passed!=42?1:0;
 }

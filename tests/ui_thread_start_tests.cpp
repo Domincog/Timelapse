@@ -93,7 +93,8 @@ LRESULT WINAPI fakeSend(HWND window,UINT message,WPARAM value,LPARAM) {
     if(message==CB_RESETCONTENT) { counts[i]=0; selections[i]=-1; }
     return 0;
 }
-DWORD WINAPI fakeProfileString(LPCWSTR,LPCWSTR,LPCWSTR,LPWSTR output,DWORD count,LPCWSTR) {
+DWORD WINAPI fakeProfileString(LPCWSTR,LPCWSTR key,LPCWSTR fallback,LPWSTR output,DWORD count,LPCWSTR) {
+    if(std::wcscmp(key,L"StopOnLowDiskSpace")==0){require(count>=2,"Low disk buffer too small");wcscpy_s(output,count,fallback);return 1;}
     ++profileReads; const wchar_t value[]=L"C:\\OwnedSynthetic";
     require(count>_countof(value),"Profile buffer too small"); std::wmemcpy(output,value,_countof(value)); return _countof(value)-1;
 }

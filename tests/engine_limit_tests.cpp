@@ -22,6 +22,7 @@ std::atomic<unsigned> cameraStarts{0}, cameraStops{0};
 std::atomic<int> desktopDelayMs{0}, cameraOpenDelayMs{0};
 std::atomic<int> previewAllocationDelayMs{0}, finalizeDelayMs{0};
 std::atomic<unsigned> previewAllocationFaults{0};
+std::atomic<bool> finalizeFailure{false};
 }
 namespace lapse {
 class LimitEncoder {
@@ -36,7 +37,12 @@ public:
     bool finish(std::wstring& error) { return real_.finish(error); }
     bool finishForPublication(std::wstring& error) {
         std::this_thread::sleep_for(std::chrono::milliseconds(finalizeDelayMs.exchange(0)));
-        return real_.finishForPublication(error);
+        const bool finished = real_.finishForPublication(error);
+        if (finished && finalizeFailure.exchange(false)) {
+            error = L"Injected MP4 finalization failure.";
+            return false;
+        }
+        return finished;
     }
     DWORD publish(const std::wstring& path) { return real_.publish(path); }
     void releasePublication() noexcept { real_.releasePublication(); }
@@ -192,25 +198,51 @@ void unlimitedAndManualFinish(const std::filesystem::path& root, int limit) {
     verify(saved.savedPath, 1);
     std::cout << "PASS unlimited=" << limit << ", frozen setting, manual Finish releases hidden camera.\n";
 }
-void collision(const std::filesystem::path& root) {
-    const auto directory = root / L"collision"; auto config = settings(directory, lapse::Mode::Desktop, true); config.interval = 60;
+void collision(const std::filesystem::path& root, bool separate = true) {
+    const auto directory = root / (separate ? L"collision-separate" : L"collision-single");
+    auto config = settings(directory, lapse::Mode::Desktop, separate); config.interval = 60;
     lapse::Engine engine; engine.configure(config); engine.record();
     await(engine, [](const auto& s) { return s.state == lapse::State::Recording && s.frames == 1; });
     std::wstring temporary;
     for (const auto& item : std::filesystem::directory_iterator(directory))
-        if (item.path().wstring().find(L"-desktop.recording.mp4") != std::wstring::npos) temporary = item.path().wstring();
+        if (item.path().wstring().find(separate ? L"-desktop.recording.mp4" : L".recording.mp4") != std::wstring::npos) temporary = item.path().wstring();
     require(!temporary.empty(), "Cannot locate owned desktop temporary file");
     auto final = temporary; final.replace(final.rfind(L".recording.mp4"), 14, L".mp4");
     { std::ofstream sentinel(final, std::ios::binary); sentinel << "existing output"; require(bool(sentinel), "Cannot create owned collision fixture"); }
     const auto saved = await(engine, [](const auto& s) { return s.state == lapse::State::Idle; }, 3000);
-    require(saved.error && saved.recordingFailed && saved.savedPaths.size() == 2 && saved.savedPath == temporary,
+    require(saved.error && saved.recordingFailed && saved.frames == 1 && saved.savedPaths.size() == (separate ? 2u : 1u) && saved.savedPath == temporary,
         "Automatic completion hid a publication failure or discarded a completed stream");
-    require(saved.message.find(L"Recording time limit reached.") != std::wstring::npos && saved.message.find(temporary) != std::wstring::npos,
-        "Automatic save failure omitted its cause or recovery path");
     for (const auto& path : saved.savedPaths) verify(path, 1);
     std::ifstream sentinel(final, std::ios::binary); std::string text; std::getline(sentinel, text);
     require(text == "existing output", "Automatic publication replaced an existing file");
-    std::cout << "PASS automatic publication collision preserves both movies and reports failure.\n";
+    require(saved.message.find(temporary) != std::wstring::npos, "Publication collision omitted the retained movie path");
+    std::wcout << L"Collision outcome: " << saved.message << L'\n';
+    require(saved.message.find(L"Recording time limit reached.") != std::wstring::npos,
+        "Automatic save failure omitted its stop reason after retained movie decoded successfully");
+    std::cout << "PASS automatic publication collision preserves movie(s) and stop reason; separate=" << separate << ".\n";
+}
+void singleFinalizationFailure(const std::filesystem::path& root) {
+    const auto directory = root / L"finalization-single";
+    auto config = settings(directory); config.interval = 60;
+    lapse::Engine engine; engine.configure(config); engine.record();
+    await(engine, [](const auto& s) { return s.state == lapse::State::Recording && s.frames == 1; });
+    std::wstring temporary;
+    for (const auto& item : std::filesystem::directory_iterator(directory))
+        if (item.path().wstring().find(L".recording.mp4") != std::wstring::npos) temporary = item.path().wstring();
+    require(!temporary.empty(), "Cannot locate finalization fixture temporary file");
+    finalizeFailure = true;
+    const auto saved = await(engine, [](const auto& s) { return s.state == lapse::State::Idle; }, 3000);
+    require(saved.error && saved.recordingFailed && saved.frames == 1 && saved.savedPaths.empty() && saved.savedPath.empty(),
+        "Finalization failure was reported as a published movie");
+    require(!finalizeFailure && saved.message.find(L"Injected MP4 finalization failure.") != std::wstring::npos &&
+        saved.message.find(temporary) != std::wstring::npos, "Finalization failure lost its diagnostic or partial path");
+    // The seam reports failure after actual finalization, so this retained
+    // fixture is decodable. Real failed finalization need not be playable.
+    verify(temporary, 1);
+    std::wcout << L"Finalization outcome: " << saved.message << L'\n';
+    require(saved.message.find(L"Recording time limit reached.") != std::wstring::npos,
+        "Automatic finalization failure omitted its stop reason after retained fixture decoded successfully");
+    std::cout << "PASS single-file finalization error preserves stop reason, diagnostic and retained path.\n";
 }
 void previewFailureDeadline(const std::filesystem::path& root) {
     auto config = settings(root / L"preview-allocation"); config.interval = 60; config.preview = true; config.recordingLimitSeconds = 2;
@@ -260,19 +292,25 @@ bool captureMonitor(const std::wstring& id, int width, int height, bool, Frame& 
     error.clear(); pixels(output, width, height); return true;
 }
 }
-int main() {
+int main(int argc, char** argv) {
     const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED); if (FAILED(com)) return 1;
     if (FAILED(MFStartup(MF_VERSION))) { CoUninitialize(); return 1; }
     const auto root = std::filesystem::current_path() / (L"engine-limit-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
     int result = 0;
     try {
+        const std::string focused = argc > 1 ? argv[1] : "";
+        if (focused == "single-collision") collision(root, false);
+        else if (focused == "single-finalization") singleFinalizationFailure(root);
+        else {
         sourceMode(root, lapse::Mode::Desktop, false); sourceMode(root, lapse::Mode::Camera, false);
         sourceMode(root, lapse::Mode::Overlay, false); sourceMode(root, lapse::Mode::Desktop, true);
         startupExcluded(root, false); startupExcluded(root, true); pauseExcluded(root); slowCapture(root);
         unlimitedAndManualFinish(root, 0); unlimitedAndManualFinish(root, -1); collision(root);
         previewFailureDeadline(root); finalizationExcluded(root);
+        collision(root, false); singleFinalizationFailure(root);
+        }
         std::filesystem::remove_all(root);
-        std::cout << "Recording limits: 13 synthetic real-encoder cases passed.\n";
+        std::cout << "Recording limits: " << (focused.empty() ? "15 synthetic real-encoder cases" : "focused outcome case") << " passed.\n";
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; std::wcerr << L"Artifacts kept at " << root.wstring() << L'\n'; result = 1; }
     MFShutdown(); CoUninitialize(); return result;
 }

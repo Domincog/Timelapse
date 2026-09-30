@@ -21,7 +21,7 @@ using namespace lapse;
 namespace {
 constexpr COLORREF Ink = RGB(25, 38, 45), Muted = RGB(88, 106, 113), Accent = RGB(0, 116, 113);
 constexpr COLORREF Background = RGB(247, 249, 250), Canvas = RGB(21, 28, 34);
-enum Id { ModeBox = 100, IntervalBox, SizeBox, EncodingQualityBox, MonitorBox, CameraBox, Refresh, Record, Pause, Finish, Folder, OpenFolder, Reset, Forward, Preview, EncodingModeBox, AdvancedToggle, StopAfterBox };
+enum Id { ModeBox = 100, IntervalBox, SizeBox, EncodingQualityBox, MonitorBox, CameraBox, Refresh, Record, Pause, Finish, Folder, OpenFolder, Reset, Forward, Preview, EncodingModeBox, AdvancedToggle, StopAfterBox, LowDiskBox };
 constexpr int RecordingLimits[] = {0,900,3600,14400,28800,86400};
 constexpr const wchar_t* RecordingLimitLabels[] = {L"Never",L"15 minutes",L"1 hour",L"4 hours",L"8 hours",L"24 hours"};
 constexpr int SeparateFilesMode = 5;
@@ -34,7 +34,7 @@ constexpr wchar_t SetupMutexName[] = L"Local\\Timelapse.Setup.{DC32D155-1B8D-488
 struct App {
     HWND window{}, preview{}, statusText{}, tooltip{};
     HWND mode{}, interval{}, videoSize{}, encodingQuality{}, encodingMode{}, monitor{}, camera{}, refresh{}, record{}, pause{}, finish{}, folder{}, openFolder{}, reset{}, forward{};
-    HWND advanced{}, stopAfter{}, labels[8]{};
+    HWND advanced{}, stopAfter{}, lowDisk{}, labels[8]{};
     HFONT font{}, titleFont{}, smallFont{};
     HBRUSH background = CreateSolidBrush(Background);
     int dpi = 96, selected = -1, modeIndex = 0;
@@ -42,11 +42,15 @@ struct App {
     bool dragging = false, resizing = false, closeWhenDone = false, inspectUI = false;
     bool layingOut = false;
     bool startupComplete = false;
+    bool visibleDirty = true, controlsUpdated = false;
+    State controlsState = State::Idle;
     bool advancedExpanded = false;
     int advancedLimitIndex = -1, advancedVisibility = -1;
     bool hiddenToTray = false, trayRegistered = false, trayNoticeShown = false, trayVersion4 = false;
     UINT taskbarCreated = 0;
     std::wstring trayTooltip;
+    State trayState = State::Idle;
+    bool trayStateValid = false, trayFailure = false, traySeparate = false;
     HICON trayIcons[5]{};
     int contentWidth = 0, contentHeight = 0, scrollX = 0, scrollY = 0;
     int wheelVertical = 0, wheelHorizontal = 0;
@@ -156,7 +160,7 @@ void updateAdvanced() {
     if(app.advancedVisibility==static_cast<int>(app.advancedExpanded))return;
     app.advancedVisibility=static_cast<int>(app.advancedExpanded);
     SendMessageW(app.advanced,BM_SETCHECK,app.advancedExpanded?BST_CHECKED:BST_UNCHECKED,0);
-    for(HWND child:{app.labels[6],app.encodingMode,app.labels[7],app.stopAfter})
+    for(HWND child:{app.labels[6],app.encodingMode,app.labels[7],app.stopAfter,app.lowDisk})
         if(child && ((GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0)!=app.advancedExpanded)
             ShowWindow(child,app.advancedExpanded?SW_SHOWNA:SW_HIDE);
 }
@@ -169,6 +173,7 @@ void configure() {
     app.settings.encodingQuality = static_cast<EncodingQuality>(std::clamp(choice(app.encodingQuality),0,2));
     app.settings.encodingMode = static_cast<EncodingMode>(std::clamp(choice(app.encodingMode),0,4));
     app.settings.recordingLimitSeconds = RecordingLimits[std::clamp(choice(app.stopAfter),0,5)];
+    app.settings.stopOnLowDiskSpace = !app.lowDisk || SendMessageW(app.lowDisk,BM_GETCHECK,0,0)!=BST_UNCHECKED;
     int m = choice(app.monitor), c = choice(app.camera);
     if (m >= 0 && m < static_cast<int>(app.monitors.size())) {
         app.settings.monitor = app.monitors[m].bounds;
@@ -209,16 +214,45 @@ void refreshSources() {
 }
 void updateControls() {
     const bool idle = !app.active();
-    for (auto control : {app.mode,app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.refresh,app.folder}) EnableWindow(control,idle);
+    for (auto control : {app.mode,app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.lowDisk,app.refresh,app.folder}) EnableWindow(control,idle);
     EnableWindow(app.monitor,idle && hasSource(Source::Desktop));
     EnableWindow(app.camera,idle && hasSource(Source::Camera) && !app.cameras.empty());
     EnableWindow(app.record,idle && hasRequiredSources());
     EnableWindow(app.pause,app.status.state==State::Recording || app.status.state==State::Paused);
     EnableWindow(app.finish,app.status.state==State::Starting || app.status.state==State::Recording || app.status.state==State::Paused);
-    SetWindowTextW(app.pause,app.status.state==State::Paused ? L"&Resume" : L"&Pause");
+    if(!app.controlsUpdated || (app.controlsState==State::Paused)!=(app.status.state==State::Paused))
+        SetWindowTextW(app.pause,app.status.state==State::Paused ? L"&Resume" : L"&Pause");
     bool collage = !app.settings.separateFiles && app.settings.layers.size() > 1;
     EnableWindow(app.reset,collage); EnableWindow(app.forward,collage && app.selected>=0);
     updateAdvanced();
+    app.controlsState=app.status.state;app.controlsUpdated=true;
+}
+void invalidateCanvas(RECT rect) {
+    OffsetRect(&rect,-app.scrollX,-app.scrollY);InvalidateRect(app.window,&rect,FALSE);
+}
+void applyStatus(Status value,bool force=false) {
+    const bool state=app.status.state!=value.state;
+    const bool stats=state || app.status.frames!=value.frames ||
+        static_cast<uint64_t>(std::max(0.0,app.status.elapsed))!=static_cast<uint64_t>(std::max(0.0,value.elapsed));
+    const bool message=app.status.message!=value.message,error=app.status.error!=value.error;
+    const bool preview=app.status.preview!=value.preview;
+    app.status=std::move(value);
+    // Status and tray handling remain live while hidden; only visual work waits.
+    if(app.hiddenToTray || IsIconic(app.window)) {
+        if(force || stats || message || error || preview)app.visibleDirty=true;
+        return;
+    }
+    if(force || app.visibleDirty) {
+        updateControls();SetWindowTextW(app.statusText,app.status.message.c_str());
+        InvalidateRect(app.window,nullptr,FALSE);InvalidateRect(app.preview,nullptr,FALSE);InvalidateRect(app.statusText,nullptr,TRUE);
+        app.visibleDirty=false;return;
+    }
+    if(!app.controlsUpdated || app.controlsState!=app.status.state)updateControls();
+    if(message)SetWindowTextW(app.statusText,app.status.message.c_str());
+    if(error)InvalidateRect(app.statusText,nullptr,TRUE);
+    if(preview)InvalidateRect(app.preview,nullptr,FALSE);
+    if(state)invalidateCanvas({app.contentWidth-app.scale(280),app.scale(20),app.contentWidth-app.scale(26),app.scale(49)});
+    if(stats)invalidateCanvas({app.scale(26),app.contentHeight-app.scale(147),app.contentWidth-app.scale(26),app.contentHeight-app.scale(123)});
 }
 void changeLayout(bool reset) {
     app.modeIndex = choice(app.mode);
@@ -250,31 +284,37 @@ HICON trayIcon(int state) {
 bool updateTray(bool addIcon=false) {
     if(!app.trayRegistered && !addIcon)return false;
     if(addIcon && !app.taskbarCreated){app.taskbarCreated=RegisterWindowMessageW(L"TaskbarCreated");if(!app.taskbarCreated)return false;}
+    if(!addIcon && app.trayStateValid && app.trayState==app.status.state &&
+       app.trayFailure==app.status.recordingFailed && app.traySeparate==app.settings.separateFiles)return true;
     const wchar_t* state=app.status.state==State::Recording?L"Recording":app.status.state==State::Paused?L"Paused":
         app.status.state==State::Starting?L"Preparing":app.status.state==State::Finishing?L"Saving":app.status.recordingFailed?L"Recording failed":L"Ready";
     std::wstring tip=L"Timelapse - ";tip+=state;
     if(app.active())tip+=app.settings.separateFiles?L" - desktop + camera files":L"";
-    if(!addIcon && tip==app.trayTooltip)return true;
+    if(!addIcon && tip==app.trayTooltip){
+        app.trayState=app.status.state;app.trayFailure=app.status.recordingFailed;app.traySeparate=app.settings.separateFiles;app.trayStateValid=true;
+        return true;
+    }
     const int icon=app.status.recordingFailed&&!app.active()?4:app.status.state==State::Recording?1:app.status.state==State::Paused?2:app.active()?3:0;
     NOTIFYICONDATAW data{sizeof(data)};data.hWnd=app.window;data.uID=1;data.uFlags=NIF_MESSAGE|NIF_ICON|NIF_TIP|NIF_SHOWTIP;
     data.uCallbackMessage=TrayMessage;data.hIcon=trayIcon(icon);wcscpy_s(data.szTip,tip.c_str());
     if(!Shell_NotifyIconW(addIcon?NIM_ADD:NIM_MODIFY,&data)){
-        Shell_NotifyIconW(NIM_DELETE,&data);app.trayRegistered=false;app.trayVersion4=false;app.trayTooltip.clear();return false;
+        Shell_NotifyIconW(NIM_DELETE,&data);app.trayRegistered=false;app.trayVersion4=false;app.trayTooltip.clear();app.trayStateValid=false;return false;
     }
     app.trayRegistered=true;app.trayTooltip=std::move(tip);
+    app.trayState=app.status.state;app.trayFailure=app.status.recordingFailed;app.traySeparate=app.settings.separateFiles;app.trayStateValid=true;
     if(addIcon){data.uVersion=NOTIFYICON_VERSION_4;app.trayVersion4=Shell_NotifyIconW(NIM_SETVERSION,&data)!=FALSE;}
     return true;
 }
 void removeTray() {
     if(app.trayRegistered){NOTIFYICONDATAW data{sizeof(data)};data.hWnd=app.window;data.uID=1;Shell_NotifyIconW(NIM_DELETE,&data);}
-    app.trayRegistered=false;app.trayVersion4=false;app.trayTooltip.clear();
+    app.trayRegistered=false;app.trayVersion4=false;app.trayTooltip.clear();app.trayStateValid=false;
 }
 void showWindow() {
     app.hiddenToTray=false;ShowWindow(app.window,SW_RESTORE);SetForegroundWindow(app.window);
-    if(app.engine)configure();
+    if(app.engine){applyStatus(app.engine->status(),true);configure();}
 }
 bool hideToTray() {
-    app.status=app.engine->status();
+    applyStatus(app.engine->status());
     if(!updateTray(!app.trayRegistered)) {
         showWindow();
         MessageBoxW(app.window,L"Windows could not add Timelapse to the system tray. The window will stay open so you can control your recording.",L"Timelapse",MB_OK|MB_ICONWARNING);
@@ -291,14 +331,14 @@ bool hideToTray() {
 }
 void exitApplication() {
     if(app.closeWhenDone)return;
-    app.status=app.engine->status();
+    applyStatus(app.engine->status());
     if(app.active()) {
         if(MessageBoxW(app.window,L"Finish the current recording and exit Timelapse?",L"Finish recording",MB_OKCANCEL|MB_ICONQUESTION)!=IDOK)return;
         app.closeWhenDone=true;app.engine->finish();EnableWindow(app.window,FALSE);
     } else DestroyWindow(app.window);
 }
 void trayMenu(POINT at={},bool usePoint=false) {
-    app.status=app.engine->status();updateControls();
+    applyStatus(app.engine->status());
     HMENU menu=CreatePopupMenu();if(!menu){showWindow();return;}
     AppendMenuW(menu,MF_STRING,TrayShow,L"&Show Timelapse");
     const bool pauseAllowed=!app.closeWhenDone&&(app.status.state==State::Recording||app.status.state==State::Paused);
@@ -373,9 +413,11 @@ void layout() {
     move(app.labels[4],pad,app.scale(121),deviceW,app.scale(20)); move(app.monitor,pad,row2,deviceW,app.scale(220));
     move(app.labels[5],cameraX,app.scale(121),deviceW,app.scale(20)); move(app.camera,cameraX,row2,deviceW,app.scale(220));
     move(app.advanced,advancedX,row2,advancedW,ch);
-    const int optionW=(width-gap)/2;
-    move(app.labels[6],pad,app.scale(190),optionW,app.scale(20));move(app.encodingMode,pad,app.scale(211),optionW,app.scale(190));
-    move(app.labels[7],pad+optionW+gap,app.scale(190),width-optionW-gap,app.scale(20));move(app.stopAfter,pad+optionW+gap,app.scale(211),width-optionW-gap,app.scale(210));
+    const int options=width-2*gap, encodingW=options*40/100, stopW=options*25/100;
+    const int stopX=pad+encodingW+gap, diskX=stopX+stopW+gap;
+    move(app.labels[6],pad,app.scale(190),encodingW,app.scale(20));move(app.encodingMode,pad,app.scale(211),encodingW,app.scale(190));
+    move(app.labels[7],stopX,app.scale(190),stopW,app.scale(20));move(app.stopAfter,stopX,app.scale(211),stopW,app.scale(210));
+    move(app.lowDisk,diskX,app.scale(211),options-encodingW-stopW,ch);
     move(app.refresh,r.right-pad-refreshW,row2,refreshW,ch);
     // The logical canvas retains a usable preview when the viewport is small.
     const int previewH=static_cast<int>(r.bottom)-previewTop-app.scale(191);
@@ -440,7 +482,7 @@ void revealFocusedControl() {
 }
 void toggleAdvanced() {
     const HWND focused=GetFocus();
-    if(app.advancedExpanded && (focused==app.encodingMode || focused==app.stopAfter ||
+    if(app.advancedExpanded && (focused==app.encodingMode || focused==app.stopAfter || focused==app.lowDisk ||
         (focused && (IsChild(app.encodingMode,focused) || IsChild(app.stopAfter,focused)))))SetFocus(app.advanced);
     app.advancedExpanded=!app.advancedExpanded;
     updateAdvanced();layout();revealFocusedControl();
@@ -548,7 +590,8 @@ bool savePreferences() {
             WritePrivateProfileStringW(L"Settings",L"Quality",quality.c_str(),pending.path) &&
             WritePrivateProfileStringW(L"Settings",L"EncodingQuality",encodingQuality.c_str(),pending.path) &&
             WritePrivateProfileStringW(L"Settings",L"EncodingMode",encodingMode.c_str(),pending.path) &&
-            WritePrivateProfileStringW(L"Settings",L"RecordingLimit",recordingLimit.c_str(),pending.path);
+            WritePrivateProfileStringW(L"Settings",L"RecordingLimit",recordingLimit.c_str(),pending.path) &&
+            WritePrivateProfileStringW(L"Settings",L"StopOnLowDiskSpace",!app.lowDisk || SendMessageW(app.lowDisk,BM_GETCHECK,0,0)!=BST_UNCHECKED?L"1":L"0",pending.path);
         // This cache-flush form returns zero even when successful.
         WritePrivateProfileStringW(nullptr,nullptr,nullptr,pending.path);
         if(!saved)return false;
@@ -577,6 +620,9 @@ void preferences(bool save) {
         choose(app.encodingMode,encodingMode<=4?static_cast<int>(encodingMode):0);
         const UINT recordingLimit=GetPrivateProfileIntW(L"Settings",L"RecordingLimit",0,path);
         choose(app.stopAfter,recordingLimit<=5?static_cast<int>(recordingLimit):0);
+        wchar_t stopOnLowDiskSpace[16]{};
+        GetPrivateProfileStringW(L"Settings",L"StopOnLowDiskSpace",L"1",stopOnLowDiskSpace,16,path);
+        SendMessageW(app.lowDisk,BM_SETCHECK,std::wcscmp(stopOnLowDiskSpace,L"0")==0?BST_UNCHECKED:BST_CHECKED,0);
         // Launch on desktop: opening the app never silently turns on a camera.
         choose(app.mode,0);
         updateAdvanced();
@@ -660,7 +706,7 @@ LRESULT CALLBACK previewProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
 
 LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
     if(app.taskbarCreated && msg==app.taskbarCreated) {
-        app.trayRegistered=false;app.trayVersion4=false;app.trayTooltip.clear();
+        app.trayRegistered=false;app.trayVersion4=false;app.trayTooltip.clear();app.trayStateValid=false;
         if(!updateTray(true) && app.hiddenToTray)showWindow();
         return 0;
     }
@@ -675,6 +721,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
     }
     case WM_CREATE: {
         app.startupComplete=false;app.advancedExpanded=false;app.advancedLimitIndex=app.advancedVisibility=-1;
+        app.visibleDirty=true;app.controlsUpdated=false;app.trayStateValid=false;
         try {
         app.window=w;app.dpi=static_cast<int>(GetDpiForWindow(w));fonts();
         bool controlsReady=true;
@@ -699,6 +746,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         app.encodingMode=combo(6,L"Encodin&g",EncodingModeBox);
         for(auto s:{L"Compatible H.264",L"Efficient H.264",L"Hardware H.264",L"Hardware HEVC",L"Quality H.264"})add(app.encodingMode,s);
         app.stopAfter=combo(7,L"S&top after",StopAfterBox);for(auto label:RecordingLimitLabels)add(app.stopAfter,label);
+        app.lowDisk=requiredControl(L"BUTTON",L"Stop on &low disk space",WS_TABSTOP|BS_AUTOCHECKBOX,LowDiskBox);
         app.record=button(L"●  &Record",Record);app.pause=button(L"&Pause",Pause);app.finish=button(L"&Finish",Finish);app.folder=button(L"&Change...",Folder);app.openFolder=button(L"&Open folder",OpenFolder);app.reset=button(L"Reset layout",Reset);app.forward=button(L"Bring forward",Forward);
         app.preview=requiredControl(L"LapsePreview",L"Collage preview. Space selects a layer. Arrow keys move it. Shift and arrow keys resize it.",WS_TABSTOP,Preview);
         app.statusText=requiredControl(L"STATIC",app.status.message.c_str(),SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX,210);
@@ -718,10 +766,13 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         tip.lpszText=const_cast<LPWSTR>(L"Separate files records full-frame desktop and camera videos together. The side-by-side preview is only for monitoring; each source has its own MP4.");
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
         tip.uId=reinterpret_cast<UINT_PTR>(app.advanced);
-        tip.lpszText=const_cast<LPWSTR>(L"Show or hide advanced options. Checked means expanded. Encoding and the recording time limit can be changed before recording.");
+        tip.lpszText=const_cast<LPWSTR>(L"Show or hide advanced options. Checked means expanded. Encoding, the time limit, and low disk space protection can be changed before recording.");
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
         tip.uId=reinterpret_cast<UINT_PTR>(app.stopAfter);
         tip.lpszText=const_cast<LPWSTR>(L"Finish and save automatically after this much active recording time. Pauses and initial startup do not count. Never records until you choose Finish.");
+        SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
+        tip.uId=reinterpret_cast<UINT_PTR>(app.lowDisk);
+        tip.lpszText=const_cast<LPWSTR>(L"Check free space in the save folder and try to finish and save before space runs out. Other programs or sudden disk changes can still cause a recording to fail. Turn this off to record when free space cannot be checked.");
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
         preferences(false);refreshSources();changeLayout(true);
         try {
@@ -750,6 +801,8 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
     case WM_SIZE:
         if(app.mode && !app.layingOut) {
             if(wp!=SIZE_MINIMIZED){layout();revealFocusedControl();}
+            if(app.engine && wp!=SIZE_MINIMIZED && !app.hiddenToTray && app.visibleDirty)
+                applyStatus(app.engine->status(),true);
             configure();
         }
         return 0;
@@ -789,14 +842,9 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         return 0;
     }
     case WM_TIMER: {
-        auto before=app.status.preview;auto oldMessage=app.status.message;bool oldError=app.status.error;
-        const bool oldRecordingFailed=app.status.recordingFailed;app.status=app.engine->status();updateControls();
+        if(wp!=1 || !app.engine)return 0;
+        const bool oldRecordingFailed=app.status.recordingFailed;applyStatus(app.engine->status());
         if(app.trayRegistered && !updateTray() && app.hiddenToTray)showWindow();
-        if(oldMessage!=app.status.message)SetWindowTextW(app.statusText,app.status.message.c_str());
-        if(oldError!=app.status.error)InvalidateRect(app.statusText,nullptr,TRUE);
-        if(before!=app.status.preview)InvalidateRect(app.preview,nullptr,FALSE);
-        // The footer shares the scrolled logical canvas with its controls.
-        InvalidateRect(w,nullptr,FALSE);
         if(app.closeWhenDone && !app.active()) {
             app.closeWhenDone=false;
             if(app.status.recordingFailed) {
@@ -826,12 +874,13 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         }
         switch(id) {
         case AdvancedToggle:toggleAdvanced();break;
+        case LowDiskBox:if(!app.active())configure();break;
         case TrayShow:showWindow();break;
         case TrayPause:if(!app.closeWhenDone && (app.status.state==State::Recording || app.status.state==State::Paused))app.engine->setPaused(app.status.state!=State::Paused);break;
         case TrayFinish:if(!app.closeWhenDone)app.engine->finish();break;
         case TrayExit:exitApplication();break;
         case Refresh:refreshSources();app.engine->refreshSources();updateControls();break;
-        case Record:configure();if(hasRequiredSources())app.engine->record();app.status=app.engine->status();updateControls();break;
+        case Record:configure();if(hasRequiredSources())app.engine->record();applyStatus(app.engine->status(),true);break;
         case Pause:app.engine->setPaused(app.status.state!=State::Paused);break;
         case Finish:app.engine->finish();break;
         case Folder:selectFolder();break;

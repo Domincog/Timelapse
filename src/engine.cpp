@@ -15,6 +15,37 @@ namespace {
 const wchar_t* recordingMessage(bool separateFiles) {
     return separateFiles ? L"Recording desktop and camera to separate files." : L"Recording. You can adjust the collage live.";
 }
+// Leave room for buffered samples and MP4 finalization instead of waiting for
+// the writer to fail on a full volume. This is a conservative policy, not a
+// reservation: another process can consume the remaining space after a check.
+constexpr ULONGLONG RecordingReservePerVideo = 64ULL * 1024 * 1024;
+std::wstring recordingDirectoryIO(const std::wstring& absoluteFolder) {
+    auto result = fileIOPath(absoluteFolder);
+    // UNC share roots require a trailing separator for GetDiskFreeSpaceEx.
+    if (!result.empty() && result.back() != L'\\' && result.back() != L'/') result += L'\\';
+    return result;
+}
+struct RecordingSpace {
+    ULONGLONG available = 0;
+    DWORD failure = ERROR_SUCCESS;
+    bool enough(bool separateFiles) const { return failure == ERROR_SUCCESS && available > RecordingReservePerVideo * (separateFiles ? 2 : 1); }
+};
+RecordingSpace queryRecordingSpace(const std::wstring& folderIO) {
+    ULARGE_INTEGER available{};
+    if (!GetDiskFreeSpaceExW(folderIO.c_str(), &available, nullptr, nullptr)) {
+        const DWORD failure = GetLastError();
+        return {0, failure ? failure : ERROR_GEN_FAILURE};
+    }
+    // Caller-available bytes account for quotas; total volume free space can
+    // be much larger. Check the combined reserve before admitting either write.
+    return {available.QuadPart, ERROR_SUCCESS};
+}
+std::wstring recordingSpaceProblem(const RecordingSpace& space, bool separateFiles) {
+    if (space.failure != ERROR_SUCCESS)
+        return L"Cannot check available space in the save folder. " + errorText(HRESULT_FROM_WIN32(space.failure));
+    return std::wstring(L"The save folder needs more than ") + (separateFiles ? L"128" : L"64") +
+        L" MiB available to leave room for finishing the video. Free space or choose another folder.";
+}
 // Applies only to this worker thread. Releasing the request restores normal
 // Windows sleep behavior; no persistent power settings are changed.
 class RecordingPower {
@@ -122,7 +153,7 @@ void Engine::run() {
             if (!previewBuffer || previewBuffer.use_count() != 1) previewBuffer = std::make_shared<Frame>();
             return *previewBuffer;
         };
-        std::wstring activeCamera, temporary, finalPath, temporaryIO, finalPathIO, sourceError;
+        std::wstring activeCamera, temporary, finalPath, temporaryIO, finalPathIO, sourceError, recordingFolder, recordingFolderIO;
         std::wstring cameraTemporary, cameraFinalPath, cameraTemporaryIO, cameraFinalPathIO;
         bool cameraRunning = false, pending = false, writing = false, paused = false;
         bool cameraWriting = false;
@@ -253,6 +284,8 @@ void Engine::run() {
             bool ok = !writing;
             std::wstring savedPath, message;
             std::vector<std::wstring> savedPaths;
+            const std::wstring failureContext = reason.empty()
+                ? (recordingLimitReached ? L"Recording time limit reached. " : L"") : reason + L" ";
             if (finalized) {
                 // Prepare every allocating success update before publishing the
                 // file. Once renamed, status publication below cannot allocate.
@@ -265,12 +298,12 @@ void Engine::run() {
                 if (!ok) {
                     savedPath = temporary;
                     savedPaths.front() = temporary;
-                    message = L"Video finished, but could not rename it. Finished video remains at: " + temporary + L". " + errorText(HRESULT_FROM_WIN32(renameError));
+                    message = failureContext + L"Video finished, but could not rename it. Finished video remains at: " + temporary + L". " + errorText(HRESULT_FROM_WIN32(renameError));
                 }
             } else if (writing) {
                 const DWORD attributes = encoder->frames() > 0 ? GetFileAttributesW(temporaryIO.c_str()) : INVALID_FILE_ATTRIBUTES;
                 const bool retainedPartial = attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
-                message = L"Could not finish video: " + error + (retainedPartial ? L" Partial file: " + temporary : L"");
+                message = failureContext + L"Could not finish video: " + error + (retainedPartial ? L" Partial file: " + temporary : L"");
             } else message = reason.empty() ? L"Recording cancelled." : reason;
             std::lock_guard<std::mutex> lock(mutex_);
             stop_ = pauseRequested_ = pauseTarget_ = false;
@@ -472,20 +505,35 @@ void Engine::run() {
                 }
                 if (pending) {
                     std::error_code ec;
-                    std::filesystem::create_directories(fileIOPath(cfg.folder), ec);
-                    if (ec || cfg.folder.empty()) { closeRecording(L"Cannot create the save folder. Choose another folder."); continue; }
+                    if (cfg.folder.empty()) { closeRecording(L"Cannot create the save folder. Choose another folder."); continue; }
+                    // Resolve relative folders once. Both writers, publication
+                    // destinations and space checks use this session directory.
+                    const auto folder = std::filesystem::absolute(std::filesystem::path(cfg.folder), ec);
+                    if (ec) { closeRecording(L"Cannot resolve the save folder. Choose another folder."); continue; }
+                    recordingFolder = folder.lexically_normal().wstring();
+                    recordingFolderIO = recordingDirectoryIO(recordingFolder);
+                    std::filesystem::create_directories(recordingFolderIO, ec);
+                    if (ec) { closeRecording(L"Cannot create the save folder. Choose another folder."); continue; }
+                    if (cfg.stopOnLowDiskSpace) {
+                        const auto space = queryRecordingSpace(recordingFolderIO);
+                        if (!space.enough(cfg.separateFiles)) {
+                            closeRecording(L"Cannot start recording: " + recordingSpaceProblem(space, cfg.separateFiles) + L" Save folder: " + recordingFolder); continue;
+                        }
+                    }
                     SYSTEMTIME t; GetLocalTime(&t);
                     wchar_t name[100];
                     swprintf_s(name, L"Timelapse-%04u%02u%02u-%02u%02u%02u-%03u-%lu", t.wYear,t.wMonth,t.wDay,t.wHour,t.wMinute,t.wSecond,t.wMilliseconds,GetCurrentProcessId());
-                    auto base = (std::filesystem::path(cfg.folder) / name).wstring();
+                    auto base = (std::filesystem::path(recordingFolder) / name).wstring();
                     const auto desktopBase = cfg.separateFiles ? base + L"-desktop" : base;
                     temporary = desktopBase + L".recording.mp4"; finalPath = desktopBase + L".mp4";
                     // Cache I/O spellings before opening: successful save
                     // publication must not allocate after the file is renamed.
-                    temporaryIO = fileIOPath(temporary); finalPathIO = fileIOPath(finalPath);
+                    const auto ioBase = recordingFolderIO + name;
+                    const auto desktopIOBase = cfg.separateFiles ? ioBase + L"-desktop" : ioBase;
+                    temporaryIO = desktopIOBase + L".recording.mp4"; finalPathIO = desktopIOBase + L".mp4";
                     if (cfg.separateFiles) {
                         cameraTemporary = base + L"-camera.recording.mp4"; cameraFinalPath = base + L"-camera.mp4";
-                        cameraTemporaryIO = fileIOPath(cameraTemporary); cameraFinalPathIO = fileIOPath(cameraFinalPath);
+                        cameraTemporaryIO = ioBase + L"-camera.recording.mp4"; cameraFinalPathIO = ioBase + L"-camera.mp4";
                     }
                     if (!encoder) encoder.emplace();
                     if (!encoder->open(temporaryIO, cfg.width, cfg.height, 30, error, cfg.encodingQuality, cfg.encodingMode)) {
@@ -509,11 +557,32 @@ void Engine::run() {
                     status_.state = State::Recording; status_.error = false; status_.message = recordingMessage(cfg.separateFiles);
                 }
                 if (captureDue && writing && !paused) {
-                    advanceElapsed(Clock::now());
-                    // A slow capture/composition may have crossed the limit.
+                    const bool firstSample = encoder->frames() == 0;
+                    if (!firstSample) advanceElapsed(Clock::now());
+                    // Preserve successful time-limit completion if capture
+                    // already used the remaining budget, without querying disk.
+                    if (!firstSample && limitExpired()) {
+                        recordingLimitReached = true; closeRecording(L""); continue;
+                    }
+                    // Capture and writer startup can take time or consume
+                    // space. Recheck after both finish, before either sample
+                    // is submitted, and fail closed if the query is unavailable.
+                    // Read the result without allocating diagnostics. An expired
+                    // deadline wins even when a slow storage query fails.
+                    const auto space = cfg.stopOnLowDiskSpace ? queryRecordingSpace(recordingFolderIO) : RecordingSpace{};
+                    if (firstSample) {
+                        // The first space check after writer opening is still
+                        // startup. Start active time only when admission ends.
+                        activeDuration = Clock::duration::zero(); elapsed = 0;
+                        lastTick = Clock::now(); nextFrame = lastTick;
+                    } else advanceElapsed(Clock::now());
+                    // A slow storage query may also cross the time limit.
                     // Admit both separate writes together, or neither of them.
                     if (limitExpired()) {
                         recordingLimitReached = true; closeRecording(L""); continue;
+                    }
+                    if (cfg.stopOnLowDiskSpace && !space.enough(cfg.separateFiles)) {
+                        closeRecording(L"Recording stopped: " + recordingSpaceProblem(space, cfg.separateFiles) + L" Save folder: " + recordingFolder); continue;
                     }
                     if (!encoder->write(composed, error)) {
                         closeRecording((cfg.separateFiles ? L"Desktop recording stopped: " : L"Recording stopped: ") + error); continue;

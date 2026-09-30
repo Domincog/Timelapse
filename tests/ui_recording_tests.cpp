@@ -148,6 +148,7 @@ struct HiddenFixture {
         probe::confirmations=probe::errorDialogs=probe::foregroundCalls=probe::destroyCalls=0;
         probe::dialogMessage.clear();
         app.settings={};app.status={};app.selected=-1;app.closeWhenDone=false;app.modeIndex=0;
+        app.visibleDirty=true;app.controlsUpdated=app.trayStateValid=false;
         app.hiddenToTray=app.trayRegistered=app.trayVersion4=app.trayNoticeShown=false;app.trayTooltip.clear();
         app.settings.folder=(ownedRoot/name).wstring();
         app.window=CreateWindowExW(0,L"STATIC",L"Owned pause review",WS_OVERLAPPED,0,0,920,720,nullptr,nullptr,nullptr,nullptr);

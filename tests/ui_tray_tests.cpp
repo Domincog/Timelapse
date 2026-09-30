@@ -21,8 +21,17 @@ int records=0,finishes=0,pauses=0,shows=0,hides=0,foregrounds=0,destroys=0,dialo
 int confirmations=0,confirmation=IDOK,menus=0,menuX=0,menuY=0;
 UINT pauseFlags=0,finishFlags=0,exitFlags=0;
 bool failAdd=false,failModify=false,failVersion=false;
+bool iconic=false;
+int statusQueries=0,enables=0,textWrites=0;
+struct Invalidated {HWND window;bool whole;RECT rect;};
+std::vector<Invalidated> invalidated;
+BOOL WINAPI enable(HWND window,BOOL value){++enables;return EnableWindow(window,value);}
+BOOL WINAPI setText(HWND window,LPCWSTR value){++textWrites;return SetWindowTextW(window,value);}
+BOOL WINAPI invalidate(HWND window,const RECT* rect,BOOL erase){invalidated.push_back({window,rect==nullptr,rect?*rect:RECT{}});return InvalidateRect(window,rect,erase);}
+BOOL WINAPI isIconic(HWND){return iconic;}
 std::wstring tip,lastDialog;
 std::vector<DWORD> notifications;
+void resetWork(){statusQueries=enables=textWrites=0;invalidated.clear();notifications.clear();}
 BOOL WINAPI notify(DWORD operation,PNOTIFYICONDATAW data){
     require(data&&data->hWnd&&data->uID==1,"Tray icon ownership changed");notifications.push_back(operation);
     if(operation==NIM_ADD){require((data->uFlags&(NIF_MESSAGE|NIF_ICON|NIF_TIP|NIF_SHOWTIP))==(NIF_MESSAGE|NIF_ICON|NIF_TIP|NIF_SHOWTIP),"Tray registration flags");if(failAdd)return FALSE;}
@@ -52,7 +61,7 @@ public:
     void pause(){}
     void setPaused(bool paused){++probe::pauses;probe::current.state=paused?State::Paused:State::Recording;}
     void finish(){++probe::finishes;probe::current.state=State::Finishing;}
-    Status status(){return probe::current;}
+    Status status(){++probe::statusQueries;return probe::current;}
 };
 std::vector<Monitor> enumerateMonitors(){throw std::runtime_error("Unexpected display enumeration");}
 std::vector<CameraDevice> enumerateCameras(std::wstring&){throw std::runtime_error("Unexpected camera enumeration");}
@@ -68,6 +77,10 @@ int runCameraHost(const wchar_t*){throw std::runtime_error("Unexpected applicati
 #define TrackPopupMenu probe::menu
 #define RegisterWindowMessageW probe::registerMessage
 #define PostQuitMessage probe::quit
+#define EnableWindow probe::enable
+#define SetWindowTextW probe::setText
+#define InvalidateRect probe::invalidate
+#define IsIconic probe::isIconic
 #pragma warning(push)
 #pragma warning(disable: 4702)
 #include "../src/main.cpp"
@@ -82,12 +95,19 @@ int runCameraHost(const wchar_t*){throw std::runtime_error("Unexpected applicati
 #undef TrackPopupMenu
 #undef RegisterWindowMessageW
 #undef PostQuitMessage
+#undef EnableWindow
+#undef SetWindowTextW
+#undef InvalidateRect
+#undef IsIconic
 
 namespace {
 using probe::require;
 struct Fixture {
     Fixture(){
         app.settings={};app.status=probe::current={};app.selected=-1;app.closeWhenDone=false;
+        app.visibleDirty=true;app.controlsUpdated=app.trayStateValid=probe::iconic=false;
+        app.advancedExpanded=false;app.advancedLimitIndex=app.advancedVisibility=-1;
+        app.scrollX=app.scrollY=0;app.contentWidth=920;app.contentHeight=720;
         app.hiddenToTray=app.trayRegistered=app.trayNoticeShown=app.trayVersion4=app.startupComplete=false;
         app.taskbarCreated=0;app.trayTooltip.clear();
         probe::records=probe::finishes=probe::pauses=probe::shows=probe::hides=probe::foregrounds=probe::destroys=probe::dialogs=probe::quits=probe::confirmations=probe::menus=0;
@@ -98,6 +118,7 @@ struct Fixture {
         auto child=[&](const wchar_t* cls,DWORD style){auto w=CreateWindowExW(0,cls,L"",WS_CHILD|style,0,0,100,100,app.window,nullptr,nullptr,nullptr);require(w!=nullptr,"Child control creation failed");return w;};
         auto combo=[&](int count){auto w=child(L"COMBOBOX",CBS_DROPDOWNLIST);for(int i=0;i<count;++i)add(w,std::to_wstring(i));choose(w,0);return w;};
         app.mode=combo(6);app.interval=combo(6);app.videoSize=combo(2);app.encodingQuality=combo(3);app.encodingMode=combo(5);app.monitor=combo(1);app.camera=combo(1);
+        app.stopAfter=combo(6);app.lowDisk=child(L"BUTTON",BS_AUTOCHECKBOX);SendMessageW(app.lowDisk,BM_SETCHECK,BST_CHECKED,0);
         app.monitors={{L"Synthetic display",{0,0,640,360},L"owned-display"}};app.cameras={{L"Synthetic camera",L"owned-camera"}};
         app.preview=child(L"STATIC",0);app.statusText=child(L"STATIC",0);
         for(auto p:{&app.refresh,&app.record,&app.pause,&app.finish,&app.folder,&app.openFolder,&app.reset,&app.forward})*p=child(L"BUTTON",BS_PUSHBUTTON);
@@ -160,8 +181,49 @@ void cleanupAndStartup(){Fixture f;app.hiddenToTray=true;configure();require(!pr
     require(updateTray(true),"Fixture tray registration failed");windowProc(app.window,WM_DESTROY,0,0);
     require(!app.engine&&!app.trayRegistered&&f.notifications(NIM_DELETE)==1&&probe::quits==1,"Window destruction leaked notification icon or engine");
 }
+void unchangedWork(){Fixture f;
+    for(State state:{State::Idle,State::Starting,State::Recording,State::Paused,State::Finishing}){
+        probe::current.state=state;f.tick();probe::resetWork();
+        for(int i=0;i<1000;++i)f.tick();
+        require(probe::statusQueries==1000&&probe::enables==0&&probe::textWrites==0&&probe::invalidated.empty()&&probe::notifications.empty(),"Unchanged visible status performed redundant visual work or lost observation");
+    }
+    f.close();probe::resetWork();for(int i=0;i<1000;++i)f.tick();
+    require(probe::statusQueries==1000&&probe::enables==0&&probe::textWrites==0&&probe::invalidated.empty()&&probe::notifications.empty(),"Unchanged hidden status performed redundant visual work or lost observation");
+    probe::resetWork();windowProc(app.window,WM_TIMER,99,0);require(probe::statusQueries==0,"Foreign timer polled engine status");
+}
+void scopedPaint(){Fixture f;probe::current.state=State::Recording;f.tick();app.scrollX=43;app.scrollY=61;
+    probe::resetWork();probe::current.frames=1;probe::current.elapsed=.2;f.tick();
+    RECT expected{app.scale(26)-43,app.contentHeight-app.scale(147)-61,app.contentWidth-app.scale(26)-43,app.contentHeight-app.scale(123)-61};
+    require(probe::invalidated.size()==1&&!probe::invalidated[0].whole&&probe::invalidated[0].window==app.window&&EqualRect(&expected,&probe::invalidated[0].rect)&&probe::enables==0,"Frame update did not invalidate only the scrolled statistics region");
+    probe::resetWork();probe::current.elapsed=.9;f.tick();require(probe::invalidated.empty(),"Fractional elapsed time repainted unchanged displayed seconds");
+    probe::current.elapsed=1;f.tick();require(probe::invalidated.size()==1,"Displayed second did not repaint statistics");
+    probe::resetWork();probe::current.message=L"New status";f.tick();require(probe::textWrites==1&&probe::invalidated.empty(),"Message update touched unrelated visuals");
+    probe::resetWork();probe::current.error=true;f.tick();require(probe::invalidated.size()==1&&probe::invalidated[0].window==app.statusText,"Error color did not repaint status text");
+    probe::resetWork();probe::current.preview=std::make_shared<Frame>();f.tick();require(probe::invalidated.size()==1&&probe::invalidated[0].window==app.preview,"New preview did not repaint only preview");
+    probe::resetWork();probe::current.state=State::Paused;f.tick();
+    require(probe::enables>0&&probe::textWrites==1&&probe::invalidated.size()==2&&!probe::invalidated[0].whole&&!probe::invalidated[1].whole,"State transition missed control, badge, or statistics update");
+}
+void deferredVisuals(bool minimized){Fixture f;probe::current.state=State::Recording;f.tick();
+    SendMessageW(app.lowDisk,BM_SETCHECK,BST_UNCHECKED,0);choose(app.stopAfter,2);configure();
+    if(minimized)probe::iconic=true;else f.close();
+    probe::resetWork();probe::current.state=State::Paused;probe::current.frames=8;probe::current.elapsed=100;
+    probe::current.message=L"Paused with a synthetic preview warning";probe::current.error=true;probe::current.preview=std::make_shared<Frame>();f.tick();
+    require(app.visibleDirty&&app.status.state==State::Paused&&probe::enables==0&&probe::textWrites==0&&probe::invalidated.empty(),"Hidden status changed visual controls or was discarded");
+    if(minimized){probe::iconic=false;windowProc(app.window,WM_SIZE,SIZE_RESTORED,0);}else f.command(TrayShow);
+    wchar_t value[128]{};GetWindowTextW(app.statusText,value,128);
+    require(!app.visibleDirty&&std::wstring(value)==probe::current.message&&!IsWindowEnabled(app.lowDisk)&&!probe::configured.stopOnLowDiskSpace&&probe::configured.recordingLimitSeconds==3600,"Restore lost deferred text, active lock, or Advanced settings");
+    GetWindowTextW(app.pause,value,128);require(std::wstring(value)==L"&Resume","Restore left a stale Pause label");
+    probe::resetWork();f.tick();require(probe::enables==0&&probe::textWrites==0&&probe::invalidated.empty(),"Restored status repeated its full refresh");
+}
+void unchangedTrayTip(){Fixture f;f.close();probe::resetWork();app.settings.separateFiles=true;
+    require(updateTray()&&app.trayStateValid&&app.traySeparate&&probe::notifications.empty(),"Equivalent idle tray text did not cache its new inputs");
+    probe::current.state=State::Recording;f.tick();require(probe::tip.find(L"desktop + camera files")!=std::wstring::npos,"Active separate-file tray summary was not refreshed");
+    probe::resetWork();app.status.recordingFailed=true;updateTray();
+    require(app.trayFailure&&probe::notifications.empty(),"Equivalent active tray text did not cache its failure input");
+}
 }
 int main(){std::cout<<std::unitbuf;try{
     hideAndShow();failedRegistration();restart(false);restart(true);legacyFallback();menuAndCommands();exitOutcome(false);exitOutcome(true);backgroundFailure();modifierFailure();cleanupAndStartup();
-    std::cout<<"PASS 11 tray lifecycle cases: owned hidden windows, synthetic engine, no tray icons, captures, input, or settings writes.\n";return 0;
+    unchangedWork();scopedPaint();deferredVisuals(false);deferredVisuals(true);unchangedTrayTip();
+    std::cout<<"PASS 16 tray/status cases: owned hidden windows, synthetic engine, no tray icons, captures, input, or settings writes.\n";return 0;
 }catch(const std::exception& error){std::cerr<<"FAIL: "<<error.what()<<'\n';return 1;}}

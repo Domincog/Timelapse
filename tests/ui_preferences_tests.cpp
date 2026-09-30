@@ -116,6 +116,8 @@ struct HiddenControls {
             for(int i=0;i<count;++i)add(window,std::to_wstring(i));choose(window,0);return window;
         };
         app.mode=combo(6);app.interval=combo(6);app.videoSize=combo(2);app.encodingQuality=combo(3);app.encodingMode=combo(5);app.stopAfter=combo(6);
+        app.lowDisk=CreateWindowExW(0,L"BUTTON",L"Stop on low disk space",WS_CHILD|BS_AUTOCHECKBOX,0,0,200,30,app.window,nullptr,nullptr,nullptr);
+        require(app.lowDisk!=nullptr,"Cannot create owned low disk option.");SendMessageW(app.lowDisk,BM_SETCHECK,BST_CHECKED,0);
     }
     ~HiddenControls(){DestroyWindow(app.window);app.window=nullptr;}
 };
@@ -228,7 +230,7 @@ void newUnicodeFile(){
 }
 void existingUnicodeRewrite(){
     PreferencesFixture fixture;
-    const std::wstring initial=L"[Settings]\r\nFolder="+unicodeFolder+L"\r\nInterval=5\r\nQuality=1\r\nEncodingQuality=2\r\nEncodingMode=0\r\nRecordingLimit=0\r\n";
+    const std::wstring initial=L"[Settings]\r\nFolder="+unicodeFolder+L"\r\nInterval=5\r\nQuality=1\r\nEncodingQuality=2\r\nEncodingMode=0\r\nRecordingLimit=0\r\nStopOnLowDiskSpace=1\r\n";
     fixture.seed(utf16(initial));reload();expectOptions(unicodeFolder,5,1,2);
     const auto initialBytes=fixture.bytes();
     const std::wstring changed=L"C:\\Synthetic videos\\\u65e5\u672c\u8a9e-\U0001f3a5";
@@ -270,6 +272,20 @@ void recordingLimits(){
         reload();require(choice(app.stopAfter)==0,"Invalid recording limit enabled automatic stop.");
     }
     fixture.onlySettingsRemain();std::cout<<"PASS recording limits roundtrip; old or invalid settings remain unlimited\n";
+}
+void diskSafety(){
+    PreferencesFixture fixture;fixture.seed(legacy);reload();
+    require(SendMessageW(app.lowDisk,BM_GETCHECK,0,0)==BST_CHECKED,"Old preferences disabled low disk protection.");
+    for(int checked:{BST_UNCHECKED,BST_CHECKED}){
+        SendMessageW(app.lowDisk,BM_SETCHECK,checked,0);preferences(true);
+        SendMessageW(app.lowDisk,BM_SETCHECK,checked==BST_CHECKED?BST_UNCHECKED:BST_CHECKED,0);reload();
+        require(SendMessageW(app.lowDisk,BM_GETCHECK,0,0)==checked,"Low disk protection lost its persisted selection.");
+    }
+    for(const wchar_t* invalid:{L"",L"-1",L"2",L"999",L"false",L"0junk",L"00000000000000000000000"}){
+        require(WritePrivateProfileStringW(L"Settings",L"StopOnLowDiskSpace",invalid,app.preferences.c_str())!=FALSE,"Cannot seed invalid low disk option.");
+        reload();require(SendMessageW(app.lowDisk,BM_GETCHECK,0,0)==BST_CHECKED,"Invalid low disk option disabled protection.");
+    }
+    fixture.onlySettingsRemain();std::cout<<"PASS low disk protection roundtrip; old and malformed settings keep protection enabled\n";
 }
 struct OwnedFile {
     HANDLE value=INVALID_HANDLE_VALUE;
@@ -381,10 +397,10 @@ int main(){
     try{
         std::cout<<std::unitbuf;std::cout<<"ACP="<<GetACP()<<'\n';
         HiddenControls controls;
-        newUnicodeFile();existingUnicodeRewrite();migrateAnsi();encodingModes();recordingLimits();readFailure();replacementFailure();
+        newUnicodeFile();existingUnicodeRewrite();migrateAnsi();encodingModes();recordingLimits();diskSafety();readFailure();replacementFailure();
         preparationAllocationFailure();partialKeyWriteFailure();stagedExceptionCleanup();
         preferencePathBoundary(248);preferencePathBoundary(278);
         require(!IsWindowVisible(app.window),"Fixture became visible.");
-        std::cout<<"All 12 preference cases passed; only owned hidden controls/settings were used.\n";return 0;
+        std::cout<<"All 13 preference cases passed; only owned hidden controls/settings were used.\n";return 0;
     }catch(const std::exception& error){std::cerr<<"PREFERENCES TEST FAILURE: "<<error.what()<<'\n';return 1;}
 }

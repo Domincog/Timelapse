@@ -96,6 +96,7 @@ int runCameraHost(const wchar_t*) { if(startupUnderTest)return -1; throw std::ru
 }
 namespace {
 bool overrideIndexes=false;
+std::wstring savedLowDisk=L"1";
 UINT savedInterval=0, savedSize=0, savedEncoding=0, savedEncodingMode=0, savedRecordingLimit=0;
 UINT WINAPI fixtureProfileInt(LPCWSTR, LPCWSTR key, INT fallback, LPCWSTR) {
     ++profileReads;
@@ -107,8 +108,9 @@ UINT WINAPI fixtureProfileInt(LPCWSTR, LPCWSTR key, INT fallback, LPCWSTR) {
     if(std::wcscmp(key,L"RecordingLimit")==0)return savedRecordingLimit;
     throw std::runtime_error("Unexpected persisted index.");
 }
-DWORD WINAPI fixtureProfileString(LPCWSTR,LPCWSTR,LPCWSTR fallback,LPWSTR target,DWORD capacity,LPCWSTR) {
+DWORD WINAPI fixtureProfileString(LPCWSTR,LPCWSTR key,LPCWSTR fallback,LPWSTR target,DWORD capacity,LPCWSTR) {
     ++profileReads;
+    if(overrideIndexes && std::wcscmp(key,L"StopOnLowDiskSpace")==0)fallback=savedLowDisk.c_str();
     const auto count=std::min<size_t>(std::wcslen(fallback),capacity-1);
     std::wmemcpy(target,fallback,count); target[count]=L'\0'; return static_cast<DWORD>(count);
 }
@@ -170,7 +172,7 @@ std::wstring caption(HWND box) {
 }
 struct HiddenFixture {
     HiddenFixture() {
-        app.dpi=96;
+        app.dpi=96;app.visibleDirty=true;app.controlsUpdated=false;
         app.window=CreateWindowExW(0,L"STATIC",L"Selection review",WS_OVERLAPPED,0,0,920,720,nullptr,nullptr,nullptr,nullptr);
         require(app.window!=nullptr,"Hidden parent creation.");
         auto child=[&](const wchar_t* cls,DWORD style) {
@@ -182,6 +184,7 @@ struct HiddenFixture {
             for(int i=0;i<count;++i)add(handle,std::to_wstring(i)); choose(handle,0); return handle;
         };
         app.mode=combo(6); app.interval=combo(6); app.videoSize=combo(2); app.encodingQuality=combo(3); app.encodingMode=combo(5);app.stopAfter=combo(6);
+        app.lowDisk=child(L"BUTTON",BS_AUTOCHECKBOX);SendMessageW(app.lowDisk,BM_SETCHECK,BST_CHECKED,0);
         app.monitor=combo(0); app.camera=combo(0);
         app.preview=child(L"STATIC",0);
         for(auto target:{&app.refresh,&app.record,&app.pause,&app.finish,&app.folder,&app.openFolder,&app.reset,&app.forward})
@@ -317,7 +320,7 @@ void activeControls() {
     seed(true);
     for(auto state:{State::Starting,State::Recording,State::Paused,State::Finishing}) {
         app.status.state=state; updateControls();
-        for(auto control:{app.refresh,app.mode,app.monitor,app.camera,app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.folder,app.record})
+        for(auto control:{app.refresh,app.mode,app.monitor,app.camera,app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.lowDisk,app.folder,app.record})
             require(!IsWindowEnabled(control),"An active-session source/settings control remained enabled.");
     }
     std::cout<<"PASS Refresh/source/settings controls disabled in Starting, Recording, Paused and Finishing.\n";
@@ -431,6 +434,11 @@ void indexLoads() {
         require(app.settings.recordingLimitSeconds==seconds[limit<=5?limit:0]&&lapse::configured.recordingLimitSeconds==app.settings.recordingLimitSeconds,"Persisted recording-limit mapping failed.");
     }
     savedRecordingLimit=0;
+    for(const wchar_t* value:{L"0",L"1",L"",L"-1",L"2",L"false",L"0junk"}){
+        savedLowDisk=value;preferences(false);configure();
+        require(app.settings.stopOnLowDiskSpace==(savedLowDisk!=L"0")&&lapse::configured.stopOnLowDiskSpace==app.settings.stopOnLowDiskSpace,"Persisted low disk protection validation failed.");
+    }
+    savedLowDisk=L"1";
     overrideIndexes=false; std::cout<<"PASS persisted defaults, valid indexes, high clamp and negative clamp; startup mode remains Desktop.\n";
 }
 void separateSources() {

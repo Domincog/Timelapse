@@ -149,7 +149,7 @@ LRESULT WINAPI fixtureDispatchMessage(const MSG* message){
 }
 std::vector<HWND> tabControls(){
     std::vector<HWND> result={app.mode,app.interval,app.videoSize,app.encodingQuality,app.monitor,app.camera,app.advanced,app.refresh};
-    if(app.advancedExpanded){result.push_back(app.encodingMode);result.push_back(app.stopAfter);}
+    if(app.advancedExpanded){result.push_back(app.encodingMode);result.push_back(app.stopAfter);result.push_back(app.lowDisk);}
     for(HWND child:{app.record,app.pause,app.finish,app.folder,app.openFolder,app.reset,app.forward,app.preview})result.push_back(child);
     return result;
 }
@@ -157,6 +157,7 @@ struct HiddenWindow {
     HiddenWindow(int width,int height,int dpi){
         app.dpi=dpi;app.scrollX=app.scrollY=app.wheelVertical=app.wheelHorizontal=0;
         app.contentWidth=app.contentHeight=0;app.layingOut=app.dragging=app.advancedExpanded=false;app.advancedLimitIndex=app.advancedVisibility=-1;
+        app.visibleDirty=true;app.controlsUpdated=false;app.hiddenToTray=false;
         ownedFocus=ownedCapture=nullptr;
         app.window=CreateWindowExW(0,L"STATIC",L"Owned hidden scrolling fixture",WS_POPUP|WS_CLIPCHILDREN,0,0,width,height,nullptr,nullptr,nullptr,nullptr);
         require(app.window && !IsWindowVisible(app.window),"Hidden parent creation failed.");
@@ -169,6 +170,7 @@ struct HiddenWindow {
         app.advanced=child(L"BUTTON",L"&Advanced",WS_TABSTOP|BS_AUTOCHECKBOX|BS_PUSHLIKE,AdvancedToggle);app.refresh=button(L"Re&fresh",Refresh);
         app.encodingMode=combo(6,L"Encodin&g",EncodingModeBox);app.stopAfter=combo(7,L"S&top after",StopAfterBox);
         SendMessageW(app.stopAfter,CB_RESETCONTENT,0,0);for(auto name:RecordingLimitLabels)add(app.stopAfter,name);choose(app.stopAfter,0);
+        app.lowDisk=child(L"BUTTON",L"Stop on &low disk space",WS_TABSTOP|BS_AUTOCHECKBOX,LowDiskBox);SendMessageW(app.lowDisk,BM_SETCHECK,BST_CHECKED,0);
         app.record=button(L"&Record",Record);app.pause=button(L"&Pause",Pause);app.finish=button(L"&Finish",Finish);
         app.folder=button(L"&Change...",Folder);app.openFolder=button(L"&Open folder",OpenFolder);app.reset=button(L"Reset layout",Reset);app.forward=button(L"Bring forward",Forward);
         app.preview=child(L"STATIC",L"Preview",WS_TABSTOP,Preview);app.statusText=child(L"STATIC",L"Ready",SS_LEFT|SS_CENTERIMAGE,210);
@@ -189,12 +191,16 @@ void checkLayout(){
     require(!intersects(bounds(app.finish),bounds(app.openFolder)),"Finish overlaps Open folder.");
     require(!intersects(bounds(app.monitor),bounds(app.camera)) && !intersects(bounds(app.camera),bounds(app.advanced)) &&
             !intersects(bounds(app.advanced),bounds(app.refresh)),"Source or Advanced controls overlap.");
-    if(app.advancedExpanded)require(!intersects(bounds(app.encodingMode),bounds(app.stopAfter))&&bounds(app.encodingMode).bottom<bounds(app.preview).top,"Advanced options overlap each other or preview.");
+    if(app.advancedExpanded)require(!intersects(bounds(app.encodingMode),bounds(app.stopAfter))&&!intersects(bounds(app.stopAfter),bounds(app.lowDisk))&&bounds(app.lowDisk).bottom<bounds(app.preview).top,"Advanced options overlap each other or preview.");
     HDC textDc=GetDC(app.mode);auto oldFont=SelectObject(textDc,app.font);SIZE labelSize{};
     GetTextExtentPoint32W(textDc,SeparateFilesLabel,static_cast<int>(std::wcslen(SeparateFilesLabel)),&labelSize);
     SelectObject(textDc,oldFont);ReleaseDC(app.mode,textDc);
     const RECT modeBounds=bounds(app.mode);
     require(labelSize.cx+GetSystemMetricsForDpi(SM_CXVSCROLL,app.dpi)+app.scale(12)<=modeBounds.right-modeBounds.left,"Separate-files label truncates in the selected source control.");
+    textDc=GetDC(app.lowDisk);oldFont=SelectObject(textDc,app.font);
+    const wchar_t diskLabel[]=L"Stop on low disk space";GetTextExtentPoint32W(textDc,diskLabel,_countof(diskLabel)-1,&labelSize);
+    SelectObject(textDc,oldFont);ReleaseDC(app.lowDisk,textDc);
+    require(labelSize.cx+app.scale(26)<=bounds(app.lowDisk).right-bounds(app.lowDisk).left,"Low disk checkbox label truncates at minimum layout width.");
     const auto preview=bounds(app.preview);
     require(preview.bottom-preview.top>=app.scale(160),"Preview is unusably short.");
     RECT local{};GetClientRect(app.preview,&local);require(equal(app.videoRect,previewVideoRect(local)),"Hit-test geometry was left waiting for paint.");
@@ -248,7 +254,7 @@ void scenario(int dpi,bool constrained){
 void advancedDisclosure(int dpi){
     HiddenWindow owned(MulDiv(500,dpi,96),MulDiv(400,dpi,96),dpi);
     auto styledVisible=[](HWND child){return (GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0;};
-    require(!app.advancedExpanded&&!styledVisible(app.encodingMode)&&!styledVisible(app.stopAfter)&&SendMessageW(app.advanced,BM_GETCHECK,0,0)==BST_UNCHECKED,"Advanced options were not collapsed by default.");
+    require(!app.advancedExpanded&&!styledVisible(app.encodingMode)&&!styledVisible(app.stopAfter)&&!styledVisible(app.lowDisk)&&SendMessageW(app.advanced,BM_GETCHECK,0,0)==BST_UNCHECKED,"Advanced options were not collapsed by default.");
     const auto collapsedHeight=app.contentHeight;
     for(int i=0;i<6;++i){
         choose(app.stopAfter,i);updateAdvanced();wchar_t label[128]{};GetWindowTextW(app.advanced,label,128);
@@ -259,16 +265,16 @@ void advancedDisclosure(int dpi){
         require(extent.cx+app.scale(18)<=bounds(app.advanced).right-bounds(app.advanced).left,"Finite-limit disclosure caption truncates at minimum layout width.");
     }
     ownedFocus=app.advanced;windowProc(app.window,WM_COMMAND,AdvancedToggle,0);
-    require(app.advancedExpanded&&styledVisible(app.encodingMode)&&styledVisible(app.stopAfter)&&SendMessageW(app.advanced,BM_GETCHECK,0,0)==BST_CHECKED,"Disclosure did not expose accessible checked state/options.");
+    require(app.advancedExpanded&&styledVisible(app.encodingMode)&&styledVisible(app.stopAfter)&&styledVisible(app.lowDisk)&&SendMessageW(app.advanced,BM_GETCHECK,0,0)==BST_CHECKED,"Disclosure did not expose accessible checked state/options.");
     require(app.contentHeight==collapsedHeight+app.scale(68),"Expanded options failed to claim their own layout row.");
-    require(GetNextDlgTabItem(app.window,app.refresh,FALSE)==app.encodingMode&&GetNextDlgTabItem(app.window,app.encodingMode,FALSE)==app.stopAfter,"Expanded native tab order skipped advanced options.");
-    checkLayout();checkFocusReachability();scrollTo(INT_MAX,INT_MAX);ownedFocus=app.stopAfter;
+    require(GetNextDlgTabItem(app.window,app.refresh,FALSE)==app.encodingMode&&GetNextDlgTabItem(app.window,app.encodingMode,FALSE)==app.stopAfter&&GetNextDlgTabItem(app.window,app.stopAfter,FALSE)==app.lowDisk,"Expanded native tab order skipped advanced options.");
+    checkLayout();checkFocusReachability();scrollTo(INT_MAX,INT_MAX);ownedFocus=app.lowDisk;
     windowProc(app.window,WM_COMMAND,AdvancedToggle,0);
     require(!app.advancedExpanded&&ownedFocus==app.advanced&&!styledVisible(app.labels[6])&&!styledVisible(app.labels[7]),"Collapsing stranded keyboard focus or labels.");
     require(app.contentHeight==collapsedHeight&&GetNextDlgTabItem(app.window,app.refresh,FALSE)==app.record,"Collapsed row retained blank height or hidden tab stops.");
     checkLayout();checkFocusReachability();
     app.status.state=State::Recording;updateControls();windowProc(app.window,WM_COMMAND,AdvancedToggle,0);
-    require(app.advancedExpanded&&IsWindowEnabled(app.advanced)&&!IsWindowEnabled(app.stopAfter)&&!IsWindowEnabled(app.encodingMode),"Recording froze disclosure or allowed advanced edits.");
+    require(app.advancedExpanded&&IsWindowEnabled(app.advanced)&&!IsWindowEnabled(app.stopAfter)&&!IsWindowEnabled(app.encodingMode)&&!IsWindowEnabled(app.lowDisk),"Recording froze disclosure or allowed advanced edits.");
     app.status={};updateControls();
     std::cout<<"PASS Advanced disclosure dpi="<<dpi<<" default, finite summaries, expansion, focus transfer, native tab order, scroll clamp, active lock\n";
 }
@@ -321,8 +327,8 @@ void dpiAndRouting(){
     dispatchAppMessage(app.window,message);
     require(app.dragging && app.scrollX==oldX && app.scrollY==oldY,"Mouse focus reveal moved the preview after drag start.");
     endLayoutDrag();ownedFocus=nullptr;
-    invalidatedWholeParent=false;windowProc(app.window,WM_TIMER,1,0);
-    require(invalidatedWholeParent,"Timer invalidates only an unscrolled footer.");
+    windowProc(app.window,WM_TIMER,1,0);invalidatedWholeParent=false;windowProc(app.window,WM_TIMER,1,0);
+    require(!invalidatedWholeParent,"Unchanged status invalidated the parent.");
     std::cout<<"PASS DPI offset scaling/reset, exact keyboard/mouse loop routing and timer invalidation\n";
 }
 void originalScenarios(){

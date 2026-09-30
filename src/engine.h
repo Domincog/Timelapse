@@ -23,6 +23,9 @@ struct Settings {
     // Active recording time, excluding initial startup and pauses. Nonpositive
     // values keep recording until the user finishes or a capture/save fails.
     int recordingLimitSeconds = 0;
+    // Best-effort room for finalization; query failure also stops admission.
+    // Disable only for destinations that cannot report caller-available space.
+    bool stopOnLowDiskSpace = true;
 };
 struct Status {
     State state = State::Idle;
