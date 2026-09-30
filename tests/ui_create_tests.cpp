@@ -309,12 +309,12 @@ struct OwnedFiles {
     }
     ~OwnedFiles(){
         failNextAllocation=false;fault=Fault::None;app.engine.reset();
-        // Only flat files inside the 56 fixed case directories created by
+        // Only flat files inside the 58 fixed case directories created by
         // this fixture are removed; no recursive traversal or user paths.
         std::error_code error;
         if(!ownedRun.is_absolute()||ownedRun.parent_path()!=base)return;
         for(const auto* name:{L"profile-copy",L"post-engine-synthetic",L"healthy",L"zero-timer-synthetic",L"failed-create",L"healthy-create",L"failed-timer-create",
-            L"required-100",L"required-101",L"required-102",L"required-103",L"required-104",L"required-105",L"required-106",L"required-107",L"required-108",L"required-109",L"required-110",L"required-111",L"required-112",L"required-113",L"required-114",L"required-115",L"required-116",L"required-117",L"required-118",L"required-119",L"required-120",L"required-121",L"required-122",L"required-123",L"required-124",L"required-125",L"required-126",L"required-127",L"required-128",L"required-129",L"required-130",
+            L"required-100",L"required-101",L"required-102",L"required-103",L"required-104",L"required-105",L"required-106",L"required-107",L"required-108",L"required-109",L"required-110",L"required-111",L"required-112",L"required-113",L"required-114",L"required-115",L"required-116",L"required-117",L"required-118",L"required-119",L"required-120",L"required-121",L"required-122",L"required-123",L"required-124",L"required-125",L"required-126",L"required-127",L"required-128",L"required-129",L"required-130",L"required-131",
             L"required-label-200",L"required-label-201",L"required-label-202",L"required-label-203",L"required-label-204",L"required-label-205",L"required-label-206",L"required-label-207",L"required-label-208",L"required-label-209",L"required-status",L"required-split-label",L"child-healthy",L"child-tooltip",
             L"os-child-interval",L"os-child-record",L"os-child-preview",L"os-child-healthy",L"os-child-tooltip"}){
             const auto directory=ownedRun/name;
@@ -339,7 +339,7 @@ int main(){
         const auto child=[&](const std::wstring& name,int id,bool tooltip=false){
             try{directChildCase(name,id,tooltip);++passed;}catch(const std::exception& error){failNextAllocation=false;++failed;std::cout<<"FAIL "<<error.what()<<'\n';}
         };
-        for(int id=ModeBox;id<=WatermarkSummary;++id)child(L"required-"+std::to_wstring(id),id);
+        for(int id=ModeBox;id<=StatusDetails;++id)child(L"required-"+std::to_wstring(id),id);
         for(int id=200;id<210;++id)child(L"required-label-"+std::to_wstring(id),id);
         child(L"required-status",210);child(L"required-split-label",211);child(L"child-healthy",-1);child(L"child-tooltip",-1,true);
         const auto className=L"TimelapseOwnedCreateTests-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64());
@@ -355,6 +355,6 @@ int main(){
         childOs(L"os-child-healthy",-1);childOs(L"os-child-tooltip",-1,true);
         require(UnregisterClassW(className.c_str(),cls.hInstance)!=FALSE,"Owned class was not released");
     }catch(const std::exception& error){failNextAllocation=false;++failed;std::cout<<"FAIL "<<error.what()<<'\n';}
-    std::cout<<passed<<"/57 cases passed: seven prior startup cases, 45 required-child direct controls and five hidden OS controls; children/fonts/Engine/timer synthetic, only owned preferences.\n";
-    return failed||passed!=57?1:0;
+    std::cout<<passed<<"/58 cases passed: seven prior startup cases, 46 required-child direct controls and five hidden OS controls; children/fonts/Engine/timer synthetic, only owned preferences.\n";
+    return failed||passed!=58?1:0;
 }

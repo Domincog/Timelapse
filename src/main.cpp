@@ -25,7 +25,7 @@ using namespace lapse;
 namespace {
 constexpr COLORREF Ink = RGB(25, 38, 45), Muted = RGB(88, 106, 113), Accent = RGB(0, 116, 113);
 constexpr COLORREF Background = RGB(247, 249, 250), Canvas = RGB(21, 28, 34);
-enum Id { ModeBox = 100, IntervalBox, SizeBox, EncodingQualityBox, MonitorBox, CameraBox, Refresh, Record, Pause, Finish, Folder, OpenFolder, Reset, Forward, Preview, EncodingModeBox, AdvancedToggle, StopAfterBox, LowDiskBox, NightBox, NightDurationBox, NightTargetBox, NightHint, NightDetail, SkipConfigure, SkipSummary, SkipDetail, RecoveryBox, SegmentBox, WatermarkConfigure, WatermarkSummary };
+enum Id { ModeBox = 100, IntervalBox, SizeBox, EncodingQualityBox, MonitorBox, CameraBox, Refresh, Record, Pause, Finish, Folder, OpenFolder, Reset, Forward, Preview, EncodingModeBox, AdvancedToggle, StopAfterBox, LowDiskBox, NightBox, NightDurationBox, NightTargetBox, NightHint, NightDetail, SkipConfigure, SkipSummary, SkipDetail, RecoveryBox, SegmentBox, WatermarkConfigure, WatermarkSummary, StatusDetails };
 constexpr int RecordingLimits[] = {0,900,3600,14400,28800,86400};
 constexpr int CaptureIntervals[] = {1000,2000,5000,10000,30000,60000};
 constexpr const wchar_t* RecordingLimitLabels[] = {L"Never",L"15 minutes",L"1 hour",L"4 hours",L"8 hours",L"24 hours"};
@@ -55,7 +55,7 @@ struct App {
         RECT bounds{};
         std::wstring sourceId;
     };
-    HWND window{}, preview{}, statusText{}, tooltip{};
+    HWND window{}, preview{}, statusText{}, statusDetails{}, tooltip{};
     HWND customDialog{};
     HWND skipConfigure{},skipSummary{},skipDetail{};
     HWND watermarkConfigure{},watermarkSummary{};
@@ -96,6 +96,7 @@ struct App {
     std::wstring nightValidation, encodingValidation, statusCaption, nightHintCaption, nightDetailCaption;
     std::wstring cameraListError, statusTooltipCaption;
     bool statusCaptionError = false;
+    int statusDetailsVisible = -1;
     bool hiddenToTray = false, trayRegistered = false, trayNoticeShown = false, trayVersion4 = false;
     UINT taskbarCreated = 0;
     std::wstring trayTooltip;
@@ -404,12 +405,62 @@ const wchar_t* statusTooltip() noexcept {
         return caption.c_str();
     }
 }
+bool hasStatusDetails() {
+    return app.status.error || app.status.recordingFailed || !app.status.savedPath.empty() || !app.status.savedPaths.empty() ||
+        (!app.active() && (!app.encodingValidation.empty() || !app.nightValidation.empty() || !app.watermarkValidation.empty())) || cameraListUnavailable();
+}
+std::wstring statusDetailsSnapshot() {
+    const auto& caption=statusCaption();
+    const bool outcome=app.status.error || app.status.recordingFailed || !app.status.savedPath.empty() || !app.status.savedPaths.empty();
+    const auto& primary=outcome && !app.status.message.empty()?app.status.message:caption;
+    std::wstring snapshot;snapshot.reserve(primary.size());
+    const auto append=[&](std::wstring_view value){
+        for(size_t i=0;i<value.size();++i){if(value[i]==L'\n' && (!i || value[i-1]!=L'\r'))snapshot+=L'\r';snapshot+=value[i];}
+    };
+    append(primary);
+    if(caption!=primary && !caption.empty()){append(L"\n\nCurrent setting:\n");append(caption);}
+    if(cameraListUnavailable()) {
+        if(app.cameraListError!=primary && app.cameraListError!=caption){append(L"\n\nCamera list:\n");append(app.cameraListError);}
+        append(L"\nRefresh sources to retry.");
+    }
+    return snapshot;
+}
+void revealFocusedControl();
+bool statusDetailsOwnerReady(HWND owner) {
+    return owner==app.window && IsWindow(owner) && IsWindowVisible(owner) && IsWindowEnabled(owner) &&
+        !app.hiddenToTray && !IsIconic(owner) && !app.closeWhenDone && app.failureNotice!=FailureNotice::Presenting;
+}
+void restoreStatusFocus(HWND owner,HWND preferred) {
+    if(!statusDetailsOwnerReady(owner))return;
+    HWND target=nullptr;
+    for(HWND child:{preferred,app.openFolder})if(child && IsChild(owner,child) && IsWindowVisible(child) && IsWindowEnabled(child) &&
+        (GetWindowLongPtrW(child,GWL_STYLE)&WS_TABSTOP)){target=child;break;}
+    SetFocus(target?target:owner);revealFocusedControl();
+}
+void layoutStatusRow() {
+    if(app.contentWidth<=0 || app.contentHeight<=0)return;
+    const int pad=app.scale(26),width=app.contentWidth-2*pad,details=app.statusDetailsVisible==1?app.scale(88):0;
+    const int top=app.contentHeight-app.scale(124)-app.scrollY;
+    MoveWindow(app.statusText,pad-app.scrollX,top,width-(details?details+app.scale(10):0),app.scale(25),TRUE);
+    if(app.statusDetails && GetParent(app.statusDetails)==app.window)
+        MoveWindow(app.statusDetails,app.contentWidth-pad-app.scale(88)-app.scrollX,top,app.scale(88),app.scale(25),TRUE);
+}
+void updateStatusDetails() {
+    if(!app.statusDetails || !IsWindow(app.statusDetails) || GetParent(app.statusDetails)!=app.window)return;
+    const bool visible=hasStatusDetails();
+    if(app.statusDetailsVisible==static_cast<int>(visible))return;
+    app.statusDetailsVisible=static_cast<int>(visible);
+    if(!visible && GetFocus()==app.statusDetails)restoreStatusFocus(app.window,app.openFolder);
+    ShowWindow(app.statusDetails,visible?SW_SHOWNA:SW_HIDE);
+    layoutStatusRow();
+}
 void updateStatusText(bool force=false) {
     const auto& caption=statusCaption();const bool error=statusCaptionError();
     if(app.hiddenToTray || IsIconic(app.window)) {
         if(force || caption!=app.statusCaption || error!=app.statusCaptionError)app.visibleDirty=true;
         return;
     }
+    updateStatusDetails();
     if(force || caption!=app.statusCaption){SetWindowTextW(app.statusText,caption.c_str());app.statusCaption=caption;}
     if(error!=app.statusCaptionError){InvalidateRect(app.statusText,nullptr,TRUE);app.statusCaptionError=error;}
 }
@@ -856,7 +907,7 @@ void layout() {
     move(app.reset,r.right-pad-app.scale(240),previewTop+previewH+app.scale(10),app.scale(113),app.scale(27));
     move(app.forward,r.right-pad-app.scale(120),previewTop+previewH+app.scale(10),app.scale(120),app.scale(27));
     move(app.folder,r.right-pad-app.scale(92),r.bottom-app.scale(92),app.scale(92),app.scale(26));
-    move(app.statusText,pad,r.bottom-app.scale(124),width,app.scale(25));
+    layoutStatusRow();
     move(app.record,pad,r.bottom-app.scale(54),app.scale(150),app.scale(34));
     move(app.pause,pad+app.scale(160),r.bottom-app.scale(54),app.scale(106),app.scale(34));
     move(app.finish,pad+app.scale(276),r.bottom-app.scale(54),app.scale(106),app.scale(34));
@@ -937,7 +988,7 @@ void fonts() {
     app.titleFont = CreateFontW(-app.scale(25),0,0,0,FW_SEMIBOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
     app.smallFont = CreateFontW(-app.scale(12),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
     EnumChildWindows(app.window,[](HWND w,LPARAM p)->BOOL { SendMessageW(w,WM_SETFONT,p,TRUE); return TRUE; },reinterpret_cast<LPARAM>(app.font));
-    for(HWND child:{app.statusText,app.nightHint,app.nightDetail,app.skipDetail})if(child)SendMessageW(child,WM_SETFONT,reinterpret_cast<WPARAM>(app.smallFont),TRUE);
+    for(HWND child:{app.statusText,app.statusDetails,app.nightHint,app.nightDetail,app.skipDetail})if(child)SendMessageW(child,WM_SETFONT,reinterpret_cast<WPARAM>(app.smallFont),TRUE);
 }
 
 enum class CustomKind { Interval, Size, Limit, Range, Segment };
@@ -1016,6 +1067,98 @@ void customFont(HWND window,CustomDraft& draft) {
     draft.font=CreateFontW(-draft.scale(14),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
     EnumChildWindows(window,[](HWND child,LPARAM font)->BOOL {SendMessageW(child,WM_SETFONT,font,TRUE);return TRUE;},reinterpret_cast<LPARAM>(draft.font));
     if(previous)DeleteObject(previous);
+}
+constexpr int StatusDetailsText=5401;
+struct StatusDetailsDraft : CustomDraft { std::wstring snapshot; HWND contents{}; };
+constexpr wchar_t StatusDetailsHelp[]=L"Snapshot when opened. Select text, or press Ctrl+A, then Ctrl+C to copy.";
+LRESULT CALLBACK statusDetailsEditProc(HWND window,UINT message,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR) {
+    if((message==WM_KEYDOWN && wp=='A') || (message==WM_CHAR && wp==1)){
+        const bool selectAll=(GetKeyState(VK_CONTROL)&0x8000) && !(GetKeyState(VK_MENU)&0x8000);
+        if(selectAll){if(message==WM_KEYDOWN)SendMessageW(window,EM_SETSEL,0,-1);return 0;}
+    }
+    return DefSubclassProc(window,message,wp,lp);
+}
+void statusDetailsLayout(HWND window,StatusDetailsDraft& draft) {
+    if(draft.layingOut)return;draft.layingOut=true;
+    RECT client{};GetClientRect(window,&client);
+    const int width=std::max(1L,client.right),height=std::max(1L,client.bottom);
+    const int pad=std::min(draft.scale(18),std::max(1,std::min(width,height)/12)),gap=std::min(draft.scale(12),pad);
+    const int inner=std::max(1,width-2*pad),buttonH=draft.scale(28);
+    RECT measured{0,0,inner,0};HDC dc=GetDC(window);
+    if(dc){const auto previous=SelectObject(dc,draft.font?draft.font:GetStockObject(DEFAULT_GUI_FONT));
+        DrawTextW(dc,StatusDetailsHelp,-1,&measured,DT_CALCRECT|DT_WORDBREAK|DT_NOPREFIX);SelectObject(dc,previous);ReleaseDC(window,dc);}
+    const int helpH=std::max(draft.scale(32),static_cast<int>(measured.bottom));
+    const int buttonY=std::max(pad,height-pad-buttonH),textY=pad+helpH+gap;
+    MoveWindow(draft.help,pad,pad,inner,helpH,TRUE);
+    MoveWindow(draft.contents,pad,textY,inner,std::max(1,buttonY-gap-textY),TRUE);
+    const int buttonW=std::min(draft.scale(88),inner);
+    MoveWindow(draft.cancel,width-pad-buttonW,buttonY,buttonW,buttonH,TRUE);
+    draft.layingOut=false;
+}
+INT_PTR CALLBACK statusDetailsProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
+    auto* draft=reinterpret_cast<StatusDetailsDraft*>(GetWindowLongPtrW(window,DWLP_USER));
+    try {
+        if(message==WM_INITDIALOG){
+            draft=reinterpret_cast<StatusDetailsDraft*>(lp);SetWindowLongPtrW(window,DWLP_USER,lp);
+            draft->previousDialog=app.customDialog;app.customDialog=window;
+            draft->dpi=static_cast<int>(GetDpiForWindow(window));if(draft->dpi<=0)draft->dpi=app.dpi;
+            SetWindowTextW(window,L"Status details");
+            const auto child=[&](const wchar_t* type,const wchar_t* label,DWORD style,int id){return CreateWindowExW(std::wcscmp(type,L"EDIT")==0?WS_EX_CLIENTEDGE:0,
+                type,label,WS_CHILD|WS_VISIBLE|style,0,0,1,1,window,reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),GetModuleHandleW(nullptr),nullptr);};
+            draft->help=child(L"STATIC",StatusDetailsHelp,SS_NOPREFIX,5400);
+            draft->contents=child(L"EDIT",L"",WS_TABSTOP|WS_VSCROLL|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY,StatusDetailsText);
+            draft->cancel=child(L"BUTTON",L"Close",WS_TABSTOP|BS_DEFPUSHBUTTON,IDCANCEL);
+            if(!draft->help || !draft->contents || !draft->cancel ||
+                !SetWindowSubclass(draft->contents,statusDetailsEditProc,1,0)){EndDialog(window,-1);return TRUE;}
+            SendMessageW(draft->contents,EM_SETLIMITTEXT,0,0);
+            if(draft->snapshot.size()>INT_MAX || !SetWindowTextW(draft->contents,draft->snapshot.c_str()) ||
+                static_cast<size_t>(GetWindowTextLengthW(draft->contents))!=draft->snapshot.size()){EndDialog(window,-1);return TRUE;}
+            customFont(window,*draft);
+            RECT rect{0,0,draft->scale(640),draft->scale(380)};
+            AdjustWindowRectExForDpi(&rect,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_STYLE)),FALSE,
+                static_cast<DWORD>(GetWindowLongPtrW(window,GWL_EXSTYLE)),draft->dpi);
+            RECT owner{};GetWindowRect(GetWindow(window,GW_OWNER),&owner);
+            OffsetRect(&rect,(owner.left+owner.right-(rect.right-rect.left))/2-rect.left,(owner.top+owner.bottom-(rect.bottom-rect.top))/2-rect.top);
+            rect=fitWindow(rect,workArea(MonitorFromWindow(GetWindow(window,GW_OWNER),MONITOR_DEFAULTTONEAREST)));
+            SetWindowPos(window,nullptr,rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top,SWP_NOZORDER|SWP_NOACTIVATE);
+            statusDetailsLayout(window,*draft);SetFocus(draft->contents);SendMessageW(draft->contents,EM_SETSEL,0,0);return FALSE;
+        }
+        if(!draft)return FALSE;
+        switch(message){
+        case WM_SIZE:statusDetailsLayout(window,*draft);return TRUE;
+        case WM_GETMINMAXINFO:{RECT minimum{0,0,draft->scale(320),draft->scale(220)};
+            AdjustWindowRectExForDpi(&minimum,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_STYLE)),FALSE,
+                static_cast<DWORD>(GetWindowLongPtrW(window,GWL_EXSTYLE)),draft->dpi);
+            const RECT work=workArea(MonitorFromWindow(window,MONITOR_DEFAULTTONEAREST));auto* limits=reinterpret_cast<MINMAXINFO*>(lp);
+            limits->ptMinTrackSize={std::min(minimum.right-minimum.left,work.right-work.left),std::min(minimum.bottom-minimum.top,work.bottom-work.top)};return TRUE;}
+        case WM_DPICHANGED:{draft->dpi=HIWORD(wp);customFont(window,*draft);
+            RECT rect=*reinterpret_cast<RECT*>(lp);rect=fitWindow(rect,workArea(MonitorFromRect(&rect,MONITOR_DEFAULTTONEAREST)));
+            SetWindowPos(window,nullptr,rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top,SWP_NOZORDER|SWP_NOACTIVATE);
+            statusDetailsLayout(window,*draft);return TRUE;}
+        case WM_COMMAND:if((LOWORD(wp)==IDCANCEL || LOWORD(wp)==IDOK) && HIWORD(wp)==BN_CLICKED){EndDialog(window,IDCANCEL);return TRUE;}break;
+        case WM_CTLCOLORSTATIC:if(reinterpret_cast<HWND>(lp)==draft->contents){SetTextColor(reinterpret_cast<HDC>(wp),Ink);
+            SetBkColor(reinterpret_cast<HDC>(wp),GetSysColor(COLOR_WINDOW));return reinterpret_cast<INT_PTR>(GetSysColorBrush(COLOR_WINDOW));}break;
+        case WM_CLOSE:EndDialog(window,IDCANCEL);return TRUE;
+        case WM_DESTROY:if(draft->font){DeleteObject(draft->font);draft->font=nullptr;}
+            if(app.customDialog==window)app.customDialog=IsWindow(draft->previousDialog)?draft->previousDialog:nullptr;return TRUE;
+        }
+    } catch(...){EndDialog(window,-1);return TRUE;}
+    return FALSE;
+}
+void showStatusDetails() {
+    const HWND owner=app.window,focused=GetFocus();
+    if(app.customDialog || !statusDetailsOwnerReady(owner) || !hasStatusDetails())return;
+    bool failed=false;
+    try {
+        // Own all text before entering a nested message loop. The native edit
+        // receives this snapshot once, so timers cannot disturb selection.
+        StatusDetailsDraft draft;draft.snapshot=statusDetailsSnapshot();CustomTemplate resource;
+        resource.dialog.style|=WS_THICKFRAME;
+        failed=DialogBoxIndirectParamW(GetModuleHandleW(nullptr),&resource.dialog,owner,statusDetailsProc,reinterpret_cast<LPARAM>(&draft))==-1;
+    } catch(...) {failed=true;}
+    if(!statusDetailsOwnerReady(owner))return;
+    if(failed)MessageBoxW(owner,L"Status details could not be opened. The original report is still available in the status line and its tooltip. Try again.",L"Timelapse",MB_OK|MB_ICONERROR);
+    restoreStatusFocus(owner,focused);
 }
 bool validateCustom(CustomDraft& draft,std::wstring& message,HWND& invalid) {
     wchar_t first[96]{},second[96]{};invalid=draft.first;
@@ -1942,6 +2085,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         app.trayMenuOpen=app.trayMenuCanceled=false;
         app.advancedNightState=app.advancedRecoveryState=app.nightVisibility=-1;app.nightValidation.clear();app.encodingValidation.clear();app.statusCaption.clear();app.statusCaptionError=false;app.nightHintCaption.clear();app.nightDetailCaption.clear();
         app.cameraListError.clear();app.statusTooltipCaption.clear();
+        app.statusDetailsVisible=-1;
         app.customDialog=nullptr;app.advancedCaption.clear();app.advancedTooltip.clear();
         app.skipRevision=0;app.advancedSkipRevision=app.skipSummaryRevision=app.skipVisibility=-1;app.skipCheckAge=UINT64_MAX;
         app.skipSummaryCaption.clear();app.skipDetailCaption.clear();app.settings.timeSkip={};
@@ -1993,12 +2137,14 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         app.record=button(L"●  &Record",Record);app.pause=button(L"&Pause",Pause);app.finish=button(L"&Finish",Finish);app.folder=button(L"&Change...",Folder);app.openFolder=button(L"&Open folder",OpenFolder);app.reset=button(L"Reset layout",Reset);app.forward=button(L"Bring forward",Forward);
         app.preview=requiredControl(L"LapsePreview",L"Collage preview. Space selects a layer. Arrow keys move it. Shift and arrow keys resize it.",WS_TABSTOP,Preview);
         app.statusText=requiredControl(L"STATIC",app.status.message.c_str(),SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX,210);
+        app.statusDetails=button(L"Deta&ils...",StatusDetails);
         if(!controlsReady) {
             app.mode=nullptr;
             OutputDebugStringW(L"Timelapse could not create its required controls.\n");
             return -1;
         }
         SendMessageW(app.statusText,WM_SETFONT,reinterpret_cast<WPARAM>(app.smallFont),TRUE);
+        SendMessageW(app.statusDetails,WM_SETFONT,reinterpret_cast<WPARAM>(app.smallFont),TRUE);
         SendMessageW(app.nightHint,WM_SETFONT,reinterpret_cast<WPARAM>(app.smallFont),TRUE);SendMessageW(app.nightDetail,WM_SETFONT,reinterpret_cast<WPARAM>(app.smallFont),TRUE);
         SendMessageW(app.skipDetail,WM_SETFONT,reinterpret_cast<WPARAM>(app.smallFont),TRUE);
         app.tooltip=CreateWindowExW(WS_EX_TOPMOST,TOOLTIPS_CLASSW,nullptr,WS_POPUP|TTS_ALWAYSTIP|TTS_NOPREFIX,0,0,0,0,w,nullptr,nullptr,nullptr);
@@ -2157,6 +2303,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
             InvalidateRect(w,nullptr,FALSE);return 0;
         }
         switch(id) {
+        case StatusDetails:if(code==BN_CLICKED)showStatusDetails();break;
         case AdvancedToggle:toggleAdvanced();break;
         case SkipConfigure:editSkip();break;
         case WatermarkConfigure:if(code==BN_CLICKED)editWatermark();break;
