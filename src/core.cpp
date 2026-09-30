@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <new>
 #include <stdexcept>
+#include <emmintrin.h>
 
 namespace lapse {
 namespace {
@@ -54,10 +55,17 @@ void draw(const Frame& source, Frame& target, const PixelRect& bounds,
     if (width == source.width && height == source.height) {
         // Desktop capture normally already matches the output size. Avoid
         // resampling those pixels while still normalizing ignored source alpha.
+        const auto opaqueAlpha = _mm_set1_epi32(-0x01000000); // 0xFF000000 per BGRA pixel.
         for (int y = 0; y < height; ++y) {
             const auto* input = source.pixels.data() + size_t(y) * source.width * 4;
             auto* output = target.pixels.data() + (size_t(top + y) * target.width + left) * 4;
-            for (int x = 0; x < width; ++x, input += 4, output += 4) {
+            // Four unaligned pixels at a time; the tail never crosses a row.
+            int x = 0;
+            for (; x + 4 <= width; x += 4, input += 16, output += 16) {
+                const auto pixels = _mm_loadu_si128(reinterpret_cast<const __m128i*>(input));
+                _mm_storeu_si128(reinterpret_cast<__m128i*>(output), _mm_or_si128(pixels, opaqueAlpha));
+            }
+            for (; x < width; ++x, input += 4, output += 4) {
                 output[0] = input[0];
                 output[1] = input[1];
                 output[2] = input[2];

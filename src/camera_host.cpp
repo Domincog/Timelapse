@@ -327,13 +327,26 @@ int hostMain(const wchar_t* mappingName) {
                 uint64_t receivedTick = 0;
                 const Frame* publication = nullptr;
                 if (requested && requestedKind == PixelRequest::Preview) {
-                    if (observationRequested) {
-                        CameraSampleInfo info;
-                        if (camera.latestNewer(frame, error, info, {})) {
-                            publication = &frame; receivedTick = info.receivedTick;
-                            rawObservation = &frame; rawInfo = info;
+                    // Initial Night preparation may also need ordinary preview.
+                    // Reuse this iteration's fresh raw contribution, never the
+                    // processed blend. Off-mode adds no clock or source read.
+                    if (rawObservation) {
+                        const uint64_t previewAt = GetTickCount64();
+                        if (rawObservation->valid() && rawObservation->width <= int(maxWidth) &&
+                            rawObservation->height <= int(maxHeight) && rawInfo.receivedTick && rawInfo.receivedTick <= previewAt &&
+                            previewAt - rawInfo.receivedTick <= 3000) {
+                            publication = rawObservation; receivedTick = rawInfo.receivedTick;
                         }
-                    } else if (camera.latest(frame, error, receivedTick)) publication = &frame;
+                    }
+                    if (!publication) {
+                        if (observationRequested) {
+                            CameraSampleInfo info;
+                            if (camera.latestNewer(frame, error, info, {})) {
+                                publication = &frame; receivedTick = info.receivedTick;
+                                rawObservation = &frame; rawInfo = info;
+                            }
+                        } else if (camera.latest(frame, error, receivedTick)) publication = &frame;
+                    }
                     if (!publication && !error.empty()) { publishError(error); result = 10; break; }
                 } else if (requested && requestedKind == PixelRequest::Night && requestedToken == nightToken &&
                            nightState == NightState::Complete && cancelledNight(*view.value) < nightCommand) {

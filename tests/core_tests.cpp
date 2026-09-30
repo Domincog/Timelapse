@@ -160,6 +160,39 @@ void fullSizeComposition() {
     check(!okay && allocationFailed && !error.empty() && output.width == 2 && output.height == 2 &&
           output.pixels == oldPixels, "failed full-size output growth preserves the previous frame");
 }
+void exactCopyTailsAndPlacement() {
+    using namespace lapse;
+    // Odd source widths give unaligned row starts. Centering within different
+    // even output widths independently varies destination alignment.
+    for (int width = 1; width <= 19; ++width) {
+        Frame original{width, 8, std::vector<uint8_t>(size_t(width) * 8 * 4)};
+        for (size_t i = 0; i < original.pixels.size(); ++i)
+            original.pixels[i] = static_cast<uint8_t>((i * 53 + i / 7) & 255);
+        for (int gap = 0; gap < 8; gap += 2) {
+            const int targetWidth = width + width % 2 + gap;
+            const int left = (targetWidth - width) / 2;
+            const auto layers = preset(Mode::Camera);
+            for (bool alias : {false, true}) {
+                auto source = original;
+                Frame separate;
+                auto& output = alias ? source : separate;
+                std::wstring error;
+                check(compose(nullptr, &source, layers, targetWidth, 8, output, error),
+                      "exact-copy rows with every vector tail and destination alignment compose");
+                bool correct = output.valid() && output.width == targetWidth && output.height == 8;
+                for (int y = 0; correct && y < 8; ++y) for (int x = 0; x < targetWidth; ++x) {
+                    const auto* actual = output.pixels.data() + (size_t(y) * targetWidth + x) * 4;
+                    if (x >= left && x < left + width) {
+                        const auto* expected = original.pixels.data() + (size_t(y) * width + x - left) * 4;
+                        correct &= actual[0] == expected[0] && actual[1] == expected[1] && actual[2] == expected[2];
+                    } else correct &= actual[0] == 20 && actual[1] == 20 && actual[2] == 20;
+                    correct &= actual[3] == 255;
+                }
+                check(correct, "exact-copy tails preserve colors, alpha, letterbox pixels and aliased input");
+            }
+        }
+    }
+}
 void failuresAndLimits() {
     using namespace lapse;
     auto desktop = solid(2, 2, 0, 230, 0);
@@ -248,6 +281,7 @@ int main() {
     geometry();
     composition();
     fullSizeComposition();
+    exactCopyTailsAndPlacement();
     failuresAndLimits();
     errorFormattingAndAllocationCleanup();
     if (failures) { std::cerr << failures << " check(s) failed\n"; return 1; }

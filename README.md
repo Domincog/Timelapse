@@ -123,9 +123,9 @@ The app retains the latest preview and camera frame, and writes samples incremen
 
 Desktop capture reuses its recording surface alongside a bounded preview surface, avoiding repeated native allocations as capture and preview sizes alternate. The extra preview surface uses at most 900 KiB. This keeps the recording-sized surface resident between saved frames while recording is visible, trading retained memory for reuse. Pause and Finish release the native surfaces even when the window stays visible; continued preview recreates only what it needs. Hidden idle or paused sessions and switching away from desktop capture release them too.
 
-A single full-frame source already matching the output size avoids unnecessary composition scratch allocation and background clearing. Pixel values, alpha handling, and the scaling/letterboxing used by other layouts are unchanged.
+A single full-frame source already matching the output size avoids unnecessary composition scratch allocation and background clearing. Sources that need no scaling copy four pixels at a time using the SSE2 instructions available on supported x64 processors, including matching-size layers within a collage. Pixel values, alpha handling, and scaling/letterboxing are unchanged.
 
-While a night window is active, its camera helper blends up to five distinct contributions per second, at up to 720p, using fixed-size accumulation buffers. Intermediate frames stay in the helper; only the completed blend crosses to the recorder. These optional buffers are released when night recording is cancelled or finished. Hardware camera capture/conversion can still consume resources independently of the blend processing.
+While a night window is active, its camera helper blends up to five distinct contributions per second, at up to 720p, using fixed-size accumulation buffers. Intermediate blend data stays in the helper; only the completed blend crosses to the recorder. During initial Night preparation, raw preview can reuse a fresh contribution from the same helper iteration instead of converting it again. After the first completed blend, preview holds the processed image. These optional buffers are released when night recording is cancelled or finished. Hardware camera capture/conversion can still consume resources independently of the blend processing.
 
 Camera access runs in a private helper process launched from the same executable. A stuck camera driver can be stopped without trapping the app in shutdown. The helper exits with its parent and uses only local shared memory; there are no network services.
 
@@ -186,7 +186,7 @@ This also checks BT.709 limited-range color metadata. FFmpeg is used only by the
 
 After building and testing, run `./package.ps1` to create both archives in `packages/`. The release ZIP is intended for GitHub Releases. Extract the source ZIP into an empty folder, then run the build commands from that folder; build outputs, test recordings, and local settings are excluded.
 
-To also create `Timelapse-v0.11.0-windows-x64-setup.exe`, supply an installed or portable Inno Setup 7 compiler:
+To also create `Timelapse-v0.12.0-windows-x64-setup.exe`, supply an installed or portable Inno Setup 7 compiler:
 
 ```powershell
 .\package.ps1 -InstallerCompiler 'C:\Path\To\Inno Setup 7\ISCC.exe'

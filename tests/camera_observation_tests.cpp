@@ -172,12 +172,101 @@ void nightSampleReuse() {
     lapse::Frame frame; h.completed(300, frame);
     std::cout << "PASS in-progress Night windows share raw contributions without optional extra reads\n";
 }
+void checkRawPreviewPixels(const lapse::Frame& frame, bool large) {
+    require(frame.width == (large ? 1280 : 64) && frame.height == (large ? 720 : 36), "raw preview geometry changed");
+    for (size_t i = 0; i < frame.pixels.size(); i += 4)
+        require(frame.pixels[i] == 32 && frame.pixels[i+1] == 32 && frame.pixels[i+2] == 32 && frame.pixels[i+3] == 255,
+                "preview did not contain exact unprocessed source pixels");
+}
+void nightPreviewReuse(bool large, bool integrating, bool observing) {
+    Harness h(large ? L"night-720p" : L"night-live"); h.first();
+    if (integrating) {
+        h.begin(1, 2000);
+        bool ready = false; const auto until = GetTickCount64() + 2000;
+        while (!ready && GetTickCount64() < until) {
+            h.inspect([&](auto& shared) { ready = shared.nightState == lapse::NightState::Integrating; });
+            if (!ready) Sleep(1);
+        }
+        require(ready, "Night watermark did not start a full window");
+    }
+    require(WaitForSingleObject(h.mutex.value, 1000) == WAIT_OBJECT_0, "hold private transport");
+    bool queued = false; LONG before = 0; lapse::Frame frame; std::wstring error;
+    try {
+        if (!integrating) h.begin(1, 2000);
+        if (observing) { lapse::CameraObservation output; h.client.observeActivity(9, output, error); require(error.empty(), "queue optional observation"); }
+        queued = !h.client.latest(frame, error) && error.empty();
+        // The helper cannot accept these requests until release. Ensure its
+        // next integration read is due in the same iteration as the preview.
+        if (integrating) Sleep(250);
+        before = h.control().copies;
+    } catch (...) { ReleaseMutex(h.mutex.value); throw; }
+    ReleaseMutex(h.mutex.value);
+    require(queued, "preview unexpectedly completed behind held transport");
+    bool received = false; const auto until = GetTickCount64() + 1000;
+    while (!received && GetTickCount64() < until) {
+        received = h.client.latest(frame, error); require(error.empty(), "combined preview failed");
+        if (!received) Sleep(1);
+    }
+    require(received, "combined preview did not arrive"); checkRawPreviewPixels(frame, large);
+    const LONG delta = h.control().copies - before;
+    h.inspect([](auto& shared) {
+        require(shared.publishedRequest == shared.completed && shared.publishedKind == lapse::PixelRequest::Preview &&
+            shared.publishedToken == 0, "raw preview lost request ownership");
+        require(shared.receivedTick == shared.nightSourceTick, "raw preview replaced the reused source receipt timestamp");
+    });
+    require(delta == 1, "Preview repeated an already available raw Night conversion");
+    if (observing) {
+        lapse::CameraObservation output; bool ready = false; const auto end = GetTickCount64() + 500;
+        while (!ready && GetTickCount64() < end) { ready = h.client.observeActivity(9, output, error); require(error.empty(), "read shared observation"); if (!ready) Sleep(1); }
+        require(ready && output.descriptor.y[0] == 32 && output.sourceWidth == frame.width,
+            "observation lost raw provenance or pixels");
+    }
+    std::cout << "PASS shared raw preview size=" << (large ? "720p" : "64x36") << " integrating=" << integrating
+        << " observation=" << observing << " rawCopies=" << delta << " exactPixels=true\n";
+    h.client.cancelNight(); h.client.cancelActivityObservation();
+}
+void nightPreviewFallback(const wchar_t* mode, const wchar_t* diagnostic) {
+    Harness h(mode); h.first(); h.begin(1, 2000);
+    bool ready = false; const auto until = GetTickCount64() + 2000;
+    while (!ready && GetTickCount64() < until) {
+        h.inspect([&](auto& shared) { ready = shared.nightState == lapse::NightState::Integrating; });
+        if (!ready) Sleep(1);
+    }
+    require(ready, "fault control did not start Night window");
+    require(WaitForSingleObject(h.mutex.value, 1000) == WAIT_OBJECT_0, "hold fault control transport");
+    lapse::Frame frame; std::wstring error; bool queued = false; LONG before = 0;
+    try { queued = !h.client.latest(frame,error) && error.empty(); Sleep(250); before = h.control().copies; }
+    catch (...) { ReleaseMutex(h.mutex.value); throw; }
+    ReleaseMutex(h.mutex.value); require(queued, "fault preview was not queued");
+    ready = false; const auto end = GetTickCount64() + 1000;
+    while (!ready && GetTickCount64() < end) {
+        ready = h.client.latest(frame,error); require(error.empty(), "invalid Night raw input contaminated ordinary preview");
+        if (!ready) Sleep(1);
+    }
+    require(ready, "fresh fallback preview missing"); checkRawPreviewPixels(frame,false);
+    require(h.control().copies - before == 2, "invalid Night raw frame bypassed normal preview conversion");
+    if (diagnostic) require(h.failed(1).find(diagnostic) != std::wstring::npos, "Night lost its independent failure diagnostic");
+    h.inspect([](auto& shared) {
+        require(shared.publishedKind == lapse::PixelRequest::Preview && shared.publishedToken == 0 &&
+            shared.receivedTick <= GetTickCount64() && GetTickCount64() - shared.receivedTick < 1000,
+            "fallback preview lost typed publication or actual fresh receipt time");
+    });
+    h.client.cancelNight();
+    std::wcout << L"PASS raw preview fallback " << mode << L" rawCopies=2 exactPreview=true nightFailureChecked="
+        << (diagnostic != nullptr) << L'\n';
+}
 }
 int main() {
     const int host = lapse::runCameraHost(nullptr); if (host >= 0) return host;
     const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED); if (FAILED(com)) return 2;
     int result = 0;
-    try { baselineAndCoalescing(); pinnedNight(); duplicateDeadlineAndIsolation(); cancellationAndProvenance(); nightDeliveryPriority(); nightSampleReuse(); }
+    try { baselineAndCoalescing(); pinnedNight(); duplicateDeadlineAndIsolation(); cancellationAndProvenance(); nightDeliveryPriority(); nightSampleReuse();
+        for (bool large : {false,true}) for (bool integrating : {false,true}) for (bool observing : {false,true})
+            nightPreviewReuse(large,integrating,observing);
+        nightPreviewFallback(L"night-reuse-stale", L"No fresh");
+        nightPreviewFallback(L"night-reuse-shape", L"unsupported");
+        nightPreviewFallback(L"night-reuse-future", L"invalid source freshness");
+        nightPreviewFallback(L"night-reuse-zero", nullptr); }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; result = 1; }
     CoUninitialize(); return result;
 }

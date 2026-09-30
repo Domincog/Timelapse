@@ -133,6 +133,15 @@ bool Camera::latestNewer(Frame& output, std::wstring& error, CameraSampleInfo& i
     if (control.throwCopy) throw std::bad_alloc();
     if (impl_->mode == L"night-slow-copy" && watermark.sequence) Sleep(3300);
     InterlockedIncrement(&control.copies); pixels(output, impl_->mode == L"night-slow" ? 128 : 32, impl_->mode == L"night-720p");
+    // Only a subsequent Night read gets the fault; ordinary preview can still
+    // fetch a healthy frame. Model late conversion/invalid raw metadata after
+    // the initial source check, without a physical source or multi-second wait.
+    if (watermark.sequence && impl_->mode == L"night-reuse-stale") info.receivedTick = now - 3100;
+    if (watermark.sequence && impl_->mode == L"night-reuse-future") info.receivedTick = now + 5000;
+    if (watermark.sequence && impl_->mode == L"night-reuse-zero") info.receivedTick = 0;
+    if (watermark.sequence && impl_->mode == L"night-reuse-shape") {
+        output.width = 1290; output.height = 36; output.pixels.assign(size_t(1290) * 36 * 4, 32);
+    }
     if ((boundary && impl_->mode == L"night-post-end-size") || inWindowSize) {
         output.width = 1290; output.height = 36; output.pixels.assign(size_t(output.width) * output.height * 4, 32);
     }
