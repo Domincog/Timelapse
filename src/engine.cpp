@@ -121,8 +121,10 @@ void Engine::configure(const Settings& s) {
     { std::lock_guard<std::mutex> lock(mutex_);
       auto sources = [](const Settings& config) { int mask = config.separateFiles ? 3 : 0; for (const auto& layer : config.layers) mask |= layer.source == Source::Desktop ? 1 : 2; return mask; };
       const int mask = sources(s);
+      const bool cameraTierChanged = status_.state == State::Idle && (mask & 2) &&
+          cameraResolutionForOutput(s.width, s.height) != cameraResolutionForOutput(settings_.width, settings_.height);
       if (!sameWatermarkSettings(s.watermark, settings_.watermark)) retirePreview(true);
-      if (mask != sources(settings_) || s.cameraId != settings_.cameraId || !s.preview) retireCameraInput();
+      if (mask != sources(settings_) || s.cameraId != settings_.cameraId || !s.preview || cameraTierChanged) retireCameraInput();
       if (!s.preview || (status_.state == State::Idle && (s.width != settings_.width || s.height != settings_.height)) ||
           mask != sources(settings_) || ((mask & 2) && s.cameraId != settings_.cameraId) ||
           ((mask & 1) && (CompareStringOrdinal(s.monitorId.c_str(), -1, settings_.monitorId.c_str(), -1, TRUE) != CSTR_EQUAL ||
@@ -236,6 +238,7 @@ void Engine::run() {
             return *previewBuffer;
         };
         std::wstring activeCamera, temporary, finalPath, temporaryIO, finalPathIO, sourceError, recordingFolder, recordingFolderIO;
+        CameraResolution activeCameraResolution = CameraResolution::Standard720;
         std::wstring cameraTemporary, cameraFinalPath, cameraTemporaryIO, cameraFinalPathIO;
         bool cameraRunning = false, pending = false, writing = false, paused = false;
         bool cameraWriting = false, segmentWriting = false, sessionStarted = false, segmentFailed = false;
@@ -974,6 +977,9 @@ void Engine::run() {
                 }
                 bool needCamera = cfg.separateFiles, needDesktop = cfg.separateFiles;
                 for (auto& layer : cfg.layers) { needCamera |= layer.source == Source::Camera; needDesktop |= layer.source == Source::Desktop; }
+                // cfg is the frozen recording snapshot while a session exists.
+                // Idle previews request detail only when the output needs it.
+                const auto cameraResolution = cameraResolutionForOutput(cfg.width, cfg.height);
                 const bool useNight = (pending || writing) && cfg.night.enabled && needCamera;
                 if (useNight != nightMode) {
                     cancelNight(); nightMode = useNight; nightStartAt = now;
@@ -1021,7 +1027,7 @@ void Engine::run() {
                     if (!needDesktop) desktop = {};
                     if (!needCamera) webcam = {};
                 }
-                if ((!needCamera || !active || activeCamera != cfg.cameraId) && cameraRunning) {
+                if ((!needCamera || !active || activeCamera != cfg.cameraId || activeCameraResolution != cameraResolution) && cameraRunning) {
                     cancelNight();
                     clearCameraInput();
                     camera->stop(); cameraRunning = false; activeCamera.clear();
@@ -1033,7 +1039,8 @@ void Engine::run() {
                 }
                 // Retry a retired failed attempt once under the new source generation.
                 // Healthy readers remain open; current-generation failures stay latched.
-                if (needCamera && active && !cameraRunning && (activeCamera != cfg.cameraId || cameraAttemptGeneration != previewGeneration || start)) {
+                if (needCamera && active && !cameraRunning && (activeCamera != cfg.cameraId || activeCameraResolution != cameraResolution ||
+                        cameraAttemptGeneration != cameraInputGeneration || start)) {
                     if (skipping && writing) {
                         // A restarted helper can reuse its local epoch values;
                         // do not compare its first report with the old reader.
@@ -1041,12 +1048,13 @@ void Engine::run() {
                         returnToBase(); inspectSkipping();
                     }
                     activeCamera = cfg.cameraId;
-                    cameraAttemptGeneration = previewGeneration;
+                    activeCameraResolution = cameraResolution;
+                    cameraAttemptGeneration = cameraInputGeneration;
                     sourceError.clear();
                     if (!cfg.cameraId.empty()) {
                         try {
                             if (!camera) camera.emplace();
-                            cameraRunning = camera->start(cfg.cameraId, sourceError);
+                            cameraRunning = camera->start(cfg.cameraId, sourceError, cameraResolution);
                         }
                         catch (...) {
                             // A startup exception may leave partial client state.
@@ -1139,7 +1147,7 @@ void Engine::run() {
                         // a new Record action can retry the same camera.
                         clearCameraInput();
                         camera->stop(); cameraRunning = false;
-                        cameraAttemptGeneration = previewGeneration;
+                        cameraAttemptGeneration = cameraInputGeneration;
                         sourceError = error;
                         if (skipping && writing) {
                             resetSkipping(cfg, (needDesktop ? 1u : 0u) | 2u);

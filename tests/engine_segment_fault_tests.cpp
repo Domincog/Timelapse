@@ -428,7 +428,7 @@ namespace lapse {
 struct CameraClient::Impl { bool running = false; };
 CameraClient::CameraClient() : impl_(std::make_unique<Impl>()) {}
 CameraClient::~CameraClient() = default;
-bool CameraClient::start(const std::wstring& id, std::wstring& error) { error.clear(); impl_->running = id == L"owned-camera"; return impl_->running; }
+bool CameraClient::start(const std::wstring& id, std::wstring& error, CameraResolution) { error.clear(); impl_->running = id == L"owned-camera"; return impl_->running; }
 void CameraClient::stop() { impl_->running = false; }
 bool CameraClient::latest(Frame& output, std::wstring& error) { error.clear(); if (!impl_->running) return false; pixels(output, 64, 48); return true; }
 bool CameraClient::beginNight(uint64_t, uint32_t, const NightSettings&, std::wstring& error) { error = L"Unexpected Night request."; return false; }

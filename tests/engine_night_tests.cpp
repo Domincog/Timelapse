@@ -21,16 +21,19 @@ using namespace std::chrono_literals;
 struct Begin { uint64_t token, tick; uint32_t duration; int target; };
 std::mutex observationsMutex;
 std::vector<Begin> begins;
+std::vector<lapse::CameraResolution> cameraResolutions;
+std::atomic<unsigned> cameraCloses{0};
 std::atomic<unsigned> cancellations{0}, opens{0}, previews{0}, resultPolls{0};
 std::atomic<bool> holdResult{false}, failBegin{false}, failResult{false}, lowSpace{false};
 std::atomic<int> resultDelayMs{0}, writeDelayMs{0}, suggestedMs{1000};
 void reset() {
-    std::lock_guard<std::mutex> lock(observationsMutex); begins.clear();
+    std::lock_guard<std::mutex> lock(observationsMutex); begins.clear(); cameraResolutions.clear(); cameraCloses=0;
     cancellations=opens=previews=resultPolls=0;
     holdResult=failBegin=failResult=lowSpace=false;
     resultDelayMs=writeDelayMs=0; suggestedMs=1000;
 }
 std::vector<Begin> observations() { std::lock_guard<std::mutex> lock(observationsMutex); return begins; }
+std::vector<lapse::CameraResolution> resolutions() { std::lock_guard<std::mutex> lock(observationsMutex); return cameraResolutions; }
 void pixels(lapse::Frame& f,int width,int height,uint8_t shade) {
     f.width=width;f.height=height;f.pixels.resize(size_t(width)*height*4);
     for(size_t i=0;i<f.pixels.size();i+=4) { f.pixels[i]=f.pixels[i+1]=f.pixels[i+2]=shade;f.pixels[i+3]=255; }
@@ -176,6 +179,7 @@ void pairedCadence(const std::filesystem::path& root,bool automatic) {
     const auto rawCalls=previews.load();
     require(first.elapsed<.2&&first.night.samples==5&&first.nightDurationMs==1000,"Initial blend counted as active time or wrong facts");
     s.night.enabled=false;s.night.durationMs=30000;s.night.targetBrightness=128;s.intervalMs = 60000;
+    s.width=1920;s.height=1080;
     engine.configure(s);writeDelayMs=80;
     const auto third=await(engine,[](const auto& value){return value.frames>=3;});
     const auto result=finish(engine);verify(result,third.frames,true);
@@ -186,6 +190,7 @@ void pairedCadence(const std::filesystem::path& root,bool automatic) {
             starts[i].tick-starts[i-1].tick<1800,"Equal interval window shortened or skipped a whole slot");
     }
     require(previews==rawCalls,"Active preview replaced processed camera with raw frames");
+    require(resolutions()==std::vector<CameraResolution>{CameraResolution::Standard720},"Active output edit renegotiated frozen low camera tier");
     require(resultPolls<=9,"Parent polled long integration at excessive frequency");
     std::cout<<"PASS paired full windows, frozen policy, decoded sources, cadence and auto clamp="<<automatic<<".\n";
 }
@@ -264,22 +269,60 @@ void shutdownPending(const std::filesystem::path& root) {
     require(GetTickCount64()-before<700&&cancellations>0&&opens==0&&!std::filesystem::exists(folder),"Shutdown waited for whole exposure or created output");
     std::cout<<"PASS shutdown cancels pending blend promptly.\n";
 }
+void frozenInputTier(const std::filesystem::path& root) {
+    reset(); auto s=config(root/L"frozen-detail-tier",true);
+    s.width=1920; s.height=1080; s.segmentDurationSeconds=1;
+    Engine engine; engine.configure(s); engine.record();
+    const auto delivered=await(engine,[](const auto& value){return value.frames==1;});
+    require(resolutions()==std::vector<CameraResolution>{CameraResolution::Detail1080},"Large separate Night output did not request high camera tier");
+    require(delivered.cameraInput.width==1920&&delivered.cameraInput.height==1080,
+        "Completed high-tier Night pixels were not reported as actual input geometry");
+    // Direct API edits must not renegotiate the accepted session even though
+    // the normal UI locks output size. Hidden pause closes/reopens the helper.
+    s.width=320; s.height=240; engine.configure(s); engine.setPaused(true);
+    await(engine,[](const auto& value){return value.state==State::Paused&&cameraCloses>0;});
+    const auto paused=engine.status(); std::this_thread::sleep_for(100ms);
+    require(engine.status().elapsed==paused.elapsed,"Paused high-tier session advanced clock");
+    engine.setPaused(false); const auto resumed=await(engine,[](const auto& value){return value.frames>=2;});
+    require(resumed.cameraInput.width==1920&&resumed.cameraInput.height==1080&&resumed.cameraInput.generation!=delivered.cameraInput.generation,
+        "High-tier hidden resume did not publish freshly verified actual input geometry");
+    const auto result=finish(engine);
+    const auto tiers=resolutions();
+    require(tiers.size()==2&&tiers[0]==CameraResolution::Detail1080&&tiers[1]==CameraResolution::Detail1080,
+        "Resume or split adopted live draft output tier");
+    split_test::verify(s.folder,result,true);
+    for(const auto& item:std::filesystem::directory_iterator(s.folder)) {
+        ComPtr<IMFSourceReader> reader; checked(MFCreateSourceReaderFromURL(item.path().c_str(),nullptr,&reader),"Cannot open frozen-tier part");
+        ComPtr<IMFMediaType> type; checked(reader->GetNativeMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM),0,&type),"Cannot read frozen-tier geometry");
+        UINT32 width=0,height=0; checked(MFGetAttributeSize(type.Get(),MF_MT_FRAME_SIZE,&width,&height),"Missing frozen-tier geometry");
+        require(width==1920&&height==1080,"Live output edit changed split recording dimensions");
+    }
+    // A later recording takes the new small draft, while the completed first
+    // session remains independent and the camera still reports actual pixels.
+    s.folder=(root/L"next-small-tier").wstring(); s.segmentDurationSeconds=0;
+    engine.configure(s); engine.record(); await(engine,[](const auto& value){return value.frames==1;});
+    const auto next=finish(engine); verify(next,1,true);
+    require(resolutions().back()==CameraResolution::Standard720,"New recording did not adopt the current small output tier");
+    std::cout<<"PASS high-tier separate Night session freezes across hidden pause/splits; next session adopts new tier.\n";
+}
 }
 namespace lapse {
 bool CameraClient::observeActivity(uint64_t, CameraObservation&, std::wstring& error) {
     error = L"Unexpected activity observer in an Off-mode fixture."; return false;
 }
 void CameraClient::cancelActivityObservation() noexcept {}
-struct CameraClient::Impl {bool active=false;uint64_t token=0,start=0;uint32_t duration=0;};
+struct CameraClient::Impl {bool active=false;uint64_t token=0,start=0;uint32_t duration=0;CameraResolution resolution=CameraResolution::Standard720;};
 CameraClient::CameraClient():impl_(std::make_unique<Impl>()){}
 CameraClient::~CameraClient()=default;
-bool CameraClient::start(const std::wstring& id,std::wstring& error) {
+bool CameraClient::start(const std::wstring& id,std::wstring& error, CameraResolution resolution) {
+    {std::lock_guard<std::mutex> lock(observationsMutex);cameraResolutions.push_back(resolution);}
+    impl_->resolution=resolution;
     error.clear();impl_->active=id==L"synthetic-night";if(!impl_->active)error=L"Unknown synthetic camera.";return impl_->active;
 }
-void CameraClient::stop(){impl_->active=false;impl_->token=0;}
+void CameraClient::stop(){if(impl_->active)++cameraCloses;impl_->active=false;impl_->token=0;}
 bool CameraClient::latest(Frame& output,std::wstring& error) {
     error.clear();if(!impl_->active){error=L"Synthetic camera stopped.";return false;}
-    ++previews;pixels(output,320,240,24);return true;
+    ++previews;pixels(output,impl_->resolution==CameraResolution::Detail1080?1920:320,impl_->resolution==CameraResolution::Detail1080?1080:240,24);return true;
 }
 bool CameraClient::beginNight(uint64_t token,uint32_t duration,const NightSettings& settings,std::wstring& error) {
     error.clear();if(failBegin||!impl_->active){error=L"Synthetic begin failure.";return false;}
@@ -293,7 +336,7 @@ bool CameraClient::nightResult(uint64_t token,Frame& output,NightWindowResult& r
     result={};result.beginTick=impl_->start;result.endTick=impl_->start+impl_->duration;
     result.firstSampleTick=result.beginTick+100;result.lastSampleTick=result.endTick-100;
     result.exposure.samples=5;result.exposure.appliedGain=4;result.exposure.suggestedDurationMs=suggestedMs;
-    pixels(output,320,240,180);return true;
+    pixels(output,impl_->resolution==CameraResolution::Detail1080?1920:320,impl_->resolution==CameraResolution::Detail1080?1080:240,180);return true;
 }
 void CameraClient::cancelNight() noexcept {++cancellations;impl_->token=0;}
 bool captureMonitor(const std::wstring& id,int width,int height,bool,Frame& output,std::wstring& error) {
@@ -310,7 +353,7 @@ int main() {
         validation(root);preparingPreview(root);firstProcessedPreview(root);singleSource(root,Mode::Camera);singleSource(root,Mode::Overlay);
         pairedCadence(root,false);pairedCadence(root,true);
         limitWindow(root);splitDuringWindow(root);pauseWindow(root);lateResult(root,false);lateResult(root,true);
-        retainedFailure(root,false);retainedFailure(root,true);beginFailure(root);shutdownPending(root);
+        retainedFailure(root,false);retainedFailure(root,true);beginFailure(root);shutdownPending(root);frozenInputTier(root);
         std::filesystem::remove_all(root);std::cout<<"Night engine: all synthetic real-encoder scenarios passed.\n";
     }catch(const std::exception& error){std::cerr<<error.what()<<'\n';std::wcerr<<L"Artifacts kept at "<<root.wstring()<<L'\n';result=1;}
     MFShutdown();CoUninitialize();return result;

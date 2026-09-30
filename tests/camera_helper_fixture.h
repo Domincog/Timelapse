@@ -3,7 +3,17 @@
 // only. No physical camera, desktop, persistent settings or quota is touched.
 #include "camera_host.h"
 #include "capture.h"
+namespace {
+// Test-only startup seam; never enabled in spawned synthetic helpers.
+void (*cameraMappingHook)(HANDLE, SIZE_T) = nullptr;
+LPVOID WINAPI cameraTestMap(HANDLE mapping, DWORD access, DWORD high, DWORD low, SIZE_T bytes) {
+    if (cameraMappingHook) cameraMappingHook(mapping, bytes);
+    return MapViewOfFile(mapping, access, high, low, bytes);
+}
+}
+#define MapViewOfFile cameraTestMap
 #include "../src/camera_host.cpp"
+#undef MapViewOfFile
 #include <chrono>
 #include <iostream>
 #include <stdexcept>
@@ -29,8 +39,8 @@ struct TestView {
     ~TestView() { if (value) UnmapViewOfFile(value); }
 };
 void require(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
-void pixels(lapse::Frame& frame, uint8_t value = 32, bool large = false) {
-    frame.width = large ? 1280 : 64; frame.height = large ? 720 : 36;
+void pixels(lapse::Frame& frame, uint8_t value = 32, int large = 0) {
+    frame.width = large == 2 ? 1920 : large ? 1280 : 64; frame.height = large == 2 ? 1080 : large ? 720 : 36;
     frame.pixels.resize(size_t(frame.width) * frame.height * 4);
     for (size_t i = 0; i < frame.pixels.size(); i += 4) {
         frame.pixels[i] = frame.pixels[i + 1] = frame.pixels[i + 2] = value; frame.pixels[i + 3] = 255;
@@ -47,8 +57,9 @@ struct Camera::Impl {
 };
 Camera::Camera() : impl_(std::make_unique<Impl>()) {}
 Camera::~Camera() { stop(); }
-bool Camera::start(const std::wstring& id, std::wstring& error) {
+bool Camera::start(const std::wstring& id, std::wstring& error, CameraResolution tier) {
     error.clear();
+    if (!cameraCaptureLimits(tier).pixelBytes) { error = L"Unknown synthetic camera resolution."; return false; }
     if (id.rfind(L"night-", 0) != 0) { error = L"Unknown synthetic night source."; return false; }
     wchar_t control[256]{};
     if (!GetEnvironmentVariableW(controlEnvironment, control, 256)) { error = L"Missing owned test mapping."; return false; }
@@ -132,7 +143,8 @@ bool Camera::latestNewer(Frame& output, std::wstring& error, CameraSampleInfo& i
     }
     if (control.throwCopy) throw std::bad_alloc();
     if (impl_->mode == L"night-slow-copy" && watermark.sequence) Sleep(3300);
-    InterlockedIncrement(&control.copies); pixels(output, impl_->mode == L"night-slow" ? 128 : 32, impl_->mode == L"night-720p");
+    InterlockedIncrement(&control.copies); pixels(output, impl_->mode == L"night-slow" ? 128 : 32,
+        impl_->mode == L"night-1080p" ? 2 : impl_->mode == L"night-720p" ? 1 : 0);
     // Only a subsequent Night read gets the fault; ordinary preview can still
     // fetch a healthy frame. Model late conversion/invalid raw metadata after
     // the initial source check, without a physical source or multi-second wait.
@@ -154,7 +166,7 @@ struct Harness {
     lapse::CameraClient client;
     TestHandle mapping, sharedMapping, mutex;
     TestView view, sharedView;
-    Harness(const wchar_t* mode) {
+    Harness(const wchar_t* mode, lapse::CameraResolution tier = lapse::CameraResolution::Standard720) {
         GUID guid{}; require(SUCCEEDED(CoCreateGuid(&guid)), "create owned control identity");
         wchar_t token[40]{}; StringFromGUID2(guid, token, 40);
         const std::wstring name = L"Local\\Timelapse.NightTest." + std::wstring(token);
@@ -166,7 +178,7 @@ struct Harness {
         std::wstring previous(length, L'\0');
         if (length) previous.resize(GetEnvironmentVariableW(controlEnvironment, previous.data(), length));
         require(SetEnvironmentVariableW(controlEnvironment, name.c_str()) != FALSE, "set child-only synthetic control");
-        std::wstring error; const bool launched = client.start(mode, error);
+        std::wstring error; const bool launched = client.start(mode, error, tier);
         SetEnvironmentVariableW(controlEnvironment, length ? previous.c_str() : nullptr);
         require(launched, "launch owned synthetic helper");
         const uint64_t until = GetTickCount64() + 3000;

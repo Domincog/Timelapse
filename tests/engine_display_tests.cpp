@@ -282,7 +282,7 @@ void CameraClient::cancelActivityObservation() noexcept {}
 struct CameraClient::Impl {};
 CameraClient::CameraClient():impl_(std::make_unique<Impl>()){}
 CameraClient::~CameraClient()=default;
-bool CameraClient::start(const std::wstring&,std::wstring&) { throw std::runtime_error("Unexpected camera activation."); }
+bool CameraClient::start(const std::wstring&,std::wstring&, CameraResolution) { throw std::runtime_error("Unexpected camera activation."); }
 void CameraClient::stop(){}
 bool CameraClient::latest(Frame&,std::wstring&) { throw std::runtime_error("Unexpected camera read."); }
 struct Encoder::Impl { uint64_t frames=0; };

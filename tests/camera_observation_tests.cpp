@@ -46,6 +46,14 @@ void baselineAndCoalescing() {
     require(h.control().copies - before == 1, "same-iteration preview and observation repeated the raw conversion");
     std::cout << "PASS disabled/paused demand, distinct raw provenance, independent pixels and shared conversion\n";
 }
+void highTierDescriptor() {
+    Harness h(L"night-1080p",lapse::CameraResolution::Detail1080);h.first();const auto result=observe(h,31);
+    require(result.sourceWidth==1920&&result.sourceHeight==1080&&result.epoch==1&&result.sequence&&result.receivedTick,
+        "High-tier activity report lost raw source identity");
+    require(std::all_of(result.descriptor.y.begin(),result.descriptor.y.end(),[](uint8_t v){return v==32;})&&
+        sizeof(result.descriptor)==6912,"High-tier source enlarged or corrupted the small descriptor");
+    std::cout<<"PASS1080 source with unchanged small activity descriptor\n";
+}
 void pinnedNight() {
     Harness h(L"night-live"); h.first(); h.begin(100);
     lapse::Frame result; lapse::NightWindowResult facts; std::wstring error;
@@ -260,7 +268,7 @@ int main() {
     const int host = lapse::runCameraHost(nullptr); if (host >= 0) return host;
     const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED); if (FAILED(com)) return 2;
     int result = 0;
-    try { baselineAndCoalescing(); pinnedNight(); duplicateDeadlineAndIsolation(); cancellationAndProvenance(); nightDeliveryPriority(); nightSampleReuse();
+    try { baselineAndCoalescing(); highTierDescriptor(); pinnedNight(); duplicateDeadlineAndIsolation(); cancellationAndProvenance(); nightDeliveryPriority(); nightSampleReuse();
         for (bool large : {false,true}) for (bool integrating : {false,true}) for (bool observing : {false,true})
             nightPreviewReuse(large,integrating,observing);
         nightPreviewFallback(L"night-reuse-stale", L"No fresh");

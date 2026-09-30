@@ -233,7 +233,7 @@ void CameraClient::cancelActivityObservation() noexcept {}
 struct CameraClient::Impl {};
 CameraClient::CameraClient() : impl_(std::make_unique<Impl>()) {}
 CameraClient::~CameraClient() = default;
-bool CameraClient::start(const std::wstring&, std::wstring& error) {
+bool CameraClient::start(const std::wstring&, std::wstring& error, CameraResolution) {
     error.clear(); return true;
 }
 void CameraClient::stop() {}

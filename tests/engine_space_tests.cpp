@@ -505,7 +505,7 @@ void CameraClient::cancelActivityObservation() noexcept {}
 struct CameraClient::Impl { bool active = false; };
 CameraClient::CameraClient() : impl_(std::make_unique<Impl>()) {}
 CameraClient::~CameraClient() = default;
-bool CameraClient::start(const std::wstring& id, std::wstring& error) {
+bool CameraClient::start(const std::wstring& id, std::wstring& error, CameraResolution) {
     if (id != L"synthetic-camera") { error = L"Invalid synthetic camera."; return false; }
     error.clear(); impl_->active = true; ++cameraStarts; return true;
 }

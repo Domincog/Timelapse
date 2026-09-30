@@ -1,5 +1,6 @@
 ﻿#pragma once
 #include "core.h"
+#include "camera_resolution.h"
 
 namespace lapse {
 struct Monitor { std::wstring name; RECT bounds{}; std::wstring id; };
@@ -31,7 +32,8 @@ public:
     ~Camera();
     Camera(const Camera&) = delete;
     Camera& operator=(const Camera&) = delete;
-    bool start(const std::wstring& id, std::wstring& error);
+    bool start(const std::wstring& id, std::wstring& error,
+               CameraResolution resolution = CameraResolution::Standard720);
     void stop();
     bool latest(Frame& output, std::wstring& error);
     // Host transport uses the actual sample receipt tick, including across processes.

@@ -276,7 +276,7 @@ namespace lapse {
 struct Camera::Impl {};
 Camera::Camera() { ExitProcess(76); }
 Camera::~Camera() = default;
-bool Camera::start(const std::wstring&, std::wstring&) { ExitProcess(76); }
+bool Camera::start(const std::wstring&, std::wstring&, CameraResolution) { ExitProcess(76); }
 void Camera::stop() { ExitProcess(76); }
 bool Camera::latest(Frame&, std::wstring&) { ExitProcess(76); }
 bool Camera::latest(Frame&, std::wstring&, uint64_t&) { ExitProcess(76); }

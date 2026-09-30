@@ -4,6 +4,9 @@
 
 namespace lapse {
 namespace {
+static_assert(uint64_t(NightMaxSamples) * 65535 <= UINT32_MAX, "Night channel sums must remain bounded");
+static_assert(uint64_t(NightMaxWidth) * NightMaxHeight * NightMaxSamples * 65535 < UINT64_MAX / 65536,
+    "Night full-image totals and luminance weights must remain bounded");
 struct Tables {
     std::array<uint16_t,256> forward{};
     std::array<uint8_t,65536> inverse{};

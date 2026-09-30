@@ -45,7 +45,7 @@ struct TestView {
 struct TestControl { volatile LONG ready, latestCalls; DWORD processId; wchar_t transportName[128]; };
 // Inspect only the header of this fixture's own mapping; actual transport code
 // performs all publication and CameraClient consumption.
-// Protocol 5 adds person observation data after the existing request/pixel
+// Protocol 6 retains the existing request/pixel prefix and appends immutable
 // metadata. This fixed prefix through completed retains its original layout.
 struct SharedHeader {
     uint32_t magic, version, state, width, height, bytes;
@@ -85,9 +85,10 @@ struct Camera::Impl {
 };
 Camera::Camera() : impl_(std::make_unique<Impl>()) {}
 Camera::~Camera() { stop(); }
-bool Camera::start(const std::wstring& id, std::wstring& error) {
+bool Camera::start(const std::wstring& id, std::wstring& error, CameraResolution tier) {
     stop(); error.clear();
-    if (id != L"transport-live" && id != L"transport-large" && id != L"transport-frozen" && id != L"transport-disconnect" &&
+    if (!cameraCaptureLimits(tier).pixelBytes) { error = L"Unknown synthetic camera resolution."; return false; }
+    if (id != L"transport-live" && id != L"transport-large" && id != L"transport-1080" && id != L"transport-frozen" && id != L"transport-disconnect" &&
         id != L"transport-starting" && id != L"transport-hang-read" && id != L"transport-warm-live" && id != L"transport-warm-stall") {
         error = L"Unknown synthetic camera."; return false;
     }
@@ -114,8 +115,8 @@ bool Camera::latest(Frame& output, std::wstring& error, uint64_t& tick) {
         error = L"Synthetic camera disconnected."; return false;
     }
     tick = impl_->mode == L"transport-frozen" ? impl_->started : GetTickCount64();
-    output.width = impl_->mode == L"transport-large" ? 1280 : 64;
-    output.height = impl_->mode == L"transport-large" ? 720 : 36;
+    output.width = impl_->mode == L"transport-1080" ? 1920 : impl_->mode == L"transport-large" ? 1280 : 64;
+    output.height = impl_->mode == L"transport-1080" ? 1080 : impl_->mode == L"transport-large" ? 720 : 36;
     output.pixels.resize(size_t(output.width) * output.height * 4);
     const uint8_t sequence = static_cast<uint8_t>(++impl_->sequence);
     for (int y = 0; y < output.height; ++y) {
@@ -155,8 +156,8 @@ lapse::Frame firstFrame(lapse::CameraClient& camera) {
     }
     throw std::runtime_error("synthetic frame did not cross process boundary");
 }
-void verifyPixels(const lapse::Frame& frame) {
-    require(frame.valid() && frame.width == 64 && frame.height == 36, "transported frame dimensions");
+void verifyPixels(const lapse::Frame& frame, int width = 64, int height = 36) {
+    require(frame.valid() && frame.width == width && frame.height == height, "transported frame dimensions");
     const uint8_t sequence = frame.pixels[2];
     require(sequence != 0, "frame sequence is nonzero");
     for (int y = 0; y < frame.height; ++y) {
@@ -188,7 +189,8 @@ struct TestEnvironment {
 };
 class TransportObserver {
 public:
-    explicit TransportObserver(lapse::CameraClient& camera, const wchar_t* mode = L"transport-live") {
+    explicit TransportObserver(lapse::CameraClient& camera, const wchar_t* mode = L"transport-live",
+        lapse::CameraResolution tier = lapse::CameraResolution::Standard720) {
         GUID guid{}; require(SUCCEEDED(CoCreateGuid(&guid)), "create transport control token");
         wchar_t token[40]{}; StringFromGUID2(guid, token, 40);
         const std::wstring name = L"Local\\Timelapse.TransportTest." + std::wstring(token);
@@ -197,7 +199,7 @@ public:
         controlView_.value = MapViewOfFile(controlMapping_.value, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(TestControl));
         require(controlView_.value != nullptr, "map owned transport control");
         std::wstring error;
-        { TestEnvironment environment(name); require(camera.start(mode, error), "launch observed synthetic helper"); }
+        { TestEnvironment environment(name); require(camera.start(mode, error, tier), "launch observed synthetic helper"); }
         auto& control = *static_cast<TestControl*>(controlView_.value);
         const auto began = Clock::now();
         while (!InterlockedCompareExchange(&control.ready, 0, 0) && elapsed(began) < 3000) Sleep(10);
@@ -216,7 +218,7 @@ public:
         require(WaitForSingleObject(mutex.value, 1000) == WAIT_OBJECT_0, "inspect shared header under actual mutex");
         const SharedHeader result = *static_cast<const SharedHeader*>(view_.value);
         ReleaseMutex(mutex.value);
-        require(result.magic == 0x4C43414D && result.version == 5, "expected shared protocol");
+        require(result.magic == 0x4C43414D && result.version == 6, "expected shared protocol");
         return result;
     }
     LONG copies() {
@@ -456,6 +458,18 @@ void delayedConsumer() {
     stopBounded(camera);
     std::cout << "delayed_consumer passed\n";
 }
+void highTierTransfer() {
+    lapse::CameraClient camera;
+    TransportObserver observer(camera,L"transport-1080",lapse::CameraResolution::Detail1080);
+    const auto output=firstFrame(camera);
+    require(output.width==1920&&output.height==1080&&output.pixels.size()==8294400,"1080p transport geometry/capacity incorrect");
+    verifyPixels(output,1920,1080);stopBounded(camera);
+    std::wstring error;require(camera.start(L"transport-1080",error),"Start oversized synthetic low-tier source");
+    lapse::Frame rejected;const auto began=Clock::now();
+    while(error.empty()&&elapsed(began)<3000){require(!camera.latest(rejected,error),"720p tier accepted1080p pixels");Sleep(5);}
+    require(error.find(L"unsupported frame size")!=std::wstring::npos&&rejected.pixels.empty(),"Low-tier producer did not reject high-tier pixels");
+    stopBounded(camera);std::cout<<"high_tier_exact_pixels_and_low_tier_rejection passed\n";
+}
 
 void unresponsiveRequest() {
     lapse::CameraClient camera;
@@ -613,7 +627,7 @@ int wmain(int argc, wchar_t** argv) {
         if (argc == 2 && std::wcscmp(argv[1], L"--warmup-only") == 0) { warmupActivationDeadline(); return 0; }
         const bool contentionOnly = argc == 2 && std::wcscmp(argv[1], L"--contention-only") == 0;
         if (!contentionOnly) {
-            frameTransfer(); staleFrame(); driverError(); delayedConsumer(); handlesReleased(); unresponsiveRequest();
+            frameTransfer(); highTierTransfer(); staleFrame(); driverError(); delayedConsumer(); handlesReleased(); unresponsiveRequest();
             failedDeliveryKeepsPreviousFrame(false); failedDeliveryKeepsPreviousFrame(true);
             warmupActivationDeadline();
         }

@@ -13,9 +13,7 @@
 namespace lapse {
 namespace {
 constexpr uint32_t protocolMagic = 0x4C43414D;
-constexpr uint32_t protocolVersion = 5;
-constexpr uint32_t maxWidth = 1280, maxHeight = 720;
-constexpr size_t maxPixels = size_t(maxWidth) * maxHeight * 4;
+constexpr uint32_t protocolVersion = 6;
 constexpr size_t idCapacity = 4096;
 constexpr wchar_t mappingPrefix[] = L"Local\\Timelapse.Camera.";
 enum class HostState : uint32_t { Starting = 1, Ready, Failed, Stopped };
@@ -59,8 +57,19 @@ struct SharedFrame {
     wchar_t observationError[256];
     wchar_t id[idCapacity];
     wchar_t error[512];
-    uint8_t pixels[maxPixels];
+    uint32_t headerBytes;
+    CameraResolution resolution;
+    uint64_t pixelCapacity;
 };
+
+size_t mappingBytes(CameraResolution tier) noexcept {
+    const auto limits = cameraCaptureLimits(tier);
+    return limits.pixelBytes ? sizeof(SharedFrame) + limits.pixelBytes : 0;
+}
+uint8_t* sharedPixels(SharedFrame& shared) noexcept { return reinterpret_cast<uint8_t*>(&shared) + sizeof(SharedFrame); }
+bool validFrame(const Frame& frame, CameraCaptureLimits limits) noexcept {
+    return frame.valid() && frame.width <= int(limits.width) && frame.height <= int(limits.height) && frame.pixels.size() <= limits.pixelBytes;
+}
 
 struct Handle {
     HANDLE value = nullptr;
@@ -101,8 +110,10 @@ void setMessage(SharedFrame& shared, HostState state, const std::wstring& error)
     shared.error[count] = L'\0';
 }
 
-bool validHeader(const SharedFrame& shared) {
-    return shared.magic == protocolMagic && shared.version == protocolVersion;
+bool validHeader(const SharedFrame& shared, CameraResolution tier) noexcept {
+    const auto limits = cameraCaptureLimits(tier);
+    return limits.pixelBytes && shared.magic == protocolMagic && shared.version == protocolVersion &&
+        shared.headerBytes == sizeof(SharedFrame) && shared.resolution == tier && shared.pixelCapacity == limits.pixelBytes;
 }
 uint64_t cancelledNight(SharedFrame& shared) noexcept {
     return static_cast<uint64_t>(InterlockedCompareExchange64(&shared.nightCancelled, 0, 0));
@@ -134,16 +145,29 @@ int hostMain(const wchar_t* mappingName) {
     view.value = static_cast<SharedFrame*>(MapViewOfFile(mapping.value, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(SharedFrame)));
     if (!view.value) return 4;
     std::wstring id;
+    CameraResolution tier;
     {
         SharedLock lock(mutex.value, 100);
-        if (!lock.acquired() || !validHeader(*view.value)) return 5;
+        if (!lock.acquired()) return 5;
+        tier = view.value->resolution;
+        if (!validHeader(*view.value, tier)) return 5;
         const wchar_t* end = static_cast<const wchar_t*>(std::wmemchr(view.value->id, L'\0', std::size(view.value->id)));
         if (!end || end == view.value->id) return 6;
         id.assign(view.value->id, size_t(end - view.value->id));
     }
+    // The accepted budget is now private. A header mutation while remapping
+    // cannot grow or reinterpret the mapped tail plane.
+    const auto captureLimits = cameraCaptureLimits(tier);
+    view.reset();
+    view.value = static_cast<SharedFrame*>(MapViewOfFile(mapping.value, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, mappingBytes(tier)));
+    if (!view.value) return 4;
+    {
+        SharedLock lock(mutex.value, 100);
+        if (!lock.acquired() || !validHeader(*view.value, tier)) return 5;
+    }
     auto publishError = [&](const std::wstring& error) {
         SharedLock lock(mutex.value, 100);
-        if (lock.acquired()) setMessage(*view.value, HostState::Failed, error);
+        if (lock.acquired() && validHeader(*view.value, tier)) setMessage(*view.value, HostState::Failed, error);
     };
     const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(com)) { publishError(L"Windows could not initialize camera capture."); return 7; }
@@ -156,7 +180,7 @@ int hostMain(const wchar_t* mappingName) {
         Camera camera;
         std::wstring error;
         if (WaitForSingleObject(stop.value, 0) == WAIT_OBJECT_0) result = 0;
-        else if (!camera.start(id, error)) { publishError(error); result = 9; }
+        else if (!camera.start(id, error, tier)) { publishError(error); result = 9; }
         else {
             Frame frame, nightFrame, observationFrame;
             std::unique_ptr<CameraPersonInput> personInput;
@@ -211,7 +235,7 @@ int hostMain(const wchar_t* mappingName) {
                         if (WaitForSingleObject(stop.value, 50) == WAIT_OBJECT_0) break;
                         SetEvent(request.value); continue;
                     }
-                    if (!validHeader(*view.value)) { result = 12; break; }
+                    if (!validHeader(*view.value, tier)) { result = 12; break; }
                     if (view.value->nightCommand != nightCommand) {
                         nightCommand = view.value->nightCommand;
                         nightToken = view.value->nightToken;
@@ -261,7 +285,7 @@ int hostMain(const wchar_t* mappingName) {
                     if (nightState == NightState::Integrating && inspectEpoch && info.epoch && info.epoch != watermark.epoch)
                         nightFailed(L"The camera format or source timeline changed during the night blend. Try recording again.");
                     if (fresh && (nightState == NightState::Waiting || (nightState == NightState::Integrating && inWindow)) &&
-                        (!nightFrame.valid() || nightFrame.width > int(maxWidth) || nightFrame.height > int(maxHeight)))
+                        !validFrame(nightFrame, captureLimits))
                         nightFailed(L"The camera returned an unsupported night blend frame size.");
                     if (fresh && nightState == NightState::Waiting) {
                         if (!accumulator) accumulator = std::make_unique<NightAccumulator>();
@@ -332,8 +356,7 @@ int hostMain(const wchar_t* mappingName) {
                     // processed blend. Off-mode adds no clock or source read.
                     if (rawObservation) {
                         const uint64_t previewAt = GetTickCount64();
-                        if (rawObservation->valid() && rawObservation->width <= int(maxWidth) &&
-                            rawObservation->height <= int(maxHeight) && rawInfo.receivedTick && rawInfo.receivedTick <= previewAt &&
+                        if (validFrame(*rawObservation, captureLimits) && rawInfo.receivedTick && rawInfo.receivedTick <= previewAt &&
                             previewAt - rawInfo.receivedTick <= 3000) {
                             publication = rawObservation; receivedTick = rawInfo.receivedTick;
                         }
@@ -352,7 +375,7 @@ int hostMain(const wchar_t* mappingName) {
                            nightState == NightState::Complete && cancelledNight(*view.value) < nightCommand) {
                     publication = completedNight; receivedTick = nightResult.lastSampleTick;
                 }
-                if (publication && (!publication->valid() || publication->width > int(maxWidth) || publication->height > int(maxHeight))) {
+                if (publication && !validFrame(*publication, captureLimits)) {
                     publishError(L"The camera returned an unsupported frame size."); result = 11; break;
                 }
                 std::optional<CameraObservation> observation;
@@ -379,7 +402,8 @@ int hostMain(const wchar_t* mappingName) {
                         else if (!fresh) observationState = ObservationState::Duplicate;
                         else if (!rawInfo.epoch || !rawInfo.sequence || !rawInfo.receivedTick || rawInfo.receivedTick > now ||
                                  now - rawInfo.receivedTick > 3000 || !rawObservation->valid() ||
-                                 rawObservation->width > int(maxWidth) || rawObservation->height > int(maxHeight) ||
+                                 rawObservation->width > int(captureLimits.width) || rawObservation->height > int(captureLimits.height) ||
+                                 rawObservation->pixels.size() > captureLimits.pixelBytes ||
                                  requestedObservationKind > ObservationKind::Person) {
                             observationState = ObservationState::Failed;
                             observationError = L"The camera activity check returned invalid or stale source data.";
@@ -423,6 +447,7 @@ int hostMain(const wchar_t* mappingName) {
                     if (WaitForSingleObject(stop.value, 50) == WAIT_OBJECT_0) break;
                     SetEvent(request.value); continue;
                 }
+                if (!validHeader(*view.value, tier)) { result = 12; break; }
                 if (view.value->nightCommand == nightCommand) {
                     view.value->nightStateCommand = nightCommand;
                     view.value->nightSourceTick = nightSourceTick;
@@ -463,7 +488,7 @@ int hostMain(const wchar_t* mappingName) {
                     ++view.value->generation;
                     view.value->width = uint32_t(publication->width); view.value->height = uint32_t(publication->height);
                     view.value->bytes = static_cast<uint32_t>(publication->pixels.size());
-                    std::memcpy(view.value->pixels, publication->pixels.data(), publication->pixels.size());
+                    std::memcpy(sharedPixels(*view.value), publication->pixels.data(), publication->pixels.size());
                     view.value->receivedTick = receivedTick;
                     view.value->publishedRequest = requested;
                     view.value->publishedKind = requestedKind;
@@ -490,7 +515,7 @@ int hostMain(const wchar_t* mappingName) {
         }
         if (!result) {
             SharedLock lock(mutex.value);
-            if (lock.acquired()) setMessage(*view.value, HostState::Stopped, L"");
+            if (lock.acquired() && validHeader(*view.value, tier)) setMessage(*view.value, HostState::Stopped, L"");
         }
     } catch (const std::bad_alloc&) {
         publishError(L"Not enough memory to capture the camera."); result = 13;
@@ -507,6 +532,8 @@ struct CameraClient::Impl {
     View view;
     PersonView personView;
     std::wstring mappingName;
+    CameraResolution resolution = CameraResolution::Standard720;
+    CameraCaptureLimits captureLimits = cameraCaptureLimits(CameraResolution::Standard720);
     uint64_t started = 0, contentionSince = 0, generation = 0;
     uint64_t request = 0, requestedTick = 0, requestedGeneration = 0;
     PixelRequest requestedKind = PixelRequest::Preview;
@@ -520,12 +547,15 @@ struct CameraClient::Impl {
 CameraClient::CameraClient() : impl_(std::make_unique<Impl>()) {}
 CameraClient::~CameraClient() { stop(); }
 
-bool CameraClient::start(const std::wstring& id, std::wstring& error) {
+bool CameraClient::start(const std::wstring& id, std::wstring& error, CameraResolution tier) {
     stop(); error.clear();
+    const auto captureLimits = cameraCaptureLimits(tier);
+    if (!captureLimits.pixelBytes) { error = L"Select a supported camera input resolution."; return false; }
     if (id.empty() || id.size() >= idCapacity || id.find(L'\0') != std::wstring::npos) {
         error = L"Select a valid camera first."; return false;
     }
     try {
+        impl_->resolution = tier; impl_->captureLimits = captureLimits;
         GUID guid{};
         HRESULT hr = CoCreateGuid(&guid);
         if (FAILED(hr)) { error = L"Windows could not prepare camera capture."; return false; }
@@ -533,7 +563,7 @@ bool CameraClient::start(const std::wstring& id, std::wstring& error) {
         StringFromGUID2(guid, token, static_cast<int>(std::size(token)));
         const std::wstring name = std::wstring(mappingPrefix) + token;
         impl_->mappingName = name;
-        impl_->mapping.value = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(SharedFrame), name.c_str());
+        impl_->mapping.value = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, static_cast<DWORD>(mappingBytes(tier)), name.c_str());
         if (!impl_->mapping.value || GetLastError() == ERROR_ALREADY_EXISTS) {
             fail(error, L"Windows could not reserve the camera frame."); stop(); return false;
         }
@@ -553,11 +583,12 @@ bool CameraClient::start(const std::wstring& id, std::wstring& error) {
         if (!impl_->responseEvent.value || GetLastError() == ERROR_ALREADY_EXISTS) {
             fail(error, L"Windows could not prepare camera responses."); stop(); return false;
         }
-        impl_->view.value = static_cast<SharedFrame*>(MapViewOfFile(impl_->mapping.value, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(SharedFrame)));
+        impl_->view.value = static_cast<SharedFrame*>(MapViewOfFile(impl_->mapping.value, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, mappingBytes(tier)));
         if (!impl_->view.value) { fail(error, L"Windows could not access the camera frame."); stop(); return false; }
         // Newly created page-file backed mappings are zero initialized by Windows.
         auto& shared = *impl_->view.value;
         shared.magic = protocolMagic; shared.version = protocolVersion; shared.state = HostState::Starting;
+        shared.headerBytes = sizeof(SharedFrame); shared.resolution = tier; shared.pixelCapacity = captureLimits.pixelBytes;
         std::wmemcpy(shared.id, id.c_str(), id.size() + 1);
         impl_->job.value = CreateJobObjectW(nullptr, nullptr);
         JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits{};
@@ -645,7 +676,7 @@ bool CameraClient::latest(Frame& output, std::wstring& error) {
         now = GetTickCount64();
         impl_->contended = false; impl_->contentionSince = 0;
         auto& shared = *impl_->view.value;
-        if (!validHeader(shared)) { error = L"The camera helper returned invalid data. Try again."; return false; }
+        if (!validHeader(shared, impl_->resolution)) { error = L"The camera helper returned invalid data. Try again."; return false; }
         if (shared.completed > shared.requested || impl_->request > shared.requested) {
             error = L"The camera helper returned an invalid response. Try again."; return false;
         }
@@ -718,8 +749,8 @@ bool CameraClient::latest(Frame& output, std::wstring& error) {
             waiting = requestFrame();
             return false;
         }
-        if (shared.state != HostState::Ready || !shared.width || !shared.height || shared.width > maxWidth || shared.height > maxHeight ||
-            uint64_t(shared.width) * shared.height * 4 != shared.bytes || !shared.generation || (shared.generation & 1) ||
+        if (shared.state != HostState::Ready || !shared.width || !shared.height || shared.width > impl_->captureLimits.width || shared.height > impl_->captureLimits.height ||
+            uint64_t(shared.width) * shared.height * 4 != shared.bytes || shared.bytes > impl_->captureLimits.pixelBytes || !shared.generation || (shared.generation & 1) ||
             shared.generation < impl_->generation || shared.receivedTick > frameNow) {
             error = L"The camera helper returned an invalid frame. Try again."; return false;
         }
@@ -728,7 +759,7 @@ bool CameraClient::latest(Frame& output, std::wstring& error) {
         }
         try {
             output.pixels.resize(shared.bytes);
-            std::memcpy(output.pixels.data(), shared.pixels, shared.bytes);
+            std::memcpy(output.pixels.data(), sharedPixels(shared), shared.bytes);
             output.width = int(shared.width); output.height = int(shared.height);
             impl_->delivered = true; impl_->generation = shared.generation;
             return true;
@@ -775,7 +806,7 @@ bool CameraClient::beginNight(uint64_t token, uint32_t durationMs, const NightSe
     }
     impl_->contended = false; impl_->contentionSince = 0;
     auto& shared = *impl_->view.value;
-    if (!validHeader(shared) || shared.nightCommand == std::numeric_limits<uint64_t>::max()) {
+    if (!validHeader(shared, impl_->resolution) || shared.nightCommand == std::numeric_limits<uint64_t>::max()) {
         error = L"The camera helper returned invalid data. Try again."; return false;
     }
     impl_->nightCommand = ++shared.nightCommand;
@@ -826,7 +857,7 @@ bool CameraClient::nightResult(uint64_t token, Frame& output, NightWindowResult&
         now = GetTickCount64();
         impl_->contended = false; impl_->contentionSince = 0;
         auto& shared = *impl_->view.value;
-        if (!validHeader(shared) || shared.completed > shared.requested || impl_->request > shared.requested) {
+        if (!validHeader(shared, impl_->resolution) || shared.completed > shared.requested || impl_->request > shared.requested) {
             error = L"The camera helper returned invalid night blend data. Try again."; return false;
         }
         if (shared.state == HostState::Failed || shared.state == HostState::Stopped) {
@@ -882,14 +913,14 @@ bool CameraClient::nightResult(uint64_t token, Frame& output, NightWindowResult&
         }
         if (shared.completedKind != PixelRequest::Night || shared.completedToken != token ||
             shared.publishedRequest != impl_->request || shared.publishedKind != PixelRequest::Night || shared.publishedToken != token ||
-            !shared.width || !shared.height || shared.width > maxWidth || shared.height > maxHeight ||
-            uint64_t(shared.width) * shared.height * 4 != shared.bytes || !shared.generation || (shared.generation & 1) ||
+            !shared.width || !shared.height || shared.width > impl_->captureLimits.width || shared.height > impl_->captureLimits.height ||
+            uint64_t(shared.width) * shared.height * 4 != shared.bytes || shared.bytes > impl_->captureLimits.pixelBytes || !shared.generation || (shared.generation & 1) ||
             shared.generation <= impl_->requestedGeneration || shared.generation < impl_->generation) {
             error = L"The camera helper returned an invalid night result. Try again."; return false;
         }
         try {
             output.pixels.resize(shared.bytes);
-            std::memcpy(output.pixels.data(), shared.pixels, shared.bytes);
+            std::memcpy(output.pixels.data(), sharedPixels(shared), shared.bytes);
             output.width = int(shared.width); output.height = int(shared.height);
             if (GetTickCount64() > impl_->nightDeadline) {
                 error = L"The camera night blend was not delivered within its deadline. Reconnect it and try again."; return false;
@@ -960,7 +991,7 @@ bool CameraClient::observe(uint64_t token, CameraObservation* activity, CameraPe
             return false;
         }
         auto& shared = *impl_->view.value;
-        if (!validHeader(shared) || shared.observationCompleted > shared.observationRequested ||
+        if (!validHeader(shared, impl_->resolution) || shared.observationCompleted > shared.observationRequested ||
             impl_->observationRequest > shared.observationRequested) {
             error = L"The camera helper returned invalid activity data."; return false;
         }
@@ -1002,7 +1033,7 @@ bool CameraClient::observe(uint64_t token, CameraObservation* activity, CameraPe
         if (shared.observationState != ObservationState::Ready || shared.observationPublished != impl_->observationRequest ||
             shared.observationPublishedToken != token || shared.observationPublishedKind != kind || !report.epoch || !report.sequence || !report.receivedTick ||
             report.receivedTick > now || now - report.receivedTick > 3000 ||
-            report.sourceWidth <= 0 || report.sourceWidth > int(maxWidth) || report.sourceHeight <= 0 || report.sourceHeight > int(maxHeight) ||
+            report.sourceWidth <= 0 || report.sourceWidth > int(impl_->captureLimits.width) || report.sourceHeight <= 0 || report.sourceHeight > int(impl_->captureLimits.height) ||
             (report.epoch == impl_->observationEpoch && report.sequence <= impl_->observationSequence)) {
             error = L"The camera activity response is invalid, repeated or stale."; return false;
         }

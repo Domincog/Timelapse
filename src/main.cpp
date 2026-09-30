@@ -239,7 +239,7 @@ bool hasRequiredSources() {
     return (!hasSource(Source::Desktop) || (m>=0 && m<static_cast<int>(app.monitors.size()))) &&
         (!hasSource(Source::Camera) || (c>=0 && c<static_cast<int>(app.cameras.size())));
 }
-constexpr wchar_t VideoSizeHelp[]=L"Use copies the selected source size once. Fit scales it down to supported even dimensions. The saved output size stays fixed when sources change. Camera input is limited to 1280 × 720; advertised camera modes are not used. Suggestions require a current available source size.";
+constexpr wchar_t VideoSizeHelp[]=L"Use copies the selected source size once. Fit scales it down to supported even dimensions. Output stays fixed when sources change. Camera input is up to 1280 × 720 for smaller outputs, or 1920 × 1080 for larger outputs if supported. Camera suggestions show the input actually received.";
 struct SourceSizeChoice {
     int width=0,height=0;bool fitted=false;const wchar_t* reason=L"";
     int64_t sourceWidth=0,sourceHeight=0;

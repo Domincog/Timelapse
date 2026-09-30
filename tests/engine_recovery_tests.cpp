@@ -55,7 +55,7 @@ void CameraClient::cancelActivityObservation() noexcept {}
 struct CameraClient::Impl { bool active = false; int warmup = 0; };
 CameraClient::CameraClient() : impl_(std::make_unique<Impl>()) {}
 CameraClient::~CameraClient() = default;
-bool CameraClient::start(const std::wstring&, std::wstring& error) {
+bool CameraClient::start(const std::wstring&, std::wstring& error, CameraResolution) {
     error.clear(); impl_->active = true; impl_->warmup = 4; ++starts; return true;
 }
 void CameraClient::stop() {

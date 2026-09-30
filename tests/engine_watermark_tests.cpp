@@ -315,7 +315,7 @@ namespace lapse {
 struct CameraClient::Impl { bool active = false; uint64_t token = 0, begin = 0; uint32_t duration = 0; };
 CameraClient::CameraClient() : impl_(std::make_unique<Impl>()) {}
 CameraClient::~CameraClient() = default;
-bool CameraClient::start(const std::wstring&, std::wstring& error) { ++cameraStarts; impl_->active = true; error.clear(); return true; }
+bool CameraClient::start(const std::wstring&, std::wstring& error, CameraResolution) { ++cameraStarts; impl_->active = true; error.clear(); return true; }
 void CameraClient::stop() { impl_->active = false; }
 bool CameraClient::latest(Frame& frame, std::wstring& error) {
     error.clear(); const auto ordinal = ++cameraReads;

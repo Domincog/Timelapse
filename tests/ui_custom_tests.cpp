@@ -252,6 +252,19 @@ void sourceSizeSnapshots(){
     require(app.settings.width==1280,"New selected camera reused the old source action.");
     lapse::fixtureStatus.cameraInput={640,480,9};open();select(app.sizeSuggestions[1].item);
     require(app.settings.width==640 && app.settings.height==480 && app.hasCustomSize,"Current camera input was not committed exactly.");
+    lapse::fixtureStatus.cameraInput={1920,1080,10};open();
+    require(itemText(app.sizeSuggestions[1].item)==L"Use camera input: 1920 × 1080","Verified high-resolution input lost its exact source label.");
+    select(app.sizeSuggestions[1].item);
+    require(app.settings.width==1920 && app.settings.height==1080 && app.committedSize==1 && !app.hasCustomSize && choice(app.videoSize)==1,
+        "Verified 1080p input did not normalize to the existing output preset.");
+    open();const int retiredHigh=app.sizeSuggestions[1].item;
+    lapse::fixtureStatus.cameraInput={0,0,11};const int beforeRetired=lapse::configurationCalls;select(retiredHigh);
+    require(app.settings.width==1920 && choice(app.videoSize)==1 && lapse::configurationCalls==beforeRetired,
+        "A camera restart committed its retired high-resolution suggestion.");
+    open();require(app.sizeSuggestions[1].item<0,"Pending replacement camera advertised the old input size.");
+    lapse::fixtureStatus.cameraInput={640,480,12};open();select(app.sizeSuggestions[1].item);
+    require(app.settings.width==640 && app.settings.height==480 && app.hasCustomSize && choice(app.videoSize)==2,
+        "Smaller actual camera fallback was replaced by a promised 1080p suggestion.");
     for(auto state:{State::Starting,State::Recording,State::Paused,State::Finishing}){
         app.status.state=State::Idle;lapse::fixtureStatus.cameraInput={1280,720,10};open();const int action=app.sizeSuggestions[1].item;
         app.status.state=state;const int before=lapse::configurationCalls;select(action);
@@ -262,7 +275,7 @@ void sourceSizeSnapshots(){
     const auto protectedMessage=L"Saved earlier parts; retained last movie.";app.status.message=protectedMessage;
     enumerationAllocation::failNext=true;open();require(app.sizeSuggestions[0].item<0 && app.sizeSuggestions[1].item<0 &&
         choice(app.videoSize)==2 && app.status.message==protectedMessage,"Suggestion allocation failure lost committed output or primary status.");
-    std::cout<<"PASS source-size exact/Fit snapshots, live topology, stable custom indices, camera generation/identity, active locks and allocation fallback\n";
+    std::cout<<"PASS source-size exact/Fit snapshots, live topology, stable custom indices, actual 1080p/fallback, camera generation/identity, active locks and allocation fallback\n";
 }
 }
 int main(){

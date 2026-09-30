@@ -3,6 +3,7 @@
 #include "night.h"
 #include "time_skip.h"
 #include "person_protocol.h"
+#include "camera_resolution.h"
 
 namespace lapse {
 struct NightWindowResult {
@@ -27,7 +28,7 @@ public:
     ~CameraClient();
     CameraClient(const CameraClient&) = delete;
     CameraClient& operator=(const CameraClient&) = delete;
-    bool start(const std::wstring& id, std::wstring& error);
+    bool start(const std::wstring& id, std::wstring& error, CameraResolution tier = CameraResolution::Standard720);
     void stop();
     bool latest(Frame& output, std::wstring& error);
     // Windows start after helper acceptance and a fresh source watermark.

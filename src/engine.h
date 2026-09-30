@@ -17,6 +17,8 @@ struct Settings {
     std::vector<Layer> layers = preset(Mode::Desktop);
     // Exact capture cadence; slower capture/encoding skips elapsed slots.
     int intervalMs = 5000;
+    // Camera input uses a bounded 1080p tier only outside the 1280x720 box;
+    // output dimensions (and therefore that request) freeze with the session.
     int width = 1280, height = 720;
     EncodingQuality encodingQuality = EncodingQuality::Balanced;
     EncodingMode encodingMode = EncodingMode::Compatible;

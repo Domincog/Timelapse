@@ -244,7 +244,7 @@ namespace lapse {
 struct CameraClient::Impl{bool active=false,pending=false;uint64_t sequence=0,requestTick=0,nightToken=0,nightStart=0;uint32_t duration=0;};
 CameraClient::CameraClient():impl_(std::make_unique<Impl>()){}
 CameraClient::~CameraClient()=default;
-bool CameraClient::start(const std::wstring& id,std::wstring& e){e.clear();impl_->active=id==L"person-camera";impl_->sequence=0;return impl_->active;}
+bool CameraClient::start(const std::wstring& id,std::wstring& e, CameraResolution){e.clear();impl_->active=id==L"person-camera";impl_->sequence=0;return impl_->active;}
 void CameraClient::stop(){impl_->active=false;impl_->pending=false;}
 bool CameraClient::latest(Frame& out,std::wstring& e){e.clear();if(!impl_->active){e=L"Synthetic camera stopped";return false;}pixels(out,160,120);return true;}
 bool CameraClient::observeActivity(uint64_t,CameraObservation&,std::wstring& e){++activityCalls;e.clear();return false;}

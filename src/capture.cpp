@@ -192,6 +192,8 @@ std::wstring attributeString(IMFAttributes* attributes, REFGUID key) {
 struct Format { UINT32 width = 0, height = 0; LONG stride = 0; UINT32 transferFunction = 0; };
 std::atomic<uint64_t> nextCameraEpoch{0};
 struct CameraState {
+    explicit CameraState(CameraResolution value = CameraResolution::Standard720) : resolution(value) {}
+    const CameraResolution resolution;
     std::mutex mutex;
     // Cleared under mutex before the owning reader reference is released.
     IMFSourceReader* reader = nullptr;
@@ -204,16 +206,22 @@ struct CameraState {
     CameraSampleInfo info{++nextCameraEpoch};
 };
 
-HRESULT readFormat(IMFSourceReader* reader, Format& format) {
+HRESULT readFormat(IMFSourceReader* reader, Format& format, CameraResolution resolution) {
+    const auto limits = cameraCaptureLimits(resolution);
+    if (!limits.pixelBytes) return E_INVALIDARG;
     ComPtr<IMFMediaType> type;
     HRESULT hr = reader->GetCurrentMediaType(videoStream, &type);
     if (FAILED(hr)) return hr;
-    GUID subtype{};
+    if (!type) return MF_E_INVALIDMEDIATYPE;
+    GUID major{}, subtype{};
+    hr = type->GetGUID(MF_MT_MAJOR_TYPE, &major);
+    if (FAILED(hr) || major != MFMediaType_Video) return MF_E_INVALIDMEDIATYPE;
     hr = type->GetGUID(MF_MT_SUBTYPE, &subtype);
     if (FAILED(hr) || subtype != MFVideoFormat_RGB32) return MF_E_INVALIDMEDIATYPE;
     UINT32 width = 0, height = 0;
     hr = MFGetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, &width, &height);
-    if (FAILED(hr) || !width || !height || width > 1280 || height > 720) return MF_E_INVALIDMEDIATYPE;
+    if (FAILED(hr) || !width || !height || width > limits.width || height > limits.height)
+        return MF_E_INVALIDMEDIATYPE;
     UINT32 stride = 0;
     hr = type->GetUINT32(MF_MT_DEFAULT_STRIDE, &stride);
     if (FAILED(hr)) {
@@ -335,7 +343,7 @@ public:
                 status = MF_E_END_OF_STREAM;
             if (SUCCEEDED(status) && (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED)) {
                 retired.Swap(state_->sample);
-                status = readFormat(state_->reader, state_->format);
+                status = readFormat(state_->reader, state_->format, state_->resolution);
                 state_->info.epoch = ++nextCameraEpoch;
             }
             if (FAILED(status)) { state_->failure = status; state_->running = false; }
@@ -377,7 +385,9 @@ private:
     std::shared_ptr<CameraState> state_;
 };
 
-HRESULT chooseCameraFormat(IMFSourceReader* reader) {
+HRESULT chooseCameraFormat(IMFSourceReader* reader, CameraResolution resolution) {
+    const auto limits = cameraCaptureLimits(resolution);
+    if (!limits.pixelBytes) return E_INVALIDARG;
     struct Candidate { ComPtr<IMFMediaType> type; double score; UINT32 width, height, n, d; };
     std::vector<Candidate> candidates;
     for (DWORD index = 0; index < 512; ++index) {
@@ -385,14 +395,20 @@ HRESULT chooseCameraFormat(IMFSourceReader* reader) {
         const HRESULT hr = reader->GetNativeMediaType(videoStream, index, &type);
         if (hr == MF_E_NO_MORE_TYPES) break;
         if (FAILED(hr)) return hr;
+        if (!type) continue;
         UINT32 w = 0, h = 0, n = 0, d = 0;
-        if (FAILED(MFGetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, &w, &h)) || !w || !h || w > 7680 || h > 4320) continue;
+        if (FAILED(MFGetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, &w, &h)) || w < 2 || h < 2 || w > 7680 || h > 4320) continue;
         MFGetAttributeRatio(type.Get(), MF_MT_FRAME_RATE, &n, &d);
         const double fps = d ? double(n) / d : 30.0;
         if (fps <= 0) continue;
-        const double sizeCost = 160.0 * std::abs(std::log(double(w) * h / (1280.0 * 720)));
-        const double rateCost = std::abs(fps - 10.0) * 3.0 + (fps < 5 ? 100.0 : 0.0);
-        const double excessCost = w > 1280 || h > 720 ? 300.0 : 0.0;
+        const double sizeCost = 160.0 * std::abs(std::log(double(w) * h / (double(limits.width) * limits.height)));
+        const double rateDifference = std::abs(fps - 10.0) * 3.0;
+        // Keep the original 720p preference unchanged. In the detail tier,
+        // a common 60fps native 1080p type should not lose to 720p solely on
+        // frame rate: the output still requests at most 10fps when supported.
+        const double rateCost = (resolution == CameraResolution::Standard720 ? rateDifference :
+            std::min(rateDifference, 60.0)) + (fps < 5 ? 100.0 : 0.0);
+        const double excessCost = w > limits.width || h > limits.height ? 300.0 : 0.0;
         candidates.push_back({std::move(type), sizeCost + rateCost + excessCost, w, h, n, d});
     }
     std::stable_sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) { return a.score < b.score; });
@@ -405,7 +421,7 @@ HRESULT chooseCameraFormat(IMFSourceReader* reader) {
         if (FAILED(lastError)) return lastError;
         output->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
         output->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_RGB32);
-        const double scale = std::min({1.0, 1280.0 / candidate.width, 720.0 / candidate.height});
+        const double scale = std::min({1.0, double(limits.width) / candidate.width, double(limits.height) / candidate.height});
         const UINT32 width = std::max(2u, UINT32(candidate.width * scale) & ~1u);
         const UINT32 height = std::max(2u, UINT32(candidate.height * scale) & ~1u);
         MFSetAttributeSize(output.Get(), MF_MT_FRAME_SIZE, width, height);
@@ -415,9 +431,12 @@ HRESULT chooseCameraFormat(IMFSourceReader* reader) {
             MFSetAttributeRatio(output.Get(), MF_MT_FRAME_RATE, candidate.n, candidate.d);
         else MFSetAttributeRatio(output.Get(), MF_MT_FRAME_RATE, 10, 1);
         lastError = reader->SetCurrentMediaType(videoStream, nullptr, output.Get());
+        Format delivered;
+        if (SUCCEEDED(lastError)) lastError = readFormat(reader, delivered, resolution);
         if (SUCCEEDED(lastError)) return S_OK;
         output->DeleteItem(MF_MT_FRAME_RATE);
         lastError = reader->SetCurrentMediaType(videoStream, nullptr, output.Get());
+        if (SUCCEEDED(lastError)) lastError = readFormat(reader, delivered, resolution);
         if (SUCCEEDED(lastError)) return S_OK;
     }
     return lastError;
@@ -530,12 +549,13 @@ struct Camera::Impl {
 Camera::Camera() : impl_(std::make_unique<Impl>()) {}
 Camera::~Camera() { stop(); }
 
-bool Camera::start(const std::wstring& id, std::wstring& error) {
+bool Camera::start(const std::wstring& id, std::wstring& error, CameraResolution resolution) {
     stop(); error.clear();
+    if (!cameraCaptureLimits(resolution).pixelBytes) { error = L"The camera resolution limit is invalid."; return false; }
     if (id.empty()) { error = L"Select a camera first."; return false; }
     HRESULT hr = S_OK;
     try {
-        auto state = std::make_shared<CameraState>();
+        auto state = std::make_shared<CameraState>(resolution);
         impl_->state = state;
         ComPtr<IMFAttributes> attributes;
         hr = MFCreateAttributes(&attributes, 2);
@@ -552,8 +572,8 @@ bool Camera::start(const std::wstring& id, std::wstring& error) {
         if (SUCCEEDED(hr)) hr = MFCreateSourceReaderFromMediaSource(impl_->source.Get(), attributes.Get(), &impl_->reader);
         if (SUCCEEDED(hr)) hr = impl_->reader->SetStreamSelection(allStreams, FALSE);
         if (SUCCEEDED(hr)) hr = impl_->reader->SetStreamSelection(videoStream, TRUE);
-        if (SUCCEEDED(hr)) hr = chooseCameraFormat(impl_->reader.Get());
-        if (SUCCEEDED(hr)) hr = readFormat(impl_->reader.Get(), state->format);
+        if (SUCCEEDED(hr)) hr = chooseCameraFormat(impl_->reader.Get(), resolution);
+        if (SUCCEEDED(hr)) hr = readFormat(impl_->reader.Get(), state->format, state->resolution);
         if (SUCCEEDED(hr)) {
             {
                 std::lock_guard<std::mutex> guard(state->mutex);

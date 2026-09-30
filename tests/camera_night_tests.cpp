@@ -1,5 +1,78 @@
 #include "camera_helper_fixture.h"
 namespace {
+lapse::SharedFrame* remapHeader = nullptr;
+void mutateOnFullMap(HANDLE, SIZE_T bytes) {
+    if (bytes <= sizeof(lapse::SharedFrame)) return;
+    remapHeader->resolution = lapse::CameraResolution::Detail1080;
+    remapHeader->pixelCapacity = lapse::cameraCaptureLimits(lapse::CameraResolution::Detail1080).pixelBytes;
+}
+void mappingContract() {
+    using namespace lapse;
+    require(mappingBytes(CameraResolution::Standard720)==sizeof(SharedFrame)+3686400 &&
+        mappingBytes(CameraResolution::Detail1080)==sizeof(SharedFrame)+8294400,
+        "Camera mapping does not preserve selected payload size");
+    CameraClient invalid; std::wstring error;
+    require(!invalid.start(L"night-live",error,static_cast<CameraResolution>(99))&&!error.empty(),"Unknown camera tier launched");
+    for(int mode=0;mode<5;++mode) {
+        GUID guid{}; require(SUCCEEDED(CoCreateGuid(&guid)),"Create startup mapping identity");
+        wchar_t token[40]{};StringFromGUID2(guid,token,40);
+        const std::wstring name=std::wstring(mappingPrefix)+token;
+        TestHandle mapping,mutex,stop,request,response; TestView view;
+        const auto tier=mode==3?CameraResolution::Detail1080:CameraResolution::Standard720;
+        const size_t bytes=mappingBytes(tier)-(mode==3?65536:0);
+        mapping.value=CreateFileMappingW(INVALID_HANDLE_VALUE,nullptr,PAGE_READWRITE,0,static_cast<DWORD>(bytes),name.c_str());
+        mutex.value=CreateMutexW(nullptr,FALSE,(name+L".mutex").c_str());
+        stop.value=CreateEventW(nullptr,TRUE,FALSE,(name+L".stop").c_str());
+        request.value=CreateEventW(nullptr,FALSE,FALSE,(name+L".request").c_str());
+        response.value=CreateEventW(nullptr,FALSE,FALSE,(name+L".response").c_str());
+        require(mapping.value&&mutex.value&&stop.value&&request.value&&response.value,"Create owned startup mapping objects");
+        view.value=MapViewOfFile(mapping.value,FILE_MAP_READ|FILE_MAP_WRITE,0,0,sizeof(SharedFrame));
+        require(view.value!=nullptr,"Map owned fixed header");
+        auto& shared=*static_cast<SharedFrame*>(view.value);
+        shared.magic=protocolMagic;shared.version=protocolVersion;shared.headerBytes=sizeof(SharedFrame);
+        shared.resolution=tier;shared.pixelCapacity=cameraCaptureLimits(tier).pixelBytes;wcscpy_s(shared.id,L"never-activate-device");
+        if(mode==0)shared.resolution=static_cast<CameraResolution>(99);
+        if(mode==1)++shared.pixelCapacity;
+        if(mode==2)--shared.headerBytes;
+        struct ClearHook { ~ClearHook(){cameraMappingHook=nullptr;remapHeader=nullptr;} } clear;
+        if(mode==4){remapHeader=&shared;cameraMappingHook=mutateOnFullMap;}
+        require(hostMain(name.c_str())==(mode==3?4:5),"Malformed/truncated/remap-mutated mapping reached camera activation");
+    }
+    std::cout<<"PASS tier-sized mapping arithmetic, unknown/header/capacity rejection, actual truncated mapping and remap mutation\n";
+}
+void acceptedTierMutation() {
+    using namespace lapse;
+    for(bool changeTier:{false,true}) {
+        Harness h(L"night-live");h.first();Frame output;std::wstring error;
+        h.inspect([&](auto& shared){if(changeTier){shared.resolution=CameraResolution::Detail1080;shared.pixelCapacity=cameraCaptureLimits(CameraResolution::Detail1080).pixelBytes;}else ++shared.pixelCapacity;});
+        require(!h.client.latest(output,error)&&error.find(L"invalid data")!=std::wstring::npos&&output.pixels.empty(),"Parent accepted mutated tier/capacity");
+    }
+    Harness h(L"night-live");h.first();Frame output;std::wstring error;
+    InterlockedExchange(&h.control().readGate,1);
+    require(!h.client.latest(output,error)&&error.empty(),"Gated publication unexpectedly completed");
+    const auto until=GetTickCount64()+1000;
+    while(!h.control().readReached&&GetTickCount64()<until)Sleep(1);
+    require(h.control().readReached,"Owned helper did not reach source gate");
+    uint64_t generation=0;
+    h.inspect([&](auto& shared){generation=shared.generation;shared.resolution=CameraResolution::Detail1080;shared.pixelCapacity=cameraCaptureLimits(CameraResolution::Detail1080).pixelBytes;});
+    TestHandle process;process.value=OpenProcess(SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION,FALSE,h.control().processId);
+    require(process.value!=nullptr,"Open owned helper termination handle");
+    InterlockedExchange(&h.control().readRelease,1);
+    require(WaitForSingleObject(process.value,2000)==WAIT_OBJECT_0,"Helper did not reject changed header before publication");
+    DWORD code=0;require(GetExitCodeProcess(process.value,&code)&&code==12,"Helper header mutation has wrong terminal outcome");
+    h.inspect([&](auto& shared){require(shared.generation==generation,"Helper copied pixels after its accepted tier changed");});
+    std::cout<<"PASS parent and helper retain original tier/capacity after acceptance\n";
+}
+void highTierNight() {
+    Harness h(L"night-1080p",lapse::CameraResolution::Detail1080);h.first();
+    h.begin(111);lapse::Frame output;const auto result=h.completed(111,output,true);
+    require(output.valid()&&output.width==1920&&output.height==1080&&result.exposure.samples>=2&&
+        result.endTick-result.beginTick==1000&&result.lastSampleTick<result.endTick,"1080p night lost geometry/window facts");
+    const auto value=output.pixels[0];require(value>32,"1080p blend was raw preview");
+    for(size_t p=0;p<output.pixels.size();p+=4)require(output.pixels[p]==value&&output.pixels[p+1]==value&&output.pixels[p+2]==value&&output.pixels[p+3]==255,"1080p blend payload tail or color damaged");
+    h.client.cancelNight();h.first();
+    std::cout<<"PASS full1080 Night pixels, exact full-window timing and raw preview separation\n";
+}
 void checkWindow(const lapse::NightWindowResult& result, const lapse::Frame& frame, uint32_t duration) {
     require(frame.valid() && frame.width == 64 && frame.height == 36 && frame.pixels[0] >= 32 && frame.pixels[3] == 255,
         "completed blend pixels are invalid");
@@ -169,6 +242,7 @@ int main() {
     const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED); if (FAILED(com)) return 2;
     int result = 0;
     try {
+        mappingContract();acceptedTierMutation();highTierNight();
         previewAndStableResult(); replaceAndCancel(); sourceSemantics(); boundedFailures(); slowSourceSuggestion(); completionBoundaries(); typedPublicationRace();
         std::cout << "Synthetic night helper transport contracts passed.\n";
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; result = 1; }

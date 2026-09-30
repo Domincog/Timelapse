@@ -37,6 +37,14 @@ void pixelsAndDemand() {
     require(ready && activity.descriptor.y[0] == 32, "person bytes were reinterpreted as image-change descriptor");
     std::cout << "PASS lazy person mapping, polling without work, exact raw pixels, provenance and mode separation\n";
 }
+void highTierTensor() {
+    Harness h(L"night-1080p",lapse::CameraResolution::Detail1080);h.first();const auto output=person(h,101);
+    require(output->source.sourceWidth==1920&&output->source.sourceHeight==1080&&output->source.width==320&&output->source.height==180,
+        "1080p source altered person input bounds or original geometry");
+    require(output->bgr.size()==320*320*3&&std::all_of(output->bgr.begin(),output->bgr.begin()+320*180*3,[](uint8_t v){return v==32;}),
+        "1080p source changed bounded person tensor pixels");
+    std::cout<<"PASS1080 original source identity with unchanged320-bounded person tensor\n";
+}
 void duplicatePolling() {
     Harness h(L"night-duplicate"); h.first(); person(h, 10);
     auto output = std::make_unique<lapse::CameraPersonInput>(); std::wstring error;
@@ -118,7 +126,7 @@ int main() {
     const int host = lapse::runCameraHost(nullptr); if (host >= 0) return host;
     const HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED); if (FAILED(com)) return 2;
     int result = 0;
-    try { pixelsAndDemand(); duplicatePolling(); corruptGeometryAndKind(); nightReuse(); }
+    try { pixelsAndDemand(); highTierTensor(); duplicatePolling(); corruptGeometryAndKind(); nightReuse(); }
     catch (const std::exception& error) { std::cerr << error.what() << '\n'; result = 1; }
     CoUninitialize(); return result;
 }

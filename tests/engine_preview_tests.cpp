@@ -226,11 +226,13 @@ struct Controls {
     std::mutex mutex;
     std::condition_variable changed;
     bool timedOut = false;
+    bool detailFrames = false;
+    std::vector<lapse::CameraResolution> resolutions;
 
     Gate& gate(Operation operation) { return operation == Operation::Open ? openGate : readGate; }
     void reset() {
         std::lock_guard<std::mutex> lock(mutex);
-        openGate = {}; readGate = {}; counts = {}; timedOut = false;
+        openGate = {}; readGate = {}; counts = {}; timedOut = detailFrames = false; resolutions.clear();
     }
     void arm(Operation operation, bool fail) {
         std::lock_guard<std::mutex> lock(mutex);
@@ -268,6 +270,8 @@ struct Controls {
         changed.notify_all();
     }
     Counts snapshot() { std::lock_guard<std::mutex> lock(mutex); return counts; }
+    void requested(lapse::CameraResolution resolution) { std::lock_guard<std::mutex> lock(mutex); resolutions.push_back(resolution); }
+    std::vector<lapse::CameraResolution> requested() { std::lock_guard<std::mutex> lock(mutex); return resolutions; }
     bool noNewOpen(int expected) {
         std::unique_lock<std::mutex> lock(mutex);
         // Include a complete idle preview deadline, so this observes both an
@@ -458,6 +462,72 @@ void cameraInputSnapshotLifecycle() {
             restored.cameraInput.generation != input.generation && restored.preview->width == 480 && restored.preview->height == 360,
             "Restoring source geometry altered output size or reported composed preview geometry.");
 }
+void cameraTierTransition(bool initialDetail, bool failOldRead) {
+    Mode mode; controls.reset(); controls.detailFrames = true;
+    lapse::Engine engine; ReleaseGates release;
+    auto initial = cameraSettings();
+    if (initialDetail) { initial.width = 1920; initial.height = 1080; }
+    engine.configure(initial);
+    require(await([&] { return cameraPreview(engine.status()); }), "Initial tier preview unavailable.");
+    const auto input = engine.status().cameraInput;
+    require(input.width == (initialDetail ? 1920 : 64), "Input metadata described requested rather than delivered dimensions.");
+    controls.arm(Operation::Read, failOldRead);
+    require(controls.awaitEntry(Operation::Read), "Old-tier read did not block.");
+    auto changed = initial; changed.width = initialDetail ? 1280 : 1920; changed.height = initialDetail ? 720 : 1080;
+    controls.arm(Operation::Open, false);
+    engine.configure(changed);
+    require(!engine.status().preview && !engine.status().cameraInput.width && engine.status().cameraInput.generation != input.generation,
+        "Idle tier change did not immediately retire source metadata/pixels.");
+    controls.release(Operation::Read);
+    require(controls.awaitEntry(Operation::Open), "Changed tier did not start one replacement helper.");
+    require(!engine.status().preview && !engine.status().cameraInput.width && !engine.status().error,
+        "Delayed old-tier pixels/error survived replacement fencing.");
+    const auto tiers = controls.requested();
+    require(tiers.size() == 2 && tiers[0] != tiers[1] && tiers[1] == lapse::cameraResolutionForOutput(changed.width, changed.height),
+        "Replacement requested the wrong camera tier or retried more than once.");
+    controls.release(Operation::Open);
+    require(await([&] { return cameraPreview(engine.status()); }), "Replacement tier preview unavailable.");
+    require(engine.status().cameraInput.width == (initialDetail ? 64 : 1920) && controls.noNewOpen(2),
+        "New delivered geometry was not published once.");
+}
+void sameTierKeepsHealthyAndFailedAttempt() {
+    Mode mode; controls.reset();
+    lapse::Engine engine; ReleaseGates release; auto initial = cameraSettings();
+    initial.width = 1920; initial.height = 1080; engine.configure(initial);
+    require(await([&] { return cameraPreview(engine.status()); }), "High-tier smaller fallback preview unavailable.");
+    const auto input = engine.status().cameraInput;
+    require(input.width == 64, "Smaller delivered fallback was mislabeled as 1080p.");
+    auto changed = initial; changed.width = 1440; changed.height = 1080;
+    engine.configure(changed);
+    require(engine.status().cameraInput.generation == input.generation && engine.status().cameraInput.width == input.width && controls.noNewOpen(1),
+        "Same-tier resize retired healthy camera provenance or helper.");
+    controls.arm(Operation::Read, true); require(controls.awaitEntry(Operation::Read), "Failed-tier read did not reach gate.");
+    controls.release(Operation::Read);
+    require(await([&] { return engine.status().error && !engine.status().preview; }), "Current high-tier failure did not latch.");
+    engine.configure(initial);
+    require(controls.noNewOpen(1), "Same-tier output resize retried failed camera.");
+    changed.watermark.enabled = true; engine.configure(changed);
+    require(controls.noNewOpen(1), "Overlay edit retried failed camera.");
+    changed.width = 1280; changed.height = 720; engine.configure(changed);
+    require(await([&] { return engine.status().preview != nullptr; }), "New tier did not retry a failed camera.");
+    require(controls.requested().size() == 2 && controls.requested().back() == lapse::CameraResolution::Standard720,
+        "Failed camera attempt was not keyed by requested tier.");
+}
+void tierRoundTripRejectsOldPublication() {
+    Mode mode; controls.reset();
+    lapse::Engine engine; ReleaseGates release; auto initial = cameraSettings(); engine.configure(initial);
+    require(await([&] { return cameraPreview(engine.status()); }), "Tier round-trip baseline unavailable.");
+    controls.arm(Operation::Read, false); require(controls.awaitEntry(Operation::Read), "Tier round-trip old read did not block.");
+    auto high = initial; high.width = 1920; high.height = 1080;
+    const auto oldGeneration = engine.status().cameraInput.generation;
+    engine.configure(high); engine.configure(initial);
+    require(engine.status().cameraInput.width == 0 && engine.status().cameraInput.generation != oldGeneration,
+        "Tier round trip retained old metadata.");
+    controls.release(Operation::Read);
+    require(await([&] { return cameraPreview(engine.status()); }), "Tier round-trip fresh preview unavailable.");
+    require(engine.status().cameraInput.width == 64 && controls.snapshot().reads >= 3 && controls.noNewOpen(1),
+        "Same final tier failed to reuse healthy helper with a fresh publication.");
+}
 }
 
 namespace lapse {
@@ -473,12 +543,14 @@ bool CameraClient::observeActivity(uint64_t, CameraObservation&, std::wstring& e
     error = L"Unexpected activity observer in an Off-mode fixture."; return false;
 }
 void CameraClient::cancelActivityObservation() noexcept {}
-struct CameraClient::Impl { std::wstring id; bool controlledRunning = false; };
+struct CameraClient::Impl { std::wstring id; bool controlledRunning = false; CameraResolution resolution = CameraResolution::Standard720; };
 CameraClient::CameraClient() : impl_(std::make_unique<Impl>()) {}
 CameraClient::~CameraClient() { if (retryCases::enabled) stop(); }
-bool CameraClient::start(const std::wstring& id, std::wstring& error) {
+bool CameraClient::start(const std::wstring& id, std::wstring& error, CameraResolution resolution) {
+    impl_->resolution = resolution;
     if (retryCases::enabled) {
         stop(); error.clear();
+        retryCases::controls.requested(resolution);
         if (retryCases::controls.enter(retryCases::Operation::Open)) { error = retryCases::startError; return false; }
         impl_->id = id; impl_->controlledRunning = true; return true;
     }
@@ -501,7 +573,10 @@ bool CameraClient::latest(Frame& output, std::wstring& error) {
         error.clear();
         if (!impl_->controlledRunning) { error = L"Synthetic camera was closed."; return false; }
         if (retryCases::controls.enter(retryCases::Operation::Read)) { error = retryCases::readError; return false; }
-        retryCases::frame(output, retryCases::cameraMarker); return true;
+        if (retryCases::controls.detailFrames && impl_->resolution == CameraResolution::Detail1080) {
+            output.width = 1920; output.height = 1080; output.pixels.assign(size_t(1920) * 1080 * 4, retryCases::cameraMarker);
+        } else retryCases::frame(output, retryCases::cameraMarker);
+        return true;
     }
     return gate.capture(L"camera:" + impl_->id, output, error);
 }
@@ -541,10 +616,17 @@ int main() {
         test(change, Completion::Error);
     const std::pair<const char*, void(*)()> retryTests[] = {
         {"input-size snapshot lifecycle uses no extra capture", retryCases::cameraInputSnapshotLifecycle},
+        {"same-tier sizes retain healthy and failed helper identity", retryCases::sameTierKeepsHealthyAndFailedAttempt},
+        {"tier A-B-A retires old replies while reusing matching healthy helper", retryCases::tierRoundTripRejectsOldPublication},
         {"healthy reader survives invalidation and latches its later current failure", retryCases::healthyReaderThenCurrentFailure},
         {"same-generation startup failure stays latched until Refresh", retryCases::currentStartFailureNeedsRefresh},
         {"due recording failure stays terminal across in-flight source invalidation", retryCases::pendingRecordingFailureStaysTerminal}
     };
+    for (bool high : {false, true}) for (bool failure : {false, true}) {
+        ++cases;
+        try { retryCases::cameraTierTransition(high, failure); std::cout << "PASS cross-tier delivery: high=" << high << " old failure=" << failure << '\n'; }
+        catch (const std::exception& error) { ++failures; std::cerr << "FAIL cross-tier delivery: " << error.what() << '\n'; }
+    }
     for (const auto& retryTest : retryTests) {
         ++cases;
         try { retryTest.second(); std::cout << "PASS " << retryTest.first << '\n'; }

@@ -96,7 +96,7 @@ void CameraClient::cancelActivityObservation() noexcept {}
 struct CameraClient::Impl {};
 CameraClient::CameraClient():impl_(std::make_unique<Impl>()){}
 CameraClient::~CameraClient(){}
-bool CameraClient::start(const std::wstring&,std::wstring&) { throw std::runtime_error("Physical camera path forbidden"); }
+bool CameraClient::start(const std::wstring&,std::wstring&,CameraResolution) { throw std::runtime_error("Physical camera path forbidden"); }
 void CameraClient::stop(){}
 bool CameraClient::latest(Frame&,std::wstring&) { throw std::runtime_error("Physical camera path forbidden"); }
 struct Encoder::Impl { HANDLE file=INVALID_HANDLE_VALUE;uint64_t count=0; };

@@ -42,7 +42,7 @@ void contracts() {
     require(night_detail::encoded(0)==0&&night_detail::encoded(65535)==255&&night_detail::encoded(UINT_MAX)==255,"Transfer endpoints overflowed");
     NightAccumulator accumulator;NightResult facts;std::wstring message;auto settings=enabled();
     require(!accumulator.begin(settings)&&!accumulator.finish(facts),"Unprepared accumulator accepted work");
-    require(!accumulator.prepare(0,1,message)&&!accumulator.prepare(1281,720,message)&&!accumulator.prepare(1,721,message),"Invalid image bound accepted");
+    require(!accumulator.prepare(0,1,message)&&!accumulator.prepare(1921,1080,message)&&!accumulator.prepare(1,1081,message),"Invalid image bound accepted");
     require(accumulator.prepare(256,2,message)&&accumulator.begin(settings),"Valid image preparation failed");
     auto frame=uniform(256,2,96);auto wrong=uniform(1,1,96);
     require(accumulator.add(wrong,1)==NightAdd::Invalid&&accumulator.add(frame,0)==NightAdd::Invalid,"Invalid sample accepted");
@@ -158,11 +158,27 @@ void lowSignalStability() {
     require(result.outputBrightness>24,"Low-signal ceiling disabled useful automatic brightening");
     std::cout<<"PASS alternating near-black boundary and gradual low-signal brightness without a gain discontinuity.\n";
 }
+void highResolutionStorage() {
+    NightAccumulator accumulator; std::wstring message; auto settings=enabled();
+    require(accumulator.storageBytes()==0,"Cold accumulator allocated image storage");
+    require(accumulator.prepare(1280,720,message)&&accumulator.storageBytes()==14745600,"720p storage changed");
+    require(accumulator.prepare(1920,1080,message)&&accumulator.storageBytes()==33177600,"1080p storage exceeds exact sums+output budget");
+    auto input=uniform(1920,1080,96); NightResult facts;
+    allocations=0; countAllocations=true;
+    require(accumulator.begin(settings)&&accumulator.add(input,1)==NightAdd::Added&&accumulator.add(input,2)==NightAdd::Added,"1080p accumulation failed");
+    const auto* output=accumulator.finish(facts);
+    countAllocations=false;
+    require(output&&output->width==1920&&output->height==1080&&facts.samples==2&&facts.appliedGain==1&&allocations==0,"1080p finish facts or steady allocation changed");
+    for(size_t p=0;p<output->pixels.size();p+=4) require(output->pixels[p]==96&&output->pixels[p+1]==96&&output->pixels[p+2]==96&&output->pixels[p+3]==255,"1080p output pixel/alpha mismatch");
+    require(!accumulator.prepare(1921,1080,message)&&accumulator.finish(facts)==output,"Over-budget preparation damaged the previous result");
+    require(accumulator.prepare(64,36,message)&&accumulator.storageBytes()==36864,"Smaller source retained high-tier image storage");
+    std::cout<<"PASS720/1080 exact storage, full output pixels, no warmed allocation and dimension-change retirement.\n";
+}
 }
 void* operator new(size_t size) {if(countAllocations)++allocations;if(void* value=std::malloc(size?size:1))return value;throw std::bad_alloc();}
 void operator delete(void* value) noexcept {std::free(value);}
 void operator delete(void* value,size_t) noexcept {std::free(value);}
 int main() {
-    try {contracts();stability();highlightsAndManual();actualNoiseReduction();periodicMetering();lowSignalStability();std::cout<<"All night image contracts passed using synthetic frames.\n";return 0;}
+    try {contracts();stability();highlightsAndManual();actualNoiseReduction();periodicMetering();lowSignalStability();highResolutionStorage();std::cout<<"All night image contracts passed using synthetic frames.\n";return 0;}
     catch(const std::exception& error){countAllocations=false;std::cerr<<error.what()<<'\n';return 1;}
 }

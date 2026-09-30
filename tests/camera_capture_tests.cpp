@@ -150,6 +150,12 @@ void ordinarySamples() {
 
 class Reader final : public IMFSourceReader {
 public:
+    struct Native {
+        ComPtr<IMFMediaType> type, delivered;
+        HRESULT nativeResult = S_OK, outputResult = S_OK;
+        bool rejectRate = false;
+    };
+    struct OutputRequest { size_t native; UINT32 width, height, n, d; bool hasRate; };
     Reader() {
         check(SUCCEEDED(MFCreateMediaType(&type_)), "create synthetic reader type");
         check(SUCCEEDED(type_->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video)) &&
@@ -167,19 +173,206 @@ public:
     STDMETHODIMP_(ULONG) Release() override { const ULONG n = --refs_; if (!n) delete this; return n; }
     STDMETHODIMP GetStreamSelection(DWORD, BOOL*) override { return E_NOTIMPL; }
     STDMETHODIMP SetStreamSelection(DWORD, BOOL) override { return E_NOTIMPL; }
-    STDMETHODIMP GetNativeMediaType(DWORD, DWORD, IMFMediaType**) override { return E_NOTIMPL; }
-    STDMETHODIMP GetCurrentMediaType(DWORD, IMFMediaType** out) override { return type_.CopyTo(out); }
-    STDMETHODIMP SetCurrentMediaType(DWORD, DWORD*, IMFMediaType*) override { return E_NOTIMPL; }
+    STDMETHODIMP GetNativeMediaType(DWORD, DWORD index, IMFMediaType** out) override {
+        ++nativeQueries;
+        if (index == enumerationFailureIndex) return E_ACCESSDENIED;
+        if (index == nullNativeIndex) { *out = nullptr; return S_OK; }
+        return index < nativeTypes.size() ? nativeTypes[index].type.CopyTo(out) : MF_E_NO_MORE_TYPES;
+    }
+    STDMETHODIMP GetCurrentMediaType(DWORD, IMFMediaType** out) override {
+        ++currentQueries;
+        if (FAILED(currentResult)) return currentResult;
+        if (nullCurrent) { *out = nullptr; return S_OK; }
+        return type_.CopyTo(out);
+    }
+    STDMETHODIMP SetCurrentMediaType(DWORD, DWORD*, IMFMediaType* type) override {
+        for (size_t i = 0; i < nativeTypes.size(); ++i) if (nativeTypes[i].type.Get() == type) {
+            nativeAttempts.push_back(i);
+            if (FAILED(nativeTypes[i].nativeResult)) return nativeTypes[i].nativeResult;
+            selectedNative = i; type_ = type; return S_OK;
+        }
+        if (selectedNative >= nativeTypes.size()) return E_UNEXPECTED;
+        GUID subtype{};
+        if (FAILED(type->GetGUID(MF_MT_SUBTYPE, &subtype)) || subtype != MFVideoFormat_RGB32) return MF_E_INVALIDMEDIATYPE;
+        UINT32 w = 0, h = 0, n = 0, d = 0;
+        MFGetAttributeSize(type, MF_MT_FRAME_SIZE, &w, &h);
+        const bool hasRate = SUCCEEDED(MFGetAttributeRatio(type, MF_MT_FRAME_RATE, &n, &d));
+        outputRequests.push_back({selectedNative, w, h, n, d, hasRate});
+        const auto& native = nativeTypes[selectedNative];
+        if (FAILED(native.outputResult)) return native.outputResult;
+        if (native.rejectRate && hasRate) return MF_E_INVALIDMEDIATYPE;
+        // Own the accepted type; deleting an attribute in a subsequent retry
+        // must not mutate a previously returned current format in this fake.
+        ComPtr<IMFMediaType> accepted;
+        HRESULT result = MFCreateMediaType(&accepted);
+        if (SUCCEEDED(result)) result = (native.delivered ? native.delivered.Get() : type)->CopyAllItems(accepted.Get());
+        if (SUCCEEDED(result)) type_ = std::move(accepted);
+        return result;
+    }
     STDMETHODIMP SetCurrentPosition(REFGUID, REFPROPVARIANT) override { return E_NOTIMPL; }
     STDMETHODIMP ReadSample(DWORD, DWORD, DWORD*, DWORD*, LONGLONG*, IMFSample**) override { ++reads; return S_OK; }
     STDMETHODIMP Flush(DWORD) override { return S_OK; }
     STDMETHODIMP GetServiceForStream(DWORD, REFGUID, REFIID, LPVOID*) override { return E_NOTIMPL; }
     STDMETHODIMP GetPresentationAttribute(DWORD, REFGUID, PROPVARIANT*) override { return E_NOTIMPL; }
     int reads = 0;
+    int nativeQueries = 0, currentQueries = 0;
+    DWORD enumerationFailureIndex = MAXDWORD;
+    DWORD nullNativeIndex = MAXDWORD;
+    HRESULT currentResult = S_OK;
+    bool nullCurrent = false;
+    size_t selectedNative = SIZE_MAX;
+    std::vector<Native> nativeTypes;
+    std::vector<size_t> nativeAttempts;
+    std::vector<OutputRequest> outputRequests;
 private:
     std::atomic<ULONG> refs_{1};
     ComPtr<IMFMediaType> type_;
 };
+
+ComPtr<IMFMediaType> syntheticType(UINT32 width, UINT32 height, UINT32 n = 10, UINT32 d = 1,
+                                const GUID& subtype = MFVideoFormat_YUY2) {
+    ComPtr<IMFMediaType> type;
+    check(SUCCEEDED(MFCreateMediaType(&type)) &&
+        SUCCEEDED(type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video)) &&
+        SUCCEEDED(type->SetGUID(MF_MT_SUBTYPE, subtype)) &&
+        SUCCEEDED(MFSetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, width, height)) &&
+        SUCCEEDED(MFSetAttributeRatio(type.Get(), MF_MT_FRAME_RATE, n, d)), "create advertised synthetic format");
+    return type;
+}
+void advertised(Reader& reader, UINT32 width, UINT32 height, UINT32 n = 10, UINT32 d = 1) {
+    Reader::Native native;
+    native.type = syntheticType(width, height, n, d);
+    reader.nativeTypes.push_back(std::move(native));
+}
+void negotiated(Reader& reader, lapse::CameraResolution resolution, UINT32 width, UINT32 height) {
+    check(SUCCEEDED(lapse::chooseCameraFormat(&reader, resolution)), "negotiate advertised camera format");
+    lapse::Format format;
+    check(SUCCEEDED(lapse::readFormat(&reader, format, resolution)) && format.width == width && format.height == height &&
+        std::abs(int64_t(format.stride)) >= int64_t(width) * 4, "verify actual negotiated RGB32 dimensions and stride");
+}
+void cameraResolutionNegotiation() {
+    using lapse::CameraResolution;
+    constexpr auto standard = CameraResolution::Standard720, detail = CameraResolution::Detail1080;
+    static_assert(lapse::cameraCaptureLimits(standard).width == 1280 && lapse::cameraCaptureLimits(standard).height == 720 &&
+        lapse::cameraCaptureLimits(standard).pixelBytes == 3686400, "standard camera limits");
+    static_assert(lapse::cameraCaptureLimits(detail).width == 1920 && lapse::cameraCaptureLimits(detail).height == 1080 &&
+        lapse::cameraCaptureLimits(detail).pixelBytes == 8294400, "detail camera limits");
+    static_assert(lapse::cameraCaptureLimits(static_cast<CameraResolution>(2)).pixelBytes == 0, "invalid tier fails closed");
+    static_assert(lapse::cameraResolutionForOutput(1280, 720) == standard &&
+        lapse::cameraResolutionForOutput(1281, 720) == detail && lapse::cameraResolutionForOutput(720, 1280) == detail,
+        "output threshold includes portrait and one-axis crossings");
+    {
+        Reader reader;
+        advertised(reader, 1920, 1080, 30); advertised(reader, 1280, 720, 60); advertised(reader, 960, 540);
+        negotiated(reader, standard, 960, 540);
+        check(reader.nativeAttempts == std::vector<size_t>{2} && reader.outputRequests[0].n == 10,
+            "default tier changed its established size/rate scoring preference");
+    }
+    {
+        Reader reader;
+        advertised(reader, 1920, 1080, 30); advertised(reader, 1280, 720); advertised(reader, 1280, 720);
+        negotiated(reader, standard, 1280, 720);
+        check(reader.nativeAttempts == std::vector<size_t>{1}, "default tier lost its 720 preference or stable tie order");
+    }
+    for (UINT32 fps : {30u, 60u}) {
+        Reader reader;
+        advertised(reader, 3840, 2160); advertised(reader, 1280, 720); advertised(reader, 1920, 1080, fps);
+        negotiated(reader, detail, 1920, 1080);
+        check(reader.nativeAttempts == std::vector<size_t>{2} && reader.outputRequests.size() == 1 &&
+            reader.outputRequests[0].hasRate && reader.outputRequests[0].n == 10 && reader.outputRequests[0].d == 1,
+            "detail tier failed to prefer real advertised 1080p or requested excessive output rate");
+    }
+    for (const auto tier : {standard, detail}) {
+        Reader reader;
+        advertised(reader, 3840, 2160);
+        const auto limits = lapse::cameraCaptureLimits(tier);
+        negotiated(reader, tier, limits.width, limits.height);
+        check(reader.nativeAttempts == std::vector<size_t>{0} && reader.outputRequests[0].width == limits.width &&
+            reader.outputRequests[0].height == limits.height, "large-only advertised source was not bounded to the selected tier");
+    }
+    {
+        Reader reader;
+        advertised(reader, 640, 480, 3, 2);
+        negotiated(reader, detail, 640, 480);
+        check(reader.outputRequests[0].n == 3 && reader.outputRequests[0].d == 2,
+            "smaller advertised fallback was upscaled or its sub-10fps native rate was raised");
+    }
+    {
+        Reader reader;
+        advertised(reader, 1920, 1080); advertised(reader, 1280, 720);
+        reader.nativeTypes[0].nativeResult = E_ACCESSDENIED;
+        negotiated(reader, detail, 1280, 720);
+        check(reader.nativeAttempts == std::vector<size_t>({0, 1}) && reader.outputRequests[0].native == 1,
+            "refused native format did not fall back to an actually advertised smaller source");
+    }
+    {
+        Reader reader;
+        advertised(reader, 1920, 1080); advertised(reader, 1280, 720);
+        reader.nativeTypes[0].outputResult = MF_E_INVALIDMEDIATYPE;
+        negotiated(reader, detail, 1280, 720);
+        check(reader.nativeAttempts == std::vector<size_t>({0, 1}) && reader.outputRequests.size() == 3 &&
+            reader.outputRequests[0].hasRate && !reader.outputRequests[1].hasRate,
+            "RGB conversion refusal lost the rate-free retry or smaller advertised fallback");
+    }
+    {
+        Reader reader;
+        advertised(reader, 1920, 1080, 30); reader.nativeTypes[0].rejectRate = true;
+        negotiated(reader, detail, 1920, 1080);
+        check(reader.nativeAttempts.size() == 1 && reader.outputRequests.size() == 2 &&
+            reader.outputRequests[0].hasRate && !reader.outputRequests[1].hasRate,
+            "camera refusing a requested output rate did not retain its valid native-format fallback");
+    }
+    for (const auto tier : {standard, detail}) {
+        Reader reader;
+        const auto limits = lapse::cameraCaptureLimits(tier);
+        advertised(reader, limits.width, limits.height); advertised(reader, 640, 480);
+        reader.nativeTypes[0].delivered = syntheticType(limits.width + 2, limits.height, 10, 1, MFVideoFormat_RGB32);
+        negotiated(reader, tier, 640, 480);
+        check(reader.nativeAttempts == std::vector<size_t>({0, 1}) && reader.outputRequests.size() == 3 && reader.currentQueries >= 3,
+            "nominally successful over-budget output bypassed validation instead of trying a valid fallback");
+    }
+    for (int bad = 0; bad < 6; ++bad) {
+        Reader reader;
+        advertised(reader, 1920, 1080);
+        auto actual = syntheticType(1920, 1080, 10, 1, MFVideoFormat_RGB32);
+        if (bad == 0) actual->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
+        if (bad == 1) actual->SetUINT32(MF_MT_DEFAULT_STRIDE, 4);
+        if (bad == 2) MFSetAttributeSize(actual.Get(), MF_MT_FRAME_SIZE, 0, 1080);
+        if (bad == 3) reader.currentResult = E_ACCESSDENIED;
+        if (bad == 4) reader.nullCurrent = true;
+        if (bad == 5) actual->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+        reader.nativeTypes[0].delivered = actual;
+        check(FAILED(lapse::chooseCameraFormat(&reader, detail)) && reader.outputRequests.size() == 2,
+            "successful SetCurrentMediaType masked an invalid or unavailable actual delivery format");
+    }
+    {
+        Reader reader;
+        advertised(reader, 0, 1080); advertised(reader, 1, 1); advertised(reader, 9000, 2160);
+        advertised(reader, 640, 481);
+        reader.nullNativeIndex = 0;
+        negotiated(reader, detail, 640, 480);
+        check(reader.nativeAttempts == std::vector<size_t>{3},
+            "malformed advertised geometry was accepted or a one-pixel source was upscaled");
+    }
+    {
+        Reader reader;
+        reader.enumerationFailureIndex = 0;
+        check(lapse::chooseCameraFormat(&reader, detail) == E_ACCESSDENIED && reader.nativeAttempts.empty(),
+            "native enumeration failure was lost");
+        reader.enumerationFailureIndex = MAXDWORD;
+        check(lapse::chooseCameraFormat(&reader, detail) == MF_E_INVALIDMEDIATYPE && reader.nativeAttempts.empty(),
+            "empty advertised list manufactured a camera format");
+        const int queries = reader.nativeQueries;
+        check(lapse::chooseCameraFormat(&reader, static_cast<CameraResolution>(2)) == E_INVALIDARG && reader.nativeQueries == queries,
+            "invalid tier accessed a camera reader");
+        lapse::Camera camera;
+        std::wstring error;
+        check(!camera.start(L"not-a-device", error, static_cast<CameraResolution>(2)) &&
+            error == L"The camera resolution limit is invalid." && !camera.impl_->state && !camera.impl_->source,
+            "invalid tier reached camera activation");
+    }
+    std::cout << "PASS tier constants, unchanged default preference, advertised 1080p/rate/size fallbacks and validated current-format negotiation\n";
+}
 
 struct Reentry {
     std::mutex mutex;
@@ -281,11 +474,12 @@ bool freshnessPixels(const lapse::Frame& frame, int width, int height, BYTE valu
         std::all_of(frame.pixels.begin(), frame.pixels.end(), [value](BYTE pixel) { return pixel == value; });
 }
 struct FreshnessCamera {
-    std::shared_ptr<lapse::CameraState> state = std::make_shared<lapse::CameraState>();
+    std::shared_ptr<lapse::CameraState> state;
     ComPtr<Reader> reader;
     ComPtr<lapse::CameraCallback> callback;
     lapse::Camera camera;
-    FreshnessCamera() {
+    explicit FreshnessCamera(lapse::CameraResolution resolution = lapse::CameraResolution::Standard720)
+        : state(std::make_shared<lapse::CameraState>(resolution)) {
         reader.Attach(new Reader);
         callback.Attach(new lapse::CameraCallback(state));
         camera.impl_->state = state; camera.impl_->reader = reader;
@@ -298,6 +492,47 @@ struct FreshnessCamera {
             "deliver no-sample format/gap callback");
     }
 };
+void resolutionChangeBounds() {
+    for (const auto tier : {lapse::CameraResolution::Standard720, lapse::CameraResolution::Detail1080}) {
+        FreshnessCamera source(tier);
+        auto oldSample = generatedFreshnessSample(2, 2, 31);
+        source.callback->OnReadSample(S_OK, 0, 0, 1, oldSample.Get());
+        lapse::Frame frame;
+        lapse::CameraSampleInfo prior, current;
+        std::wstring error;
+        check(source.camera.latestNewer(frame, error, prior, {}), "prime owned old-format sample");
+        const auto limits = lapse::cameraCaptureLimits(tier);
+        ComPtr<IMFMediaType> type;
+        check(SUCCEEDED(source.reader->GetCurrentMediaType(lapse::videoStream, &type)) &&
+            SUCCEEDED(MFSetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, limits.width, limits.height)) &&
+            SUCCEEDED(type->SetUINT32(MF_MT_DEFAULT_STRIDE, limits.width * 4)), "set tier-boundary format");
+        auto sample = generatedFreshnessSample(int(limits.width), int(limits.height), 197);
+        source.callback->OnReadSample(S_OK, 0, MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED, 2, sample.Get());
+        check(source.camera.latestNewer(frame, error, current, prior) && error.empty() &&
+            freshnessPixels(frame, int(limits.width), int(limits.height), 197) && frame.pixels.size() == limits.pixelBytes &&
+            current.epoch != prior.epoch && current.sequence == prior.sequence + 1,
+            "valid changed format at immutable tier boundary lost pixel bytes or source identity");
+        const auto before = frame;
+        const auto oldSequence = current.sequence;
+        const int reads = source.reader->reads;
+        check(SUCCEEDED(MFSetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, limits.width, limits.height + 1)), "set out-of-tier format");
+        source.callback->OnReadSample(S_OK, 0, MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED, 3, sample.Get());
+        check(!source.state->running && source.state->failure == MF_E_INVALIDMEDIATYPE && !source.state->sample &&
+            source.reader->reads == reads && source.state->info.sequence == oldSequence &&
+            !source.camera.latestNewer(frame, error, current, {}) && !error.empty() && frame.pixels == before.pixels &&
+            frame.width == before.width && frame.height == before.height,
+            "later oversized current format bypassed the reader tier, retained old media, or overwrote the caller's frame");
+    }
+    FreshnessCamera standard;
+    ComPtr<IMFMediaType> type;
+    standard.reader->GetCurrentMediaType(lapse::videoStream, &type);
+    MFSetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, 1920, 1080);
+    type->SetUINT32(MF_MT_DEFAULT_STRIDE, 1920 * 4);
+    standard.gap();
+    check(!standard.state->running && standard.state->failure == MF_E_INVALIDMEDIATYPE,
+        "default reader silently adopted another tier during a current-format change");
+    std::cout << "PASS exact 720p/1080p bytes, immutable callback tier bounds, sample retirement and source identity\n";
+}
 void formatChangeFreshness() {
     lapse::Frame frame;
     std::wstring error;
@@ -406,10 +641,12 @@ int main() {
     int result = 0;
     try {
         legacySamples(); modernSamples(); ordinarySamples();
+        cameraResolutionNegotiation();
         for (const char* mode : {"stop", "replace", "format_change"})
             check(runCase(mode), "Sample cleanup could not reenter callback before Release returned");
         formatChangeFreshness();
         sourceSampleIdentity();
+        resolutionChangeBounds();
         std::cout << "Synthetic native camera buffer and sample-lifetime checks passed.\n";
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; result = 1; }
     MFShutdown(); CoUninitialize(); return result;

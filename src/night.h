@@ -3,7 +3,7 @@
 #include <array>
 
 namespace lapse {
-constexpr int NightMaxWidth = 1280, NightMaxHeight = 720;
+constexpr int NightMaxWidth = 1920, NightMaxHeight = 1080;
 constexpr int NightMinDurationMs = 1000, NightMaxDurationMs = 30000;
 constexpr int NightInitialDurationMs = 3000;
 constexpr unsigned NightMaxSamples = 300;
