@@ -127,6 +127,7 @@ void validation(const std::filesystem::path& root) {
     reset();auto s=config(root/L"desktop-ignores-night");s.layers=preset(Mode::Desktop);s.night.durationMs=123;
     Engine engine;engine.configure(s);engine.record();
     await(engine,[](const auto& value){return value.frames==1;});const auto result=finish(engine);
+    require(result.cameraInput.width==0&&result.cameraInput.height==0,"Desktop-only recording reported camera dimensions");
     require(!result.recordingFailed&&observations().empty()&&!result.nightEnabled,"Desktop-only session used night controls");
     decode(result.savedPath,1,40);
     std::cout<<"PASS validation before output and desktop-only scope.\n";
@@ -145,7 +146,11 @@ void preparingPreview(const std::filesystem::path& root) {
 void singleSource(const std::filesystem::path& root,Mode mode) {
     reset();auto s=config(root/(mode==Mode::Camera?L"camera-only":L"overlay"));
     s.layers=preset(mode);s.intervalMs = 60000;Engine engine;engine.configure(s);engine.record();
-    await(engine,[](const auto& value){return value.frames==1;});const auto result=finish(engine);
+    const auto delivered=await(engine,[](const auto& value){return value.frames==1;});
+    require(delivered.cameraInput.width==320&&delivered.cameraInput.height==240&&delivered.cameraInput.generation!=0&&previews==0,
+        "Completed Night input geometry was missing or required an extra raw camera read");
+    const auto result=finish(engine);
+    require(result.cameraInput.width==0&&result.cameraInput.height==0,"Hidden finish retained retired camera dimensions");
     require(!result.recordingFailed&&result.savedPaths.size()==1&&result.frames==1&&result.night.samples==5,
         "Single-source night output lost its completed camera window");
     decode(result.savedPath,1,mode==Mode::Camera?180:40);

@@ -120,9 +120,34 @@ void recordingFormats() {
         for (bool recovery : {false,true})
             check(!validateEncodingMode(mode,recovery,error) && !error.empty(), "invalid encoder rejected before file creation");
 }
+void sourceSizeSuggestions() {
+    using lapse::sourceVideoDimensions;
+    for (auto size : {std::pair<int,int>{1280,720},{1920,1080},{3440,1440},{3840,2160},{2160,3840},{48,48}})
+        check(sourceVideoDimensions(size.first,size.second)==size,"supported source suggestions remain exact");
+    check(sourceVideoDimensions(5120,1440)==std::pair<int,int>{4096,1152},"ultrawide screen fits without changing aspect");
+    check(sourceVideoDimensions(1440,5120)==std::pair<int,int>{1152,4096},"portrait source preserves orientation");
+    check(sourceVideoDimensions(641,481)==std::pair<int,int>{640,480} &&
+          sourceVideoDimensions(48,49)==std::pair<int,int>{48,48},"odd source suggestions round down rather than upscale");
+    check(sourceVideoDimensions(4096,4096)==std::pair<int,int>{2974,2974},"square source respects the total pixel budget");
+    for (auto size : {std::pair<int64_t,int64_t>{0,0},{-1,720},{47,1080},{1080,47},
+                     {INT_MAX,48},{48,INT_MAX},{int64_t(INT_MAX)+1,INT_MAX},{INT64_MAX,INT64_MAX}})
+        check(sourceVideoDimensions(size.first,size.second)==std::pair<int,int>{0,0},"unusable or malformed sources have no suggestion");
+    std::wstring error;
+    for (int width : {48,49,100,641,1280,1919,3440,4096,5120,7680,16385,INT_MAX})
+        for (int height : {48,49,240,481,720,1079,1440,2160,4096,4320,16385,INT_MAX}) {
+            const auto size=sourceVideoDimensions(width,height);
+            check(size==sourceVideoDimensions(width,height),"source suggestion is deterministic");
+            if (!size.first) {check(!size.second,"unavailable suggestion has no partial geometry");continue;}
+            check(lapse::validateVideoSize(size.first,size.second,error) && size.first<=width && size.second<=height,
+                  "suggested sizes remain even, bounded and never upscaled");
+            const double scale=(std::max)(double(size.first)/width,double(size.second)/height);
+            check(width*scale-size.first<2.000001 && height*scale-size.second<2.000001,
+                  "source aspect is preserved within even-pixel rounding");
+        }
+}
 }
 int main() {
-    durationParsing(); formatsAndBounds(); previewGeometry(); recordingFormats();
+    durationParsing(); formatsAndBounds(); previewGeometry(); recordingFormats(); sourceSizeSuggestions();
     if (failures) return 1;
     std::cout << "Exact custom settings and bounded geometry checks passed\n";
     return 0;

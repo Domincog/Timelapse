@@ -121,6 +121,7 @@ void Engine::configure(const Settings& s) {
     { std::lock_guard<std::mutex> lock(mutex_);
       auto sources = [](const Settings& config) { int mask = config.separateFiles ? 3 : 0; for (const auto& layer : config.layers) mask |= layer.source == Source::Desktop ? 1 : 2; return mask; };
       const int mask = sources(s);
+      if (mask != sources(settings_) || s.cameraId != settings_.cameraId || !s.preview) retireCameraInput();
       if (!s.preview || (status_.state == State::Idle && (s.width != settings_.width || s.height != settings_.height)) ||
           mask != sources(settings_) || ((mask & 2) && s.cameraId != settings_.cameraId) ||
           ((mask & 1) && (CompareStringOrdinal(s.monitorId.c_str(), -1, settings_.monitorId.c_str(), -1, TRUE) != CSTR_EQUAL ||
@@ -128,6 +129,10 @@ void Engine::configure(const Settings& s) {
       settings_ = s;
       ++settingsRevision_; }
     wake_.notify_one();
+}
+void Engine::retireCameraInput() noexcept {
+    if (++cameraInputGeneration_ == 0) ++cameraInputGeneration_;
+    status_.cameraInput = {0, 0, cameraInputGeneration_};
 }
 void Engine::retirePreview() {
     ++previewGeneration_;
@@ -143,6 +148,7 @@ void Engine::retirePreview() {
 void Engine::refreshSources() {
     { std::lock_guard<std::mutex> lock(mutex_);
       if (status_.state != State::Idle) return;
+      retireCameraInput();
       retirePreview();
       retrySources_ = true; previewProblem_ = false;
       status_.error = false; status_.message = L"Ready to record."; }
@@ -222,7 +228,19 @@ void Engine::run() {
             if (clearFrame) nightFrameReady = false;
             nightPollAt = nightExpectedAt = Clock::time_point::max();
         };
-        uint64_t previewGeneration = 0, cameraAttemptGeneration = 0;
+        uint64_t previewGeneration = 0, cameraAttemptGeneration = 0, cameraInputGeneration = 0;
+        auto clearCameraInput = [&]() {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (cameraInputGeneration != cameraInputGeneration_) return;
+            retireCameraInput(); cameraInputGeneration = cameraInputGeneration_;
+        };
+        auto publishCameraInput = [&](const Frame& frame) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (cameraInputGeneration != cameraInputGeneration_ || previewGeneration != previewGeneration_ ||
+                activeCamera != settings_.cameraId) return;
+            if (frame.valid()) status_.cameraInput = {frame.width, frame.height, cameraInputGeneration};
+            else { retireCameraInput(); cameraInputGeneration = cameraInputGeneration_; }
+        };
         uint64_t settingsRevision = UINT64_MAX;
         auto lastPreview = Clock::time_point::min(), nextFrame = Clock::now();
         auto retryFrameAt = Clock::time_point::min();
@@ -771,7 +789,7 @@ void Engine::run() {
               status_.state = State::Finishing; status_.nightWaiting = false;
               if (!segmentFailed) status_.message = L"Finishing MP4...";
               keepCamera = settings_.preview; }
-            if (!keepCamera && cameraRunning) { camera->stop(); cameraRunning = false; activeCamera.clear(); }
+            if (!keepCamera && cameraRunning) { clearCameraInput(); camera->stop(); cameraRunning = false; activeCamera.clear(); }
             finishSegment(reason, true);
             // Legacy Off reporting already commits Idle and all session state
             // together. Do not overwrite a Record queued after that commit.
@@ -796,6 +814,7 @@ void Engine::run() {
         };
         for (;;) {
             bool previewOnlyWork = false;
+            bool readingCameraInput = false;
             try {
                 std::optional<Settings> snapshot;
                 bool quit, start = false, stop = false, pauseRequested = false, pauseTarget = false, retry = false;
@@ -835,6 +854,7 @@ void Engine::run() {
                   // their settings snapshot has succeeded.
                   quit = quit_;
                   previewGeneration = previewGeneration_;
+                  cameraInputGeneration = cameraInputGeneration_;
                   const auto requiredWork = nightMode ? (nightQueued ? nightPollAt : nightStartAt) : nextFrame;
                   previewOnlyWork = !start_ && !stop_ && !quit_ && !pending &&
                       (!writing || paused || Clock::now() < requiredWork) && Clock::now() < recordingDeadline() && Clock::now() < segmentDeadline();
@@ -852,7 +872,7 @@ void Engine::run() {
                 if (quit) { if (writing || pending) { previewOnlyWork = false; closeRecording(L""); } break; }
                 Settings& cfg = *snapshot;
                 bool resetSkipRequested = false;
-                if (retry) { if (camera) camera->stop(); cameraRunning = false; activeCamera.clear(); }
+                if (retry) { clearCameraInput(); if (camera) camera->stop(); cameraRunning = false; activeCamera.clear(); }
                 if (FAILED(com)) { publishError(L"Windows media initialization failed: " + errorText(com), true); continue; }
                 if (start) {
                     previewOnlyWork = false;
@@ -966,6 +986,7 @@ void Engine::run() {
                 }
                 if ((!needCamera || !active || activeCamera != cfg.cameraId) && cameraRunning) {
                     cancelNight();
+                    clearCameraInput();
                     camera->stop(); cameraRunning = false; activeCamera.clear();
                 }
                 if (!needCamera) {
@@ -993,6 +1014,7 @@ void Engine::run() {
                         catch (...) {
                             // A startup exception may leave partial client state.
                             // Permit the promised preview retry after cleanup.
+                            clearCameraInput();
                             if (camera) camera->stop();
                             cameraRunning = false;
                             activeCamera.clear(); sourceError.clear();
@@ -1029,20 +1051,23 @@ void Engine::run() {
                             nightPollAt = std::min(nightExpectedAt, Clock::now() + std::chrono::seconds(1));
                             retryFrameAt = Clock::time_point::min();
                             std::lock_guard<std::mutex> lock(mutex_); status_.nightWaiting = true;
-                        } else if (!nightError.empty()) { closeRecording(L"Night camera stopped: " + nightError); continue; }
+                        } else if (!nightError.empty()) { clearCameraInput(); closeRecording(L"Night camera stopped: " + nightError); continue; }
                         else retryFrameAt = Clock::now() + std::chrono::milliseconds(50);
                     }
                     if (cameraRunning && nightQueued && Clock::now() >= nightPollAt) {
                         previewOnlyWork = false;
                         std::wstring nightError;
+                        readingCameraInput = true;
                         const bool complete = camera->nightResult(nightToken, webcam, completedNight, nightError);
+                        readingCameraInput = false;
+                        if (complete) publishCameraInput(webcam);
                         advanceElapsed(Clock::now());
                         if (limitExpired()) { recordingLimitReached = true; closeRecording(L""); continue; }
                         if (complete) {
                             firstNightPreview = !nightFrameReady;
                             nightQueued = false; nightFrameReady = nightCompleted = true;
                             retryFrameAt = Clock::time_point::min();
-                        } else if (!nightError.empty()) { closeRecording(L"Night camera stopped: " + nightError); continue; }
+                        } else if (!nightError.empty()) { clearCameraInput(); closeRecording(L"Night camera stopped: " + nightError); continue; }
                         else {
                             const auto observed = Clock::now();
                             nightPollAt = observed >= nightExpectedAt ? observed + std::chrono::milliseconds(50)
@@ -1064,7 +1089,10 @@ void Engine::run() {
                 std::wstring error;
                 bool ready = true, cameraWaiting = false;
                 if (needCamera && !(nightMode && nightFrameReady)) {
+                    readingCameraInput = true;
                     ready = cameraRunning && camera->latest(webcam, error);
+                    readingCameraInput = false;
+                    if (ready) publishCameraInput(webcam);
                     cameraWaiting = cameraRunning && !ready && error.empty();
                     if (!cameraRunning) error = sourceError.empty() ? L"No camera available." : sourceError;
                     else if (!ready && !error.empty()) {
@@ -1072,6 +1100,7 @@ void Engine::run() {
                         // its old sample. Keep the device id as the failed-attempt
                         // marker so idle preview does not repeatedly reopen it;
                         // a new Record action can retry the same camera.
+                        clearCameraInput();
                         camera->stop(); cameraRunning = false;
                         cameraAttemptGeneration = previewGeneration;
                         sourceError = error;
@@ -1294,6 +1323,7 @@ void Engine::run() {
                       previewProblem_ = false;
                   } }
             } catch (const std::exception&) {
+                if (readingCameraInput) clearCameraInput();
                 if (previewOnlyWork) {
                     // Preview buffers are disposable. Do not close a healthy
                     // recording or camera when only this refresh ran out of
@@ -1327,6 +1357,7 @@ void Engine::run() {
                     }
                 }
                 releaseDesktopCaptureCache();
+                clearCameraInput();
                 if (camera) camera->stop();
                 cameraRunning = false;
                 nightMode = nightQueued = nightFrameReady = false;

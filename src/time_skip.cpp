@@ -6,11 +6,12 @@
 namespace lapse {
 namespace {
 constexpr int pixels = TimeSkipWidth * TimeSkipHeight;
-enum class Invalid { None, Mode, Multiplier, Quiet, Ramp, Repeat, Count, Range, Period, Empty };
+enum class Invalid { None, Mode, Multiplier, Quiet, Sensitivity, Ramp, Repeat, Count, Range, Period, Empty };
 Invalid normalize(TimeSkipSettings& value) noexcept {
     if (value.mode < TimeSkipMode::Off || value.mode > TimeSkipMode::NoPersonWithinSchedule) return Invalid::Mode;
     if (value.multiplier < 2 || value.multiplier > 64) return Invalid::Multiplier;
     if (value.quietAfterMs < 1000 || value.quietAfterMs > int64_t(INT_MAX) * 1000 || value.quietAfterMs % 1000) return Invalid::Quiet;
+    if (value.quietSensitivity < QuietSensitivity::Low || value.quietSensitivity > QuietSensitivity::High) return Invalid::Sensitivity;
     if (value.rampFrames != 15 && value.rampFrames != 30 && value.rampFrames != 60) return Invalid::Ramp;
     if (value.repeatSeconds < 0) return Invalid::Repeat;
     if (value.rangeCount > TimeSkipMaxRanges) return Invalid::Count;
@@ -90,7 +91,11 @@ int noiseFloor(const std::array<int, 511>& histogram) noexcept {
     return std::clamp(deviation * 4, 9, 24);
 }
 struct Difference { bool active = false, strong = false; };
-Difference compare(const TimeSkipDescriptor& a, const TimeSkipDescriptor& b) noexcept {
+int sensitivityThreshold(int value, QuietSensitivity sensitivity) noexcept {
+    return sensitivity == QuietSensitivity::Low ? (value * 3 + 1) / 2 :
+        sensitivity == QuietSensitivity::High ? (value * 3 + 3) / 4 : value;
+}
+Difference compare(const TimeSkipDescriptor& a, const TimeSkipDescriptor& b, QuietSensitivity sensitivity) noexcept {
     const int am = percentile(a.y, 1, 2), bm = percentile(b.y, 1, 2);
     const int ar = percentile(a.y, 3, 4) - percentile(a.y, 1, 4);
     const int br = percentile(b.y, 3, 4) - percentile(b.y, 1, 4);
@@ -101,7 +106,8 @@ Difference compare(const TimeSkipDescriptor& a, const TimeSkipDescriptor& b) noe
         const int predicted = std::clamp(am + shift + ((int(a.y[i]) - am) * gain) / 256, 0, 255);
         ++hy[255 + int(b.y[i]) - predicted]; ++hu[255 + int(b.u[i]) - a.u[i]]; ++hv[255 + int(b.v[i]) - a.v[i]];
     }
-    const int ty = noiseFloor(hy), tc = std::max(noiseFloor(hu), noiseFloor(hv));
+    const int ty = sensitivityThreshold(noiseFloor(hy), sensitivity);
+    const int tc = sensitivityThreshold(std::max(noiseFloor(hu), noiseFloor(hv)), sensitivity);
     std::array<int, 48> changed{}; int sum = 0, count = 0;
     for (int i = 0; i < pixels; ++i) {
         const int predicted = std::clamp(am + shift + ((int(a.y[i]) - am) * gain) / 256, 0, 255);
@@ -125,6 +131,7 @@ bool normalizeTimeSkipSettings(TimeSkipSettings& settings, std::wstring& error) 
     case Invalid::Quiet: error = personMode(settings.mode)
         ? L"No-person time must be a whole number of seconds between 1 and 2147483647."
         : L"Quiet time must be a whole number of seconds between 1 and 2147483647."; break;
+    case Invalid::Sensitivity: error = L"Choose a valid quiet-scene sensitivity."; break;
     case Invalid::Ramp: error = L"Choose a transition of 15, 30, or 60 output frames."; break;
     case Invalid::Repeat: error = L"The schedule repeat duration cannot be negative."; break;
     case Invalid::Count: error = L"Use at most 16 time-compression ranges."; break;
@@ -194,7 +201,8 @@ bool TimeSkipController::observe(unsigned index, const TimeSkipDescriptor& input
         if (automatic(settings_.mode)) baseReturn();
         return true;
     }
-    const auto recent = compare(source.previous, input), anchor = compare(source.anchor, input);
+    const auto recent = compare(source.previous, input, settings_.quietSensitivity);
+    const auto anchor = compare(source.anchor, input, settings_.quietSensitivity);
     source.compared = true;
     source.weak = recent.active || anchor.active ? source.weak + 1 : 0;
     // Even one plausible weak change ends quiet eligibility. Persistence only

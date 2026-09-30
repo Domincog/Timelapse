@@ -18,7 +18,7 @@ using namespace std::chrono_literals;
 constexpr uint8_t oldMarker = 65, newMarker = 201;
 enum class Completion { Frame, Error, Exception };
 enum class Change { Source, Monitor, CameraId, RoundTrip, PreviewToggle, SameSource, Refresh, Record, CameraStart,
-    CameraRoundTrip, CameraPreviewToggle, CameraStartRoundTrip, CameraStartToggle };
+    CameraRoundTrip, CameraPreviewToggle, CameraStartRoundTrip, CameraStartToggle, CameraIdRoundTrip, CameraSameSource };
 
 struct CaptureGate {
     std::mutex mutex;
@@ -105,6 +105,8 @@ const char* name(Change change) {
     case Change::CameraPreviewToggle: return "camera preview off then on";
     case Change::CameraStartRoundTrip: return "camera startup round trip";
     case Change::CameraStartToggle: return "camera startup preview off then on";
+    case Change::CameraIdRoundTrip: return "camera ID A to B to A";
+    case Change::CameraSameSource: return "same-camera input control";
     }
     return "unknown change";
 }
@@ -126,7 +128,8 @@ void runCase(Change change, Completion completion) {
     original.monitorId = L"synthetic-display-0";
     original.cameraId = L"old-camera";
     const bool camera = change == Change::CameraId || change == Change::Refresh ||
-        change == Change::Record || startup || change == Change::CameraRoundTrip || change == Change::CameraPreviewToggle;
+        change == Change::Record || startup || change == Change::CameraRoundTrip || change == Change::CameraPreviewToggle ||
+        change == Change::CameraIdRoundTrip || change == Change::CameraSameSource;
     original.layers = lapse::preset(camera ? lapse::Mode::Camera : lapse::Mode::Desktop);
     lapse::Engine engine;
     ReleaseBarriers releaseOnExit; // Releases gates before engine joins worker.
@@ -142,17 +145,20 @@ void runCase(Change change, Completion completion) {
         updated.monitor = {640, 0, 1280, 360};
         updated.monitorId = L"synthetic-display-640";
     }
-    if (change == Change::CameraId) updated.cameraId = L"new-camera";
+    if (change == Change::CameraId || change == Change::CameraIdRoundTrip) updated.cameraId = L"new-camera";
     if (change == Change::CameraStart) updated.layers = lapse::preset(lapse::Mode::Desktop);
     if (change == Change::PreviewToggle || change == Change::CameraPreviewToggle || change == Change::CameraStartToggle)
         updated.preview = false;
     engine.configure(updated);
     if (change == Change::RoundTrip || change == Change::PreviewToggle || change == Change::CameraRoundTrip ||
-        change == Change::CameraPreviewToggle || change == Change::CameraStartRoundTrip || change == Change::CameraStartToggle)
+        change == Change::CameraPreviewToggle || change == Change::CameraStartRoundTrip || change == Change::CameraStartToggle ||
+        change == Change::CameraIdRoundTrip)
         engine.configure(original);
     if (change == Change::Refresh) engine.refreshSources();
     if (change == Change::Record) engine.record();
     const auto afterConfigure = engine.status();
+    require(afterConfigure.cameraInput.width == 0 && afterConfigure.cameraInput.height == 0,
+            "Camera input size appeared before a valid delivery.");
     require(!afterConfigure.preview && !afterConfigure.error, "Unexpected status before releasing old capture.");
     if (change == Change::Refresh)
         require(afterConfigure.message == L"Ready to record.", "Refresh did not publish its current message.");
@@ -171,7 +177,7 @@ void runCase(Change change, Completion completion) {
         : change == Change::Monitor ? L"desktop:640"
         : change == Change::CameraId ? L"camera:new-camera"
         : change == Change::Refresh || change == Change::Record || change == Change::CameraRoundTrip ||
-          change == Change::CameraPreviewToggle ? L"camera:old-camera"
+          change == Change::CameraPreviewToggle || change == Change::CameraIdRoundTrip || change == Change::CameraSameSource ? L"camera:old-camera"
         : change == Change::CameraStartRoundTrip || change == Change::CameraStartToggle ? L"start:old-camera" : L"desktop:0";
     {
         std::lock_guard<std::mutex> lock(gate.mutex);
@@ -179,7 +185,11 @@ void runCase(Change change, Completion completion) {
         require(gate.firstSource == first && gate.secondSource == second,
                 "The capture configurations do not match this test case.");
     }
-    const bool accepted = change == Change::SameSource;
+    const bool accepted = change == Change::SameSource || change == Change::CameraSameSource;
+    const bool inputAccepted = change == Change::CameraSameSource && completion == Completion::Frame;
+    require(inputAccepted ? between.cameraInput.width == 64 && between.cameraInput.height == 36
+                          : between.cameraInput.width == 0 && between.cameraInput.height == 0,
+            "An invalidated input size was published, or valid camera geometry was lost.");
     const bool previewCorrect = accepted ? hasMarker(between, oldMarker) : !between.preview;
     const auto expectedState = change == Change::Record ? lapse::State::Starting : lapse::State::Idle;
     const bool statusCorrect = !between.error && between.message == afterConfigure.message &&
@@ -192,6 +202,11 @@ void runCase(Change change, Completion completion) {
             "The preview test unexpectedly recorded a frame or remained active.");
     require(previewCorrect, accepted ? "A valid same-source frame was discarded." : "An invalidated frame was republished.");
     require(statusCorrect, "An invalidated preview error or exception changed current status.");
+    const bool finalCamera = change == Change::Source || (camera && change != Change::CameraStart);
+    require(finalCamera ? healthy.cameraInput.width == 64 && healthy.cameraInput.height == 36
+                        : healthy.cameraInput.width == 0 && healthy.cameraInput.height == 0,
+            "Input-size metadata did not identify the delivered camera pixels.");
+    if (finalCamera) require(healthy.cameraInput.generation != 0, "Camera geometry lacked a source generation.");
 }
 }
 
@@ -303,12 +318,16 @@ void healthyReaderThenCurrentFailure() {
     engine.configure(initial);
     require(await([&] { const auto s = engine.status(); return cameraPreview(s) && !s.error; }),
             "Initial camera preview did not appear.");
+    const auto initialInput = engine.status().cameraInput;
+    require(initialInput.width == 64 && initialInput.height == 36 && initialInput.generation != 0,
+            "Current raw camera input dimensions were not published.");
     controls.arm(Operation::Read, false);
     require(controls.awaitEntry(Operation::Read), "Healthy camera read did not reach its gate.");
     const auto before = controls.snapshot();
     auto different = initial; different.cameraId = L"synthetic-camera-B";
     engine.configure(different); engine.configure(initial);
     require(!engine.status().preview, "Camera round trip did not retire the old image.");
+    require(engine.status().cameraInput.width == 0, "Camera round trip did not immediately retire input dimensions.");
     controls.release(Operation::Read);
     require(await([&] { const auto s = engine.status(); return cameraPreview(s) && !s.error; }),
             "Healthy camera did not publish in the new generation.");
@@ -321,12 +340,15 @@ void healthyReaderThenCurrentFailure() {
     controls.release(Operation::Read);
     require(await([&] { const auto s = engine.status(); return s.error && !s.preview &&
             s.message.find(readError) != std::wstring::npos; }), "Current read failure was not reported.");
+    require(engine.status().cameraInput.width == 0 && engine.status().cameraInput.height == 0,
+            "Camera failure retained stale input dimensions.");
     auto geometryOnly = initial; geometryOnly.layers[0].rect = {.1, .1, .8, .8}; geometryOnly.intervalMs = 7000;
     engine.configure(geometryOnly); engine.configure(initial);
     require(controls.noNewOpen(before.opens), "Current-generation failure reopened without an explicit retry.");
     require(controls.snapshot().closes == before.closes + 1 && engine.status().error,
             "Current failed reader was not closed and left latched.");
     engine.refreshSources();
+    require(engine.status().cameraInput.width == 0, "Refresh retained unverified camera dimensions.");
     require(await([&] { const auto s = engine.status(); return cameraPreview(s) && !s.error; }),
             "Refresh did not recover the latched read failure.");
     require(controls.snapshot().opens == before.opens + 1 && controls.healthyGates(),
@@ -391,10 +413,58 @@ void pendingRecordingFailureStaysTerminal() {
 }
 }
 
+namespace retryCases {
+void cameraInputSnapshotLifecycle() {
+    Mode mode; controls.reset();
+    lapse::Engine engine; ReleaseGates release;
+    auto initial = cameraSettings(); engine.configure(initial);
+    require(await([&] { return cameraPreview(engine.status()); }), "Input-size lifecycle preview did not appear.");
+    controls.arm(Operation::Read, false);
+    require(controls.awaitEntry(Operation::Read), "Input-size lifecycle read did not reach gate.");
+    const auto input = engine.status().cameraInput;
+    const auto counts = controls.snapshot();
+    auto resized = initial; resized.width = 800; resized.height = 600;
+    engine.configure(resized);
+    const auto afterSize = engine.status().cameraInput;
+    require(afterSize.width == input.width && afterSize.height == input.height && afterSize.generation == input.generation,
+            "Changing fixed video output size changed verified camera input size.");
+    for (int i = 0; i < 100; ++i) {
+        const auto snapshot = engine.status();
+        require(snapshot.cameraInput.width == 64 && snapshot.cameraInput.height == 36, "Metadata snapshot changed unexpectedly.");
+    }
+    const auto afterReads = controls.snapshot();
+    require(afterReads.reads == counts.reads && afterReads.opens == counts.opens,
+            "Reading input-size status performed additional capture work.");
+    engine.refreshSources();
+    require(engine.status().cameraInput.width == 0 && engine.status().cameraInput.generation != input.generation,
+            "Refresh did not immediately invalidate camera metadata.");
+    auto hidden = resized; hidden.preview = false; engine.configure(hidden);
+    require(engine.status().cameraInput.width == 0, "Hiding idle preview retained camera dimensions.");
+    controls.release(Operation::Read);
+    require(await([&] { return controls.snapshot().closes > counts.closes; }), "Hidden idle camera did not retire.");
+    require(engine.status().cameraInput.width == 0 && engine.status().cameraInput.height == 0,
+            "A delayed frame republished dimensions after hiding.");
+    const auto retired = controls.snapshot();
+    for (int i = 0; i < 100; ++i) (void)engine.status();
+    require(controls.snapshot().reads == retired.reads && controls.snapshot().opens == retired.opens,
+            "Unavailable size snapshots restarted a hidden camera.");
+    engine.configure(resized);
+    require(await([&] { const auto s = engine.status(); return s.preview && s.preview->valid() &&
+                s.preview->width == 480 && s.preview->height == 360 &&
+                s.preview->pixels[(size_t(s.preview->height / 2) * s.preview->width + s.preview->width / 2) * 4] == cameraMarker; }),
+            "Camera did not return after ordinary visible preview demand.");
+    const auto restored = engine.status();
+    require(restored.cameraInput.width == 64 && restored.cameraInput.height == 36 &&
+            restored.cameraInput.generation != input.generation && restored.preview->width == 480 && restored.preview->height == 360,
+            "Restoring source geometry altered output size or reported composed preview geometry.");
+}
+}
+
 namespace lapse {
 bool CameraClient::beginNight(uint64_t, uint32_t, const NightSettings&, std::wstring& error) {
     error = L"Unexpected night request in ordinary-mode fixture."; return false;
 }
+
 bool CameraClient::nightResult(uint64_t, Frame&, NightWindowResult&, std::wstring& error) {
     error = L"Unexpected night result in ordinary-mode fixture."; return false;
 }
@@ -463,11 +533,14 @@ int main() {
                        Change::Refresh, Change::Record})
         for (auto completion : {Completion::Frame, Completion::Error, Completion::Exception}) test(change, completion);
     test(Change::SameSource, Completion::Frame);
+    test(Change::CameraSameSource, Completion::Frame);
+    for (auto completion : {Completion::Frame, Completion::Error, Completion::Exception}) test(Change::CameraIdRoundTrip, completion);
     test(Change::CameraStart, Completion::Error);
     test(Change::CameraStart, Completion::Exception);
     for (auto change : {Change::CameraRoundTrip, Change::CameraPreviewToggle, Change::CameraStartRoundTrip, Change::CameraStartToggle})
         test(change, Completion::Error);
     const std::pair<const char*, void(*)()> retryTests[] = {
+        {"input-size snapshot lifecycle uses no extra capture", retryCases::cameraInputSnapshotLifecycle},
         {"healthy reader survives invalidation and latches its later current failure", retryCases::healthyReaderThenCurrentFailure},
         {"same-generation startup failure stays latched until Refresh", retryCases::currentStartFailureNeedsRefresh},
         {"due recording failure stays terminal across in-flight source invalidation", retryCases::pendingRecordingFailureStaysTerminal}

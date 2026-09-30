@@ -7,11 +7,14 @@ constexpr unsigned TimeSkipMaxRanges = 16;
 constexpr int TimeSkipWidth = 64, TimeSkipHeight = 36;
 constexpr int TimeSkipObservationMs = 1000;
 enum class TimeSkipMode { Off, Quiet, Manual, QuietWithinSchedule, NoPerson, NoPersonWithinSchedule };
+enum class QuietSensitivity { Low, Standard, High };
 struct TimeSkipRange { int startSeconds = 0, endSeconds = 0; };
 struct TimeSkipSettings {
     TimeSkipMode mode = TimeSkipMode::Off;
     int multiplier = 4;
     int64_t quietAfterMs = 120000;
+    // Image-change sensitivity applies only to Quiet modes, not person checks.
+    QuietSensitivity quietSensitivity = QuietSensitivity::Standard;
     int rampFrames = 30;
     int repeatSeconds = 0;
     unsigned rangeCount = 0;

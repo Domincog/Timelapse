@@ -61,15 +61,15 @@ DWORD replacementError=ERROR_SUCCESS;
 enum class WriteFault { None, DenySecond, DenyCompression, DenySegment, ThrowAfterFirst };
 WriteFault writeFault=WriteFault::None;
 int keyWrites=0, failedKeyWrites=0, syntheticExceptions=0, saveDiagnostics=0;
-DWORD keyWriteError=ERROR_SUCCESS;
+DWORD keyWriteError=ERROR_SUCCESS;std::wstring failedPreferenceKey;
 HANDLE deniedWrite=INVALID_HANDLE_VALUE;
 BOOL WINAPI fixtureWriteProfile(LPCWSTR section,LPCWSTR key,LPCWSTR value,LPCWSTR path){
     const BOOL result=WritePrivateProfileStringW(section,key,value,path);
     const DWORD error=result?ERROR_SUCCESS:GetLastError();
     if(section&&key){
         ++keyWrites;
-        if(!result){++failedKeyWrites;keyWriteError=error;}
-        const int denyAt=writeFault==WriteFault::DenySecond?2:writeFault==WriteFault::DenyCompression?22:writeFault==WriteFault::DenySegment?11:0;
+        if(!result){++failedKeyWrites;keyWriteError=error;failedPreferenceKey=key;}
+        const int denyAt=writeFault==WriteFault::DenySecond?2:writeFault==WriteFault::DenyCompression?23:writeFault==WriteFault::DenySegment?11:0;
         if(denyAt && keyWrites==denyAt-1 && result){
             deniedWrite=CreateFileW(path,GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
             if(deniedWrite==INVALID_HANDLE_VALUE)throw std::runtime_error("Cannot deny the next owned staging write.");
@@ -242,7 +242,7 @@ void newUnicodeFile(){
 }
 void existingUnicodeRewrite(){
     PreferencesFixture fixture;
-    const std::wstring initial=L"[Settings]\r\nFolder="+unicodeFolder+L"\r\nInterval=5\r\nQuality=1\r\nEncodingQuality=2\r\nEncodingMode=0\r\nRecordingLimit=0\r\nStopOnLowDiskSpace=1\r\nRecoveryMode=0\r\nNightEnabled=0\r\nNightDurationMs=0\r\nNightTargetBrightness=96\r\nCaptureIntervalMs=5000\r\nVideoWidth=1280\r\nVideoHeight=720\r\nRecordingLimitSeconds=900\r\nSegmentDurationSeconds=0\r\nTimeSkipMode=0\r\nTimeSkipMultiplier=4\r\nTimeSkipQuietAfterMs=120000\r\nTimeSkipRampFrames=30\r\nTimeSkipRepeatSeconds=0\r\nTimeSkipRanges=\r\n";
+    const std::wstring initial=L"[Settings]\r\nFolder="+unicodeFolder+L"\r\nInterval=5\r\nQuality=1\r\nEncodingQuality=2\r\nEncodingMode=0\r\nRecordingLimit=0\r\nStopOnLowDiskSpace=1\r\nRecoveryMode=0\r\nNightEnabled=0\r\nNightDurationMs=0\r\nNightTargetBrightness=96\r\nCaptureIntervalMs=5000\r\nVideoWidth=1280\r\nVideoHeight=720\r\nRecordingLimitSeconds=900\r\nSegmentDurationSeconds=0\r\nTimeSkipMode=0\r\nTimeSkipMultiplier=4\r\nTimeSkipQuietAfterMs=120000\r\nTimeSkipRampFrames=30\r\nTimeSkipRepeatSeconds=0\r\nTimeSkipRanges=\r\nTimeSkipQuietSensitivity=1\r\n";
     fixture.seed(utf16(initial));reload();expectOptions(unicodeFolder,5,1,2);
     const auto initialBytes=fixture.bytes();
     const std::wstring changed=L"C:\\Synthetic videos\\\u65e5\u672c\u8a9e-\U0001f3a5";
@@ -469,22 +469,24 @@ void timeCompressionPreferences(){
     PreferencesFixture fixture;fixture.seed(legacy);reload();
     require(app.settings.timeSkip.mode==TimeSkipMode::Off && app.settings.timeSkip.multiplier==4,"Legacy preferences enabled compression.");
     TimeSkipSettings expected;expected.mode=TimeSkipMode::QuietWithinSchedule;expected.multiplier=64;expected.rampFrames=60;
-    expected.quietAfterMs=int64_t(INT_MAX)*1000;expected.repeatSeconds=INT_MAX;expected.rangeCount=2;
+    expected.quietSensitivity=QuietSensitivity::High;expected.quietAfterMs=int64_t(INT_MAX)*1000;expected.repeatSeconds=INT_MAX;expected.rangeCount=2;
     expected.ranges[0]={INT_MAX-1,INT_MAX};expected.ranges[1]={0,1};
     app.settings.timeSkip=expected;preferences(true);reload();
-    require(app.settings.timeSkip.mode==expected.mode && app.settings.timeSkip.quietAfterMs==expected.quietAfterMs && app.settings.timeSkip.repeatSeconds==INT_MAX &&
+    require(app.settings.timeSkip.mode==expected.mode && app.settings.timeSkip.quietSensitivity==expected.quietSensitivity && app.settings.timeSkip.quietAfterMs==expected.quietAfterMs && app.settings.timeSkip.repeatSeconds==INT_MAX &&
         app.settings.timeSkip.rangeCount==2 && app.settings.timeSkip.ranges[0].startSeconds==0 && app.settings.timeSkip.ranges[1].endSeconds==INT_MAX,"Exact complete policy lost values on real INI roundtrip.");
     require(choice(app.mode)==0,"Loading compression changed Desktop startup.");expectUnknownContent(fixture);
     const auto values=skipValues(app.settings.timeSkip);
     const auto restore=[&](){for(size_t i=0;i<values.size();++i)require(WritePrivateProfileStringW(L"Settings",SkipKeys[i],values[i].c_str(),app.preferences.c_str())!=FALSE,"Cannot restore owned compression values.");};
     for(size_t i=0;i<values.size();++i){
-        for(const wchar_t* invalid:{L"-1",L"garbage",L"999999999999999999999999999999999999999"}){
+        for(const wchar_t* invalid:{L"-1",L"garbage",L"?",L"999999999999999999999999999999999999999"}){
             restore();require(WritePrivateProfileStringW(L"Settings",SkipKeys[i],invalid,app.preferences.c_str())!=FALSE,"Cannot seed invalid policy.");reload();
             require(app.settings.timeSkip.mode==TimeSkipMode::Off && app.settings.timeSkip.multiplier==4 && app.settings.timeSkip.rangeCount==0,"Malformed saved policy partially enabled or retained stale fields.");
         }
         restore();require(WritePrivateProfileStringW(L"Settings",SkipKeys[i],nullptr,app.preferences.c_str())!=FALSE,"Cannot delete owned policy key.");reload();
-        require(app.settings.timeSkip.mode==TimeSkipMode::Off,"Missing enabled-policy key silently defaulted and enabled.");
+        if(i==6)require(app.settings.timeSkip.mode==expected.mode && app.settings.timeSkip.quietSensitivity==QuietSensitivity::Standard,"Missing optional sensitivity changed old policy instead of using Standard.");
+        else require(app.settings.timeSkip.mode==TimeSkipMode::Off,"Missing enabled-policy key silently defaulted and enabled.");
     }
+    for(auto invalid:{L"",L"3",L"01"}){restore();require(WritePrivateProfileStringW(L"Settings",SkipKeys[6],invalid,app.preferences.c_str())!=FALSE,"Cannot seed malformed optional sensitivity.");reload();require(app.settings.timeSkip.mode==TimeSkipMode::Off && app.settings.timeSkip.quietSensitivity==QuietSensitivity::Standard,"Malformed optional sensitivity did not reject the complete policy.");}
     restore();const std::wstring oversized=L"0:1"+std::wstring(520,L' ')+L"junk";
     require(WritePrivateProfileStringW(L"Settings",SkipKeys[5],oversized.c_str(),app.preferences.c_str())!=FALSE,"Cannot seed oversized range string.");reload();require(app.settings.timeSkip.mode==TimeSkipMode::Off,"Truncated saved schedule accepted.");
     restore();require(WritePrivateProfileStringW(L"Settings",SkipKeys[5],L"5:20;0:5;40:60",app.preferences.c_str())!=FALSE,"Cannot seed touching saved schedule.");reload();
@@ -498,10 +500,10 @@ void timeCompressionPreferences(){
     require(app.settings.timeSkip.mode==TimeSkipMode::Off,"Unknown numeric policy mode enabled a partial policy.");
     restore();reload();app.settings.timeSkip.mode=TimeSkipMode::NoPersonWithinSchedule;preferences(true);reload();
     const auto before=fixture.bytes();keyWrites=0;app.settings.timeSkip={};writeFault=WriteFault::DenyCompression;preferences(true);writeFault=WriteFault::None;
-    require(keyWrites==22 && failedKeyWrites==1 && fixture.bytes()==before,"Final compression-key failure published a partial policy.");
+    require(keyWrites==23 && failedKeyWrites==1 && failedPreferenceKey==L"TimeSkipQuietSensitivity" && fixture.bytes()==before,"Final compression-key failure published a partial policy.");
     fixture.onlySettingsRemain();reload();require(app.settings.timeSkip.mode==TimeSkipMode::NoPersonWithinSchedule,"Failed complete policy write lost original mode.");
     app.settings.timeSkip={};
-    std::cout<<"PASS real compression preferences: exact six-key policy, every missing/malformed key Off, bounded ranges, merged loads, preserved content and final-key atomic failure\n";
+    std::cout<<"PASS real compression preferences: six required keys plus optional sensitivity, missing sensitivity Standard, malformed policy Off, bounded ranges, merged loads, preserved content and final-key atomic failure\n";
 }
 void preferencePathBoundary(size_t length){
     std::filesystem::path ownedRoot;
@@ -535,6 +537,30 @@ void preferencePathBoundary(size_t length){
     }
     require(GetFileAttributesW(fileIOPath(ownedRoot.wstring()).c_str())==INVALID_FILE_ATTRIBUTES,"Owned long-path fixture was not cleaned.");
     std::cout<<"PASS settings path "<<length<<": real load/save, preserved values/content, locked replacement cleanup and retry\n";
+}
+void sizeCommandPreferences(){
+    PreferencesFixture fixture;fixture.seed(legacy);reload();
+    app.camera=CreateWindowExW(0,L"COMBOBOX",L"",WS_CHILD|CBS_DROPDOWNLIST,0,0,120,80,app.window,nullptr,nullptr,nullptr);
+    require(app.camera!=nullptr,"Cannot create owned source-size preference control.");
+    add(app.camera,L"Synthetic camera");choose(app.camera,0);app.cameras={{L"Synthetic camera",L"owned-size-camera"}};
+    app.engine=std::make_unique<lapse::FixtureEngine>();app.status=lapse::fixtureStatus={};
+    const auto select=[&](int item){choose(app.videoSize,item);windowProc(app.window,WM_COMMAND,MAKEWPARAM(SizeBox,CBN_SELCHANGE),reinterpret_cast<LPARAM>(app.videoSize));};
+    const auto open=[&]{choose(app.mode,1);app.settings.layers=preset(Mode::Camera);configure();lapse::fixtureStatus.cameraInput={640,480,17};
+        windowProc(app.window,WM_COMMAND,MAKEWPARAM(SizeBox,CBN_DROPDOWN),reinterpret_cast<LPARAM>(app.videoSize));};
+    select(1);require(app.settings.width==1920 && app.settings.height==1080 && app.committedSize==1,"Actual preset command did not configure 1080p.");
+    preferences(true);reload();configure();require(choice(app.videoSize)==1 && app.settings.width==1920 && app.settings.height==1080,"Actual preset command did not persist through reload.");
+    open();require(app.sizeSuggestions[1].item>=0,"Verified camera size action was unavailable in owned preferences fixture.");
+    select(app.sizeSuggestions[1].item);require(app.committedSize==2 && app.hasCustomSize && app.settings.width==640 && app.settings.height==480,"Source command did not commit exact custom dimensions.");
+    preferences(true);reload();configure();require(choice(app.videoSize)==2 && app.settings.width==640 && app.settings.height==480,"Source command did not persist exact custom dimensions.");
+    open();choose(app.videoSize,app.sizeSuggestions[1].item);configure();
+    require(app.settings.width==640 && app.settings.height==480,"Uncommitted transient row changed configured dimensions.");
+    preferences(true);reload();configure();
+    wchar_t quality[16]{};GetPrivateProfileStringW(L"Settings",L"Quality",L"",quality,16,app.preferences.c_str());
+    require(std::wstring(quality)==L"2" && choice(app.videoSize)==2 && app.settings.width==640 && app.settings.height==480,"Transient source-action index leaked into saved preferences.");
+    select(0);preferences(true);reload();configure();require(choice(app.videoSize)==0 && app.settings.width==1280 && app.settings.height==720,"Later actual preset command did not supersede a saved source snapshot.");
+    expectUnknownContent(fixture);fixture.onlySettingsRemain();app.engine.reset();app.status=lapse::fixtureStatus={};
+    DestroyWindow(app.camera);app.camera=nullptr;app.cameras.clear();app.settings.layers=preset(Mode::Desktop);
+    std::cout<<"PASS actual size commands persist presets and exact source snapshots; transient action indices never serialize\n";
 }
 void checkpointBeforeRecording(){
     PreferencesFixture fixture;fixture.seed(legacy);reload();const auto original=fixture.bytes();
@@ -600,8 +626,8 @@ int main(){
         HiddenControls controls;
         newUnicodeFile();existingUnicodeRewrite();migrateAnsi();encodingModes();recordingLimits();segmentOptions();diskSafety();recoveryOptions();nightOptions();customOptions();readFailure();replacementFailure();
         preparationAllocationFailure();partialKeyWriteFailure();stagedExceptionCleanup();
-        preferencePathBoundary(248);preferencePathBoundary(278);timeCompressionPreferences();checkpointBeforeRecording();
+        preferencePathBoundary(248);preferencePathBoundary(278);timeCompressionPreferences();sizeCommandPreferences();checkpointBeforeRecording();
         require(!IsWindowVisible(app.window),"Fixture became visible.");
-        std::cout<<"All 19 preference cases passed; only owned hidden controls/settings were used.\n";return 0;
+        std::cout<<"All 20 preference cases passed; only owned hidden controls/settings were used.\n";return 0;
     }catch(const std::exception& error){std::cerr<<"PREFERENCES TEST FAILURE: "<<error.what()<<'\n';return 1;}
 }

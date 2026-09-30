@@ -93,7 +93,7 @@ void modalLayoutAndInactiveDraft(){
     skipScript=[](HWND window,DLGPROC procedure,LPARAM parameter){
         if(procedure==customProc){rangeDraft(window,*reinterpret_cast<CustomDraft*>(parameter),0,120);return;}
         auto& draft=*reinterpret_cast<SkipDraft*>(parameter);require(caption(draft.speed)==L"3×","Valid nonpreset multiplier silently displayed 4×.");
-        require(GetNextDlgTabItem(window,draft.mode,FALSE)==draft.speed && GetNextDlgTabItem(window,draft.speed,FALSE)==draft.ramp,"Native modal tab order changed.");
+        require(GetNextDlgTabItem(window,draft.mode,FALSE)==draft.speed && GetNextDlgTabItem(window,draft.speed,FALSE)==draft.ranges,"Manual mode tab order skipped its visible schedule.");
         skipProc(window,WM_COMMAND,SkipEdit,0);mode(window,draft,TimeSkipMode::Off);
         require(draft.repeatCleared && draft.policy.repeatSeconds==0 && draft.policy.rangeCount==1 && draft.policy.ranges[0].endSeconds==120,"Off did not retain ranges with a valid inactive repeat.");
         wchar_t help[2048]{};GetWindowTextW(draft.help,help,2048);require(std::wstring(help).find(L"reset to Never")!=std::wstring::npos,"Inactive repeat reset was not explained.");
@@ -103,7 +103,7 @@ void modalLayoutAndInactiveDraft(){
     skipScript=[](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);mode(window,draft,TimeSkipMode::QuietWithinSchedule);
         SetWindowTextW(draft.quiet,L"0");skipProc(window,WM_COMMAND,IDOK,0);require(!outcome() && !caption(draft.error).empty(),"Invalid quiet duration was accepted.");
         for(int dpi:{96,144,192,288}){
-            RECT suggested{0,0,320,260};skipProc(window,WM_DPICHANGED,MAKELONG(dpi,dpi),reinterpret_cast<LPARAM>(&suggested));
+            draft.fineExpanded=true;skipHelp(draft);RECT suggested{0,0,320,260};skipProc(window,WM_DPICHANGED,MAKELONG(dpi,dpi),reinterpret_cast<LPARAM>(&suggested));
             require(draft.dpi==dpi && (GetWindowLongPtrW(window,GWL_STYLE)&WS_HSCROLL) && (GetWindowLongPtrW(window,GWL_STYLE)&WS_VSCROLL),"Constrained modal lost DPI/scroll state.");
             for(HWND child:{draft.help,draft.error}){RECT bounds{};GetClientRect(child,&bounds);wchar_t value[2048]{};GetWindowTextW(child,value,2048);RECT measured{0,0,bounds.right,0};
                 HDC dc=GetDC(window);auto prior=SelectObject(dc,draft.font);DrawTextW(dc,value,-1,&measured,DT_CALCRECT|DT_WORDBREAK|DT_NOPREFIX);SelectObject(dc,prior);ReleaseDC(window,dc);
@@ -307,6 +307,57 @@ void nativeModalButtons(){
     }
     app.status={};std::cout<<"PASS native compression button focus, safe actions, nested ranges, manager clicks, Enter/Escape/Space and read-only Close\n";
 }
+void fineTuning(){
+    HiddenFixture owned;setupSkip();app.settings.timeSkip.mode=TimeSkipMode::Quiet;
+    app.settings.timeSkip.rampFrames=60;app.settings.timeSkip.quietSensitivity=QuietSensitivity::High;
+    const auto visible=[](HWND child){return (GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0;};
+    const auto toggle=[](HWND window,SkipDraft& draft){
+        const bool before=draft.fineExpanded;SendMessageW(window,WM_NEXTDLGCTL,reinterpret_cast<WPARAM>(draft.fine),TRUE);
+        require(GetFocus()==draft.fine && draft.fineExpanded==before && !outcome(),"Focusing Fine tuning activated the disclosure or dialog.");
+        SendMessageW(draft.fine,WM_KEYDOWN,VK_SPACE,0);SendMessageW(draft.fine,WM_KEYUP,VK_SPACE,0);
+        require(draft.fineExpanded!=before && !outcome(),"Space failed to toggle Fine tuning safely.");
+    };
+    const int initial=lapse::configurationCalls;
+    skipScript=[&](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);
+        require(!draft.fineExpanded && !visible(draft.ramp) && !visible(draft.sensitivity) &&
+            caption(draft.fine).find(L"2 s transition")!=std::wstring::npos && caption(draft.fine).find(L"High sensitivity")!=std::wstring::npos,
+            "Default collapse hid nondefault tuning settings or left tuning controls visible.");
+        require(caption(draft.help).find(L"not people")!=std::wstring::npos && caption(draft.help).find(L"stale")!=std::wstring::npos,
+            "Quiet help lost image-change scope or conservative fallback.");
+        toggle(window,draft);require(visible(draft.ramp)&&visible(draft.sensitivity),"Expanded Quiet tuning did not show both settings.");
+        for(int dpi:{96,144,192,288}){
+            RECT suggested{0,0,360,260};skipProc(window,WM_DPICHANGED,MAKELONG(dpi,dpi),reinterpret_cast<LPARAM>(&suggested));
+            SendMessageW(window,WM_NEXTDLGCTL,reinterpret_cast<WPARAM>(draft.sensitivity),TRUE);
+            RECT bounds{},client{};GetWindowRect(draft.sensitivity,&bounds);MapWindowPoints(nullptr,window,reinterpret_cast<POINT*>(&bounds),2);GetClientRect(window,&client);
+            require(GetFocus()==draft.sensitivity && bounds.right>0 && bounds.left<client.right && bounds.bottom>0 && bounds.top<client.bottom,
+                "Fine tuning field could not be revealed by native focus at constrained DPI.");
+            HDC dc=GetDC(window);auto prior=SelectObject(dc,draft.font);RECT button{};GetClientRect(draft.fine,&button);auto value=caption(draft.fine);value.erase(std::remove(value.begin(),value.end(),L'&'),value.end());SIZE measured{};
+            GetTextExtentPoint32W(dc,value.c_str(),static_cast<int>(value.size()),&measured);SelectObject(dc,prior);ReleaseDC(window,dc);
+            require(measured.cx+draft.scale(12)<=button.right,"Fine tuning nondefault summary truncated at minimum canvas width.");
+        }
+        toggle(window,draft);choose(draft.ramp,-1);skipProc(window,WM_COMMAND,IDOK,0);
+        require(!outcome() && draft.fineExpanded && GetFocus()==draft.ramp && !caption(draft.error).empty(),"Hidden invalid transition did not expand and focus its error.");
+        choose(draft.ramp,1);toggle(window,draft);choose(draft.sensitivity,-1);skipProc(window,WM_COMMAND,IDOK,0);
+        require(!outcome() && draft.fineExpanded && GetFocus()==draft.sensitivity,"Hidden invalid sensitivity did not reveal its field.");
+        mode(window,draft,TimeSkipMode::NoPerson);require(!visible(draft.sensitivity)&&visible(draft.ramp)&&caption(draft.help).find(L"camera only")!=std::wstring::npos,
+            "Person mode exposed a quiet sensitivity or lost camera scope.");
+        mode(window,draft,TimeSkipMode::Off);skipProc(window,WM_COMMAND,IDOK,0);require(outcome()==IDOK,"Off was blocked by an invalid inactive tuning control.");
+    };editSkip();require(app.settings.timeSkip.mode==TimeSkipMode::Off && app.settings.timeSkip.quietSensitivity==QuietSensitivity::High &&
+        lapse::configurationCalls==initial+1,"Atomic Off commit changed inactive sensitivity.");
+    app.settings.timeSkip.mode=TimeSkipMode::Quiet;
+    skipScript=[&](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);toggle(window,draft);choose(draft.sensitivity,0);choose(draft.ramp,0);skipProc(window,WM_COMMAND,IDCANCEL,0);};
+    editSkip();require(app.settings.timeSkip.quietSensitivity==QuietSensitivity::High && app.settings.timeSkip.rampFrames==30,"Cancelled tuning changed saved policy.");
+    for(auto state:{State::Starting,State::Recording,State::Paused,State::Finishing}){
+        app.status.state=state;
+        skipScript=[&](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);
+            require(IsWindowEnabled(draft.fine) && !IsWindowEnabled(draft.ramp) && !IsWindowEnabled(draft.sensitivity),"Read-only tuning lost inspection or unlocked session options.");
+            toggle(window,draft);require(visible(draft.sensitivity),"Read-only disclosure could not expose saved tuning.");
+            skipProc(window,WM_COMMAND,IDCANCEL,0);
+        };editSkip();
+    }
+    app.status={};require(app.settings.timeSkip.quietSensitivity==QuietSensitivity::High && lapse::configurationCalls==initial+1,"Read-only inspection reconfigured tuning.");
+    std::cout<<"PASS Fine tuning default/nondefault disclosure, native keyboard/DPI, hidden validation, Off, cancellation and read-only inspection\n";
 }
-int main(){try{transactionalRanges();boundsAndFreeze();modalLayoutAndInactiveDraft();strictPolicy();nativeCompressionInsertion();statusAndNestedClose();personModesAndManagement();personLayoutAndStatus();nativeModalButtons();std::cout<<"All nine time-compression UI groups passed using owned hidden windows only.\n";return 0;}
+}
+int main(){try{transactionalRanges();boundsAndFreeze();modalLayoutAndInactiveDraft();strictPolicy();nativeCompressionInsertion();statusAndNestedClose();personModesAndManagement();personLayoutAndStatus();nativeModalButtons();fineTuning();std::cout<<"All ten time-compression UI groups passed using owned hidden windows only.\n";return 0;}
 catch(const std::exception& error){std::cerr<<"TIME COMPRESSION UI FAILURE: "<<error.what()<<'\n';return 1;}}

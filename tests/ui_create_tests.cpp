@@ -180,7 +180,7 @@ void run(const wchar_t* name,Fault selectedFault){
     if(selectedFault==Fault::AfterEngine)require(failedAllocations==0&&syntheticThrows==1&&engineStarts==1,"Synthetic post-engine exception changed");
     if(selectedFault==Fault::Timer)require(failedAllocations==0&&syntheticThrows==0&&engineStarts==1&&engineStops==1,"Synthetic zero-timer cleanup changed");
     if(failed){require(!escaped&&created==-1,"WM_CREATE did not reject failed startup");require(resizeQueries==0&&resizeConfigures==0,"Failed startup processed resize configuration");require(keyWrites==0&&unchanged&&debugMessages==1&&timerStarts==(selectedFault==Fault::Timer?1:0),"Failed startup changed preferences or timer attempts");}
-    else {require(!escaped&&created==0&&failedAllocations==0&&engineStarts==1&&keyWrites==22&&!unchanged&&timerStarts==1&&debugMessages==0,"Healthy create/destroy changed");
+    else {require(!escaped&&created==0&&failedAllocations==0&&engineStarts==1&&keyWrites==23&&!unchanged&&timerStarts==1&&debugMessages==0,"Healthy create/destroy changed");
         require(!app.advancedExpanded&&app.advancedVisibility==0&&app.advancedLimitIndex==0,"Recreated controls inherited stale Advanced caption or expanded state");
         require(app.advancedNightState==0&&app.nightVisibility==0&&app.nightValidation.empty()&&app.nightHintCaption.empty()&&app.nightDetailCaption.empty(),"Recreated controls inherited stale night visibility, validation or facts");
         require(app.settings.timeSkip.mode==TimeSkipMode::Off && app.skipVisibility==0 && app.skipSummaryCaption.empty() && app.skipDetailCaption.empty() && app.skipCheckAge==UINT64_MAX,"Recreated controls inherited stale compression policy/visibility/facts");
@@ -230,7 +230,7 @@ void osCase(const wchar_t* className,const wchar_t* name,Fault selectedFault){
     require(routeEscapes==0&&routedCreates==1&&routedDestroys==1&&!app.engine&&timerStops==1&&quits==1,"Unexpected callback escape or missing OS cleanup");
     if(selectedFault==Fault::ProfileCopy)require(!created&&!acceptedAtReturn&&destroysAtReturn==1&&failedAllocations==1&&failedBytes>0&&keyWrites==0&&unchanged&&engineStarts==0&&engineStops==0&&timerStarts==0&&debugMessages==1,"OS failed-creation behavior changed");
     else if(selectedFault==Fault::Timer)require(!created&&!acceptedAtReturn&&!app.mode&&destroysAtReturn==1&&stopsAtReturn==1&&writesAtReturn==0&&failedAllocations==0&&syntheticThrows==0&&keyWrites==0&&unchanged&&engineStarts==1&&engineStops==1&&timerStarts==1&&debugMessages==1,"OS failed-timer cleanup or preference preservation changed");
-    else require(created&&acceptedAtReturn&&destroysAtReturn==0&&stopsAtReturn==0&&writesAtReturn==0&&failedAllocations==0&&keyWrites==22&&!unchanged&&engineStarts==1&&engineStops==1&&timerStarts==1&&debugMessages==0,"OS healthy-creation behavior changed");
+    else require(created&&acceptedAtReturn&&destroysAtReturn==0&&stopsAtReturn==0&&writesAtReturn==0&&failedAllocations==0&&keyWrites==23&&!unchanged&&engineStarts==1&&engineStops==1&&timerStarts==1&&debugMessages==0,"OS healthy-creation behavior changed");
     for(const auto& file:std::filesystem::directory_iterator(ownedCase))require(file.path()==path,"Owned settings stage remained");
 }
 }
@@ -254,7 +254,7 @@ void verifyChildCleanup(bool rejected){
     require(app.cameraListError.empty()&&app.statusTooltipCaption.empty(),"Window recreation retained a prior camera enumeration diagnostic/tooltip");
     require(!app.engine&&!app.startupComplete&&timerStops==1&&quits==1,"Destruction missed Engine/timer/quit cleanup");
     if(rejected)require(engineStarts==0&&engineStops==0&&engineConfigures==0&&timerStarts==0&&profileReads==0&&monitorEnumerations==0&&cameraEnumerations==0&&tooltipAttempts==0&&keyWrites==0&&debugMessages==1&&childUnchanged(),"Failed required child reached initialization or changed preferences");
-    else require(engineStarts==1&&engineStops==1&&timerStarts==1&&profileReads==1&&monitorEnumerations==1&&cameraEnumerations==1&&tooltipAttempts==1&&keyWrites==22*(recordCalls?2:1)&&debugMessages==0&&lastConfiguredInterval==5000&&!childUnchanged(),"Healthy initialization/persistence changed");
+    else require(engineStarts==1&&engineStops==1&&timerStarts==1&&profileReads==1&&monitorEnumerations==1&&cameraEnumerations==1&&tooltipAttempts==1&&keyWrites==23*(recordCalls?2:1)&&debugMessages==0&&lastConfiguredInterval==5000&&!childUnchanged(),"Healthy initialization/persistence changed");
     require(GetPrivateProfileIntW(L"Settings",L"Interval",99,currentIni.c_str())==2,"Owned interval preference changed");
     for(const auto& entry:std::filesystem::directory_iterator(ownedCase))require(entry.path()==currentIni,"Owned preference stage leaked");
 }

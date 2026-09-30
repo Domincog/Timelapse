@@ -131,6 +131,27 @@ bool validateCaptureInterval(int milliseconds, std::wstring& error) {
     }
     return true;
 }
+std::pair<int, int> sourceVideoDimensions(int64_t width, int64_t height) noexcept {
+    if (width < MinVideoDimension || height < MinVideoDimension ||
+        width > (std::numeric_limits<int>::max)() || height > (std::numeric_limits<int>::max)()) return {};
+    const int evenWidth = int(width) & ~1, evenHeight = int(height) & ~1;
+    if (videoSizeValid(evenWidth, evenHeight)) return {evenWidth, evenHeight};
+    const bool landscape = width >= height;
+    const int64_t longer = landscape ? width : height, shorter = landscape ? height : width;
+    int low = 1, high = int((std::min)(longer, int64_t(MaxVideoDimension))) / 2;
+    int fittedLong = 0, fittedShort = 0;
+    // Search even long edges. The proportional short edge and resulting area
+    // are monotonic; wide intermediates cover the full accepted source range.
+    while (low <= high) {
+        const int middle = low + (high - low) / 2, candidateLong = middle * 2;
+        const int candidateShort = int(shorter * candidateLong / longer) & ~1;
+        if (int64_t(candidateLong) * candidateShort <= MaxVideoPixels) {
+            fittedLong = candidateLong; fittedShort = candidateShort; low = middle + 1;
+        } else high = middle - 1;
+    }
+    if (!videoSizeValid(fittedLong, fittedShort)) return {};
+    return landscape ? std::pair<int, int>{fittedLong, fittedShort} : std::pair<int, int>{fittedShort, fittedLong};
+}
 bool validateVideoSize(int width, int height, std::wstring& error) {
     error.clear();
     if (!videoSizeValid(width, height)) {

@@ -30,7 +30,7 @@ void normalization() {
     require(normalizeTimeSkipSettings(settings, error) && settings.rangeCount == 1 &&
         settings.ranges[0].startSeconds == 0 && settings.ranges[0].endSeconds == 40 && settings.ranges[1].endSeconds == 0,
         "Ranges were not sorted/merged/cleared");
-    for (int kind = 0; kind < 10; ++kind) {
+    for (int kind = 0; kind < 12; ++kind) {
         auto invalid = settings;
         switch (kind) {
         case 0: invalid.mode = static_cast<TimeSkipMode>(99); break;
@@ -43,10 +43,13 @@ void normalization() {
         case 7: invalid.repeatSeconds = 20; break;
         case 8: invalid.rangeCount = 0; break;
         case 9: invalid.quietAfterMs = 1500; break;
+        case 10: invalid.quietSensitivity = static_cast<QuietSensitivity>(-1); break;
+        case 11: invalid.quietSensitivity = static_cast<QuietSensitivity>(3); break;
         }
         const auto before = invalid;
         require(!normalizeTimeSkipSettings(invalid, error) && !error.empty() && invalid.rangeCount == before.rangeCount &&
-            invalid.ranges[0].endSeconds == before.ranges[0].endSeconds && invalid.mode == before.mode,
+            invalid.ranges[0].endSeconds == before.ranges[0].endSeconds && invalid.mode == before.mode &&
+            invalid.quietSensitivity == before.quietSensitivity,
             "Invalid settings accepted or partially modified");
         TimeSkipController controller;
         require(!controller.reset(invalid, 1000, 3) && controller.inspect(0).reason == TimeSkipReason::Off,
@@ -178,6 +181,75 @@ void descriptorNoise() {
         "Invalid descriptor source changed output");
     std::cout << "PASS generated 720p noise/flicker/gain at production 1 Hz; invalid frames preserve descriptor\n";
 }
+void quietSensitivity() {
+    static_assert(int(QuietSensitivity::Low) == 0 && int(QuietSensitivity::Standard) == 1 && int(QuietSensitivity::High) == 2);
+    require(TimeSkipSettings{}.quietSensitivity == QuietSensitivity::Standard, "Default sensitivity changed");
+    const auto image = flat();
+    for (auto mode : {TimeSkipMode::Quiet, TimeSkipMode::QuietWithinSchedule})
+        for (auto sensitivity : {QuietSensitivity::Low, QuietSensitivity::Standard, QuietSensitivity::High})
+            for (int channel = 0; channel < 3; ++channel) for (int amplitude : {6, 7, 8, 9, 12, 13, 14, 30}) {
+                TimeSkipSettings settings; settings.mode = mode; settings.quietAfterMs = 3000;
+                settings.quietSensitivity = sensitivity; settings.rangeCount = 1; settings.ranges[0] = {0, 1000};
+                TimeSkipController controller; require(controller.reset(settings, 100, 3), "Prepare sensitivity profile");
+                for (int i = 0; i <= 8; ++i) {
+                    for (unsigned source = 0; source < 2; ++source)
+                        require(controller.observe(source, image, 1, i + 1, i * 1000), "Sensitivity baseline rejected");
+                    controller.onFrame(i * 1000);
+                }
+                require(controller.inspect(8000).accelerated, "Static sensitivity baseline did not accelerate");
+                auto changed = image; auto& plane = channel == 0 ? changed.y : channel == 1 ? changed.u : changed.v;
+                for (int i = 0; i < 4; ++i) plane[i] = static_cast<uint8_t>(plane[i] + amplitude);
+                require(controller.observe(0, image, 1, 10, 9000) && controller.observe(1, changed, 1, 10, 9000),
+                        "Sensitivity change rejected");
+                const auto result = controller.inspect(9000);
+                const int threshold = sensitivity == QuietSensitivity::Low ? 14 : sensitivity == QuietSensitivity::High ? 7 : 9;
+                const bool noticed = amplitude >= threshold;
+                require(result.returnToBase == noticed && result.accelerated != noticed &&
+                        result.reason == (noticed ? TimeSkipReason::Checking : TimeSkipReason::Quiet),
+                        "Localized luma/chroma sensitivity did not match its boundary");
+                require(!controller.inspect(9000).returnToBase, "Sensitivity return repeated");
+                require(controller.inspect(12001).reason == TimeSkipReason::Unavailable,
+                        "Sensitivity weakened stale-source fallback");
+            }
+    for (auto sensitivity : {QuietSensitivity::Low, QuietSensitivity::Standard, QuietSensitivity::High}) {
+        TimeSkipSettings settings; settings.mode = TimeSkipMode::Quiet; settings.quietAfterMs = 3000;
+        settings.quietSensitivity = sensitivity; TimeSkipController controller;
+        require(controller.reset(settings, 100, 1), "Prepare minor-variation history");
+        for (int i = 0; i <= 8; ++i) {
+            controller.observe(0, image, 1, i + 1, i * 1000); controller.onFrame(i * 1000);
+        }
+        // Alternating four-cell variation: Low deliberately tolerates this;
+        // Standard/High conservatively restart dwell at the first change.
+        for (int i = 9; i <= 14; ++i) {
+            auto varied = image; if (i & 1) for (int cell = 0; cell < 4; ++cell) varied.y[cell] += 12;
+            controller.observe(0, varied, 1, i + 1, i * 1000);
+            require(controller.inspect(i * 1000).reason ==
+                    (sensitivity == QuietSensitivity::Low ? TimeSkipReason::Quiet : TimeSkipReason::Checking),
+                    "Minor recurring variation ignored the selected sensitivity");
+        }
+        require(!controller.observe(0, image, 1, 15, 15000) &&
+                controller.inspect(15000).reason == TimeSkipReason::Unavailable, "Sensitivity trusted a duplicate sample");
+        require(controller.reset(settings, 100, 1) && controller.inspect(0).reason == TimeSkipReason::Unavailable,
+                "Sensitivity reset retained quiet qualification");
+        controller.observe(0, image, 1, 1, 0);
+        require(controller.inspect(3000).reason == TimeSkipReason::Checking, "Sensitivity qualified a single baseline");
+        for (int i = 1; i < 7; ++i) {
+            auto exposure = image; exposure.y.fill(static_cast<uint8_t>(80 + (i & 1 ? 6 : -6)));
+            controller.observe(0, exposure, 1, i + 1, i * 1000);
+            if (i >= 3) require(controller.inspect(i * 1000).reason == TimeSkipReason::Quiet,
+                                "Sensitivity changed ordinary exposure compensation");
+        }
+        settings.mode = TimeSkipMode::NoPerson; settings.quietAfterMs = 1000;
+        require(controller.reset(settings, 100, 2), "Prepare person independence");
+        controller.observePerson({PersonPresence::QualifiedAbsent, 1, 1, 0});
+        require(controller.inspect(1000).reason == TimeSkipReason::Checking, "Sensitivity weakened person baseline guard");
+        controller.observePerson({PersonPresence::QualifiedAbsent, 1, 2, 1000}); controller.onFrame(1000);
+        require(controller.inspect(1000).reason == TimeSkipReason::NoPerson, "Sensitivity changed qualified absence");
+        controller.observePerson({PersonPresence::Unknown, 1, 3, 2000});
+        require(controller.inspect(2000).reason == TimeSkipReason::Unavailable, "Sensitivity weakened unknown-person fallback");
+    }
+    std::cout << "PASS quiet sensitivity boundaries/history, chroma, exposure, immediate return, stale/duplicate/reset and person independence\n";
+}
 void delaysAndAllocation() {
     TimeSkipController controller; auto settings = manual(30);
     require(controller.reset(settings, 5000, 0), "Prepare delayed policy");
@@ -190,17 +262,20 @@ void delaysAndAllocation() {
     Frame frame{64, 36, std::vector<uint8_t>(64 * 36 * 4, 90)}; TimeSkipDescriptor image;
     settings.mode = TimeSkipMode::Quiet; settings.quietAfterMs = 1000;
     const auto count = allocations.load();
-    require(controller.reset(settings, 1000, 1), "Prepare no-allocation policy");
-    for (int i = 0; i < 1000; ++i) {
-        describeTimeSkipFrame(frame, image); controller.observe(0, image, 1, i + 1, i * 1000);
-        controller.inspect(i * 1000); controller.onFrame(i * 1000);
+    for (auto sensitivity : {QuietSensitivity::Low, QuietSensitivity::Standard, QuietSensitivity::High}) {
+        settings.quietSensitivity = sensitivity;
+        require(controller.reset(settings, 1000, 1), "Prepare no-allocation policy");
+        for (int i = 0; i < 1000; ++i) {
+            describeTimeSkipFrame(frame, image); controller.observe(0, image, 1, i + 1, i * 1000);
+            controller.inspect(i * 1000); controller.onFrame(i * 1000);
+        }
     }
     require(allocations.load() == count, "Steady descriptor/controller allocated");
-    std::cout << "PASS delay/base fallback, duplicate admission, Off and 1000 allocation-free controller observations\n";
+    std::cout << "PASS delay/base fallback, duplicate admission, Off and 3000 allocation-free observations across sensitivities\n";
 }
 }
 int main() {
-    try { normalization(); manualProfiles(); scheduleBoundaries(); quietAndSources(); descriptorNoise(); delaysAndAllocation();
+    try { normalization(); manualProfiles(); scheduleBoundaries(); quietAndSources(); descriptorNoise(); quietSensitivity(); delaysAndAllocation();
         std::cout << "All time-compression policy contracts passed. Controller bytes: " << sizeof(TimeSkipController) << '\n'; return 0;
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

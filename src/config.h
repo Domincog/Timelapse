@@ -23,6 +23,10 @@ bool parseDuration(std::wstring_view text, DurationUnit unit, int64_t minMs,
 bool parsePixelDimension(std::wstring_view text, int& result, std::wstring& error);
 bool validateCaptureInterval(int milliseconds, std::wstring& error);
 bool validateVideoSize(int width, int height, std::wstring& error);
+// A one-time source-size suggestion, never a following/recording policy.
+// Keep exact supported sizes; otherwise downscale and round down to even pixels
+// within the video bounds. Return {0,0} if no usable fit exists. No allocation.
+std::pair<int, int> sourceVideoDimensions(int64_t width, int64_t height) noexcept;
 // Recovery mode uses the native fragmented sink, which accepts H.264 only.
 bool validateEncodingMode(EncodingMode mode, bool recoveryMode, std::wstring& error);
 // Largest exact single unit requiring at most three fractional digits.

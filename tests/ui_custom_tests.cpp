@@ -213,9 +213,60 @@ void nativeButtonNavigation(){
     }
     std::cout<<"PASS native custom tab focus scrolls without activation at two DPIs; Click, Space, Enter and Escape retain their meanings\n";
 }
+void sourceSizeSnapshots(){
+    HiddenFixture owned;setupCustom();
+    const auto open=[](){windowProc(app.window,WM_COMMAND,MAKEWPARAM(SizeBox,CBN_DROPDOWN),reinterpret_cast<LPARAM>(app.videoSize));};
+    const auto select=[](int item){choose(app.videoSize,item);windowProc(app.window,WM_COMMAND,MAKEWPARAM(SizeBox,CBN_SELCHANGE),reinterpret_cast<LPARAM>(app.videoSize));};
+    const auto itemText=[](int item){wchar_t value[128]{};SendMessageW(app.videoSize,CB_GETLBTEXT,item,reinterpret_cast<LPARAM>(value));return std::wstring(value);};
+    lapse::listedMonitors[1].bounds={100,200,5220,1640}; // Live topology differs from the cached source list.
+    const auto sourceList=app.monitors;
+    open();require(app.sizeSuggestions[0].width==4096 && app.sizeSuggestions[0].height==1152 &&
+        itemText(app.sizeSuggestions[0].item)==L"Fit screen: 4096 × 1152" && itemText(2)==L"Custom..." && choice(app.videoSize)==0,
+        "Fitted source action changed preset/custom identity or ignored live screen bounds.");
+    const int calls=lapse::configurationCalls;select(app.sizeSuggestions[0].item);
+    require(app.settings.width==4096 && app.settings.height==1152 && app.committedSize==2 && app.hasCustomSize &&
+        lapse::configurationCalls==calls+1 && !dialogCalls && caption(app.videoSize)==L"4096 × 1152",
+        "Source action did not materialize one exact custom setting without a modal.");
+    require(EqualRect(&app.monitors[1].bounds,&sourceList[1].bounds),"Suggestion replaced the source-list snapshot.");
+    open();require(itemText(3)==L"Custom..." && app.sizeSuggestions[0].item==4,"Source actions displaced committed custom or Custom... indices.");
+    for(int changed=0;changed<3;++changed){
+        lapse::listedMonitors={displayA,displayB};open();const int action=app.sizeSuggestions[0].item;
+        if(changed==0)lapse::listedMonitors[1].bounds.right+=2;
+        if(changed==1)lapse::listedMonitors.erase(lapse::listedMonitors.begin()+1);
+        if(changed==2){lapse::listedMonitors[1].bounds.left+=10;lapse::listedMonitors[1].bounds.right+=10;}
+        const auto committed=app.settings;const int before=lapse::configurationCalls;select(action);
+        require(app.settings.width==committed.width && app.settings.height==committed.height && choice(app.videoSize)==2 && lapse::configurationCalls==before,
+            "Changed, moved or removed screen committed a stale dropdown snapshot.");
+    }
+    lapse::listedMonitors={displayA,displayB};lapse::listedMonitors[1].bounds={0,0,1280,720};open();select(app.sizeSuggestions[0].item);
+    require(!app.hasCustomSize && app.committedSize==0 && choice(app.videoSize)==0,"Exact preset source dimensions left a duplicate custom row.");
+    sourceMode(Mode::Camera);app.status.cameraInput={1920,1080,99};lapse::fixtureStatus.cameraInput={};
+    open();require(app.sizeSuggestions[0].item<0 && app.sizeSuggestions[1].item<0 &&
+        std::wstring(videoSizeTooltip()).find(L"current frame")!=std::wstring::npos,"Old polled camera metadata or unrelated screen became a suggestion.");
+    lapse::fixtureStatus.cameraInput={640,480,7};open();require(itemText(app.sizeSuggestions[1].item)==L"Use camera input: 640 × 480","Verified camera feed was not labeled as input.");
+    const int cameraAction=app.sizeSuggestions[1].item;lapse::fixtureStatus.cameraInput.generation=8;select(cameraAction);
+    require(app.settings.width==1280 && choice(app.videoSize)==0,"Retired camera generation committed a stale action.");
+    open();const int changedSize=app.sizeSuggestions[1].item;lapse::fixtureStatus.cameraInput.width=642;select(changedSize);
+    require(app.settings.width==1280,"Changed camera dimensions committed a stale action.");
+    open();const int changedCamera=app.sizeSuggestions[1].item;choose(app.camera,1-choice(app.camera));configure();select(changedCamera);
+    require(app.settings.width==1280,"New selected camera reused the old source action.");
+    lapse::fixtureStatus.cameraInput={640,480,9};open();select(app.sizeSuggestions[1].item);
+    require(app.settings.width==640 && app.settings.height==480 && app.hasCustomSize,"Current camera input was not committed exactly.");
+    for(auto state:{State::Starting,State::Recording,State::Paused,State::Finishing}){
+        app.status.state=State::Idle;lapse::fixtureStatus.cameraInput={1280,720,10};open();const int action=app.sizeSuggestions[1].item;
+        app.status.state=state;const int before=lapse::configurationCalls;select(action);
+        require(app.settings.width==640 && choice(app.videoSize)==2 && lapse::configurationCalls==before,"Active-session source-size action changed frozen geometry.");
+    }
+    app.status={};lapse::fixtureStatus.cameraInput={32,32,11};open();require(app.sizeSuggestions[1].item<0 &&
+        std::wstring(videoSizeTooltip()).find(L"cannot fit")!=std::wstring::npos,"Unsupported tiny camera input offered an upscaled match.");
+    const auto protectedMessage=L"Saved earlier parts; retained last movie.";app.status.message=protectedMessage;
+    enumerationAllocation::failNext=true;open();require(app.sizeSuggestions[0].item<0 && app.sizeSuggestions[1].item<0 &&
+        choice(app.videoSize)==2 && app.status.message==protectedMessage,"Suggestion allocation failure lost committed output or primary status.");
+    std::cout<<"PASS source-size exact/Fit snapshots, live topology, stable custom indices, camera generation/identity, active locks and allocation fallback\n";
+}
 }
 int main(){
-    try{intervalAndCancellation();dimensionsAndLimit();activeAndNight();segmentDurations();nativeNumericInsertion();nativeButtonNavigation();dialogDpiAndLifecycle();
+    try{intervalAndCancellation();dimensionsAndLimit();activeAndNight();segmentDurations();nativeNumericInsertion();nativeButtonNavigation();dialogDpiAndLifecycle();sourceSizeSnapshots();
         std::cout<<"All custom UI cases passed with hidden controls and synthetic engine.\n";return 0;
     }catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
 }

@@ -48,6 +48,12 @@ struct TimeSkipStatus {
     bool observationDelayed = false;
     std::array<wchar_t, 256> diagnostic{};
 };
+struct CameraInputSize {
+    // Verified delivered pixels, not the camera's advertised native modes.
+    // Zero dimensions mean no current input is available.
+    int width = 0, height = 0;
+    uint64_t generation = 0;
+};
 struct Status {
     State state = State::Idle;
     // Session-wide samples submitted to every output, including closed parts.
@@ -73,6 +79,7 @@ struct Status {
     uint32_t nightDurationMs = 0;
     NightResult night;
     TimeSkipStatus timeSkip;
+    CameraInputSize cameraInput;
     std::shared_ptr<const Frame> preview;
 };
 class Engine {
@@ -90,11 +97,14 @@ private:
     void run();
     // Called with mutex_ held when a preview selection is retired.
     void retirePreview();
+    // Called with mutex_ held. Invalidates in-flight input-size publication.
+    void retireCameraInput() noexcept;
     std::mutex mutex_;
     std::condition_variable wake_;
     Settings settings_;
     Status status_;
     uint64_t previewGeneration_ = 0;
+    uint64_t cameraInputGeneration_ = 0;
     uint64_t settingsRevision_ = 0;
     bool previewProblem_ = false;
     bool quit_ = false, start_ = false, stop_ = false, pauseRequested_ = false, pauseTarget_ = false, retrySources_ = false;
