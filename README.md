@@ -16,6 +16,8 @@ A small native Windows timelapse recorder. Record a display, a camera, or both i
 
 **System tray:** Closing the window hides Timelapse while recording continues. Reopen it from its tray icon or the Start menu. Right-click the tray icon for Show, Pause/Resume, Finish, or Exit. Exit finishes an active recording before closing; a saving failure brings the window back with the recovery information. Hidden windows stop preview processing. If Windows cannot add the tray icon, the app stays accessible in its window.
 
+A recording failure received while hidden opens the window with its details. Opening the tray menu does not dismiss that notice. A fresh failure is shown before Hide or Exit can dismiss it; after it has been shown, those controls work normally.
+
 **Advanced options:** Expand Advanced (Alt + A) for the encoder selector and optional Stop after limit. Choose a preset or Custom for a positive active duration in seconds, minutes, hours, or days. Custom limits must equal a whole number of seconds, up to 2,147,483,647 seconds. Initial startup and paused time do not count. Timelapse automatically finishes and saves the video or pair of videos at the limit, including while hidden in the tray. Finishing may wait for a capture or encoding operation already in progress and for the files to save. The default is Never. The selected limit is remembered. The collapsed Advanced label shows active options, or a warning when Night blend or MP4 recovery settings need correction; recording settings remain locked while recording. Finishing a hidden recording also releases the camera.
 
 **Low disk space:** Advanced also contains Stop on low disk space, enabled by default. Before opening a recording and before each captured frame is admitted, Timelapse checks the space available to your account in the save folder. It stops and attempts to save when 64 MiB or less remains for one output, or 128 MiB for two outputs. If Windows cannot report available space, recording is refused or stopped with a diagnostic. The option is remembered and locked during a recording; turn it off for a folder that cannot provide space information. Checks do not run for preview, idle time, or paused recordings.
@@ -119,7 +121,9 @@ The executable is then in `build/release/Timelapse.exe`. Developers can launch i
 
 The app retains the latest preview and camera frame, and writes samples incrementally. Preview runs at two frames per second when idle and one while recording; minimized windows do not generate preview frames. There is no growing in-memory recording buffer. The app requests that Windows stay awake while recording or saving. It releases the request while paused and after saving finishes. Manual locking is still respected.
 
-Desktop capture reuses its native image buffers while needed, and releases them when hidden and idle or paused, after hidden Finish, or when switching away from desktop capture. Capture recreates those buffers on the next request.
+Desktop capture reuses its recording surface alongside a bounded preview surface, avoiding repeated native allocations as capture and preview sizes alternate. The extra preview surface uses at most 900 KiB. This keeps the recording-sized surface resident between saved frames while recording is visible, trading retained memory for reuse. Pause and Finish release the native surfaces even when the window stays visible; continued preview recreates only what it needs. Hidden idle or paused sessions and switching away from desktop capture release them too.
+
+A single full-frame source already matching the output size avoids unnecessary composition scratch allocation and background clearing. Pixel values, alpha handling, and the scaling/letterboxing used by other layouts are unchanged.
 
 While a night window is active, its camera helper blends up to five distinct contributions per second, at up to 720p, using fixed-size accumulation buffers. Intermediate frames stay in the helper; only the completed blend crosses to the recorder. These optional buffers are released when night recording is cancelled or finished. Hardware camera capture/conversion can still consume resources independently of the blend processing.
 
@@ -182,7 +186,7 @@ This also checks BT.709 limited-range color metadata. FFmpeg is used only by the
 
 After building and testing, run `./package.ps1` to create both archives in `packages/`. The release ZIP is intended for GitHub Releases. Extract the source ZIP into an empty folder, then run the build commands from that folder; build outputs, test recordings, and local settings are excluded.
 
-To also create `Timelapse-v0.10.0-windows-x64-setup.exe`, supply an installed or portable Inno Setup 7 compiler:
+To also create `Timelapse-v0.11.0-windows-x64-setup.exe`, supply an installed or portable Inno Setup 7 compiler:
 
 ```powershell
 .\package.ps1 -InstallerCompiler 'C:\Path\To\Inno Setup 7\ISCC.exe'

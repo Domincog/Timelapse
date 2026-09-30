@@ -42,6 +42,7 @@ constexpr UINT TrayShow = 4001, TrayPause = 4002, TrayFinish = 4003, TrayExit = 
 constexpr UINT ExitSystemCommand = 0x1000;
 constexpr wchar_t InstanceMutexName[] = L"Local\\Timelapse.Application.{DC32D155-1B8D-4880-9902-CE6245D34923}";
 constexpr wchar_t SetupMutexName[] = L"Local\\Timelapse.Setup.{DC32D155-1B8D-4880-9902-CE6245D34923}";
+enum class FailureNotice { None, Pending, Presenting, Presented };
 struct App {
     HWND window{}, preview{}, statusText{}, tooltip{};
     HWND customDialog{};
@@ -55,6 +56,8 @@ struct App {
     bool dragging = false, resizing = false, closeWhenDone = false, inspectUI = false;
     bool layingOut = false;
     bool startupComplete = false;
+    FailureNotice failureNotice = FailureNotice::None;
+    bool trayMenuOpen = false, trayMenuCanceled = false;
     bool visibleDirty = true, controlsUpdated = false;
     State controlsState = State::Idle;
     bool advancedExpanded = false;
@@ -425,6 +428,12 @@ void invalidateCanvas(RECT rect) {
     OffsetRect(&rect,-app.scrollX,-app.scrollY);InvalidateRect(app.window,&rect,FALSE);
 }
 void applyStatus(Status value,bool force=false) {
+    // Polling from a menu or lifecycle command must not consume a recording
+    // failure before its recovery information has actually been presented.
+    if(app.failureNotice!=FailureNotice::Presenting) {
+        if(!value.recordingFailed)app.failureNotice=FailureNotice::None;
+        else if(app.failureNotice==FailureNotice::None)app.failureNotice=FailureNotice::Pending;
+    }
     const bool state=app.status.state!=value.state;
     const bool stats=state || app.status.frames!=value.frames ||
         static_cast<uint64_t>(std::max(0.0,app.status.elapsed))!=static_cast<uint64_t>(std::max(0.0,value.elapsed));
@@ -514,13 +523,37 @@ void removeTray() {
     if(app.trayRegistered){NOTIFYICONDATAW data{sizeof(data)};data.hWnd=app.window;data.uID=1;Shell_NotifyIconW(NIM_DELETE,&data);}
     app.trayRegistered=false;app.trayVersion4=false;app.trayTooltip.clear();app.trayStateValid=false;
 }
-void showWindow() {
+bool pendingRecordingFailure() {
+    return !app.active() && app.status.recordingFailed && app.failureNotice==FailureNotice::Pending;
+}
+void acknowledgeVisibleFailure() {
+    if(pendingRecordingFailure() && !app.hiddenToTray && !IsIconic(app.window) && IsWindowEnabled(app.window))app.failureNotice=FailureNotice::Presented;
+}
+void showWindow(bool acknowledgeFailure=false) {
     app.hiddenToTray=false;ShowWindow(app.window,SW_RESTORE);SetForegroundWindow(app.window);
     if(app.engine){applyStatus(app.engine->status(),true);configure();}
+    if(acknowledgeFailure)acknowledgeVisibleFailure();
+}
+bool reportRecordingFailure() {
+    if(!pendingRecordingFailure())return false;
+    std::wstring message;
+    const wchar_t* warning=L"Recording could not finish normally. See the main window's status message for recovery details.";
+    try {message=app.status.message;warning=message.c_str();}
+    catch(const std::bad_alloc&) {} // Keep the full status available if its snapshot cannot be allocated.
+    // ShowWindow and the warning run nested message loops. Suppress duplicate
+    // notices and owner-closing commands before either can dispatch messages.
+    app.failureNotice=FailureNotice::Presenting;
+    if(app.trayMenuOpen){app.trayMenuCanceled=true;EndMenu();}
+    showWindow();
+    if(IsWindow(app.window))MessageBoxW(app.window,warning,L"Timelapse could not finish normally",MB_OK|MB_ICONERROR);
+    app.failureNotice=app.status.recordingFailed?FailureNotice::Presented:FailureNotice::None;
+    return true;
 }
 bool hideToTray() {
+    if(app.failureNotice==FailureNotice::Presenting)return false;
     cancelOwnedDialogs();
     applyStatus(app.engine->status());
+    if(reportRecordingFailure())return false;
     if(!updateTray(!app.trayRegistered)) {
         showWindow();
         MessageBoxW(app.window,L"Windows could not add Timelapse to the system tray. The window will stay open so you can control your recording.",L"Timelapse",MB_OK|MB_ICONWARNING);
@@ -536,16 +569,19 @@ bool hideToTray() {
     return true;
 }
 void exitApplication() {
-    if(app.closeWhenDone)return;
+    if(app.closeWhenDone || app.failureNotice==FailureNotice::Presenting)return;
     cancelOwnedDialogs();
     applyStatus(app.engine->status());
+    if(reportRecordingFailure())return;
     if(app.active()) {
         if(MessageBoxW(app.window,L"Finish the current recording and exit Timelapse?",L"Finish recording",MB_OKCANCEL|MB_ICONQUESTION)!=IDOK)return;
         app.closeWhenDone=true;app.engine->finish();EnableWindow(app.window,FALSE);
     } else DestroyWindow(app.window);
 }
 void trayMenu(POINT at={},bool usePoint=false) {
+    if(app.failureNotice==FailureNotice::Presenting || app.trayMenuOpen)return;
     applyStatus(app.engine->status());
+    if(app.hiddenToTray && reportRecordingFailure())return;
     HMENU menu=CreatePopupMenu();if(!menu){showWindow();return;}
     AppendMenuW(menu,MF_STRING,TrayShow,L"&Show Timelapse");
     const bool pauseAllowed=!app.closeWhenDone&&(app.status.state==State::Recording||app.status.state==State::Paused);
@@ -554,9 +590,12 @@ void trayMenu(POINT at={},bool usePoint=false) {
     AppendMenuW(menu,MF_STRING|(finishAllowed?MF_ENABLED:MF_GRAYED),TrayFinish,L"&Finish recording");
     AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING|(app.closeWhenDone?MF_GRAYED:MF_ENABLED),TrayExit,L"E&xit Timelapse");
     SetMenuDefaultItem(menu,TrayShow,FALSE);if(!usePoint)GetCursorPos(&at);SetForegroundWindow(app.window);
+    app.trayMenuOpen=true;app.trayMenuCanceled=false;
     const UINT command=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,at.x,at.y,0,app.window,nullptr);
+    app.trayMenuOpen=false;
     DestroyMenu(menu);PostMessageW(app.window,WM_NULL,0,0);
-    if(command)SendMessageW(app.window,WM_COMMAND,command,0);
+    // A failure delivered inside the menu loop cancels its original action.
+    if(command && !app.trayMenuCanceled)SendMessageW(app.window,WM_COMMAND,command,0);
 }
 void endLayoutDrag() {
     // Keep the last applied edit, but never reuse a pointer origin after the
@@ -1458,15 +1497,18 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
     }
     switch(msg) {
     case WM_SYSCOMMAND:if((wp&0xfff0)==ExitSystemCommand){exitApplication();return 0;}break;
-    case ShowExistingMessage:showWindow();return 0;
+    case ShowExistingMessage:if(app.failureNotice!=FailureNotice::Presenting)showWindow(true);return 0;
     case TrayMessage: {
+        if(app.failureNotice==FailureNotice::Presenting)return 0;
         const UINT event=app.trayVersion4?LOWORD(lp):static_cast<UINT>(lp);
-        if(event==WM_LBUTTONUP || event==WM_LBUTTONDBLCLK || event==NIN_SELECT || event==NIN_KEYSELECT || event==NIN_BALLOONUSERCLICK)showWindow();
+        if(event==WM_LBUTTONUP || event==WM_LBUTTONDBLCLK || event==NIN_SELECT || event==NIN_KEYSELECT || event==NIN_BALLOONUSERCLICK)showWindow(true);
         else if(event==WM_RBUTTONUP || event==WM_CONTEXTMENU){POINT at{GET_X_LPARAM(wp),GET_Y_LPARAM(wp)};trayMenu(at,app.trayVersion4 && !(at.x==-1 && at.y==-1));}
         return 0;
     }
     case WM_CREATE: {
         app.startupComplete=false;app.advancedExpanded=false;app.advancedLimitIndex=app.advancedVisibility=-1;
+        app.failureNotice=FailureNotice::None;
+        app.trayMenuOpen=app.trayMenuCanceled=false;
         app.advancedNightState=app.advancedRecoveryState=app.nightVisibility=-1;app.nightValidation.clear();app.encodingValidation.clear();app.statusCaption.clear();app.statusCaptionError=false;app.nightHintCaption.clear();app.nightDetailCaption.clear();
         app.customDialog=nullptr;app.advancedCaption.clear();app.advancedTooltip.clear();
         app.skipRevision=0;app.advancedSkipRevision=app.skipSummaryRevision=app.skipVisibility=-1;app.skipCheckAge=UINT64_MAX;
@@ -1622,21 +1664,22 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
     }
     case WM_TIMER: {
         if(wp!=1 || !app.engine)return 0;
-        const bool oldRecordingFailed=app.status.recordingFailed;applyStatus(app.engine->status());
+        const bool wasHidden=app.hiddenToTray;applyStatus(app.engine->status());
         if(app.trayRegistered && !updateTray() && app.hiddenToTray)showWindow();
+        if(app.failureNotice==FailureNotice::Presenting)return 0;
         if(app.closeWhenDone && !app.active()) {
             app.closeWhenDone=false;
             if(app.status.recordingFailed) {
                 // Keep the recovery path visible if saving failed while the
                 // user was waiting for Finish and close.
-                EnableWindow(w,TRUE);showWindow();
-                MessageBoxW(w,app.status.message.c_str(),L"Timelapse could not finish normally",MB_OK|MB_ICONERROR);
+                EnableWindow(w,TRUE);if(!reportRecordingFailure())showWindow();
             } else DestroyWindow(w);
-        } else if(app.hiddenToTray && !oldRecordingFailed && app.status.recordingFailed) {
-            showWindow();MessageBoxW(w,app.status.message.c_str(),L"Timelapse could not finish normally",MB_OK|MB_ICONERROR);
-        }return 0;
+        } else if(wasHidden && pendingRecordingFailure())reportRecordingFailure();
+        else acknowledgeVisibleFailure();
+        return 0;
     }
     case WM_COMMAND: {
+        if(app.failureNotice==FailureNotice::Presenting)return 0;
         const int id=LOWORD(wp),code=HIWORD(wp);
         if(code==CBN_SELCHANGE){
             if(app.active() && (id==EncodingModeBox || id==NightDurationBox || id==NightTargetBox || id==IntervalBox || id==SizeBox || id==StopAfterBox)){
@@ -1672,7 +1715,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
             else {configure();updateControls();}
             break;
         case NightBox:if(!app.active()){configure();updateControls();layout();revealFocusedControl();}break;
-        case TrayShow:showWindow();break;
+        case TrayShow:showWindow(true);break;
         case TrayPause:if(!app.closeWhenDone && (app.status.state==State::Recording || app.status.state==State::Paused))app.engine->setPaused(app.status.state!=State::Paused);break;
         case TrayFinish:if(!app.closeWhenDone)app.engine->finish();break;
         case TrayExit:exitApplication();break;
@@ -1687,7 +1730,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
                 if(app.startupComplete)preferences(true);
                 app.engine->record();
             }
-            applyStatus(app.engine->status(),true);break;
+            applyStatus(app.engine->status(),true);acknowledgeVisibleFailure();break;
         case Pause:app.engine->setPaused(app.status.state!=State::Paused);break;
         case Finish:app.engine->finish();break;
         case Folder:selectFolder();break;

@@ -139,6 +139,20 @@ bool compose(const Frame* desktop, const Frame* camera, const std::vector<Layer>
         }
     }
     try {
+        if (layers.size() == 1) {
+            const auto bounds = pixelsFor(layers.front().rect, width, height);
+            const Frame& source = *(layers.front().source == Source::Desktop ? desktop : camera);
+            if (bounds.left == 0 && bounds.top == 0 && bounds.right == width && bounds.bottom == height &&
+                source.width == width && source.height == height) {
+                // Every output pixel is replaced; exact in-place copy is safe too.
+                output.pixels.resize(size_t(width) * height * 4);
+                output.width = width;
+                output.height = height;
+                std::vector<Sample> unused;
+                draw(source, output, bounds, unused);
+                return true;
+            }
+        }
         // Usually retain the output allocation between frames. A temporary makes
         // in-place composition safe when the caller also passes output as a source.
         Frame temporary;

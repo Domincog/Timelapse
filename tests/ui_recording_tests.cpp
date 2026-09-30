@@ -164,6 +164,7 @@ struct HiddenFixture {
         probe::confirmations=probe::errorDialogs=probe::foregroundCalls=probe::destroyCalls=0;
         probe::dialogMessage.clear();
         app.settings={};app.status={};app.selected=-1;app.closeWhenDone=false;app.modeIndex=0;
+        app.failureNotice=FailureNotice::None;
         app.visibleDirty=true;app.controlsUpdated=app.trayStateValid=false;
         app.encodingValidation.clear();
         app.hiddenToTray=app.trayRegistered=app.trayVersion4=app.trayNoticeShown=false;app.trayTooltip.clear();
@@ -274,6 +275,19 @@ void recoveryRecording(){
     click(Finish,app.finish);waitState(State::Idle);tick();
     std::cout<<"PASS actual Record/worker rejects HEVC recovery, passes enabled H.264 policy, finishes and restores ordinary subsequent recording\n";
 }
+void unseenWorkerFailure(bool exit){
+    HiddenFixture f(exit?L"unseen-failure-exit":L"unseen-failure-hide");f.start();
+    if(exit)windowProc(app.window,WM_CLOSE,0,0);
+    probe::failFinish=true;click(Finish,app.finish);const auto failed=waitState(State::Idle);
+    require(failed.recordingFailed&&failed.error&&!app.status.recordingFailed&&app.status.state==State::Recording,
+        "Need a real unobserved terminal worker failure before the next timer");
+    if(exit)windowProc(app.window,WM_COMMAND,TrayExit,0);else windowProc(app.window,WM_CLOSE,0,0);
+    require(!app.hiddenToTray&&probe::errorDialogs==1&&!probe::destroyCalls&&!probe::confirmations&&probe::dialogMessage==failed.message,
+        "Lifecycle command hid or destroyed an unreported real worker failure");
+    tick();windowProc(app.window,WM_COMMAND,TrayExit,0);
+    require(probe::destroyCalls==1&&probe::errorDialogs==1,"Deliberate Exit after the real failure warning did not proceed exactly once");
+    std::cout<<"PASS actual worker failed finalization is surfaced before "<<(exit?"Exit":"Hide")<<" even without an intervening status timer\n";
+}
 void requestClose() {
     windowProc(app.window,WM_COMMAND,TrayExit,0);
     require(probe::confirmations==1 && app.closeWhenDone && !IsWindowEnabled(app.window),
@@ -353,7 +367,7 @@ int main(){
         require(ownedRoot.is_absolute()&&ownedRoot.parent_path()==std::filesystem::current_path()/L"fixtures","Fixture path escaped review");
         require(!std::filesystem::exists(ownedRoot),"Owned fixture directory already exists");
         repeatedPause();repeatedResume();finishThenRecord(false,false);finishThenRecord(false,true);finishThenRecord(true,false);
-        recordingWhileHidden();recoveryRecording();
+        recordingWhileHidden();recoveryRecording();unseenWorkerFailure(false);unseenWorkerFailure(true);
         int closePassed=0;
         closePassed+=successfulClose(false);closePassed+=successfulClose(true);
         closePassed+=terminalFailure(0);closePassed+=terminalFailure(1);closePassed+=terminalFailure(2);
@@ -369,7 +383,7 @@ int main(){
             require(std::filesystem::remove(directory.path()),"Synthetic folder cleanup failed");
         }
         require(std::filesystem::remove(ownedRoot),"Owned fixture root cleanup failed");
-        std::cout<<"PASS all twelve actual-handler/worker command and exit/tray cases; no visible UI, input, hardware or real encoding.\n";
+        std::cout<<"PASS all fourteen actual-handler/worker command and exit/tray cases; no visible UI, input, hardware or real encoding.\n";
         return 0;
     }catch(const std::exception& error){std::cerr<<"FIXTURE_FAILURE: "<<error.what()<<'\n';return 1;}
 }

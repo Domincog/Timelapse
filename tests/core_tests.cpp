@@ -116,6 +116,50 @@ void composition() {
     check(compose(&desktop, nullptr, layers, 2, 2, result, error) && pixel(result, 1, 1, 0, 0, 240),
           "tiny constrained layer still paints a pixel without exceeding frame bounds");
 }
+void fullSizeComposition() {
+    using namespace lapse;
+    Frame original{64, 48, std::vector<uint8_t>(64 * 48 * 4)};
+    for (size_t i = 0; i < original.pixels.size(); ++i)
+        original.pixels[i] = static_cast<uint8_t>((i * 37 + i / 13) & 255);
+    auto expected = original.pixels;
+    for (size_t i = 3; i < expected.size(); i += 4) expected[i] = 255;
+    const Rect rectangles[] = {{0, 0, 1, 1}, {0.000001, 0.000001, 0.999999, 0.999999},
+        {0, 0, std::numeric_limits<double>::quiet_NaN(), 1}};
+    for (auto kind : {Source::Desktop, Source::Camera}) {
+        for (const auto rect : rectangles) {
+            for (bool alias : {false, true}) {
+                auto source = original;
+                auto separateOutput = original;
+                Frame& output = alias ? source : separateOutput;
+                const std::vector<Layer> layers{{kind, rect}};
+                std::wstring error;
+                error.reserve(256);
+                // A retained full-size output needs no intermediate allocation,
+                // including when the exact same frame is both input and output.
+                coreTestFailNextAllocation = true;
+                const bool okay = compose(kind == Source::Desktop ? &source : nullptr,
+                    kind == Source::Camera ? &source : nullptr, layers, 64, 48, output, error);
+                const bool allocationUnused = coreTestFailNextAllocation;
+                coreTestFailNextAllocation = false;
+                check(okay && allocationUnused && error.empty(),
+                      "full-size composition reuses storage without allocating scratch or alias copies");
+                check(output.width == 64 && output.height == 48 && output.pixels == expected,
+                      "full-size composition preserves every color byte and normalizes alpha");
+            }
+        }
+    }
+    auto output = solid(2, 2, 1, 2, 3);
+    const auto oldPixels = output.pixels;
+    const auto layers = preset(Mode::Desktop);
+    std::wstring error;
+    error.reserve(256);
+    coreTestFailNextAllocation = true;
+    const bool okay = compose(&original, nullptr, layers, 64, 48, output, error);
+    const bool allocationFailed = !coreTestFailNextAllocation;
+    coreTestFailNextAllocation = false;
+    check(!okay && allocationFailed && !error.empty() && output.width == 2 && output.height == 2 &&
+          output.pixels == oldPixels, "failed full-size output growth preserves the previous frame");
+}
 void failuresAndLimits() {
     using namespace lapse;
     auto desktop = solid(2, 2, 0, 230, 0);
@@ -203,6 +247,7 @@ int main() {
     filePaths();
     geometry();
     composition();
+    fullSizeComposition();
     failuresAndLimits();
     errorFormattingAndAllocationCleanup();
     if (failures) { std::cerr << failures << " check(s) failed\n"; return 1; }

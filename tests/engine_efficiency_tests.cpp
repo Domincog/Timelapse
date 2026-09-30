@@ -180,6 +180,32 @@ int main() {
             require(!saved.error && saved.frames == 2 && saved.elapsed >= paused.elapsed + .2 &&
                     !saved.preview && !saved.savedPath.empty(),
                     "Finish lost active time, resumed late, or counted paused time");
+
+            // Visible Pause/Finish must also retire native recording surfaces.
+            // Subsequent previews may recreate their small surface and retain
+            // it; a cleanup on every preview would undo the cache improvement.
+            settings.preview = true; settings.width = 1920; settings.height = 1080;
+            engine.configure(settings); engine.record();
+            await(engine, [](const auto& s) { return s.state == lapse::State::Recording && s.frames == 1 && s.preview; });
+            const auto visiblePauseBefore = captureCacheReleases.load();
+            engine.setPaused(true);
+            const auto visiblePaused = await(engine, [](const auto& s) { return s.state == lapse::State::Paused; });
+            const auto visiblePauseReleases = captureCacheReleases.load();
+            require(visiblePauseReleases == visiblePauseBefore + 1, "Visible Pause did not release its recording surface once");
+            const auto pausedPreview = await(engine, [&](const auto& s) { return s.preview && s.preview != visiblePaused.preview; });
+            boundedPreview(pausedPreview);
+            require(pausedPreview.frames == 1 && captureCacheReleases == visiblePauseReleases,
+                "Paused preview discarded its native surface repeatedly or admitted a video frame");
+            engine.setPaused(false);
+            await(engine, [](const auto& s) { return s.state == lapse::State::Recording && s.frames == 2; });
+            const auto visibleFinishBefore = captureCacheReleases.load();
+            engine.finish();
+            const auto visibleFinished = await(engine, [](const auto& s) { return s.state == lapse::State::Idle; });
+            require(!visibleFinished.error && visibleFinished.frames == 2 && !visibleFinished.savedPath.empty() &&
+                captureCacheReleases == visibleFinishBefore + 1, "Visible Finish did not save and release its recording surface once");
+            const auto finishedPreview = await(engine, [&](const auto& s) { return s.preview && s.preview != visibleFinished.preview; });
+            boundedPreview(finishedPreview);
+            require(captureCacheReleases == visibleFinishBefore + 1, "Visible idle repeatedly discarded the preview surface");
         }
         std::filesystem::remove_all(directory);
         std::cout << "Bounded previews, immutable snapshots, reusable capture buffers and hidden recording checks passed.\n";

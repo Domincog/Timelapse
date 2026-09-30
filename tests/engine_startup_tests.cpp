@@ -26,6 +26,7 @@ thread_local bool queuedStart = false, allWorkerAllocationsFail = false;
 std::atomic<Stage> target{Stage::None};
 std::atomic<bool> persistent{false}, onlyQueued{false}, gateFault{false}, failAllAfterClose{false};
 std::atomic<unsigned> injections{0}, captures{0}, constructors[static_cast<size_t>(Stage::Count)]{};
+std::atomic<unsigned> cacheReleases{0};
 std::atomic<size_t> failedBytes{0};
 HANDLE startupEntered, startupRelease, faultEntered, faultRelease, completed;
 
@@ -36,7 +37,7 @@ void boundedWait(HANDLE event) {
 }
 void reset() {
     target = Stage::None; persistent = onlyQueued = gateFault = failAllAfterClose = false;
-    injections = captures = 0; failedBytes = 0;
+    injections = captures = cacheReleases = 0; failedBytes = 0;
     for (auto& n : constructors) n = 0;
     ResetEvent(startupEntered); ResetEvent(startupRelease); ResetEvent(faultEntered); ResetEvent(faultRelease);
 }
@@ -205,6 +206,10 @@ void persistentSnapshot(bool record, const std::filesystem::path& directory) {
         std::this_thread::sleep_for(10ms);
     }
     require(injections >= 2 && injections <= 4, "Existing queued command caused unbounded retry");
+    // A queued Record takes recording/startup failure cleanup. Refresh instead
+    // follows disposable preview recovery, which must retain active capture
+    // surfaces rather than disturb an otherwise healthy recording.
+    if (record) require(cacheReleases >= 2, "Persistent startup allocation failure retained native capture surfaces during retry waits");
     require(captures == 0 && constructors[static_cast<size_t>(Stage::Camera)] == 0 && constructors[static_cast<size_t>(Stage::Encoder)] == 0,
         "Failed snapshots reached capture/resources");
     const auto before = injections.load();
@@ -316,4 +321,4 @@ int main() {
 }
 
 // This fixture owns no native desktop capture surface.
-namespace lapse { void releaseDesktopCaptureCache() noexcept {} }
+namespace lapse { void releaseDesktopCaptureCache() noexcept { ++cacheReleases; } }

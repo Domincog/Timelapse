@@ -522,6 +522,9 @@ void Engine::run() {
             }
         };
         auto closeRecording = [&](const std::wstring& reason) {
+            // Retire recording-sized native surfaces before any reporting can
+            // allocate. Visible preview recreates its small surface on demand.
+            releaseDesktopCaptureCache();
             cancelNight(); nightMode = false;
             cancelObservation(); skipping = observing = false;
             observationDesktop = {};
@@ -531,7 +534,6 @@ void Engine::run() {
             // Hidden idle workers have no next tick on which to release the
             // device. Finish/cancel must stop it before returning to that wait.
             if (!keepCamera && cameraRunning) { camera->stop(); cameraRunning = false; activeCamera.clear(); }
-            if (!keepCamera) releaseDesktopCaptureCache();
             if (session && session->separateFiles) {
                 std::array<std::wstring, 2> errors;
                 const std::array<bool, 2> opened{writing, cameraWriting};
@@ -753,6 +755,7 @@ void Engine::run() {
                     cancelNight(false);
                     cancelObservation();
                     paused = pauseTarget;
+                    if (paused) releaseDesktopCaptureCache();
                     resetSkipRequested = skipping;
                     const bool desktopNeeded = (session && session->separateFiles) || std::any_of(cfg.layers.begin(), cfg.layers.end(),
                         [](const Layer& layer) { return layer.source == Source::Desktop; });
@@ -1138,6 +1141,7 @@ void Engine::run() {
                         try { status_.message = L"Capture stopped. Check the save folder and try recording again."; } catch (...) {}
                     }
                 }
+                releaseDesktopCaptureCache();
                 if (camera) camera->stop();
                 cameraRunning = false;
                 nightMode = nightQueued = nightFrameReady = false;

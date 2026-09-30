@@ -81,7 +81,7 @@ struct ScreenDC {
     ~ScreenDC() { if (value) ReleaseDC(nullptr, value); }
 };
 
-// Reuse one output-sized surface per capture thread; never allocate a full
+// Reuse output-sized surfaces per capture thread; never allocate a full
 // desktop-sized intermediate image just to shrink it for the timelapse.
 struct DesktopSurface {
     HDC dc = nullptr;
@@ -119,7 +119,23 @@ struct DesktopSurface {
 };
 
 struct DesktopSurfaceCache {
-    DesktopSurface normal, observation;
+    DesktopSurface normal, preview, observation;
+    DesktopSurface& select(int width, int height, int maximumWidth, int maximumHeight) noexcept {
+        // Requested bounds distinguish observation from an unusually narrow
+        // recording or preview whose aspect-fitted pixels happen to be tiny.
+        if (maximumWidth <= 64 && maximumHeight <= 36) return observation;
+        if (normal.dc && normal.width == width && normal.height == height) return normal;
+        if (preview.dc && preview.width == width && preview.height == height) return preview;
+        if (width <= 640 && height <= 360) return normal.dc ? preview : normal;
+        // Preserve a bounded preview populated before recording starts. Swap
+        // raw ownership fields, never copy a destructor-owning Surface object.
+        if (normal.dc && normal.width <= 640 && normal.height <= 360) {
+            std::swap(normal.dc, preview.dc); std::swap(normal.bitmap, preview.bitmap);
+            std::swap(normal.previous, preview.previous); std::swap(normal.pixels, preview.pixels);
+            std::swap(normal.width, preview.width); std::swap(normal.height, preview.height);
+        }
+        return normal;
+    }
 };
 // Keep cold cleanup from initializing a destructor-bearing thread-local cache.
 // In particular, finishing a camera-only recording needs no desktop resources.
@@ -453,6 +469,7 @@ std::vector<CameraDevice> enumerateCameras(std::wstring& error) {
 void releaseDesktopCaptureCache() noexcept {
     if (auto* cache = existingDesktopCache) {
         cache->normal.clear();
+        cache->preview.clear();
         cache->observation.clear();
     }
 }
@@ -477,11 +494,10 @@ bool captureDesktop(const RECT& bounds, int maxWidth, int maxHeight, bool cursor
     const int width = std::max(1, int(std::lround(sourceWidth * scale)));
     const int height = std::max(1, int(std::lround(sourceHeight * scale)));
     ScreenDC screen;
-    // Small activity checks must not retire/recreate the much larger recording
-    // or preview DIB. This second cache can retain at most 9 KiB of pixel data
-    // and acquires no GDI objects until a small capture is actually requested.
+    // Keep recording, bounded preview (640x360), and observation (64x36)
+    // storage reusable. Each acquires GDI objects only when requested.
     auto& cache = desktopSurfaceCache();
-    auto& surface = width <= 64 && height <= 36 ? cache.observation : cache.normal;
+    auto& surface = cache.select(width, height, maxWidth, maxHeight);
     if (!screen.value || !surface.prepare(screen.value, width, height)) {
         error = L"Windows could not prepare the desktop capture."; return false;
     }

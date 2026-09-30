@@ -11,7 +11,21 @@
 #include <algorithm>
 #include <filesystem>
 #include <iostream>
+#include <functional>
 #include <stdexcept>
+#include <cstdlib>
+#include <new>
+
+namespace noticeAllocation {thread_local bool failNext=false;thread_local unsigned failures=0;}
+void* operator new(size_t size){
+    if(noticeAllocation::failNext){noticeAllocation::failNext=false;++noticeAllocation::failures;throw std::bad_alloc();}
+    if(auto memory=std::malloc(size?size:1))return memory;throw std::bad_alloc();
+}
+void* operator new[](size_t size){return ::operator new(size);}
+void operator delete(void* memory)noexcept{std::free(memory);}
+void operator delete[](void* memory)noexcept{std::free(memory);}
+void operator delete(void* memory,size_t)noexcept{std::free(memory);}
+void operator delete[](void* memory,size_t)noexcept{std::free(memory);}
 
 namespace probe {
 void require(bool value,const char* message){if(!value)throw std::runtime_error(message);}
@@ -19,9 +33,11 @@ lapse::Settings configured;
 lapse::Status current;
 int records=0,finishes=0,pauses=0,shows=0,hides=0,foregrounds=0,destroys=0,dialogs=0,quits=0;
 int confirmations=0,confirmation=IDOK,menus=0,menuX=0,menuY=0;
+int endedMenus=0;UINT menuResult=0;
 UINT pauseFlags=0,finishFlags=0,exitFlags=0;
 bool failAdd=false,failModify=false,failVersion=false;
 bool iconic=false;
+bool failAfterStatus=false;
 ULONGLONG now=1000000;
 ULONGLONG WINAPI ticks(){return now;}
 int statusQueries=0,enables=0,textWrites=0;
@@ -33,7 +49,9 @@ BOOL WINAPI invalidate(HWND window,const RECT* rect,BOOL erase){invalidated.push
 BOOL WINAPI isIconic(HWND){return iconic;}
 std::wstring tip,lastDialog;
 std::vector<DWORD> notifications;
+std::function<void()> onShow,onWarning,onMenu;
 void resetWork(){statusQueries=enables=textWrites=0;invalidated.clear();notifications.clear();}
+LRESULT WINAPI send(HWND window,UINT message,WPARAM wp,LPARAM lp);
 BOOL WINAPI notify(DWORD operation,PNOTIFYICONDATAW data){
     require(data&&data->hWnd&&data->uID==1,"Tray icon ownership changed");notifications.push_back(operation);
     if(operation==NIM_ADD){require((data->uFlags&(NIF_MESSAGE|NIF_ICON|NIF_TIP|NIF_SHOWTIP))==(NIF_MESSAGE|NIF_ICON|NIF_TIP|NIF_SHOWTIP),"Tray registration flags");if(failAdd)return FALSE;}
@@ -42,15 +60,16 @@ BOOL WINAPI notify(DWORD operation,PNOTIFYICONDATAW data){
     if(data->uFlags&NIF_TIP)tip=data->szTip;
     return TRUE;
 }
-BOOL WINAPI show(HWND,int command){if(command==SW_HIDE)++hides;else ++shows;return TRUE;}
+BOOL WINAPI show(HWND,int command){if(command==SW_HIDE)++hides;else {++shows;auto callback=std::move(onShow);if(callback)callback();}return TRUE;}
 BOOL WINAPI foreground(HWND){++foregrounds;return TRUE;}
 BOOL WINAPI destroy(HWND){++destroys;return TRUE;}
-int WINAPI dialog(HWND,LPCWSTR message,LPCWSTR,UINT flags){lastDialog=message;++dialogs;if((flags&MB_ICONMASK)==MB_ICONQUESTION){++confirmations;return confirmation;}return IDOK;}
+int WINAPI dialog(HWND,LPCWSTR message,LPCWSTR,UINT flags){lastDialog=message;++dialogs;if((flags&MB_ICONMASK)==MB_ICONQUESTION){++confirmations;return confirmation;}auto callback=std::move(onWarning);if(callback)callback();return IDOK;}
 BOOL WINAPI point(LPPOINT value){*value={17,29};return TRUE;}
 BOOL WINAPI menu(HMENU value,UINT flags,int x,int y,int,HWND,const RECT*){
     require((flags&TPM_RETURNCMD)!=0,"Menu must not dispatch commands asynchronously");++menus;menuX=x;menuY=y;
-    pauseFlags=GetMenuState(value,4002,MF_BYCOMMAND);finishFlags=GetMenuState(value,4003,MF_BYCOMMAND);exitFlags=GetMenuState(value,4004,MF_BYCOMMAND);return 0;
+    pauseFlags=GetMenuState(value,4002,MF_BYCOMMAND);finishFlags=GetMenuState(value,4003,MF_BYCOMMAND);exitFlags=GetMenuState(value,4004,MF_BYCOMMAND);auto callback=std::move(onMenu);if(callback)callback();return static_cast<BOOL>(menuResult);
 }
+BOOL WINAPI endMenu(){++endedMenus;return TRUE;}
 UINT WINAPI registerMessage(LPCWSTR){return 0xc123;}
 void WINAPI quit(int){++quits;}
 }
@@ -63,7 +82,7 @@ public:
     void pause(){}
     void setPaused(bool paused){++probe::pauses;probe::current.state=paused?State::Paused:State::Recording;}
     void finish(){++probe::finishes;probe::current.state=State::Finishing;}
-    Status status(){++probe::statusQueries;return probe::current;}
+    Status status(){++probe::statusQueries;Status value=probe::current;if(probe::failAfterStatus){probe::failAfterStatus=false;noticeAllocation::failNext=true;}return value;}
 };
 std::vector<Monitor> enumerateMonitors(){throw std::runtime_error("Unexpected display enumeration");}
 std::vector<CameraDevice> enumerateCameras(std::wstring&){throw std::runtime_error("Unexpected camera enumeration");}
@@ -77,6 +96,7 @@ int runCameraHost(const wchar_t*){throw std::runtime_error("Unexpected applicati
 #define MessageBoxW probe::dialog
 #define GetCursorPos probe::point
 #define TrackPopupMenu probe::menu
+#define EndMenu probe::endMenu
 #define RegisterWindowMessageW probe::registerMessage
 #define PostQuitMessage probe::quit
 #define EnableWindow probe::enable
@@ -84,6 +104,7 @@ int runCameraHost(const wchar_t*){throw std::runtime_error("Unexpected applicati
 #define InvalidateRect probe::invalidate
 #define IsIconic probe::isIconic
 #define GetTickCount64 probe::ticks
+#define SendMessageW probe::send
 #pragma warning(push)
 #pragma warning(disable: 4702)
 #include "ui_person_pack_stub.h"
@@ -97,6 +118,7 @@ int runCameraHost(const wchar_t*){throw std::runtime_error("Unexpected applicati
 #undef MessageBoxW
 #undef GetCursorPos
 #undef TrackPopupMenu
+#undef EndMenu
 #undef RegisterWindowMessageW
 #undef PostQuitMessage
 #undef EnableWindow
@@ -104,12 +126,22 @@ int runCameraHost(const wchar_t*){throw std::runtime_error("Unexpected applicati
 #undef InvalidateRect
 #undef IsIconic
 #undef GetTickCount64
+#undef SendMessageW
+
+LRESULT WINAPI probe::send(HWND window,UINT message,WPARAM wp,LPARAM lp){
+    // Owned parents are STATIC controls; explicitly route the returned native
+    // menu command so stale-command assertions exercise the actual handler.
+    if(window==app.window && message==WM_COMMAND)return windowProc(window,message,wp,lp);
+    return SendMessageW(window,message,wp,lp);
+}
 
 namespace {
 using probe::require;
 struct Fixture {
     Fixture(){
         app.settings={};app.status=probe::current={};app.selected=-1;app.closeWhenDone=false;
+        app.failureNotice=FailureNotice::None;app.trayMenuOpen=app.trayMenuCanceled=false;probe::onShow=probe::onWarning=probe::onMenu={};probe::endedMenus=0;probe::menuResult=0;
+        probe::failAfterStatus=noticeAllocation::failNext=false;noticeAllocation::failures=0;
         app.visibleDirty=true;app.controlsUpdated=app.trayStateValid=probe::iconic=false;
         app.advancedExpanded=false;app.advancedLimitIndex=app.advancedVisibility=-1;
         app.advancedNightState=app.nightVisibility=-1;app.nightValidation.clear();
@@ -184,6 +216,99 @@ void exitOutcome(bool fail){Fixture f;f.state(State::Recording);f.close();f.comm
 }
 void backgroundFailure(){Fixture f;f.state(State::Recording);f.close();probe::current.state=State::Idle;probe::current.recordingFailed=true;probe::current.message=L"Synthetic recording stopped";f.tick();
     require(!app.hiddenToTray&&probe::shows==1&&probe::dialogs==1&&probe::destroys==0,"Background recording failure did not become visible");f.tick();require(probe::dialogs==1,"Background failure notification repeated");
+}
+void publishRecordingFailure(){
+    probe::current.state=State::Idle;probe::current.error=probe::current.recordingFailed=true;
+    probe::current.frames=42;probe::current.savedPath=L"C:\\OwnedSynthetic\\retained.recording.mp4";
+    probe::current.message=L"Could not finish normally. Retained C:\\OwnedSynthetic\\retained.recording.mp4";
+}
+void failureOrdering(int order){Fixture f;f.state(State::Recording);if(order!=2)f.close();publishRecordingFailure();
+    require(!app.status.recordingFailed,"Need a fresh failure before its first UI poll");
+    if(order==0)applyStatus(probe::current);
+    else if(order==1 || order==4)windowProc(app.window,TrayMessage,MAKELPARAM(30,40),MAKELPARAM(WM_CONTEXTMENU,1));
+    else if(order==2)f.close();
+    else f.command(TrayExit);
+    for(int i=0;i<5;++i)f.tick();
+    require(!app.hiddenToTray&&probe::shows==1&&probe::dialogs==1&&!probe::destroys&&probe::lastDialog==probe::current.message&&app.failureNotice==FailureNotice::Presented,
+        "A non-timer status read consumed the terminal failure notice or lost its recovery path");
+    if(order==4)f.command(TrayExit);
+    else {f.close();require(app.hiddenToTray&&probe::dialogs==1,"Already presented failure prevented a deliberate Hide");f.command(TrayExit);}
+    require(probe::destroys==1&&probe::dialogs==1,"Deliberate Exit after a shown failure was blocked or repeated the warning");
+}
+void visibleFailure(){Fixture f;f.state(State::Recording);publishRecordingFailure();f.tick();
+    wchar_t caption[256]{};GetWindowTextW(app.statusText,caption,256);
+    require(!probe::dialogs&&!probe::shows&&std::wstring(caption)==probe::current.message&&app.failureNotice==FailureNotice::Presented,
+        "Visible failure added a popup or was not acknowledged after its normal status refresh");
+    f.command(TrayExit);require(probe::destroys==1&&!probe::dialogs,"Exit after a visible failure repeated its warning");
+}
+void obscuredFailure(){Fixture f;f.state(State::Recording);EnableWindow(app.window,FALSE);publishRecordingFailure();f.tick();
+    require(!probe::dialogs&&app.failureNotice==FailureNotice::Pending,"A disabled modal owner counted its status as presented");
+    EnableWindow(app.window,TRUE);f.command(TrayExit);
+    require(probe::dialogs==1&&!probe::destroys&&app.failureNotice==FailureNotice::Presented,"Exit lost a failure observed while its main owner was disabled");
+    f.command(TrayExit);require(probe::destroys==1&&probe::dialogs==1,"Acknowledged obscured failure blocked later Exit");
+}
+void shownFailure(int showKind){Fixture f;f.state(State::Recording);f.close();publishRecordingFailure();
+    if(showKind==0)f.command(TrayShow);
+    else if(showKind==1)windowProc(app.window,ShowExistingMessage,0,0);
+    else windowProc(app.window,TrayMessage,0,MAKELPARAM(NIN_KEYSELECT,1));
+    require(!app.hiddenToTray&&probe::shows==1&&!probe::dialogs&&app.failureNotice==FailureNotice::Presented,"Explicit Show did not present the fresh failure normally");
+    f.close();f.tick();f.command(TrayExit);require(probe::destroys==1&&!probe::dialogs,"Explicit Show failed to acknowledge the shown recovery message");
+}
+void nextFailedSession(){Fixture f;f.state(State::Recording);f.close();publishRecordingFailure();f.tick();
+    require(probe::dialogs==1,"First session did not report failure");
+    probe::current={};probe::current.state=State::Starting;f.tick();require(app.failureNotice==FailureNotice::None,"New nonfailed session retained old acknowledgement");
+    probe::current.state=State::Recording;f.tick();f.close();publishRecordingFailure();f.tick();
+    require(probe::dialogs==2&&!app.hiddenToTray&&probe::shows==2,"A later failed session reused an old acknowledgement");
+    f.tick();require(probe::dialogs==2,"Second session warning repeated");
+}
+void previewOnlyError(){Fixture f;f.close();probe::current.error=true;probe::current.message=L"Disposable preview unavailable";f.tick();
+    require(app.hiddenToTray&&!probe::dialogs&&app.failureNotice==FailureNotice::None,"Preview-only error became a terminal recording warning");
+    f.command(TrayExit);require(probe::destroys==1&&!probe::dialogs,"Preview-only error blocked ordinary Exit");
+}
+void failureNoticeReentrancy(bool duringShow,bool finishing){Fixture f;f.state(State::Recording);f.close();
+    if(finishing)f.command(TrayExit);
+    const int originalDialogs=probe::dialogs,originalHides=probe::hides;publishRecordingFailure();const auto recovery=probe::current.message;
+    int reentries=0;
+    auto callback=[&]{
+        ++reentries;require(app.failureNotice==FailureNotice::Presenting&&!app.closeWhenDone,"Notice was not guarded before a nested message loop");
+        probe::current.message=L"Status refreshed during warning presentation";
+        f.tick();f.command(TrayExit);f.close();f.command(TrayShow);f.command(Record);
+        windowProc(app.window,WM_SYSCOMMAND,ExitSystemCommand,0);windowProc(app.window,ShowExistingMessage,0,0);
+        windowProc(app.window,TrayMessage,MAKELPARAM(30,40),MAKELPARAM(WM_CONTEXTMENU,1));
+        require(!probe::destroys&&probe::hides==originalHides&&!probe::records&&!probe::menus&&app.failureNotice==FailureNotice::Presenting,
+            "Nested tray/Close/Exit/Record bypassed the warning owner guard");
+    };
+    if(duringShow)probe::onShow=callback;else probe::onWarning=callback;
+    f.tick();require(reentries==1&&probe::dialogs==originalDialogs+1&&probe::shows==1&&!probe::destroys&&probe::lastDialog==recovery&&IsWindowEnabled(app.window),
+        "Reentrant presentation duplicated the warning, replaced its original detail or disabled its owner");
+    f.tick();f.command(TrayExit);require(probe::dialogs==originalDialogs+1&&probe::destroys==1,"Post-warning Exit remained trapped in presentation state");
+}
+void trayLossWithFailure(){Fixture f;f.state(State::Recording);f.close();probe::failModify=true;publishRecordingFailure();f.tick();
+    require(!app.hiddenToTray&&probe::dialogs==1&&!probe::destroys&&probe::lastDialog==probe::current.message,
+        "Tray restoration consumed the simultaneous recording failure notice");
+}
+void failureInsideMenu(){Fixture f;f.state(State::Recording);f.close();
+    probe::menuResult=TrayExit;probe::onMenu=[&]{require(app.trayMenuOpen,"Owned menu was not marked before its nested message loop");publishRecordingFailure();f.tick();};
+    windowProc(app.window,TrayMessage,MAKELPARAM(30,40),MAKELPARAM(WM_CONTEXTMENU,1));
+    require(probe::menus==1&&probe::endedMenus==1&&!app.trayMenuOpen&&!probe::destroys&&probe::dialogs==1&&!app.hiddenToTray,
+        "Failure inside menu did not cancel tracking or executed a stale Exit after the warning");
+    f.command(TrayExit);require(probe::destroys==1&&probe::dialogs==1,"A deliberate Exit after canceled menu was not allowed");
+}
+void visibleFailureInsideMenu(){Fixture f;f.state(State::Recording);publishRecordingFailure();
+    probe::menuResult=TrayExit;probe::onMenu=[&]{f.tick();require(app.failureNotice==FailureNotice::Presented,"Visible timer failed to acknowledge its status");};
+    trayMenu();require(probe::menus==1&&!probe::endedMenus&&!probe::dialogs&&probe::destroys==1,
+        "An ordinary visible status refresh canceled a deliberate menu Exit without a warning");
+}
+void failureMessageAllocation(){Fixture f;f.state(State::Recording);f.close();publishRecordingFailure();
+    probe::current.message.append(500,L'x');const auto original=probe::current.message;
+    // Return a complete status snapshot first. Hidden applyStatus performs no
+    // allocations, so the next allocation is the warning's reentrancy-safe copy.
+    probe::failAfterStatus=true;f.command(TrayExit);
+    require(noticeAllocation::failures==1&&!noticeAllocation::failNext&&!probe::destroys&&probe::dialogs==1&&!app.hiddenToTray&&app.failureNotice==FailureNotice::Presented,
+        "Warning-copy allocation failure escaped, closed the owner or stranded notice state");
+    require(probe::lastDialog.find(L"main window's status message")!=std::wstring::npos&&app.status.message==original,"Fallback lost the original recovery detail or failed to explain where to find it");
+    wchar_t visible[1024]{};GetWindowTextW(app.statusText,visible,1024);require(std::wstring(visible)==original,"Allocation fallback removed the full visible status");
+    f.tick();f.command(TrayExit);require(probe::dialogs==1&&probe::destroys==1,"A failed warning copy prevented deliberate subsequent Exit");
 }
 void modifierFailure(){Fixture f;f.state(State::Recording);f.close();probe::failModify=true;probe::current.state=State::Paused;f.tick();
     require(!app.hiddenToTray&&!app.trayRegistered&&probe::shows==1,"Lost tray icon left hidden recorder");
@@ -264,5 +389,7 @@ void compressionResultWork(){Fixture f;app.advancedExpanded=true;app.settings.ti
 int main(){std::cout<<std::unitbuf;try{
     hideAndShow();failedRegistration();restart(false);restart(true);legacyFallback();menuAndCommands();exitOutcome(false);exitOutcome(true);backgroundFailure();modifierFailure();cleanupAndStartup();
     unchangedWork();scopedPaint();deferredVisuals(false);deferredVisuals(true);unchangedTrayTip();nightResultDetails();compressionResultWork();
-    std::cout<<"PASS 18 tray/status cases: owned hidden windows, synthetic engine, no tray icons, captures, input, or settings writes.\n";return 0;
+    for(int order=0;order<5;++order)failureOrdering(order);visibleFailure();obscuredFailure();for(int kind=0;kind<3;++kind)shownFailure(kind);nextFailedSession();previewOnlyError();
+    for(bool duringShow:{false,true})for(bool finishing:{false,true})failureNoticeReentrancy(duringShow,finishing);trayLossWithFailure();failureInsideMenu();visibleFailureInsideMenu();failureMessageAllocation();
+    std::cout<<"PASS 38 tray/status cases: owned hidden windows, synthetic engine, no tray icons, captures, input, or settings writes.\n";return 0;
 }catch(const std::exception& error){std::cerr<<"FAIL: "<<error.what()<<'\n';return 1;}}
