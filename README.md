@@ -10,6 +10,8 @@ A small native Windows timelapse recorder. Record a display, a camera, or both i
 4. In a collage, click and drag a source to move it. Drag its lower-right corner to resize it. Use Bring forward to change overlap. Changes during recording appear in subsequent frames.
 5. Press Record. Pause skips recording until resumed; Finish finalizes the MP4 file or pair of files. Open folder shows the saved files. The default destination is Videos/Timelapse.
 
+When a camera source is selected and the camera list cannot be loaded, hover over the status message for the Windows error and a retry hint. The reason also appears in the status line when no current error, saved result or settings warning takes priority.
+
 **Custom values:** Capture every and Video size keep their presets and offer Custom. Capture intervals can be from 0.1 seconds to 24 hours, in exact milliseconds. Video dimensions can be even numbers from 48 to 4096 pixels per side, with at most 8,847,360 pixels (4096 x 2160); portrait and square outputs are supported. The preview follows the chosen aspect ratio. Installed encoders may reject some sizes; try a smaller size or another encoding mode if this happens. Large outputs need more memory and encoding time. The actual capture rate can be lower than requested when processing is slow; missed slots are skipped without a catch-up burst. Custom dialogs keep the previous value until you accept valid input.
 
 **Separate files:** Desktop + camera (2 files) saves a `-desktop.mp4` and a `-camera.mp4` with a shared capture interval, playback rate, quality, and pause/resume controls. Each file shows the complete source at the selected output size, preserving its aspect ratio. The side-by-side preview helps position the camera; it is not burned into either output. Collage editing is disabled in this mode. If a source or encoder fails, both recordings stop and the app attempts to save each file, reporting each outcome.
@@ -186,7 +188,7 @@ This also checks BT.709 limited-range color metadata. FFmpeg is used only by the
 
 After building and testing, run `./package.ps1` to create both archives in `packages/`. The release ZIP is intended for GitHub Releases. Extract the source ZIP into an empty folder, then run the build commands from that folder; build outputs, test recordings, and local settings are excluded.
 
-To also create `Timelapse-v0.12.0-windows-x64-setup.exe`, supply an installed or portable Inno Setup 7 compiler:
+To also create `Timelapse-v0.13.0-windows-x64-setup.exe`, supply an installed or portable Inno Setup 7 compiler:
 
 ```powershell
 .\package.ps1 -InstallerCompiler 'C:\Path\To\Inno Setup 7\ISCC.exe'

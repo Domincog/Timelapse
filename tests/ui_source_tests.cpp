@@ -15,8 +15,30 @@
 #include <iostream>
 #include <sstream>
 #include <stdexcept>
+#include <cstdlib>
+#include <new>
+
+namespace enumerationAllocation {
+bool failNext=false, count=false;
+size_t calls=0;
+int failures=0;
+}
+void* operator new(size_t bytes) {
+    if(enumerationAllocation::count)++enumerationAllocation::calls;
+    if(enumerationAllocation::failNext){enumerationAllocation::failNext=false;++enumerationAllocation::failures;throw std::bad_alloc();}
+    if(void* value=std::malloc(bytes?bytes:1))return value;
+    throw std::bad_alloc();
+}
+void* operator new[](size_t bytes){return ::operator new(bytes);}
+void operator delete(void* value)noexcept{std::free(value);}
+void operator delete[](void* value)noexcept{std::free(value);}
+void operator delete(void* value,size_t)noexcept{std::free(value);}
+void operator delete[](void* value,size_t)noexcept{std::free(value);}
 
 namespace {
+HWND observedStatus=nullptr;
+int statusWrites=0;
+BOOL WINAPI fixtureSetText(HWND window,LPCWSTR value){if(window==observedStatus)++statusWrites;return SetWindowTextW(window,value);}
 bool startupUnderTest=false;
 int startupCOM=0, startupMedia=0, startupMediaStops=0, startupCOMStops=0;
 int startupClasses=0, startupWindows=0, startupEngines=0, profileReads=0;
@@ -78,7 +100,7 @@ std::vector<CameraDevice> listedCameras;
 std::wstring listError;
 Settings configured, recorded;
 Status fixtureStatus;
-int configurationCalls=0, recordCalls=0, refreshCalls=0;
+int configurationCalls=0, recordCalls=0, refreshCalls=0, cameraListCalls=0;
 class FixtureEngine {
 public:
     FixtureEngine(){if(startupUnderTest)++startupEngines;}
@@ -91,7 +113,7 @@ public:
     Status status() { return fixtureStatus; }
 };
 std::vector<Monitor> enumerateMonitors() { return listedMonitors; }
-std::vector<CameraDevice> enumerateCameras(std::wstring& error) { error=listError; return listedCameras; }
+std::vector<CameraDevice> enumerateCameras(std::wstring& error) { ++cameraListCalls;error=listError; return listedCameras; }
 int runCameraHost(const wchar_t*) { if(startupUnderTest)return -1; throw std::runtime_error("Unexpected application entry."); }
 }
 namespace {
@@ -138,6 +160,7 @@ DWORD WINAPI fixtureProfileString(LPCWSTR,LPCWSTR key,LPCWSTR fallback,LPWSTR ta
 #define CreateMutexW fixtureCreateMutex
 #define CloseHandle fixtureCloseHandle
 #define RegisterWindowMessageW fixtureRegisterMessage
+#define SetWindowTextW fixtureSetText
 #include "ui_person_pack_stub.h"
 #include "../src/main.cpp"
 #undef SHGetKnownFolderPath
@@ -160,6 +183,7 @@ DWORD WINAPI fixtureProfileString(LPCWSTR,LPCWSTR key,LPCWSTR fallback,LPWSTR ta
 #undef CreateMutexW
 #undef CloseHandle
 #undef RegisterWindowMessageW
+#undef SetWindowTextW
 #undef Engine
 #undef GetPrivateProfileIntW
 #undef GetPrivateProfileStringW
@@ -193,11 +217,12 @@ struct HiddenFixture {
         app.skipConfigure=child(L"BUTTON",BS_PUSHBUTTON);app.skipSummary=child(L"STATIC",0);app.skipDetail=child(L"STATIC",0);
         app.preview=child(L"STATIC",0);
         app.statusText=child(L"STATIC",0);
+        observedStatus=app.statusText;
         for(auto target:{&app.refresh,&app.record,&app.pause,&app.finish,&app.folder,&app.openFolder,&app.reset,&app.forward})
             *target=child(L"BUTTON",BS_PUSHBUTTON);
         app.engine=std::make_unique<lapse::FixtureEngine>();
     }
-    ~HiddenFixture() { app.engine.reset(); DestroyWindow(app.window); app.window=app.preview=nullptr; }
+    ~HiddenFixture() { app.engine.reset(); DestroyWindow(app.window); app.window=app.preview=observedStatus=nullptr; }
 };
 const lapse::Monitor displayA{L"Display A",{0,0,640,360},L"display-a"}, displayB{L"Display B",{640,0,1280,360},L"display-b"};
 const lapse::CameraDevice cameraA{L"Camera A",L"camera-a"}, cameraB{L"Camera B",L"camera-b"};
@@ -274,6 +299,118 @@ void emptyListRecovery(bool camera) {
     require(selectedId(camera)==original&&choice(camera?app.camera:app.monitor)==1&&IsWindowEnabled(app.record),
             "Selected device did not recover after empty/error list.");
     std::cout<<"PASS "<<(camera?"camera":"display")<<" empty/error list retains choice\n";
+}
+const wchar_t* statusTip() {
+    NMTTDISPINFOW info{};info.hdr.code=TTN_GETDISPINFOW;info.hdr.idFrom=reinterpret_cast<UINT_PTR>(app.statusText);
+    windowProc(app.window,WM_NOTIFY,0,reinterpret_cast<LPARAM>(&info));
+    require(info.lpszText!=nullptr,"Status tooltip returned no text.");return info.lpszText;
+}
+void enumerationDiagnostics() {
+    for(bool remembered:{false,true}) {
+        seed(true);if(!remembered)app.settings.cameraId.clear();
+        const auto identity=app.settings.cameraId;
+        lapse::listedCameras.clear();lapse::listError=L"Cannot list cameras. "+errorText(E_ACCESSDENIED);refresh();
+        require(app.cameraListError==lapse::listError && caption(app.statusText)==lapse::listError && statusCaptionError() &&
+            !IsWindowEnabled(app.record) && app.settings.cameraId==identity,"Enumeration cause was lost or the missing camera was replaced.");
+        const std::wstring tip=statusTip();
+        require(tip==lapse::listError+L"\nRefresh sources to retry." && tip.find(L"0x80070005")!=std::wstring::npos,
+            "Exact enumeration cause/retry hint missing or repeated in tooltip.");
+        require(app.status.message==lapse::fixtureStatus.message && !app.status.error,"UI enumeration failure mutated engine status.");
+        windowProc(app.window,WM_COMMAND,MAKEWPARAM(Record,BN_CLICKED),reinterpret_cast<LPARAM>(app.record));
+        require(lapse::recordCalls==0,"Enumeration failure allowed missing-source Record.");
+    }
+    const int enumerations=lapse::cameraListCalls;
+    sourceMode(Mode::Desktop);
+    require(caption(app.statusText)==app.status.message && std::wstring(statusTip())==app.status.message && IsWindowEnabled(app.record),
+        "Irrelevant camera enumeration failure affected Desktop recording.");
+    sourceMode(Mode::Camera);
+    require(caption(app.statusText)==app.cameraListError && lapse::cameraListCalls==enumerations,"Mode switch lost cause or enumerated again.");
+    sourceMode(static_cast<Mode>(SeparateFilesMode));
+    require(caption(app.statusText)==app.cameraListError && !IsWindowEnabled(app.record),"Paired recording hid its unavailable-camera cause.");
+    lapse::listError=L"Not enough memory to list cameras.";refresh();
+    require(caption(app.statusText)==lapse::listError && std::wstring(statusTip()).find(L"0x80070005")==std::wstring::npos,
+        "Failed Refresh retained the old diagnostic.");
+    lapse::listedCameras={cameraA};refresh();
+    choose(app.camera,0);windowProc(app.window,WM_COMMAND,MAKEWPARAM(CameraBox,CBN_SELCHANGE),reinterpret_cast<LPARAM>(app.camera));
+    require(!app.cameraListError.empty() && IsWindowEnabled(app.record) && caption(app.statusText)==app.status.message && std::wstring(statusTip())==app.status.message,
+        "Available camera selection retained an irrelevant diagnostic.");
+    lapse::listError.clear();refresh();
+    require(app.cameraListError.empty() && std::wstring(statusTip())==app.status.message,"Successful Refresh retained an old error.");
+    lapse::listedCameras.clear();lapse::listError=L"New synthetic enumeration failure.";refresh();
+    lapse::listError.clear();refresh();
+    require(app.cameraListError.empty() && caption(app.statusText)==app.status.message && std::wstring(statusTip())==app.status.message &&
+        !IsWindowEnabled(app.record),"Successful empty list retained a prior enumeration failure.");
+    std::cout<<"PASS enumeration cause, exact HRESULT/retry, Record guard, Desktop/paired/available-camera transitions and Refresh replacement/clearing\n";
+}
+void enumerationPrecedence() {
+    seed(true);lapse::listedCameras.clear();lapse::listError=L"Cannot list cameras. "+errorText(E_ACCESSDENIED);refresh();
+    const auto protectedStatus=[&](const Status& value,const wchar_t* expected){
+        applyStatus(value,true);
+        const auto notice=app.failureNotice;const auto paths=app.status.savedPaths;const auto path=app.status.savedPath;
+        const auto error=app.status.error,failed=app.status.recordingFailed;const auto message=app.status.message;
+        const std::wstring tip=statusTip();
+        require(caption(app.statusText)==expected && tip==std::wstring(expected)+L"\n\n"+app.cameraListError+L"\nRefresh sources to retry.",
+            "Enumeration detail replaced or omitted a protected current status/validation report.");
+        require(app.status.message==message && app.status.error==error && app.status.recordingFailed==failed &&
+            app.status.savedPaths==paths && app.status.savedPath==path && app.failureNotice==notice,
+            "Diagnostic routing mutated engine outcome, paths or notice state.");
+    };
+    Status value;value.error=true;value.message=L"No camera found. Connect a camera and refresh sources.";
+    protectedStatus(value,value.message.c_str());
+    value.message=L"Cannot open selected camera: current helper activation failure.";protectedStatus(value,value.message.c_str());
+    value.recordingFailed=true;value.message=L"Cannot finish MP4. Recover C:\\Synthetic\\retained.recording.mp4";
+    protectedStatus(value,value.message.c_str());
+    value.error=false;protectedStatus(value,value.message.c_str());
+    value={};value.message=L"Saved C:\\Synthetic\\completed.mp4";value.savedPath=L"C:\\Synthetic\\completed.mp4";
+    protectedStatus(value,value.message.c_str());
+    value.savedPaths={value.savedPath};value.savedPath.clear();protectedStatus(value,value.message.c_str());
+    value={};app.encodingValidation=L"MP4 recovery mode requires H.264.";protectedStatus(value,app.encodingValidation.c_str());
+    app.encodingValidation.clear();app.nightValidation=L"Night blend duration must not exceed Capture every.";
+    protectedStatus(value,app.nightValidation.c_str());app.nightValidation.clear();
+    for(State state:{State::Starting,State::Recording,State::Paused,State::Finishing}){
+        value.state=state;value.message=L"Current active session message";applyStatus(value,true);
+        require(caption(app.statusText)==value.message && std::wstring(statusTip())==value.message,
+            "Idle enumeration cause intruded on active-session status.");
+    }
+    applyStatus(Status{},true);
+    require(caption(app.statusText)==app.cameraListError,"Return to unprotected idle status lost the retained cause.");
+    value={};value.savedPaths={L"C:\\Synthetic\\completed.mp4"};applyStatus(value);
+    require(caption(app.statusText)==value.message,"Same-message saved outcome did not refresh diagnostic precedence.");
+    value.savedPaths.clear();applyStatus(value);
+    require(caption(app.statusText)==app.cameraListError,"Removing a same-message saved outcome retained stale precedence.");
+    value.recordingFailed=true;applyStatus(value);
+    require(caption(app.statusText)==value.message,"Same-message failed outcome did not refresh diagnostic precedence.");
+    value.recordingFailed=false;applyStatus(value);
+    require(caption(app.statusText)==app.cameraListError,"Removing a same-message failed outcome retained stale precedence.");
+    std::cout<<"PASS current preview/engine error, recovery, saved paths, validation and active status precedence without engine/notice mutation\n";
+}
+void enumerationTooltipSafety() {
+    seed(true);lapse::listedCameras.clear();lapse::listError=L"Cannot list cameras. "+errorText(E_ACCESSDENIED);refresh();
+    lapse::fixtureStatus.error=true;lapse::fixtureStatus.message=L"A long current engine diagnostic that must survive tooltip allocation failure.";
+    applyStatus(lapse::fixtureStatus,true);
+    const std::wstring expected=app.status.message+L"\n\n"+app.cameraListError+L"\nRefresh sources to retry.";
+    const wchar_t* tip=statusTip();
+    require(tip==app.statusTooltipCaption.c_str() && std::wstring(tip)==expected,"Tooltip did not return owned storage.");
+    const auto notice=app.failureNotice;const int failures=enumerationAllocation::failures;
+    enumerationAllocation::failNext=true;const wchar_t* fallback=statusTip();
+    const bool consumed=!enumerationAllocation::failNext;enumerationAllocation::failNext=false;
+    require(consumed && enumerationAllocation::failures==failures+1 && fallback==app.status.message.c_str() &&
+        app.failureNotice==notice && app.statusTooltipCaption==expected,"Tooltip allocation failure escaped or lost primary diagnostic/state.");
+    require(std::wstring(statusTip())==expected,"Tooltip did not recover after allocation failure.");
+    lapse::fixtureStatus={};applyStatus(lapse::fixtureStatus,true);
+    const auto unchangedTicks=[&]{
+        const int writes=statusWrites,enumerations=lapse::cameraListCalls;
+        const auto* storage=app.statusTooltipCaption.data();const auto capacity=app.statusTooltipCaption.capacity();
+        enumerationAllocation::calls=0;enumerationAllocation::count=true;
+        for(int tick=0;tick<100;++tick)windowProc(app.window,WM_TIMER,1,0);
+        enumerationAllocation::count=false;
+        require(statusWrites==writes && lapse::cameraListCalls==enumerations && app.statusTooltipCaption.data()==storage &&
+            app.statusTooltipCaption.capacity()==capacity && app.statusTooltipCaption==expected,"Unchanged timer rebuilt text/tooltip or enumerated devices.");
+        return enumerationAllocation::calls;
+    };
+    const auto withCause=unchangedTicks();app.cameraListError.clear();updateControls();const auto withoutCause=unchangedTicks();
+    require(withCause==withoutCause,"Retained enumeration cause introduced extra allocations on unchanged timer ticks.");
+    std::cout<<"PASS owned tooltip lifetime/OOM fallback; 100 unchanged ticks each allocations="<<withCause<<'/'<<withoutCause<<" status writes=0 enumeration calls=0\n";
 }
 void explicitReplacement(bool camera) {
     seed(camera);removeSelected(camera);refresh();
@@ -541,6 +678,7 @@ int main() {
             modeSwitchPreservesMissingChoice(camera);changedMetadata(camera);
         }
         activeControls();indexLoads();separateSources();nightSettings();recoverySettings();
+        enumerationDiagnostics();enumerationPrecedence();enumerationTooltipSafety();
         require(!IsWindowVisible(app.window)&&!IsWindowVisible(app.preview),"Fixture became visible.");
         std::cout<<"All source selection and settings assertions passed with hidden controls. No actual source was opened.\n";
         return 0;

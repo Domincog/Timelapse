@@ -242,6 +242,7 @@ void prepareChildCase(const std::wstring& name,int rejected,bool tooltip){
     failedAllocations=windows=fontsCreated=profileReads=keyWrites=engineStarts=engineStops=engineConfigures=syntheticThrows=choiceQueries=timerStarts=timerStops=quits=debugMessages=0;
     failedChild=rejected;failTooltip=tooltip;creationFailures=nullMessages=recordCalls=lastConfiguredInterval=lastRecordedInterval=monitorEnumerations=cameraEnumerations=tooltipAttempts=0;
     selections.fill(-1);counts.fill(0);app.settings={};app.status={};
+    app.cameraListError=L"Prior window camera-list failure";app.statusTooltipCaption=L"Prior window tooltip detail";
     app.monitors.clear();app.cameras.clear();app.selectedMonitorId.clear();app.mode=nullptr;app.preview=nullptr;app.window=nullptr;app.layingOut=false;app.closeWhenDone=false;
     ownedCase=ownedRun/name;require(std::filesystem::create_directory(ownedCase),"Owned case exists");
     currentIni=ownedCase/L"settings.ini";app.preferences=currentIni.native();
@@ -250,6 +251,7 @@ void prepareChildCase(const std::wstring& name,int rejected,bool tooltip){
 }
 bool childUnchanged(){std::ifstream input(currentIni,std::ios::binary);return std::string(std::istreambuf_iterator<char>(input),{})==priorBytes;}
 void verifyChildCleanup(bool rejected){
+    require(app.cameraListError.empty()&&app.statusTooltipCaption.empty(),"Window recreation retained a prior camera enumeration diagnostic/tooltip");
     require(!app.engine&&!app.startupComplete&&timerStops==1&&quits==1,"Destruction missed Engine/timer/quit cleanup");
     if(rejected)require(engineStarts==0&&engineStops==0&&engineConfigures==0&&timerStarts==0&&profileReads==0&&monitorEnumerations==0&&cameraEnumerations==0&&tooltipAttempts==0&&keyWrites==0&&debugMessages==1&&childUnchanged(),"Failed required child reached initialization or changed preferences");
     else require(engineStarts==1&&engineStops==1&&timerStarts==1&&profileReads==1&&monitorEnumerations==1&&cameraEnumerations==1&&tooltipAttempts==1&&keyWrites==21*(recordCalls?2:1)&&debugMessages==0&&lastConfiguredInterval==5000&&!childUnchanged(),"Healthy initialization/persistence changed");

@@ -72,6 +72,7 @@ struct App {
     PersonPackInfo personPack{};
     bool personPackKnown=false;
     std::wstring nightValidation, encodingValidation, statusCaption, nightHintCaption, nightDetailCaption;
+    std::wstring cameraListError, statusTooltipCaption;
     bool statusCaptionError = false;
     bool hiddenToTray = false, trayRegistered = false, trayNoticeShown = false, trayVersion4 = false;
     UINT taskbarCreated = 0;
@@ -260,12 +261,35 @@ void updateSkipText(bool force=false) {
     if(force || detail!=app.skipDetailCaption){SetWindowTextW(app.skipDetail,detail.c_str());app.skipDetailCaption=std::move(detail);}
 }
 int nightRow() { return hasSource(Source::Camera) ? (app.settings.night.enabled?2:1) : 0; }
+bool cameraListUnavailable() {
+    if(app.active() || app.cameraListError.empty() || !hasSource(Source::Camera))return false;
+    const int selected=choice(app.camera);
+    return selected<0 || selected>=static_cast<int>(app.cameras.size());
+}
 const std::wstring& statusCaption() {
     if(!app.active() && !app.status.error && !app.encodingValidation.empty())return app.encodingValidation;
-    return !app.active() && !app.status.error && !app.nightValidation.empty() ? app.nightValidation : app.status.message;
+    if(!app.active() && !app.status.error && !app.nightValidation.empty())return app.nightValidation;
+    if(!app.status.error && !app.status.recordingFailed && app.status.savedPath.empty() && app.status.savedPaths.empty() && cameraListUnavailable())
+        return app.cameraListError;
+    return app.status.message;
 }
 bool statusCaptionError() {
-    return app.status.error || (!app.active() && (!app.nightValidation.empty() || !app.encodingValidation.empty()));
+    return app.status.error || (!app.active() && (!app.nightValidation.empty() || !app.encodingValidation.empty() || &statusCaption()==&app.cameraListError));
+}
+const wchar_t* statusTooltip() noexcept {
+    const auto& caption=statusCaption();
+    if(!cameraListUnavailable())return caption.c_str();
+    // Build only on tooltip demand. Keep the current engine/save/recovery
+    // report first; the source-list failure must not replace its details.
+    try {
+        std::wstring detail=caption;
+        if(&caption!=&app.cameraListError)detail+=L"\n\n"+app.cameraListError;
+        detail+=L"\nRefresh sources to retry.";
+        app.statusTooltipCaption=std::move(detail);
+        return app.statusTooltipCaption.c_str();
+    } catch (...) {
+        return caption.c_str();
+    }
 }
 void updateStatusText(bool force=false) {
     const auto& caption=statusCaption();const bool error=statusCaptionError();
@@ -386,6 +410,7 @@ void refreshSources() {
     app.monitors = enumerateMonitors();
     std::wstring error;
     app.cameras = enumerateCameras(error);
+    app.cameraListError=std::move(error);
     SendMessageW(app.monitor,CB_RESETCONTENT,0,0); SendMessageW(app.camera,CB_RESETCONTENT,0,0);
     for (auto& m : app.monitors) add(app.monitor,m.name);
     for (auto& c : app.cameras) add(app.camera,c.name);
@@ -402,7 +427,7 @@ void refreshSources() {
         if (sameSourceId(app.cameras[i].id,oldCamera)) cameraIndex = static_cast<int>(i);
     if (cameraIndex < 0) {
         cameraIndex = static_cast<int>(app.cameras.size());
-        add(app.camera,!error.empty() ? L"Camera list unavailable"
+        add(app.camera,!app.cameraListError.empty() ? L"Camera list unavailable"
             : oldCamera.empty() ? L"No camera connected" : L"Selected camera unavailable");
     }
     choose(app.camera,cameraIndex);
@@ -438,6 +463,8 @@ void applyStatus(Status value,bool force=false) {
     const bool stats=state || app.status.frames!=value.frames ||
         static_cast<uint64_t>(std::max(0.0,app.status.elapsed))!=static_cast<uint64_t>(std::max(0.0,value.elapsed));
     const bool message=app.status.message!=value.message,error=app.status.error!=value.error;
+    const bool outcome=app.status.recordingFailed!=value.recordingFailed || app.status.savedPath.empty()!=value.savedPath.empty() ||
+        app.status.savedPaths.empty()!=value.savedPaths.empty();
     const bool preview=app.status.preview!=value.preview;
     const bool night=app.status.nightEnabled!=value.nightEnabled || app.status.nightWaiting!=value.nightWaiting ||
         app.status.nightDurationMs!=value.nightDurationMs || app.status.night.samples!=value.night.samples ||
@@ -448,7 +475,7 @@ void applyStatus(Status value,bool force=false) {
     app.status=std::move(value);
     // Status and tray handling remain live while hidden; only visual work waits.
     if(app.hiddenToTray || IsIconic(app.window)) {
-        if(force || stats || message || error || preview || night || skip)app.visibleDirty=true;
+        if(force || stats || message || error || outcome || preview || night || skip)app.visibleDirty=true;
         return;
     }
     if(force || app.visibleDirty) {
@@ -457,7 +484,7 @@ void applyStatus(Status value,bool force=false) {
         app.visibleDirty=false;return;
     }
     if(!app.controlsUpdated || app.controlsState!=app.status.state)updateControls();
-    if(message || error || state)updateStatusText();
+    if(message || error || outcome || state)updateStatusText();
     if(night)updateNightText();
     if(app.advancedExpanded && skipEnabled()){
         const auto tick=app.status.timeSkip.lastCheckTick,now=GetTickCount64();
@@ -1510,6 +1537,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         app.failureNotice=FailureNotice::None;
         app.trayMenuOpen=app.trayMenuCanceled=false;
         app.advancedNightState=app.advancedRecoveryState=app.nightVisibility=-1;app.nightValidation.clear();app.encodingValidation.clear();app.statusCaption.clear();app.statusCaptionError=false;app.nightHintCaption.clear();app.nightDetailCaption.clear();
+        app.cameraListError.clear();app.statusTooltipCaption.clear();
         app.customDialog=nullptr;app.advancedCaption.clear();app.advancedTooltip.clear();
         app.skipRevision=0;app.advancedSkipRevision=app.skipSummaryRevision=app.skipVisibility=-1;app.skipCheckAge=UINT64_MAX;
         app.skipSummaryCaption.clear();app.skipDetailCaption.clear();app.settings.timeSkip={};
@@ -1751,8 +1779,9 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
     case WM_NOTIFY:
         if(reinterpret_cast<NMHDR*>(lp)->code==TTN_GETDISPINFOW){
             auto info=reinterpret_cast<NMTTDISPINFOW*>(lp);const auto child=reinterpret_cast<HWND>(info->hdr.idFrom);
-            info->lpszText=const_cast<LPWSTR>((child==app.advanced?app.advancedTooltip:child==app.nightHint?app.nightHintCaption:child==app.nightDetail?app.nightDetailCaption:
-                child==app.skipSummary?app.skipSummaryCaption:child==app.skipDetail?app.skipDetailCaption:statusCaption()).c_str());return 0;
+            info->lpszText=const_cast<LPWSTR>(child==app.statusText?statusTooltip():
+                (child==app.advanced?app.advancedTooltip:child==app.nightHint?app.nightHintCaption:child==app.nightDetail?app.nightDetailCaption:
+                 child==app.skipSummary?app.skipSummaryCaption:child==app.skipDetail?app.skipDetailCaption:statusCaption()).c_str());return 0;
         }break;
     case WM_CTLCOLORSTATIC: {
         const auto child=reinterpret_cast<HWND>(lp);const bool warning=(child==app.statusText && statusCaptionError()) || (child==app.nightHint && !app.nightValidation.empty());
