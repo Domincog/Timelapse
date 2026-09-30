@@ -1272,7 +1272,7 @@ void editCustom(CustomKind kind) {
     if(!IsWindow(app.window))return;
     if(outcome==IDOK && !app.active())commitCustom(draft);
     else if(outcome==-1)MessageBoxW(app.window,L"The custom settings dialog could not be opened. Try again.",L"Timelapse",MB_OK|MB_ICONERROR);
-    if(!app.closeWhenDone){SetFocus(box);revealFocusedControl();}
+    if(!app.closeWhenDone && !app.hiddenToTray){SetFocus(box);revealFocusedControl();}
 }
 enum SkipId { SkipMode=5101,SkipSpeed,SkipRamp,SkipQuiet,SkipQuietUnits,SkipRanges,SkipAdd,SkipEdit,SkipRemove,SkipRepeat,SkipRepeatUnits,SkipHelp,SkipError,SkipPackInfo,SkipPackManage,SkipFine,SkipSensitivity };
 struct SkipDraft : CustomDraft {

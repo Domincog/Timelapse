@@ -1,22 +1,34 @@
-// Actual custom-dialog callbacks and controls in owned hidden windows. The modal
-// invocation is scripted; no user input, device, normal app or settings is used.
+// Actual custom-dialog callbacks and controls in owned windows. Lifecycle checks
+// show only a nonactivating tool parent wholly offscreen; dialogs remain hidden.
+// No user input, device, normal app, actual tray icon or settings I/O is used.
 #include <windows.h>
+#include <shellapi.h>
 #include <functional>
 namespace {
 std::function<void(HWND,LPARAM)> dialogScript;
 INT_PTR dialogOutcome=0;
 int dialogCalls=0;
 bool failDialog=false;
+bool allowTray=true;
+BOOL WINAPI customTray(DWORD message,PNOTIFYICONDATAW){return message!=NIM_ADD || allowTray;}
+BOOL WINAPI customForeground(HWND){return TRUE;}
+BOOL WINAPI customShow(HWND window,int mode){return ShowWindow(window,mode==SW_RESTORE?SW_SHOWNOACTIVATE:mode);}
 INT_PTR WINAPI ownedDialog(HINSTANCE,LPCDLGTEMPLATEW,HWND,DLGPROC,LPARAM);
 BOOL WINAPI ownedEndDialog(HWND,INT_PTR value){dialogOutcome=value;return TRUE;}
 }
 #define DialogBoxIndirectParamW ownedDialog
 #define EndDialog ownedEndDialog
+#define Shell_NotifyIconW customTray
+#define SetForegroundWindow customForeground
+#define ShowWindow customShow
 #define main sourceFixtureMain
 #include "ui_source_tests.cpp"
 #undef main
 #undef EndDialog
 #undef DialogBoxIndirectParamW
+#undef Shell_NotifyIconW
+#undef SetForegroundWindow
+#undef ShowWindow
 
 namespace {
 INT_PTR WINAPI ownedDialog(HINSTANCE instance,LPCDLGTEMPLATEW resource,HWND owner,DLGPROC procedure,LPARAM parameter){
@@ -163,6 +175,39 @@ void dialogDpiAndLifecycle(){
     require(!IsWindow(app.window) && !app.customDialog,"Tray Exit left an owned custom dialog or owner behind.");
     std::cout<<"PASS owned dialog DPI/reflow/scroll reachability, cleanup and explicit tray Exit\n";
 }
+void canceledDialogFocus(){
+    for(auto kind:{CustomKind::Interval,CustomKind::Size,CustomKind::Limit,CustomKind::Segment})for(int action=0;action<5;++action){
+        HiddenFixture owned;setupCustom();app.hiddenToTray=app.closeWhenDone=app.trayRegistered=app.trayNoticeShown=app.startupComplete=false;
+        app.failureNotice=FailureNotice::None;app.trayStateValid=false;app.taskbarCreated=0;app.customDialog=nullptr;app.trayTooltip.clear();allowTray=action!=2;
+        const HWND owner=app.window,box=kind==CustomKind::Interval?app.interval:kind==CustomKind::Size?app.videoSize:kind==CustomKind::Segment?app.splitEvery:app.stopAfter;
+        RECT screen{GetSystemMetrics(SM_XVIRTUALSCREEN),GetSystemMetrics(SM_YVIRTUALSCREEN),0,0};
+        screen.right=screen.left+GetSystemMetrics(SM_CXVIRTUALSCREEN);screen.bottom=screen.top+GetSystemMetrics(SM_CYVIRTUALSCREEN);
+        const auto outside=[&]{if(IsWindow(owner)){RECT bounds{},overlap{};GetWindowRect(owner,&bounds);require(!IntersectRect(&overlap,&bounds,&screen),"Custom lifecycle fixture entered the visible desktop.");}};
+        SetWindowLongPtrW(owner,GWL_EXSTYLE,GetWindowLongPtrW(owner,GWL_EXSTYLE)|WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE);
+        SetWindowPos(owner,nullptr,screen.right+20000,screen.bottom+20000,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);
+        outside();ShowWindow(box,SW_SHOWNA);ShowWindow(owner,SW_SHOWNOACTIVATE);outside();
+        const auto prior=app.settings;const int configurations=lapse::configurationCalls;
+        dialogScript=[&](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<CustomDraft*>(parameter);
+            SetFocus(draft.first);require(GetFocus()==draft.first,"Native custom field did not receive focus.");SetWindowTextW(draft.first,L"123");
+            if(action==0)customProc(window,WM_COMMAND,IDCANCEL,0);
+            else if(action<=2)windowProc(owner,WM_CLOSE,0,0);
+            else if(action==3)windowProc(owner,WM_COMMAND,TrayExit,0);
+            else windowProc(owner,WM_ENDSESSION,TRUE,0);
+            outside();
+        };
+        invoke(kind);const HWND focused=GetFocus();
+        require(dialogOutcome==IDCANCEL && !app.customDialog,"Lifecycle cancellation left a dialog or accepted its draft.");
+        require(app.settings.intervalMs==prior.intervalMs && app.settings.width==prior.width && app.settings.height==prior.height &&
+            app.settings.recordingLimitSeconds==prior.recordingLimitSeconds && app.settings.segmentDurationSeconds==prior.segmentDurationSeconds,
+            "Canceled lifecycle path committed draft settings.");
+        require(lapse::recordCalls==0 && lapse::configurationCalls-configurations==(action==1 || action==2?1:0),"Dialog cancellation changed recording or added configuration work.");
+        if(action==0 || action==2)require(IsWindow(owner)&&IsWindowVisible(owner)&&!app.hiddenToTray&&focused==box,"Visible Cancel or rejected Hide failed to restore the invoking control.");
+        else if(action==1)require(IsWindow(owner)&&!IsWindowVisible(owner)&&app.hiddenToTray&&focused!=owner&&!IsChild(owner,focused),"Successful Hide restored native focus inside the hidden owner.");
+        else require(!IsWindow(owner),"Exit or session shutdown retained the custom dialog owner.");
+        outside();if(IsWindow(owner))ShowWindow(owner,SW_HIDE);app.trayRegistered=false;allowTray=true;
+    }
+    std::cout<<"PASS native custom focus after Cancel/Hide/rejected Hide/Exit/session end for all four custom kinds, with canceled drafts unchanged\n";
+}
 void nativeNumericInsertion(){
     HiddenFixture owned;setupCustom();
     for(int field=0;field<4;++field){
@@ -279,7 +324,7 @@ void sourceSizeSnapshots(){
 }
 }
 int main(){
-    try{intervalAndCancellation();dimensionsAndLimit();activeAndNight();segmentDurations();nativeNumericInsertion();nativeButtonNavigation();dialogDpiAndLifecycle();sourceSizeSnapshots();
-        std::cout<<"All custom UI cases passed with hidden controls and synthetic engine.\n";return 0;
+    try{intervalAndCancellation();dimensionsAndLimit();activeAndNight();segmentDurations();nativeNumericInsertion();nativeButtonNavigation();dialogDpiAndLifecycle();canceledDialogFocus();sourceSizeSnapshots();
+        std::cout<<"All custom UI cases passed with owned controls and synthetic engine.\n";return 0;
     }catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
 }
