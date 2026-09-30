@@ -382,6 +382,28 @@ void failuresAndUnchangedTicks(){
     require(detailsProbe::records==0&&detailsProbe::finishes==0&&detailsProbe::invalidFocus==0,"Failure handling changed recording or focused dead UI.");
     std::cout<<"PASS snapshot/dialog failures preserve report; 100 unchanged ticks add no text, enumeration, modal or allocations beyond Status copies\n";
 }
+void cursorKeyboard(){
+    Fixture fixture;showOffscreen(fixture);fixture.command(AdvancedToggle);
+    require(IsWindowEnabled(app.captureCursor)&&ownVisible(app.captureCursor)&&SendMessageW(app.captureCursor,BM_GETCHECK,0,0)==BST_CHECKED,"Cursor checkbox did not start visible, editable and checked in Advanced.");
+    const int configured=detailsProbe::configures,folders=detailsProbe::folderCalls,dialogs=detailsProbe::dialogs;
+    nativeMnemonic(app.interval,L'k');
+    require(!app.settings.captureCursor&&!detailsProbe::configured.captureCursor&&detailsProbe::configures==configured+1&&GetFocus()==app.captureCursor,"Native Alt+K did not toggle only the desktop cursor option.");
+    SendMessageW(app.captureCursor,WM_KEYDOWN,VK_SPACE,0);SendMessageW(app.captureCursor,WM_KEYUP,VK_SPACE,0);checkCallback();
+    require(app.settings.captureCursor&&detailsProbe::configures==configured+2,"Native Space did not restore the cursor checkbox.");
+    nativeMnemonic(app.interval,L'k');fixture.tick();fixture.tick();
+    const int stable=detailsProbe::configures;detailsProbe::textWrites=0;detailsProbe::allocations=0;detailsProbe::countAllocations=true;
+    for(int i=0;i<100;++i){auto copied=detailsProbe::current;(void)copied;}const auto copyAllocations=detailsProbe::allocations;detailsProbe::allocations=0;
+    for(int i=0;i<100;++i)fixture.tick();detailsProbe::countAllocations=false;
+    require(detailsProbe::configures==stable&&detailsProbe::textWrites==0&&detailsProbe::allocations==copyAllocations,"Unchanged cursor-off status ticks added UI work beyond existing Status copies.");
+    for(State state:{State::Starting,State::Recording,State::Paused,State::Finishing}){
+        Status status;status.state=state;fixture.publish(status);const int calls=detailsProbe::configures;
+        nativeMnemonic(app.preview,L'k');require(!app.settings.captureCursor&&detailsProbe::configures==calls&&!IsWindowEnabled(app.captureCursor),"Disabled cursor mnemonic changed an active session.");
+    }
+    fixture.publish({});choose(app.mode,1);SendMessageW(fixture.window,WM_COMMAND,MAKEWPARAM(ModeBox,CBN_SELCHANGE),reinterpret_cast<LPARAM>(app.mode));checkCallback();
+    const int calls=detailsProbe::configures;nativeMnemonic(app.preview,L'k');require(!app.settings.captureCursor&&detailsProbe::configures==calls&&!IsWindowEnabled(app.captureCursor),"Camera-only native cursor mnemonic changed the retained choice.");
+    require(detailsProbe::folderCalls==folders&&detailsProbe::dialogs==dialogs&&!detailsProbe::records&&!detailsProbe::finishes,"Cursor shortcut activated an unrelated command.");
+    std::cout<<"PASS actual Alt+K/Space, desktop/active/camera locks, distinct commands and no added unchanged cursor-off UI work\n";
+}
 void distinctMainMnemonics(){
     Fixture fixture;showOffscreen(fixture);app.settings.folder=std::filesystem::current_path().wstring();
     int compressionDialogs=0,detailDialogs=0;bool expectReadOnly=false;
@@ -415,6 +437,6 @@ void distinctMainMnemonics(){
 
 int main(){try{
     INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_WIN95_CLASSES};require(InitCommonControlsEx(&controls)!=FALSE,"Common controls unavailable.");
-    exactSelectableReports();outcomeAndPrimaryPrecedence();keyboardAndCompactLayout();stableSnapshot();modalLifecycle();failuresAndUnchangedTicks();distinctMainMnemonics();
-    std::cout<<"All seven status/keyboard groups passed with inert engine and owned native windows.\n";return 0;
+    exactSelectableReports();outcomeAndPrimaryPrecedence();keyboardAndCompactLayout();stableSnapshot();modalLifecycle();failuresAndUnchangedTicks();distinctMainMnemonics();cursorKeyboard();
+    std::cout<<"All eight status/keyboard groups passed with inert engine and owned native windows.\n";return 0;
 }catch(const std::exception& error){std::cerr<<"STATUS DETAILS FAILURE: "<<error.what()<<'\n';return 1;}}

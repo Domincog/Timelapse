@@ -213,6 +213,7 @@ struct HiddenFixture {
         app.splitEvery=combo(5);app.segmentLabel=child(L"STATIC",0);app.hasCustomSegment=false;app.committedSegment=0;app.customSegmentSeconds=900;app.advancedSegmentSeconds=-1;
         app.lowDisk=child(L"BUTTON",BS_AUTOCHECKBOX);SendMessageW(app.lowDisk,BM_SETCHECK,BST_CHECKED,0);
         app.recoveryMode=child(L"BUTTON",BS_AUTOCHECKBOX);
+        app.captureCursor=child(L"BUTTON",BS_AUTOCHECKBOX);SendMessageW(app.captureCursor,BM_SETCHECK,BST_CHECKED,0);
         app.nightEnabled=child(L"BUTTON",BS_AUTOCHECKBOX);app.nightDuration=combo(6);app.nightTarget=combo(3);choose(app.nightTarget,1);
         app.monitor=combo(0); app.camera=combo(0);
         app.skipConfigure=child(L"BUTTON",BS_PUSHBUTTON);app.skipSummary=child(L"STATIC",0);app.skipDetail=child(L"STATIC",0);
@@ -223,7 +224,7 @@ struct HiddenFixture {
             *target=child(L"BUTTON",BS_PUSHBUTTON);
         app.engine=std::make_unique<lapse::FixtureEngine>();
     }
-    ~HiddenFixture() { app.engine.reset(); DestroyWindow(app.window); app.window=app.preview=observedStatus=nullptr; }
+    ~HiddenFixture() { app.engine.reset(); DestroyWindow(app.window); app.window=app.preview=app.captureCursor=observedStatus=nullptr; }
 };
 const lapse::Monitor displayA{L"Display A",{0,0,640,360},L"display-a"}, displayB{L"Display B",{640,0,1280,360},L"display-b"};
 const lapse::CameraDevice cameraA{L"Camera A",L"camera-a"}, cameraB{L"Camera B",L"camera-b"};
@@ -627,6 +628,32 @@ void nightSettings(){
     SendMessageW(app.nightEnabled,BM_SETCHECK,BST_UNCHECKED,0);windowProc(app.window,WM_COMMAND,NightBox,0);sourceMode(Mode::Desktop);
     std::cout<<"PASS night Auto/manual/target mapping, equality, validation/error priority, active locks and camera-only scope\n";
 }
+void cursorSettings(){
+    seed(false);app.status=lapse::fixtureStatus={};sourceMode(Mode::Desktop);
+    require(app.settings.captureCursor&&lapse::configured.captureCursor,"Cursor default changed existing recording behavior.");
+    const auto set=[&](bool value){SendMessageW(app.captureCursor,BM_SETCHECK,value?BST_CHECKED:BST_UNCHECKED,0);
+        windowProc(app.window,WM_COMMAND,MAKEWPARAM(CursorBox,BN_CLICKED),reinterpret_cast<LPARAM>(app.captureCursor));};
+    for(bool visible:{false,true}){
+        set(visible);require(app.settings.captureCursor==visible&&lapse::configured.captureCursor==visible,"Cursor click did not configure preview.");
+        for(int mode=0;mode<=SeparateFilesMode;++mode){
+            choose(app.mode,mode);changeLayout(false);const bool desktop=hasSource(Source::Desktop);
+            require(app.settings.captureCursor==visible&&((IsWindowEnabled(app.captureCursor)!=FALSE)==desktop),"Source switch lost cursor preference or wrong scope was editable.");
+            if(!desktop){const auto count=lapse::configurationCalls;set(!visible);
+                require(app.settings.captureCursor==visible&&lapse::configurationCalls==count&&SendMessageW(app.captureCursor,BM_GETCHECK,0,0)==(visible?BST_CHECKED:BST_UNCHECKED),"Camera-only forged cursor click changed retained preference.");}
+        }
+        record();require(lapse::recorded.captureCursor==visible&&lapse::recorded.separateFiles,"Paired Record lost the accepted cursor policy.");
+        for(State state:{State::Starting,State::Recording,State::Paused,State::Finishing}){
+            app.status.state=state;updateControls();const auto count=lapse::configurationCalls;set(!visible);
+            require(!IsWindowEnabled(app.captureCursor)&&app.settings.captureCursor==visible&&lapse::configurationCalls==count&&SendMessageW(app.captureCursor,BM_GETCHECK,0,0)==(visible?BST_CHECKED:BST_UNCHECKED),"Active cursor command changed frozen/displayed policy.");
+        }
+        app.status=lapse::fixtureStatus={};sourceMode(Mode::Desktop);
+    }
+    const auto count=lapse::configurationCalls;windowProc(app.window,WM_COMMAND,MAKEWPARAM(CursorBox,BN_SETFOCUS),reinterpret_cast<LPARAM>(app.captureCursor));
+    require(lapse::configurationCalls==count,"Cursor focus notification configured the engine.");
+    const HWND cursor=app.captureCursor;app.captureCursor=nullptr;app.settings.captureCursor=false;configure();app.captureCursor=cursor;
+    require(app.settings.captureCursor&&lapse::configured.captureCursor,"Partial fixture/null cursor control did not preserve the default.");
+    std::cout<<"PASS cursor default/clicks, all source modes, paired admission, every active lock, notification guard and null-control default\n";
+}
 void recoverySettings(){
     seed(false);choose(app.encodingMode,0);SendMessageW(app.recoveryMode,BM_SETCHECK,BST_UNCHECKED,0);
     windowProc(app.window,WM_COMMAND,RecoveryBox,0);
@@ -678,7 +705,7 @@ int main() {
             unavailableSelection(camera);emptyListRecovery(camera);explicitReplacement(camera);
             modeSwitchPreservesMissingChoice(camera);changedMetadata(camera);
         }
-        activeControls();indexLoads();separateSources();nightSettings();recoverySettings();
+        activeControls();indexLoads();separateSources();nightSettings();recoverySettings();cursorSettings();
         enumerationDiagnostics();enumerationPrecedence();enumerationTooltipSafety();
         require(!IsWindowVisible(app.window)&&!IsWindowVisible(app.preview),"Fixture became visible.");
         std::cout<<"All source selection and settings assertions passed with hidden controls. No actual source was opened.\n";

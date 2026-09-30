@@ -9,6 +9,8 @@ BOOL WINAPI probeIconInfo(HICON,PICONINFO);
 BOOL WINAPI probeDrawIcon(HDC,int,int,HICON,int,int,UINT,HBRUSH,UINT);
 int WINAPI probeMetrics(int);
 HDC WINAPI rejectDesktopDC(HWND);
+int WINAPI probeReleaseDC(HWND,HDC);
+BOOL WINAPI probeStretchBlt(HDC,int,int,int,int,HDC,int,int,int,int,DWORD);
 HICON WINAPI probeCopyIcon(HICON);
 BOOL WINAPI probeDestroyIcon(HICON);
 BOOL WINAPI probeDeleteObject(HGDIOBJ);
@@ -17,6 +19,8 @@ BOOL WINAPI probeDeleteObject(HGDIOBJ);
 #define DrawIconEx probeDrawIcon
 #define GetSystemMetrics probeMetrics
 #define GetDC rejectDesktopDC
+#define ReleaseDC probeReleaseDC
+#define StretchBlt probeStretchBlt
 #define CopyIcon probeCopyIcon
 #define DestroyIcon probeDestroyIcon
 #define DeleteObject probeDeleteObject
@@ -24,6 +28,8 @@ BOOL WINAPI probeDeleteObject(HGDIOBJ);
 #undef DeleteObject
 #undef DestroyIcon
 #undef CopyIcon
+#undef StretchBlt
+#undef ReleaseDC
 #undef GetDC
 #undef GetSystemMetrics
 #undef DrawIconEx
@@ -84,6 +90,10 @@ int copyCalls=0,copyCreated=0,copyDestroyed=0;
 bool failCopy=false,failMetadata=false;
 BOOL drawResult=FALSE;
 DWORD drawError=0;
+int cursorQueries=0,cursorMetrics=0,expectedOffset=4,expectedExtent=4;
+HDC ownedSourceDC=nullptr,captureTargetDC=nullptr;
+HBITMAP captureBitmap=nullptr;
+int sourceAcquired=0,sourceReleased=0,captureCopies=0,captureBitmapsDeleted=0;
 bool caseRun(bool retire) {
     Surface target(16,16);OwnedCursor cursor;
     activeCursor=&cursor;expectedDC=target.dc;retireAfterMetadata=retire;
@@ -131,8 +141,47 @@ void earlyFailure(bool copying) {
         <<": copied="<<copyCreated<<" destroyed="<<copyDestroyed<<" original_retained=1 draws=0\n";
     activeCursor=nullptr;expectedDC=nullptr;failCopy=failMetadata=false;
 }
+void captureToggle(int extent) {
+    Surface source(16,16);OwnedCursor cursor;
+    activeCursor=&cursor;ownedSourceDC=source.dc;retireAfterMetadata=false;
+    expectedOffset=expectedExtent=extent/4;
+    cursorQueries=cursorMetrics=metadataCalls=drawCalls=copyCalls=copyCreated=copyDestroyed=0;
+    sourceAcquired=sourceReleased=captureCopies=captureBitmapsDeleted=0;
+    lapse::Frame output;std::wstring error;
+    const BYTE* storage=nullptr;
+    const DWORD before=GetGuiResources(GetCurrentProcess(),GR_GDIOBJECTS);
+    for(bool show:{true,false,true}) {
+        const int queries=cursorQueries,metrics=cursorMetrics,metadata=metadataCalls;
+        const int copies=copyCalls,draws=drawCalls,destroyed=copyDestroyed;
+        require(lapse::captureDesktop({-100,200,-84,216},extent,extent,show,output,error)&&
+                error.empty()&&output.valid()&&output.width==extent&&output.height==extent,
+                "Owned on/off desktop capture failed or changed geometry");
+        if(storage)require(storage==output.pixels.data(),"Cursor toggle discarded reusable output storage");
+        storage=output.pixels.data();
+        for(int y=0;y<extent;++y)for(int x=0;x<extent;++x) {
+            const bool red=show&&x>=extent/4&&x<extent/2&&y>=extent/4&&y<extent/2;
+            const auto* pixel=output.pixels.data()+(size_t(y)*extent+x)*4;
+            require(pixel[0]==(red?0:20)&&pixel[1]==(red?0:40)&&pixel[2]==(red?255:60),
+                    "Cursor toggle left a ghost or changed unrelated RGB pixels");
+        }
+        require(cursorQueries==queries+int(show)&&cursorMetrics==metrics+2*int(show)&&
+                metadataCalls==metadata+int(show)&&copyCalls==copies+int(show)&&
+                drawCalls==draws+int(show)&&copyDestroyed==destroyed+int(show),
+                "Off capture performed cursor API work or On omitted expected work");
+        require(!copiedCursor&&!metadataMask&&!metadataColor,"Capture retained cursor resources");
+    }
+    lapse::releaseDesktopCaptureCache();
+    require(!captureBitmap&&captureBitmapsDeleted==1&&sourceAcquired==3&&sourceReleased==3&&captureCopies==3,
+            "Capture did not reuse/release its owned surface or balance the borrowed source DC");
+    require(GetGuiResources(GetCurrentProcess(),GR_GDIOBJECTS)==before,"Capture toggle leaked a GDI resource");
+    std::cout<<"PASS actual capture on/off/on "<<extent<<"x"<<extent
+        <<": exact RGB, no ghost, Off cursor calls=0, one reused DIB released\n";
+    activeCursor=nullptr;ownedSourceDC=captureTargetDC=expectedDC=nullptr;
+    expectedOffset=expectedExtent=4;
+}
 }
 BOOL WINAPI probeCursorInfo(PCURSORINFO info) {
+    ++cursorQueries;
     require(activeCursor&&activeCursor->value&&info&&info->cbSize==sizeof(CURSORINFO),"Unexpected cursor query");
     info->flags=CURSOR_SHOWING;info->hCursor=activeCursor->value;info->ptScreenPos={-95,206};return TRUE;
 }
@@ -155,15 +204,35 @@ BOOL WINAPI probeIconInfo(HICON value,PICONINFO info) {
     return result;
 }
 BOOL WINAPI probeDrawIcon(HDC dc,int x,int y,HICON icon,int w,int h,UINT frame,HBRUSH brush,UINT flags) {
-    require(dc==expectedDC&&x==4&&y==4&&w==4&&h==4&&frame==0&&!brush&&flags==DI_NORMAL,
+    require(dc==expectedDC&&x==expectedOffset&&y==expectedOffset&&w==expectedExtent&&h==expectedExtent&&frame==0&&!brush&&flags==DI_NORMAL,
             "Cursor hotspot, rectangle or owned target is wrong");
     ++drawCalls;SetLastError(ERROR_SUCCESS);
     drawResult=DrawIconEx(dc,x,y,icon,w,h,frame,brush,flags);drawError=GetLastError();return drawResult;
 }
 int WINAPI probeMetrics(int index) {
-    require(index==SM_CXCURSOR||index==SM_CYCURSOR,"Unexpected desktop metrics query");return 32;
+    if(ownedSourceDC) {
+        if(index==SM_XVIRTUALSCREEN)return -100;
+        if(index==SM_YVIRTUALSCREEN)return 200;
+        if(index==SM_CXVIRTUALSCREEN||index==SM_CYVIRTUALSCREEN)return 16;
+    }
+    require(index==SM_CXCURSOR||index==SM_CYCURSOR,"Unexpected desktop metrics query");++cursorMetrics;return 32;
 }
-HDC WINAPI rejectDesktopDC(HWND){throw std::runtime_error("Physical desktop access forbidden");}
+HDC WINAPI rejectDesktopDC(HWND window){
+    require(!window&&ownedSourceDC,"Physical desktop access forbidden");++sourceAcquired;return ownedSourceDC;
+}
+int WINAPI probeReleaseDC(HWND window,HDC dc){
+    require(!window&&dc==ownedSourceDC,"Unexpected source DC release");++sourceReleased;return 1;
+}
+BOOL WINAPI probeStretchBlt(HDC target,int x,int y,int w,int h,HDC source,int sx,int sy,int sw,int sh,DWORD flags){
+    require(source==ownedSourceDC&&source&&x==0&&y==0&&w==h&&(w==16||w==8)&&
+            sx==-100&&sy==200&&sw==16&&sh==16&&flags==(SRCCOPY|CAPTUREBLT),
+            "Capture escaped the owned source geometry");
+    const auto bitmap=static_cast<HBITMAP>(GetCurrentObject(target,OBJ_BITMAP));
+    require(bitmap&&(!captureTargetDC||(captureTargetDC==target&&captureBitmap==bitmap)),
+            "Cursor toggle recreated the capture surface");
+    captureTargetDC=expectedDC=target;captureBitmap=bitmap;++captureCopies;
+    return StretchBlt(target,x,y,w,h,source,0,0,sw,sh,flags);
+}
 HICON WINAPI probeCopyIcon(HICON value) {
     ++copyCalls;
     require(!copiedCursor&&activeCursor&&value==activeCursor->value,"Unexpected source cursor copy");
@@ -177,6 +246,10 @@ BOOL WINAPI probeDestroyIcon(HICON value) {
     copiedCursor=nullptr;++copyDestroyed;return result;
 }
 BOOL WINAPI probeDeleteObject(HGDIOBJ value) {
+    if(value&&value==captureBitmap) {
+        const BOOL result=DeleteObject(value);require(result!=FALSE,"Capture bitmap cleanup failed");
+        captureBitmap=nullptr;++captureBitmapsDeleted;return result;
+    }
     require(value&&(value==metadataMask||value==metadataColor),"Unexpected production GDI deletion");
     const BOOL result=DeleteObject(value);require(result!=FALSE,"Actual metadata bitmap cleanup failed");
     if(value==metadataMask)metadataMask=nullptr;if(value==metadataColor)metadataColor=nullptr;return result;
@@ -188,11 +261,12 @@ int main(){
         const DWORD before=GetGuiResources(GetCurrentProcess(),GR_GDIOBJECTS);
         int passed=0;passed+=caseRun(false);passed+=caseRun(true);
         earlyFailure(true);earlyFailure(false);
+        captureToggle(16);captureToggle(8);
         const DWORD after=GetGuiResources(GetCurrentProcess(),GR_GDIOBJECTS);
         // DrawIconEx may initialize cached process GDI resources. Assert actual
         // owned handle deletions, and use the broader count only as a diagnostic.
         require(!cleanupFailed,"Owned fixture resource cleanup failed");
-        std::cout<<passed<<"/2 lifetime cases passed"<<"; 2/2 early-failure controls passed"
+        std::cout<<passed<<"/2 lifetime cases passed"<<"; 2/2 early-failure controls; 2/2 capture toggle cases passed"
             <<"; fixture GDI="<<before<<" -> "<<after<<"; no real cursor/display/input used.\n";
         return passed==2?0:1;
     }catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 2;}

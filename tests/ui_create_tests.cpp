@@ -36,7 +36,7 @@ void resetChildFaults(){
     creationFailures=nullMessages=recordCalls=lastConfiguredInterval=lastRecordedInterval=monitorEnumerations=cameraEnumerations=tooltipAttempts=0;
 }
 std::array<int,256> selections{};
-std::array<int,256> counts{};
+std::array<int,256> counts{},checks{};
 std::filesystem::path ownedRun,ownedCase;
 void require(bool condition,const char* text){if(!condition)throw std::runtime_error(text);}
 int index(HWND hwnd){auto value=reinterpret_cast<INT_PTR>(hwnd);require(value>=0&&value<256,"Unexpected fake handle");return static_cast<int>(value);}
@@ -55,6 +55,8 @@ LRESULT WINAPI fakeSend(HWND hwnd,UINT message,WPARAM value,LPARAM parameter){
     // No real recipient exists; retain Win32 NULL-handle results for omitted controls.
     if(!hwnd){++nullMessages;return ::SendMessageW(nullptr,message,value,parameter);}
     const int i=index(hwnd);
+    if(message==BM_SETCHECK){checks[i]=static_cast<int>(value);return 0;}
+    if(message==BM_GETCHECK)return checks[i];
     if(message==CB_GETCURSEL){++choiceQueries;return selections[i];}
     if(message==CB_SETCURSEL){selections[i]=static_cast<int>(value);return static_cast<LRESULT>(value);}
     if(message==CB_ADDSTRING)return counts[i]++;
@@ -63,7 +65,7 @@ LRESULT WINAPI fakeSend(HWND hwnd,UINT message,WPARAM value,LPARAM parameter){
     return 0;
 }
 DWORD WINAPI fakeProfileString(LPCWSTR section,LPCWSTR key,LPCWSTR fallback,LPWSTR output,DWORD count,LPCWSTR path){
-    if(std::wcscmp(key,L"SegmentDurationSeconds")==0 || std::wcsncmp(key,L"TimeSkip",8)==0 || std::wcsncmp(key,L"Watermark",9)==0 || std::wcscmp(key,L"StopOnLowDiskSpace")==0 || std::wcscmp(key,L"RecoveryMode")==0 || std::wcscmp(key,L"NightEnabled")==0 || std::wcscmp(key,L"NightDurationMs")==0 || std::wcscmp(key,L"NightTargetBrightness")==0){require(count>std::wcslen(fallback),"Option buffer too small");wcscpy_s(output,count,fallback);return static_cast<DWORD>(std::wcslen(fallback));}
+    if(std::wcscmp(key,L"SegmentDurationSeconds")==0 || std::wcsncmp(key,L"TimeSkip",8)==0 || std::wcsncmp(key,L"Watermark",9)==0 || std::wcscmp(key,L"StopOnLowDiskSpace")==0 || std::wcscmp(key,L"RecoveryMode")==0 || std::wcscmp(key,L"ShowDesktopCursor")==0 || std::wcscmp(key,L"NightEnabled")==0 || std::wcscmp(key,L"NightDurationMs")==0 || std::wcscmp(key,L"NightTargetBrightness")==0){require(count>std::wcslen(fallback),"Option buffer too small");wcscpy_s(output,count,fallback);return static_cast<DWORD>(std::wcslen(fallback));}
     require(std::wcscmp(section,L"Settings")==0&&std::wcscmp(key,L"Folder")==0&&count>=1025&&path&&*path,"Unexpected profile read");
     ++profileReads;std::wmemset(output,L'x',1024);output[0]=L'C';output[1]=L':';output[2]=L'\\';output[1024]=0;
     if(fault==Fault::ProfileCopy)failNextAllocation=true;
@@ -90,7 +92,7 @@ class ProbeEngine {
 public:
     ProbeEngine(){++engineStarts;}
     ~ProbeEngine(){++engineStops;}
-    void configure(const Settings& settings){++engineConfigures;lastConfiguredInterval=settings.intervalMs;if(fault==Fault::AfterEngine){++syntheticThrows;throw std::bad_alloc();}}
+    void configure(const Settings& settings){++engineConfigures;lastConfiguredInterval=settings.intervalMs;require(settings.captureCursor,"Startup lost the default cursor policy");if(fault==Fault::AfterEngine){++syntheticThrows;throw std::bad_alloc();}}
     void refreshSources(){} void record(){++recordCalls;lastRecordedInterval=lastConfiguredInterval;} void pause(){} void setPaused(bool){} void finish(){}
     Status status(){return {};}
 };
@@ -149,7 +151,7 @@ void run(const wchar_t* name,Fault selectedFault){
     failNextAllocation=false;fault=Fault::None;app.engine.reset();
     fault=selectedFault;resetChildFaults();
     failedAllocations=windows=fontsCreated=profileReads=keyWrites=engineStarts=engineStops=engineConfigures=syntheticThrows=choiceQueries=timerStarts=timerStops=quits=debugMessages=0;failedBytes=0;
-    selections.fill(-1);counts.fill(0);
+    selections.fill(-1);counts.fill(0);checks.fill(0);
     std::wstring{}.swap(app.settings.folder);app.monitors.clear();app.cameras.clear();app.selectedMonitorId.clear();
     app.settings.cameraId.clear();app.settings.monitorId.clear();app.mode=nullptr;app.preview=nullptr;app.window=nullptr;app.layingOut=false;
     app.advancedExpanded=true;app.advancedVisibility=1;app.advancedLimitIndex=5;
@@ -181,7 +183,7 @@ void run(const wchar_t* name,Fault selectedFault){
     if(selectedFault==Fault::AfterEngine)require(failedAllocations==0&&syntheticThrows==1&&engineStarts==1,"Synthetic post-engine exception changed");
     if(selectedFault==Fault::Timer)require(failedAllocations==0&&syntheticThrows==0&&engineStarts==1&&engineStops==1,"Synthetic zero-timer cleanup changed");
     if(failed){require(!escaped&&created==-1,"WM_CREATE did not reject failed startup");require(resizeQueries==0&&resizeConfigures==0,"Failed startup processed resize configuration");require(keyWrites==0&&unchanged&&debugMessages==1&&timerStarts==(selectedFault==Fault::Timer?1:0),"Failed startup changed preferences or timer attempts");}
-    else {require(!escaped&&created==0&&failedAllocations==0&&engineStarts==1&&keyWrites==30&&!unchanged&&timerStarts==1&&debugMessages==0,"Healthy create/destroy changed");
+    else {require(!escaped&&created==0&&failedAllocations==0&&engineStarts==1&&keyWrites==31&&!unchanged&&timerStarts==1&&debugMessages==0,"Healthy create/destroy changed");
         require(!app.advancedExpanded&&app.advancedVisibility==0&&app.advancedLimitIndex==0,"Recreated controls inherited stale Advanced caption or expanded state");
         require(app.advancedNightState==0&&app.nightVisibility==0&&app.nightValidation.empty()&&app.nightHintCaption.empty()&&app.nightDetailCaption.empty(),"Recreated controls inherited stale night visibility, validation or facts");
         require(app.settings.timeSkip.mode==TimeSkipMode::Off && app.skipVisibility==0 && app.skipSummaryCaption.empty() && app.skipDetailCaption.empty() && app.skipCheckAge==UINT64_MAX,"Recreated controls inherited stale compression policy/visibility/facts");
@@ -208,7 +210,7 @@ LRESULT CALLBACK route(HWND window,UINT message,WPARAM wp,LPARAM lp){
 void osCase(const wchar_t* className,const wchar_t* name,Fault selectedFault){
     failNextAllocation=false;fault=Fault::None;app.engine.reset();fault=selectedFault;resetChildFaults();
     failedAllocations=windows=fontsCreated=profileReads=keyWrites=engineStarts=engineStops=engineConfigures=syntheticThrows=choiceQueries=timerStarts=timerStops=quits=debugMessages=0;failedBytes=0;
-    routedCreates=routedDestroys=routeEscapes=0;selections.fill(-1);counts.fill(0);
+    routedCreates=routedDestroys=routeEscapes=0;selections.fill(-1);counts.fill(0);checks.fill(0);
     std::wstring{}.swap(app.settings.folder);app.monitors.clear();app.cameras.clear();app.selectedMonitorId.clear();
     app.settings.cameraId.clear();app.settings.monitorId.clear();app.mode=nullptr;app.preview=nullptr;app.window=nullptr;app.layingOut=false;
     ownedCase=ownedRun/name;require(std::filesystem::create_directory(ownedCase),"Owned OS case exists");
@@ -232,7 +234,7 @@ void osCase(const wchar_t* className,const wchar_t* name,Fault selectedFault){
     require(routeEscapes==0&&routedCreates==1&&routedDestroys==1&&!app.engine&&timerStops==1&&quits==1,"Unexpected callback escape or missing OS cleanup");
     if(selectedFault==Fault::ProfileCopy)require(!created&&!acceptedAtReturn&&destroysAtReturn==1&&failedAllocations==1&&failedBytes>0&&keyWrites==0&&unchanged&&engineStarts==0&&engineStops==0&&timerStarts==0&&debugMessages==1,"OS failed-creation behavior changed");
     else if(selectedFault==Fault::Timer)require(!created&&!acceptedAtReturn&&!app.mode&&destroysAtReturn==1&&stopsAtReturn==1&&writesAtReturn==0&&failedAllocations==0&&syntheticThrows==0&&keyWrites==0&&unchanged&&engineStarts==1&&engineStops==1&&timerStarts==1&&debugMessages==1,"OS failed-timer cleanup or preference preservation changed");
-    else require(created&&acceptedAtReturn&&destroysAtReturn==0&&stopsAtReturn==0&&writesAtReturn==0&&failedAllocations==0&&keyWrites==30&&!unchanged&&engineStarts==1&&engineStops==1&&timerStarts==1&&debugMessages==0,"OS healthy-creation behavior changed");
+    else require(created&&acceptedAtReturn&&destroysAtReturn==0&&stopsAtReturn==0&&writesAtReturn==0&&failedAllocations==0&&keyWrites==31&&!unchanged&&engineStarts==1&&engineStops==1&&timerStarts==1&&debugMessages==0,"OS healthy-creation behavior changed");
     for(const auto& file:std::filesystem::directory_iterator(ownedCase))require(file.path()==path,"Owned settings stage remained");
 }
 }
@@ -243,8 +245,8 @@ void prepareChildCase(const std::wstring& name,int rejected,bool tooltip){
     fault=Fault::None;failNextAllocation=false;app.engine.reset();
     failedAllocations=windows=fontsCreated=profileReads=keyWrites=engineStarts=engineStops=engineConfigures=syntheticThrows=choiceQueries=timerStarts=timerStops=quits=debugMessages=0;
     failedChild=rejected;failTooltip=tooltip;creationFailures=nullMessages=recordCalls=lastConfiguredInterval=lastRecordedInterval=monitorEnumerations=cameraEnumerations=tooltipAttempts=0;
-    selections.fill(-1);counts.fill(0);app.settings={};app.status={};
-    app.cameraListError=L"Prior window camera-list failure";app.statusTooltipCaption=L"Prior window tooltip detail";
+    selections.fill(-1);counts.fill(0);checks.fill(0);app.settings={};app.status={};
+    app.advancedCursorState=99;app.cameraListError=L"Prior window camera-list failure";app.statusTooltipCaption=L"Prior window tooltip detail";
     app.monitors.clear();app.cameras.clear();app.selectedMonitorId.clear();app.mode=nullptr;app.preview=nullptr;app.window=nullptr;app.layingOut=false;app.closeWhenDone=false;
     ownedCase=ownedRun/name;require(std::filesystem::create_directory(ownedCase),"Owned case exists");
     currentIni=ownedCase/L"settings.ini";app.preferences=currentIni.native();
@@ -253,10 +255,10 @@ void prepareChildCase(const std::wstring& name,int rejected,bool tooltip){
 }
 bool childUnchanged(){std::ifstream input(currentIni,std::ios::binary);return std::string(std::istreambuf_iterator<char>(input),{})==priorBytes;}
 void verifyChildCleanup(bool rejected){
-    require(app.cameraListError.empty()&&app.statusTooltipCaption.empty(),"Window recreation retained a prior camera enumeration diagnostic/tooltip");
+    require(app.advancedCursorState!=99&&app.cameraListError.empty()&&app.statusTooltipCaption.empty(),"Window recreation retained a prior camera enumeration diagnostic/tooltip");
     require(!app.engine&&!app.startupComplete&&timerStops==1&&quits==1,"Destruction missed Engine/timer/quit cleanup");
     if(rejected)require(engineStarts==0&&engineStops==0&&engineConfigures==0&&timerStarts==0&&profileReads==0&&monitorEnumerations==0&&cameraEnumerations==0&&tooltipAttempts==0&&keyWrites==0&&debugMessages==1&&childUnchanged(),"Failed required child reached initialization or changed preferences");
-    else require(engineStarts==1&&engineStops==1&&timerStarts==1&&profileReads==1&&monitorEnumerations==1&&cameraEnumerations==1&&tooltipAttempts==1&&keyWrites==30*(recordCalls?2:1)&&debugMessages==0&&lastConfiguredInterval==5000&&!childUnchanged(),"Healthy initialization/persistence changed");
+    else require(engineStarts==1&&engineStops==1&&timerStarts==1&&profileReads==1&&monitorEnumerations==1&&cameraEnumerations==1&&tooltipAttempts==1&&keyWrites==31*(recordCalls?2:1)&&debugMessages==0&&lastConfiguredInterval==5000&&!childUnchanged(),"Healthy initialization/persistence changed");
     require(GetPrivateProfileIntW(L"Settings",L"Interval",99,currentIni.c_str())==2,"Owned interval preference changed");
     for(const auto& entry:std::filesystem::directory_iterator(ownedCase))require(entry.path()==currentIni,"Owned preference stage leaked");
 }
@@ -309,12 +311,12 @@ struct OwnedFiles {
     }
     ~OwnedFiles(){
         failNextAllocation=false;fault=Fault::None;app.engine.reset();
-        // Only flat files inside the 58 fixed case directories created by
+        // Only flat files inside the 59 fixed case directories created by
         // this fixture are removed; no recursive traversal or user paths.
         std::error_code error;
         if(!ownedRun.is_absolute()||ownedRun.parent_path()!=base)return;
         for(const auto* name:{L"profile-copy",L"post-engine-synthetic",L"healthy",L"zero-timer-synthetic",L"failed-create",L"healthy-create",L"failed-timer-create",
-            L"required-100",L"required-101",L"required-102",L"required-103",L"required-104",L"required-105",L"required-106",L"required-107",L"required-108",L"required-109",L"required-110",L"required-111",L"required-112",L"required-113",L"required-114",L"required-115",L"required-116",L"required-117",L"required-118",L"required-119",L"required-120",L"required-121",L"required-122",L"required-123",L"required-124",L"required-125",L"required-126",L"required-127",L"required-128",L"required-129",L"required-130",L"required-131",
+            L"required-100",L"required-101",L"required-102",L"required-103",L"required-104",L"required-105",L"required-106",L"required-107",L"required-108",L"required-109",L"required-110",L"required-111",L"required-112",L"required-113",L"required-114",L"required-115",L"required-116",L"required-117",L"required-118",L"required-119",L"required-120",L"required-121",L"required-122",L"required-123",L"required-124",L"required-125",L"required-126",L"required-127",L"required-128",L"required-129",L"required-130",L"required-131",L"required-132",
             L"required-label-200",L"required-label-201",L"required-label-202",L"required-label-203",L"required-label-204",L"required-label-205",L"required-label-206",L"required-label-207",L"required-label-208",L"required-label-209",L"required-status",L"required-split-label",L"child-healthy",L"child-tooltip",
             L"os-child-interval",L"os-child-record",L"os-child-preview",L"os-child-healthy",L"os-child-tooltip"}){
             const auto directory=ownedRun/name;
@@ -339,7 +341,7 @@ int main(){
         const auto child=[&](const std::wstring& name,int id,bool tooltip=false){
             try{directChildCase(name,id,tooltip);++passed;}catch(const std::exception& error){failNextAllocation=false;++failed;std::cout<<"FAIL "<<error.what()<<'\n';}
         };
-        for(int id=ModeBox;id<=StatusDetails;++id)child(L"required-"+std::to_wstring(id),id);
+        for(int id=ModeBox;id<=CursorBox;++id)child(L"required-"+std::to_wstring(id),id);
         for(int id=200;id<210;++id)child(L"required-label-"+std::to_wstring(id),id);
         child(L"required-status",210);child(L"required-split-label",211);child(L"child-healthy",-1);child(L"child-tooltip",-1,true);
         const auto className=L"TimelapseOwnedCreateTests-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64());
@@ -355,6 +357,6 @@ int main(){
         childOs(L"os-child-healthy",-1);childOs(L"os-child-tooltip",-1,true);
         require(UnregisterClassW(className.c_str(),cls.hInstance)!=FALSE,"Owned class was not released");
     }catch(const std::exception& error){failNextAllocation=false;++failed;std::cout<<"FAIL "<<error.what()<<'\n';}
-    std::cout<<passed<<"/58 cases passed: seven prior startup cases, 46 required-child direct controls and five hidden OS controls; children/fonts/Engine/timer synthetic, only owned preferences.\n";
-    return failed||passed!=58?1:0;
+    std::cout<<passed<<"/59 cases passed: seven prior startup cases, 47 required-child direct controls and five hidden OS controls; children/fonts/Engine/timer synthetic, only owned preferences.\n";
+    return failed||passed!=59?1:0;
 }

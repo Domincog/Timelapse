@@ -1,4 +1,4 @@
-param([string]$Version = '0.23.0', [string]$BuildDirectory = 'build', [string]$InstallerCompiler = '', [string]$PersonWorker = '')
+param([string]$Version = '0.24.0', [string]$BuildDirectory = 'build', [string]$InstallerCompiler = '', [string]$PersonWorker = '')
 $ErrorActionPreference = 'Stop'
 if ($Version -notmatch '^\d+\.\d+\.\d+([-.][A-Za-z0-9.-]+)?$') { throw 'Use a version such as 0.1.0 or 0.1.0-beta.1.' }
 $projectRoot = $PSScriptRoot

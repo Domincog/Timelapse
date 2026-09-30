@@ -18,7 +18,8 @@ using namespace std::chrono_literals;
 constexpr uint8_t oldMarker = 65, newMarker = 201;
 enum class Completion { Frame, Error, Exception };
 enum class Change { Source, Monitor, CameraId, RoundTrip, PreviewToggle, SameSource, Refresh, Record, CameraStart,
-    CameraRoundTrip, CameraPreviewToggle, CameraStartRoundTrip, CameraStartToggle, CameraIdRoundTrip, CameraSameSource };
+    CameraRoundTrip, CameraPreviewToggle, CameraStartRoundTrip, CameraStartToggle, CameraIdRoundTrip, CameraSameSource,
+    Cursor, CursorRoundTrip };
 
 struct CaptureGate {
     std::mutex mutex;
@@ -28,11 +29,13 @@ struct CaptureGate {
     bool secondIsWarmup = false, blockCameraStart = false;
     Completion completion = Completion::Frame;
     std::wstring firstSource, secondSource;
+    bool firstCursor = true, secondCursor = true;
 
     void reset(Completion result, bool warmup, bool startup) {
         std::lock_guard<std::mutex> lock(mutex);
         calls = 0; releaseOld = releaseNew = timedOut = false;
         completion = result; firstSource.clear(); secondSource.clear();
+        firstCursor = secondCursor = true;
         secondIsWarmup = warmup; blockCameraStart = startup;
     }
     bool awaitCall(int count) {
@@ -44,11 +47,11 @@ struct CaptureGate {
           releaseOld = true; if (all) releaseNew = true; }
         changed.notify_all();
     }
-    bool capture(const std::wstring& source, lapse::Frame& frame, std::wstring& error) {
+    bool capture(const std::wstring& source, lapse::Frame& frame, std::wstring& error, bool cursor = true) {
         std::unique_lock<std::mutex> lock(mutex);
         const int ordinal = ++calls;
-        if (ordinal == 1) firstSource = source;
-        if (ordinal == 2) secondSource = source;
+        if (ordinal == 1) { firstSource = source; firstCursor = cursor; }
+        if (ordinal == 2) { secondSource = source; secondCursor = cursor; }
         changed.notify_all();
         if (ordinal <= 2 && !changed.wait_for(lock, 5s, [&] {
                 return ordinal == 1 ? releaseOld : releaseNew;
@@ -107,6 +110,8 @@ const char* name(Change change) {
     case Change::CameraStartToggle: return "camera startup preview off then on";
     case Change::CameraIdRoundTrip: return "camera ID A to B to A";
     case Change::CameraSameSource: return "same-camera input control";
+    case Change::Cursor: return "cursor on to off";
+    case Change::CursorRoundTrip: return "cursor on to off to on";
     }
     return "unknown change";
 }
@@ -147,12 +152,13 @@ void runCase(Change change, Completion completion) {
     }
     if (change == Change::CameraId || change == Change::CameraIdRoundTrip) updated.cameraId = L"new-camera";
     if (change == Change::CameraStart) updated.layers = lapse::preset(lapse::Mode::Desktop);
+    if (change == Change::Cursor || change == Change::CursorRoundTrip) updated.captureCursor = false;
     if (change == Change::PreviewToggle || change == Change::CameraPreviewToggle || change == Change::CameraStartToggle)
         updated.preview = false;
     engine.configure(updated);
     if (change == Change::RoundTrip || change == Change::PreviewToggle || change == Change::CameraRoundTrip ||
         change == Change::CameraPreviewToggle || change == Change::CameraStartRoundTrip || change == Change::CameraStartToggle ||
-        change == Change::CameraIdRoundTrip)
+        change == Change::CameraIdRoundTrip || change == Change::CursorRoundTrip)
         engine.configure(original);
     if (change == Change::Refresh) engine.refreshSources();
     if (change == Change::Record) engine.record();
@@ -184,6 +190,9 @@ void runCase(Change change, Completion completion) {
         require(!gate.timedOut, "A capture barrier timed out.");
         require(gate.firstSource == first && gate.secondSource == second,
                 "The capture configurations do not match this test case.");
+        if (change == Change::Cursor || change == Change::CursorRoundTrip)
+            require(gate.firstCursor && gate.secondCursor == (change == Change::CursorRoundTrip),
+                    "Desktop preview did not use the current cursor setting.");
     }
     const bool accepted = change == Change::SameSource || change == Change::CameraSameSource;
     const bool inputAccepted = change == Change::CameraSameSource && completion == Completion::Frame;
@@ -210,6 +219,26 @@ void runCase(Change change, Completion completion) {
 }
 }
 
+namespace {
+void acceptedCursorAtRecord() {
+    gate.reset(Completion::Frame, false, false);
+    lapse::Settings cfg; cfg.monitorId = L"synthetic-display-0";
+    lapse::Engine engine; ReleaseBarriers release;
+    engine.configure(cfg);
+    require(gate.awaitCall(1), "Record cursor test did not reach the old idle capture.");
+    engine.record(); cfg.captureCursor = false; engine.configure(cfg);
+    require(engine.status().state == lapse::State::Starting, "Record cursor test did not retain the accepted start.");
+    gate.release(false);
+    require(gate.awaitCall(2), "First recording capture did not reach the cursor barrier.");
+    bool accepted = false;
+    { std::lock_guard<std::mutex> lock(gate.mutex); accepted = gate.firstCursor && gate.secondCursor && !gate.timedOut; }
+    engine.finish(); gate.release(true);
+    require(awaitHealthyPreview(engine), "Preview failed after canceling gated recording preparation.");
+    require(accepted && engine.status().frames == 0 && engine.status().savedPaths.empty(),
+            "Cursor policy changed after Record acceptance but before the worker's start snapshot.");
+}
+}
+
 namespace retryCases {
 using namespace std::chrono_literals;
 // Set before Engine construction and reset only after its worker is joined.
@@ -226,13 +255,13 @@ struct Controls {
     std::mutex mutex;
     std::condition_variable changed;
     bool timedOut = false;
-    bool detailFrames = false;
+    bool detailFrames = false, cursorPixels = false;
     std::vector<lapse::CameraResolution> resolutions;
 
     Gate& gate(Operation operation) { return operation == Operation::Open ? openGate : readGate; }
     void reset() {
         std::lock_guard<std::mutex> lock(mutex);
-        openGate = {}; readGate = {}; counts = {}; timedOut = detailFrames = false; resolutions.clear();
+        openGate = {}; readGate = {}; counts = {}; timedOut = detailFrames = cursorPixels = false; resolutions.clear();
     }
     void arm(Operation operation, bool fail) {
         std::lock_guard<std::mutex> lock(mutex);
@@ -311,6 +340,38 @@ lapse::Settings cameraSettings(bool preview = true) {
     // create a recording. Every Record test fails before reaching this check.
     settings.folder.clear();
     return settings;
+}
+
+void cursorKeepsCameraEvidence() {
+    Mode mode; controls.reset(); controls.cursorPixels = true;
+    lapse::Engine engine; ReleaseGates release;
+    auto cfg = cameraSettings(); cfg.width = 640; cfg.height = 360;
+    cfg.layers = lapse::preset(lapse::Mode::SideBySide);
+    const auto matches = [](const lapse::Status& status, bool cursor) {
+        if (!status.preview || status.preview->width != 640 || status.preview->height != 360) return false;
+        const auto& pixels = status.preview->pixels;
+        return pixels[(180u * 640 + 160) * 4] == (cursor ? desktopMarker : uint8_t(29)) &&
+            pixels[(180u * 640 + 480) * 4] == cameraMarker;
+    };
+    engine.configure(cfg);
+    require(await([&] { return matches(engine.status(), true); }), "Default cursor collage preview unavailable.");
+    const auto input = engine.status().cameraInput;
+    controls.arm(Operation::Read, false);
+    require(controls.awaitEntry(Operation::Read), "Cursor change did not overlap a live camera read.");
+    cfg.captureCursor = false; engine.configure(cfg);
+    const auto retired = engine.status();
+    require(!retired.preview && retired.cameraInput.width == input.width && retired.cameraInput.height == input.height &&
+        retired.cameraInput.generation == input.generation, "Cursor edit failed to retire pixels or retired camera evidence.");
+    controls.release(Operation::Read);
+    require(await([&] { return matches(engine.status(), false); }), "Cursor-off collage preview or camera pixels incorrect.");
+    require(controls.noNewOpen(1) && controls.snapshot().closes == 0, "Visual cursor edit reopened the healthy camera.");
+    cfg.layers = lapse::preset(lapse::Mode::Camera); engine.configure(cfg);
+    require(await([&] { return cameraPreview(engine.status()); }), "Camera-only cursor control unavailable.");
+    const auto cameraOnly = engine.status(); cfg.captureCursor = true; engine.configure(cfg);
+    const auto unchanged = engine.status();
+    require(unchanged.preview && unchanged.cameraInput.generation == cameraOnly.cameraInput.generation &&
+        unchanged.cameraInput.width == cameraOnly.cameraInput.width && controls.noNewOpen(1),
+        "Camera-only cursor edit retired source evidence or healthy preview.");
 }
 
 void healthyReaderThenCurrentFailure() {
@@ -580,14 +641,14 @@ bool CameraClient::latest(Frame& output, std::wstring& error) {
     }
     return gate.capture(L"camera:" + impl_->id, output, error);
 }
-bool captureMonitor(const std::wstring& id, int, int, bool, Frame& output, std::wstring& error) {
+bool captureMonitor(const std::wstring& id, int, int, bool cursor, Frame& output, std::wstring& error) {
     // The worker can wake before the test's initial configure() under load.
     // Do not let its unconfigured default display consume either real barrier.
     if (id != L"synthetic-display-0" && id != L"synthetic-display-640") {
         error = L"The synthetic display has not been configured."; return false;
     }
-    if (retryCases::enabled) { retryCases::frame(output, retryCases::desktopMarker); error.clear(); return true; }
-    return gate.capture(id == L"synthetic-display-0" ? L"desktop:0" : L"desktop:640", output, error);
+    if (retryCases::enabled) { retryCases::frame(output, retryCases::controls.cursorPixels && !cursor ? uint8_t(29) : retryCases::desktopMarker); error.clear(); return true; }
+    return gate.capture(id == L"synthetic-display-0" ? L"desktop:0" : L"desktop:640", output, error, cursor);
 }
 }
 
@@ -605,7 +666,7 @@ int main() {
         }
     };
     for (auto change : {Change::Source, Change::Monitor, Change::CameraId, Change::RoundTrip, Change::PreviewToggle,
-                       Change::Refresh, Change::Record})
+                       Change::Refresh, Change::Record, Change::Cursor, Change::CursorRoundTrip})
         for (auto completion : {Completion::Frame, Completion::Error, Completion::Exception}) test(change, completion);
     test(Change::SameSource, Completion::Frame);
     test(Change::CameraSameSource, Completion::Frame);
@@ -615,6 +676,8 @@ int main() {
     for (auto change : {Change::CameraRoundTrip, Change::CameraPreviewToggle, Change::CameraStartRoundTrip, Change::CameraStartToggle})
         test(change, Completion::Error);
     const std::pair<const char*, void(*)()> retryTests[] = {
+        {"Record acceptance freezes cursor before worker preparation", acceptedCursorAtRecord},
+        {"cursor visual changes preserve camera evidence and camera-only preview", retryCases::cursorKeepsCameraEvidence},
         {"input-size snapshot lifecycle uses no extra capture", retryCases::cameraInputSnapshotLifecycle},
         {"same-tier sizes retain healthy and failed helper identity", retryCases::sameTierKeepsHealthyAndFailedAttempt},
         {"tier A-B-A retires old replies while reusing matching healthy helper", retryCases::tierRoundTripRejectsOldPublication},

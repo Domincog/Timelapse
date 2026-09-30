@@ -136,7 +136,7 @@ void offAndNoCamera(const std::filesystem::path& root) {
     std::cout<<"off/manual/no-camera isolation passed\n";
 }
 void accelerateAndActivity(const std::filesystem::path& root) {
-    resetEvidence();Engine e;auto s=configuration(root/L"paired");s.separateFiles=true;e.configure(s);e.record();
+    resetEvidence();Engine e;auto s=configuration(root/L"paired");s.separateFiles=true;s.captureCursor=false;e.configure(s);e.record();
     await(e,[](const auto& x){return x.timeSkip.intervalMs>120&&x.timeSkip.reason==TimeSkipReason::NoPerson;});
     require(!startedBeforeVideo&&detectorStarts==1&&desktopObservations==0&&activityCalls==0,"Person checks did not isolate camera/first admission");
     const auto beforeGeometry=cameraReports.load();sourceMode=7;inferenceDelay=250;
@@ -268,7 +268,10 @@ bool CameraClient::beginNight(uint64_t token,uint32_t duration,const NightSettin
 bool CameraClient::nightResult(uint64_t token,Frame& out,NightWindowResult& r,std::wstring& e){e.clear();if(token!=impl_->nightToken){e=L"Wrong synthetic Night token";return false;}if(GetTickCount64()<impl_->nightStart+impl_->duration)return false;
     r={};r.beginTick=impl_->nightStart;r.endTick=r.beginTick+impl_->duration;r.firstSampleTick=r.beginTick+100;r.lastSampleTick=r.endTick-100;r.exposure.samples=5;r.exposure.suggestedDurationMs=1000;pixels(out,160,120);return true;}
 void CameraClient::cancelNight()noexcept{impl_->nightToken=0;}
-bool captureMonitor(const std::wstring&,int w,int h,bool cursor,Frame& out,std::wstring& e){if(!cursor)++desktopObservations;e.clear();pixels(out,w,h);return true;}
+bool captureMonitor(const std::wstring&,int w,int h,bool cursor,Frame& out,std::wstring& e){
+    if(w==TimeSkipWidth && h==TimeSkipHeight){require(!cursor,"Quiet observation included the desktop cursor");++desktopObservations;}
+    e.clear();pixels(out,w,h);return true;
+}
 struct PersonClient::Impl{bool active=false,pending=false;uint64_t started=0,due=0;person::Source expected;};
 PersonClient::PersonClient(){if(throwConstruction.exchange(false))throw std::bad_alloc();impl_=std::make_unique<Impl>();++detectorConstructions;++detectorLive;}
 PersonClient::~PersonClient(){--detectorLive;}

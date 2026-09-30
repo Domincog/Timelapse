@@ -123,7 +123,8 @@ void Engine::configure(const Settings& s) {
       const int mask = sources(s);
       const bool cameraTierChanged = status_.state == State::Idle && (mask & 2) &&
           cameraResolutionForOutput(s.width, s.height) != cameraResolutionForOutput(settings_.width, settings_.height);
-      if (!sameWatermarkSettings(s.watermark, settings_.watermark)) retirePreview(true);
+      if (!sameWatermarkSettings(s.watermark, settings_.watermark) ||
+          (status_.state == State::Idle && (mask & 1) && s.captureCursor != settings_.captureCursor)) retirePreview(true);
       if (mask != sources(settings_) || s.cameraId != settings_.cameraId || !s.preview || cameraTierChanged) retireCameraInput();
       if (!s.preview || (status_.state == State::Idle && (s.width != settings_.width || s.height != settings_.height)) ||
           mask != sources(settings_) || ((mask & 2) && s.cameraId != settings_.cameraId) ||
@@ -137,10 +138,10 @@ void Engine::retireCameraInput() noexcept {
     if (++cameraInputGeneration_ == 0) ++cameraInputGeneration_;
     status_.cameraInput = {0, 0, cameraInputGeneration_};
 }
-void Engine::retirePreview(bool watermarkOnly) {
-    // Overlay edits invalidate pixels without retiring camera source evidence
+void Engine::retirePreview(bool visualOnly) {
+    // Visual policy edits invalidate pixels without retiring camera source evidence
     // or turning a failed camera attempt into an implicit device retry.
-    if (watermarkOnly) ++watermarkPreviewGeneration_;
+    if (visualOnly) ++visualPreviewGeneration_;
     else ++previewGeneration_;
     status_.preview.reset();
     if (!previewProblem_) return;
@@ -164,6 +165,7 @@ void Engine::record() {
     { std::lock_guard<std::mutex> lock(mutex_); if (status_.state != State::Idle) return;
       ++previewGeneration_; previewProblem_ = false;
       stop_ = pauseRequested_ = pauseTarget_ = false;
+      requestedCursor_ = settings_.captureCursor;
       start_ = true; status_.state = State::Starting; status_.error = false; status_.recordingFailed = false;
       status_.message = L"Preparing recording..."; status_.frames = 0; status_.elapsed = 0; status_.savedPath.clear(); status_.savedPaths.clear();
       status_.completedSegments = 0;
@@ -257,7 +259,7 @@ void Engine::run() {
             if (clearFrame) nightFrameReady = false;
             nightPollAt = nightExpectedAt = Clock::time_point::max();
         };
-        uint64_t previewGeneration = 0, watermarkPreviewGeneration = 0, cameraAttemptGeneration = 0, cameraInputGeneration = 0;
+        uint64_t previewGeneration = 0, visualPreviewGeneration = 0, cameraAttemptGeneration = 0, cameraInputGeneration = 0;
         auto clearCameraInput = [&]() {
             std::lock_guard<std::mutex> lock(mutex_);
             if (cameraInputGeneration != cameraInputGeneration_) return;
@@ -586,7 +588,7 @@ void Engine::run() {
         };
         auto publishPreviewError = [&](const std::wstring& message) {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (start_ || previewGeneration != previewGeneration_ || watermarkPreviewGeneration != watermarkPreviewGeneration_) return;
+            if (start_ || previewGeneration != previewGeneration_ || visualPreviewGeneration != visualPreviewGeneration_) return;
             status_.preview.reset();
             // A preview can recover on its next refresh, but it must not
             // replace a recording or resource error that the user needs to see.
@@ -886,7 +888,7 @@ void Engine::run() {
                   // their settings snapshot has succeeded.
                   quit = quit_;
                   previewGeneration = previewGeneration_;
-                  watermarkPreviewGeneration = watermarkPreviewGeneration_;
+                  visualPreviewGeneration = visualPreviewGeneration_;
                   cameraInputGeneration = cameraInputGeneration_;
                   const auto requiredWork = nightMode ? (nightQueued ? nightPollAt : nightStartAt) : nextFrame;
                   previewOnlyWork = !start_ && !stop_ && !quit_ && !pending &&
@@ -895,6 +897,9 @@ void Engine::run() {
                       snapshot.emplace(settings_);
                       settingsRevision = settingsRevision_;
                       start = start_; stop = stop_; pauseRequested = pauseRequested_; pauseTarget = pauseTarget_; retry = retrySources_;
+                      // Record fixes cursor policy at acceptance even if an idle
+                      // capture delays this worker and next-session edits arrive.
+                      if (start) snapshot->captureCursor = requestedCursor_;
                       start_ = stop_ = pauseRequested_ = retrySources_ = false;
                   } }
                 const auto now = Clock::now();
@@ -1157,7 +1162,7 @@ void Engine::run() {
                 }
                 const auto previewSize = previewDimensions(cfg.width, cfg.height);
                 const int width = captureDue ? cfg.width : previewSize.first, height = captureDue ? cfg.height : previewSize.second;
-                if (needDesktop && ready) ready = captureMonitor(cfg.monitorId, width, height, true, desktop, error);
+                if (needDesktop && ready) ready = captureMonitor(cfg.monitorId, width, height, cfg.captureCursor, desktop, error);
                 if (ready && captureDue && cfg.separateFiles) {
                     ready = compose(&desktop, nullptr, desktopLayers, width, height, composed, error) &&
                         compose(nullptr, &webcam, cameraLayers, width, height, cameraComposed, error);
@@ -1377,7 +1382,7 @@ void Engine::run() {
                 { std::lock_guard<std::mutex> lock(mutex_);
                   // A selection change, Refresh, or Record may have retired
                   // this disposable preview while capture was in flight.
-                  if (previewGeneration != previewGeneration_ || watermarkPreviewGeneration != watermarkPreviewGeneration_) continue;
+                  if (previewGeneration != previewGeneration_ || visualPreviewGeneration != visualPreviewGeneration_) continue;
                   if (cfg.preview && settings_.preview) {
                       auto previous = std::move(status_.preview);
                       status_.preview = previewBuffer;

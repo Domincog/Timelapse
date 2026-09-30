@@ -188,7 +188,7 @@ void offAndManual(const std::filesystem::path& root) {
     std::cout<<"PASS Off/manual zero observation work, smooth growth, frozen policy and pause/resume.\n";
 }
 void pairedActivity(const std::filesystem::path& root) {
-    reset();auto settings=config(root/L"paired");settings.separateFiles=true;
+    reset();auto settings=config(root/L"paired");settings.separateFiles=true;settings.captureCursor=false;
     Engine engine;engine.configure(settings);engine.record();
     await(engine,[](const auto& s){return s.timeSkip.intervalMs>=300;},9000);
     require(checks>=3&&observerCaptures>0,"Sparse paired admission did not retain independent observations");
@@ -388,7 +388,9 @@ bool CameraClient::nightResult(uint64_t token,Frame& output,NightWindowResult& r
 }
 void CameraClient::cancelNight()noexcept{++nightCancels;impl_->token=0;}
 bool captureMonitor(const std::wstring& id,int width,int height,bool cursor,Frame& output,std::wstring& error){
-    ++captures;if(!cursor)++observerCaptures;error.clear();if(id!=L"skip-desktop"){error=L"Unknown synthetic desktop.";return false;}pixels(output,width,height,desktopScene);return true;
+    ++captures;
+    if(width==TimeSkipWidth && height==TimeSkipHeight){require(!cursor,"Quiet observation included the desktop cursor");++observerCaptures;}
+    error.clear();if(id!=L"skip-desktop"){error=L"Unknown synthetic desktop.";return false;}pixels(output,width,height,desktopScene);return true;
 }
 }
 int main(){

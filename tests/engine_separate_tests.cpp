@@ -26,6 +26,7 @@ std::atomic<bool> disconnectCamera{false}, disconnectDesktop{false};
 std::atomic<bool> cameraWarming{false}, allocationFreeCommit{false};
 std::atomic<unsigned> cameraStarts{0}, cameraStops{0}, captures{0}, allocationFailures{0};
 std::atomic<unsigned> recoveryOpens{0};
+std::atomic<bool> cursorPattern{false};
 thread_local bool failAllocation = false;
 }
 void* operator new(std::size_t size) {
@@ -112,7 +113,7 @@ lapse::Settings settings(const std::filesystem::path& folder) {
     result.preview = false; result.folder = folder.wstring();
     return result;
 }
-void resetFaults() { fault = Fault::None; disconnectCamera = disconnectDesktop = cameraWarming = allocationFreeCommit = false; allocationFailures = 0; }
+void resetFaults() { fault = Fault::None; disconnectCamera = disconnectDesktop = cameraWarming = allocationFreeCommit = cursorPattern = false; allocationFailures = 0; }
 std::vector<std::filesystem::path> files(const std::filesystem::path& folder) {
     std::vector<std::filesystem::path> result;
     if (std::filesystem::exists(folder)) for (const auto& item : std::filesystem::directory_iterator(folder)) result.push_back(item.path());
@@ -139,7 +140,7 @@ void protectedFile(const std::filesystem::path& file) {
     require(!MoveFileExW(file.c_str(), stolen.c_str(), 0) && GetLastError() == ERROR_SHARING_VIOLATION, "Active output could be replaced");
 }
 void verify(const std::filesystem::path& path, unsigned frames, bool camera,
-            bool recoveryMode = false, std::vector<LONGLONG>* timestamps = nullptr) {
+            bool recoveryMode = false, std::vector<LONGLONG>* timestamps = nullptr, int expectedCursor = -1) {
     constexpr DWORD stream = static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM);
     ComPtr<IMFSourceReader> reader;
     checked(MFCreateSourceReaderFromURL(path.c_str(), nullptr, &reader), "Cannot reopen output MP4");
@@ -182,6 +183,13 @@ void verify(const std::filesystem::path& path, unsigned frames, bool camera,
                 correct &= std::abs(int(pixels[point.y * stride + point.x]) - expectedY) <= 10 &&
                     std::abs(int(uv[0]) - expectedU) <= 10 && std::abs(int(uv[1]) - expectedV) <= 10;
             }
+            if (correct && expectedCursor >= 0) {
+                const bool white = !camera && expectedCursor != 0;
+                const BYTE* uv = pixels + stride * 240 + 4 * stride + 8;
+                correct &= std::abs(int(pixels[8 * stride + 8]) - (white ? 235 : expectedY)) <= 10 &&
+                    std::abs(int(uv[0]) - (white ? 128 : expectedU)) <= 10 &&
+                    std::abs(int(uv[1]) - (white ? 128 : expectedV)) <= 10;
+            }
             if (twoD) plane->Unlock2D(); else buffer->Unlock();
             require(correct, "Separate output contains wrong source or composited/letterboxed content"); ++decoded;
         }
@@ -203,6 +211,52 @@ void verifyPaths(const lapse::Status& status, unsigned desktopFrames, unsigned c
         require(status.message.find(path) != std::wstring::npos, "Outcome did not name each playable video");
     }
 }
+void cursorPolicy(const std::filesystem::path& root) {
+    resetFaults(); cursorPattern = true;
+    lapse::Engine engine;
+    auto config = settings(root / L"cursor-default");
+    require(config.captureCursor, "Desktop cursor default changed.");
+    const auto stop = [&] {
+        engine.finish(); const auto result = await(engine, [](const auto& s) { return s.state == lapse::State::Idle; });
+        require(!result.error && !result.recordingFailed && result.savedPaths.size() == 2, "Cursor pair failed to save.");
+        return result;
+    };
+    const auto check = [&](const lapse::Status& result, bool cursor) {
+        for (const auto& path : result.savedPaths)
+            verify(path, 1, path.find(L"-camera") != std::wstring::npos, false, nullptr, cursor ? 1 : 0);
+    };
+    engine.configure(config); engine.record();
+    await(engine, [](const auto& s) { return s.frames == 1; }); check(stop(), true);
+
+    config.folder = (root / L"cursor-frozen").wstring(); config.captureCursor = false; config.segmentDurationSeconds = 1;
+    config.preview = true; config.layers = lapse::preset(lapse::Mode::SideBySide);
+    engine.configure(config); engine.record();
+    await(engine, [](const auto& s) { return s.frames == 1 && s.completedSegments == 1; });
+    engine.setPaused(true); await(engine, [](const auto& s) { return s.state == lapse::State::Paused; });
+    const auto pausedPreview = await(engine, [](const auto& s) { return s.preview && s.preview->valid(); }).preview;
+    // Next-session edits while paused cannot change the active session's next
+    // part, including its freshly opened encoder after a completed boundary.
+    config.captureCursor = true; engine.configure(config);
+    const auto refreshed = await(engine, [&](const auto& s) { return s.preview && s.preview != pausedPreview; });
+    bool white = false;
+    for (size_t i = 0; i < refreshed.preview->pixels.size(); i += 4)
+        white |= refreshed.preview->pixels[i] == 255 && refreshed.preview->pixels[i + 1] == 255 && refreshed.preview->pixels[i + 2] == 255;
+    require(!white && refreshed.state == lapse::State::Paused && refreshed.frames == 1,
+        "Active paused preview used a next-session cursor policy or admitted a frame.");
+    engine.setPaused(false);
+    await(engine, [](const auto& s) { return s.frames == 2; });
+    const auto saved = stop();
+    require(saved.frames == 2 && saved.completedSegments == 2, "Cursor policy reset split counters.");
+    const auto parts = files(config.folder); require(parts.size() == 4, "Cursor split did not publish exactly two paired sets.");
+    for (const auto& path : parts)
+        verify(path, 1, path.wstring().find(L"-camera") != std::wstring::npos, false, nullptr, 0);
+
+    config.folder = (root / L"cursor-next-session").wstring(); config.segmentDurationSeconds = 0; config.preview = false;
+    engine.configure(config); engine.record();
+    await(engine, [](const auto& s) { return s.frames == 1; }); check(stop(), true);
+    std::cout << "PASS decoded default/on/off desktop cursor marker, unchanged paired camera, frozen pause/split and next-session setting.\n";
+}
+
 void lifecycle(const std::filesystem::path& root, bool recoveryMode = false) {
     resetFaults(); const auto folder = root / (recoveryMode ? L"recovery-lifecycle" : L"lifecycle"); auto config = settings(folder);
     config.recoveryMode = recoveryMode;
@@ -397,9 +451,13 @@ bool CameraClient::latest(Frame& output, std::wstring& error) {
     if (cameraWarming) { error.clear(); return false; }
     error.clear(); pattern(output, 320, 240, true); return true;
 }
-bool captureMonitor(const std::wstring& id, int width, int height, bool, Frame& output, std::wstring& error) {
+bool captureMonitor(const std::wstring& id, int width, int height, bool cursor, Frame& output, std::wstring& error) {
     if (id != L"synthetic-display" || disconnectDesktop) { error = L"Synthetic display disconnected."; return false; }
-    error.clear(); ++captures; pattern(output, width, height, false); return true;
+    error.clear(); ++captures; pattern(output, width, height, false);
+    if (cursorPattern && cursor) for (int y = 0; y < std::min(height, 16); ++y)
+        for (int x = 0; x < std::min(width, 16); ++x)
+            for (int channel = 0; channel < 3; ++channel) output.pixels[(size_t(y) * width + x) * 4 + channel] = 255;
+    return true;
 }
 }
 int main(int argc, char** argv) {
@@ -413,7 +471,7 @@ int main(int argc, char** argv) {
             std::wcout << L"Hardware artifacts kept at " << root.wstring() << L'\n';
             MFShutdown(); CoUninitialize(); return 0;
         }
-        lifecycle(root);
+        cursorPolicy(root); lifecycle(root);
         lifecycle(root, true); singleRecoveryAndInvalidMode(root);
         for (const auto selected : {Fault::OpenDesktop, Fault::OpenCamera, Fault::WriteDesktop, Fault::WriteCamera,
             Fault::FinishDesktop, Fault::FinishCamera, Fault::SecondPublicationAllocation}) failure(root, selected);
@@ -421,7 +479,7 @@ int main(int argc, char** argv) {
         collision(root, false); collision(root, true); sourceFailure(root, false); sourceFailure(root, true); shutdown(root);
         intervalAndCommit(root); warmupAndInvalidSource(root);
         std::filesystem::remove_all(root);
-        std::cout << "Separate engine: 19 synthetic real-encoder case groups passed.\n";
+        std::cout << "Separate engine: 20 synthetic real-encoder case groups passed.\n";
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; std::wcerr << L"Artifacts kept at " << root.wstring() << L'\n'; result = 1; }
     MFShutdown(); CoUninitialize(); return result;
 }

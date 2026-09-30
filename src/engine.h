@@ -42,6 +42,9 @@ struct Settings {
     WatermarkSettings watermark;
     // Optional fragmented H.264 MP4; ordinary MP4 remains the default.
     bool recoveryMode = false;
+    // Include the native cursor in desktop video and preview. Frozen with the
+    // session; dedicated desktop Quiet observations always omit the cursor.
+    bool captureCursor = true;
 };
 struct TimeSkipStatus {
     bool enabled = false;
@@ -101,7 +104,7 @@ public:
 private:
     void run();
     // Called with mutex_ held when a preview selection is retired.
-    void retirePreview(bool watermarkOnly = false);
+    void retirePreview(bool visualOnly = false);
     // Called with mutex_ held. Invalidates in-flight input-size publication.
     void retireCameraInput() noexcept;
     std::mutex mutex_;
@@ -109,9 +112,10 @@ private:
     Settings settings_;
     Status status_;
     uint64_t previewGeneration_ = 0;
-    uint64_t watermarkPreviewGeneration_ = 0;
+    uint64_t visualPreviewGeneration_ = 0;
     uint64_t cameraInputGeneration_ = 0;
     uint64_t settingsRevision_ = 0;
+    bool requestedCursor_ = true;
     bool previewProblem_ = false;
     bool quit_ = false, start_ = false, stop_ = false, pauseRequested_ = false, pauseTarget_ = false, retrySources_ = false;
     std::thread worker_;
