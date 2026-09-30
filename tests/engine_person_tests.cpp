@@ -5,6 +5,7 @@
 #include "camera_host.h"
 #include "person_client.h"
 #include "capture.h"
+#include "engine_segment_decode.h"
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
@@ -186,6 +187,22 @@ void scheduledNight(const std::filesystem::path& root) {
     {std::lock_guard<std::mutex> lock(evidenceMutex);require(!nightDurations.empty(),"Night exposure never started");for(auto n:nightDurations)require(n==1000,"Person return truncated Night integration");}
     std::cout<<"scheduled outside-window observation and paired Night finalization passed\n";
 }
+void splitPresenceContinuity(const std::filesystem::path& root) {
+    resetEvidence(); Engine e; auto s=configuration(root/L"split-person");
+    s.segmentDurationSeconds=1; s.recordingLimitSeconds=5; s.separateFiles=true;
+    e.configure(s); e.record();
+    await(e,[](const auto& x){return x.completedSegments>=2&&x.timeSkip.intervalMs>120&&x.timeSkip.reason==TimeSkipReason::NoPerson;},4500);
+    require(detectorStarts==1&&detectorLive==1&&activityCalls==0&&desktopObservations==0,
+        "File rollover restarted the detector or enabled unrelated observations");
+    {std::lock_guard<std::mutex> lock(evidenceMutex);require(tokens.size()==1,"Split reset person evidence token");}
+    verdict=2;
+    await(e,[](const auto& x){return x.timeSkip.reason==TimeSkipReason::PersonPresent&&x.timeSkip.intervalMs==100;},1800);
+    const auto done=await(e,[](const auto& x){return x.state==State::Idle;},4000);
+    require(done.elapsed>=5&&done.elapsed<6.5&&detectorStarts==1&&detectorLive==0&&
+        done.message.find(L"time limit")!=std::wstring::npos,"Split person session lost clock, limit or cleanup");
+    boundedCadence(); split_test::verify(s.folder,done,true);
+    std::cout<<"split files preserve absence dwell, detector lifetime, person return and shared playback\n";
+}
 }
 
 namespace lapse {
@@ -237,7 +254,7 @@ bool PersonClient::submit(const CameraPersonInput& input)noexcept{if(!impl_->act
 int main(){
     const HRESULT com=CoInitializeEx(nullptr,COINIT_MULTITHREADED);if(FAILED(com))return 1;if(FAILED(MFStartup(MF_VERSION))){CoUninitialize();return 1;}
     const auto root=std::filesystem::current_path()/(L"engine-person-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64()));int code=0;
-    try{offAndNoCamera(root/L"isolation");accelerateAndActivity(root);pauseProvenance(root);malformedAndDuplicate(root);failuresLatch(root/L"failures");asynchronousDeadlines(root);scheduledNight(root);
+    try{offAndNoCamera(root/L"isolation");accelerateAndActivity(root);pauseProvenance(root);malformedAndDuplicate(root);failuresLatch(root/L"failures");asynchronousDeadlines(root);scheduledNight(root);splitPresenceContinuity(root);
         std::filesystem::remove_all(root);std::cout<<"All synthetic person engine contracts passed.\n";
     }catch(const std::exception& e){std::cerr<<e.what()<<'\n';std::wcerr<<L"Retained artifacts: "<<root.wstring()<<L'\n';code=1;}
     MFShutdown();CoUninitialize();return code;

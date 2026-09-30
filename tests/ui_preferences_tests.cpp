@@ -58,7 +58,7 @@ namespace {
 std::function<void()> beforePreferenceReplace;
 int replacementAttempts=0;
 DWORD replacementError=ERROR_SUCCESS;
-enum class WriteFault { None, DenySecond, DenyCompression, ThrowAfterFirst };
+enum class WriteFault { None, DenySecond, DenyCompression, DenySegment, ThrowAfterFirst };
 WriteFault writeFault=WriteFault::None;
 int keyWrites=0, failedKeyWrites=0, syntheticExceptions=0, saveDiagnostics=0;
 DWORD keyWriteError=ERROR_SUCCESS;
@@ -69,7 +69,7 @@ BOOL WINAPI fixtureWriteProfile(LPCWSTR section,LPCWSTR key,LPCWSTR value,LPCWST
     if(section&&key){
         ++keyWrites;
         if(!result){++failedKeyWrites;keyWriteError=error;}
-        const int denyAt=writeFault==WriteFault::DenySecond?2:writeFault==WriteFault::DenyCompression?21:0;
+        const int denyAt=writeFault==WriteFault::DenySecond?2:writeFault==WriteFault::DenyCompression?22:writeFault==WriteFault::DenySegment?11:0;
         if(denyAt && keyWrites==denyAt-1 && result){
             deniedWrite=CreateFileW(path,GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
             if(deniedWrite==INVALID_HANDLE_VALUE)throw std::runtime_error("Cannot deny the next owned staging write.");
@@ -122,6 +122,7 @@ struct HiddenControls {
             for(int i=0;i<count;++i)add(window,std::to_wstring(i));choose(window,0);return window;
         };
         app.mode=combo(6);app.interval=combo(6);app.videoSize=combo(2);app.encodingQuality=combo(3);app.encodingMode=combo(5);app.stopAfter=combo(6);
+        app.splitEvery=combo(5);
         app.lowDisk=CreateWindowExW(0,L"BUTTON",L"Stop on low disk space",WS_CHILD|BS_AUTOCHECKBOX,0,0,200,30,app.window,nullptr,nullptr,nullptr);
         require(app.lowDisk!=nullptr,"Cannot create owned low disk option.");SendMessageW(app.lowDisk,BM_SETCHECK,BST_CHECKED,0);
         app.recoveryMode=CreateWindowExW(0,L"BUTTON",L"MP4 recovery mode (H.264)",WS_CHILD|BS_AUTOCHECKBOX,0,0,300,30,app.window,nullptr,nullptr,nullptr);
@@ -241,7 +242,7 @@ void newUnicodeFile(){
 }
 void existingUnicodeRewrite(){
     PreferencesFixture fixture;
-    const std::wstring initial=L"[Settings]\r\nFolder="+unicodeFolder+L"\r\nInterval=5\r\nQuality=1\r\nEncodingQuality=2\r\nEncodingMode=0\r\nRecordingLimit=0\r\nStopOnLowDiskSpace=1\r\nRecoveryMode=0\r\nNightEnabled=0\r\nNightDurationMs=0\r\nNightTargetBrightness=96\r\nCaptureIntervalMs=5000\r\nVideoWidth=1280\r\nVideoHeight=720\r\nRecordingLimitSeconds=900\r\nTimeSkipMode=0\r\nTimeSkipMultiplier=4\r\nTimeSkipQuietAfterMs=120000\r\nTimeSkipRampFrames=30\r\nTimeSkipRepeatSeconds=0\r\nTimeSkipRanges=\r\n";
+    const std::wstring initial=L"[Settings]\r\nFolder="+unicodeFolder+L"\r\nInterval=5\r\nQuality=1\r\nEncodingQuality=2\r\nEncodingMode=0\r\nRecordingLimit=0\r\nStopOnLowDiskSpace=1\r\nRecoveryMode=0\r\nNightEnabled=0\r\nNightDurationMs=0\r\nNightTargetBrightness=96\r\nCaptureIntervalMs=5000\r\nVideoWidth=1280\r\nVideoHeight=720\r\nRecordingLimitSeconds=900\r\nSegmentDurationSeconds=0\r\nTimeSkipMode=0\r\nTimeSkipMultiplier=4\r\nTimeSkipQuietAfterMs=120000\r\nTimeSkipRampFrames=30\r\nTimeSkipRepeatSeconds=0\r\nTimeSkipRanges=\r\n";
     fixture.seed(utf16(initial));reload();expectOptions(unicodeFolder,5,1,2);
     const auto initialBytes=fixture.bytes();
     const std::wstring changed=L"C:\\Synthetic videos\\\u65e5\u672c\u8a9e-\U0001f3a5";
@@ -283,6 +284,29 @@ void recordingLimits(){
         reload();require(choice(app.stopAfter)==0,"Invalid recording limit enabled automatic stop.");
     }
     fixture.onlySettingsRemain();std::cout<<"PASS recording limits roundtrip; old or invalid settings remain unlimited\n";
+}
+void segmentOptions(){
+    PreferencesFixture fixture;fixture.seed(legacy);reload();configure();
+    require(!app.settings.segmentDurationSeconds && choice(app.splitEvery)==0,"Old preferences enabled splitting.");
+    for(int seconds:{0,900,3600,21600,86400,1,90,2147483647}){
+        app.customSegmentSeconds=seconds;app.hasCustomSegment=true;app.committedSegment=5;normalizeCustomSelections();customItems();configure();preferences(true);
+        choose(app.splitEvery,0);reload();configure();
+        wchar_t value[48]{};GetPrivateProfileStringW(L"Settings",L"SegmentDurationSeconds",L"",value,48,app.preferences.c_str());
+        require(app.settings.segmentDurationSeconds==seconds && std::wstring(value)==std::to_wstring(seconds) && choice(app.mode)==0,
+            "Split seconds lost exact atomic roundtrip or Desktop startup.");
+        const bool preset=std::find(std::begin(SegmentDurations),std::end(SegmentDurations),seconds)!=std::end(SegmentDurations);
+        require(app.hasCustomSegment!=preset && SendMessageW(app.splitEvery,CB_GETCOUNT,0,0)==(preset?6:7),"Split load duplicated a preset or lost its permanent Custom action.");
+    }
+    for(const wchar_t* invalid:{L"",L"-1",L"1.5",L"1junk",L"01",L"2147483648",L"999999999999999999999999999999999999999999999999999999999"}){
+        require(WritePrivateProfileStringW(L"Settings",L"SegmentDurationSeconds",invalid,app.preferences.c_str()),"Cannot seed malformed splitting preference.");reload();configure();
+        require(!app.settings.segmentDurationSeconds && !app.hasCustomSegment && choice(app.splitEvery)==0,"Malformed saved split enabled partial/stale settings.");
+    }
+    require(WritePrivateProfileStringW(L"Settings",L"SegmentDurationSeconds",L"90",app.preferences.c_str()),"Cannot seed prior split.");reload();configure();
+    const auto previous=fixture.bytes();choose(app.splitEvery,2);configure();keyWrites=failedKeyWrites=0;writeFault=WriteFault::DenySegment;preferences(true);writeFault=WriteFault::None;
+    require(keyWrites==11 && failedKeyWrites==1 && fixture.bytes()==previous,"Failed split-key write published a partial settings file.");reload();configure();
+    require(app.settings.segmentDurationSeconds==90,"Failed transaction lost the prior exact split setting.");
+    expectUnknownContent(fixture);fixture.onlySettingsRemain();
+    std::cout<<"PASS exact split presets/custom/max/off preferences, strict malformed fallback, preset normalization and atomic split-key failure\n";
 }
 void diskSafety(){
     PreferencesFixture fixture;fixture.seed(legacy);reload();
@@ -474,7 +498,7 @@ void timeCompressionPreferences(){
     require(app.settings.timeSkip.mode==TimeSkipMode::Off,"Unknown numeric policy mode enabled a partial policy.");
     restore();reload();app.settings.timeSkip.mode=TimeSkipMode::NoPersonWithinSchedule;preferences(true);reload();
     const auto before=fixture.bytes();keyWrites=0;app.settings.timeSkip={};writeFault=WriteFault::DenyCompression;preferences(true);writeFault=WriteFault::None;
-    require(keyWrites==21 && failedKeyWrites==1 && fixture.bytes()==before,"Final compression-key failure published a partial policy.");
+    require(keyWrites==22 && failedKeyWrites==1 && fixture.bytes()==before,"Final compression-key failure published a partial policy.");
     fixture.onlySettingsRemain();reload();require(app.settings.timeSkip.mode==TimeSkipMode::NoPersonWithinSchedule,"Failed complete policy write lost original mode.");
     app.settings.timeSkip={};
     std::cout<<"PASS real compression preferences: exact six-key policy, every missing/malformed key Off, bounded ranges, merged loads, preserved content and final-key atomic failure\n";
@@ -525,6 +549,7 @@ void checkpointBeforeRecording(){
     SendMessageW(app.recoveryMode,BM_SETCHECK,BST_CHECKED,0);
     app.settings.timeSkip.mode=TimeSkipMode::NoPerson;app.settings.timeSkip.quietAfterMs=90000;app.settings.timeSkip.multiplier=8;
     app.hasCustomInterval=true;app.customIntervalMs=2500;app.committedInterval=6;
+    app.hasCustomSegment=true;app.customSegmentSeconds=777;app.committedSegment=5;
     app.hasCustomLimit=true;app.customLimitSeconds=3700;app.committedLimit=6;customItems();
     windowProc(app.window,WM_COMMAND,MAKEWPARAM(IntervalBox,CBN_SELCHANGE),reinterpret_cast<LPARAM>(app.interval));
     windowProc(app.window,WM_COMMAND,NightBox,0);
@@ -535,7 +560,7 @@ void checkpointBeforeRecording(){
     require(!lapse::recordCalls && !replacementAttempts && !keyWrites && fixture.bytes()==original,"Invalid source/Night Record wrote settings or started capture.");
     lapse::beforeRecording=[&]{require(replacementAttempts==1 && fixture.bytes()!=original,"Capture began before its preference checkpoint.");};
     windowProc(app.window,WM_COMMAND,Record,0);
-    require(lapse::recordCalls==1 && lapse::recordedSettings.intervalMs==2500 && lapse::recordedSettings.recordingLimitSeconds==3700 &&
+    require(lapse::recordCalls==1 && lapse::recordedSettings.intervalMs==2500 && lapse::recordedSettings.recordingLimitSeconds==3700 && lapse::recordedSettings.segmentDurationSeconds==777 &&
         lapse::recordedSettings.recoveryMode && lapse::recordedSettings.night.enabled && lapse::recordedSettings.night.durationMs==2000 && lapse::recordedSettings.night.targetBrightness==128 &&
         lapse::recordedSettings.timeSkip.mode==TimeSkipMode::NoPerson && lapse::recordedSettings.timeSkip.quietAfterMs==90000,
         "Accepted Record did not use the exact checkpointed custom/Night/person settings.");
@@ -552,7 +577,7 @@ void checkpointBeforeRecording(){
     require(replacementAttempts==1 && keyWrites==writes,"Status polling introduced periodic preference writes.");
     // Simulate reopening after interruption without WM_DESTROY or another save.
     reload();app.settings.layers=preset(Mode::Desktop);configure();
-    require(choice(app.mode)==0 && app.settings.intervalMs==2500 && app.settings.recordingLimitSeconds==3700 &&
+    require(choice(app.mode)==0 && app.settings.intervalMs==2500 && app.settings.recordingLimitSeconds==3700 && app.settings.segmentDurationSeconds==777 &&
         SendMessageW(app.nightEnabled,BM_GETCHECK,0,0)==BST_CHECKED && choice(app.nightDuration)==2 && choice(app.nightTarget)==2 &&
         app.settings.recoveryMode && !app.settings.night.enabled && app.settings.timeSkip.mode==TimeSkipMode::NoPerson && app.settings.timeSkip.quietAfterMs==90000,
         "Interrupted-session restart lost checkpointed settings or silently enabled camera capture.");
@@ -573,10 +598,10 @@ int main(){
     try{
         std::cout<<std::unitbuf;std::cout<<"ACP="<<GetACP()<<'\n';
         HiddenControls controls;
-        newUnicodeFile();existingUnicodeRewrite();migrateAnsi();encodingModes();recordingLimits();diskSafety();recoveryOptions();nightOptions();customOptions();readFailure();replacementFailure();
+        newUnicodeFile();existingUnicodeRewrite();migrateAnsi();encodingModes();recordingLimits();segmentOptions();diskSafety();recoveryOptions();nightOptions();customOptions();readFailure();replacementFailure();
         preparationAllocationFailure();partialKeyWriteFailure();stagedExceptionCleanup();
         preferencePathBoundary(248);preferencePathBoundary(278);timeCompressionPreferences();checkpointBeforeRecording();
         require(!IsWindowVisible(app.window),"Fixture became visible.");
-        std::cout<<"All 18 preference cases passed; only owned hidden controls/settings were used.\n";return 0;
+        std::cout<<"All 19 preference cases passed; only owned hidden controls/settings were used.\n";return 0;
     }catch(const std::exception& error){std::cerr<<"PREFERENCES TEST FAILURE: "<<error.what()<<'\n';return 1;}
 }

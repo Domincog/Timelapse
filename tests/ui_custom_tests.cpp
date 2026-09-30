@@ -32,28 +32,29 @@ INT_PTR WINAPI ownedDialog(HINSTANCE instance,LPCDLGTEMPLATEW resource,HWND owne
 void setupCustom(){
     app.advanced=app.nightHint=app.nightDetail=nullptr;
     app.hasCustomInterval=app.hasCustomSize=app.hasCustomLimit=false;
+    app.hasCustomSegment=false;app.committedSegment=0;app.customSegmentSeconds=900;choose(app.splitEvery,0);
     app.customIntervalMs=5000;app.customWidth=1280;app.customHeight=720;app.customLimitSeconds=900;
     app.committedInterval=2;app.committedSize=app.committedLimit=0;
     choose(app.interval,2);choose(app.videoSize,0);choose(app.stopAfter,0);
     customItems();seed(false);dialogCalls=0;failDialog=false;dialogScript={};
 }
 void invoke(CustomKind kind){
-    HWND box=kind==CustomKind::Interval?app.interval:kind==CustomKind::Size?app.videoSize:app.stopAfter;
-    int id=kind==CustomKind::Interval?IntervalBox:kind==CustomKind::Size?SizeBox:StopAfterBox;
+    HWND box=kind==CustomKind::Interval?app.interval:kind==CustomKind::Size?app.videoSize:kind==CustomKind::Segment?app.splitEvery:app.stopAfter;
+    int id=kind==CustomKind::Interval?IntervalBox:kind==CustomKind::Size?SizeBox:kind==CustomKind::Segment?SegmentBox:StopAfterBox;
     const int action=static_cast<int>(SendMessageW(box,CB_GETCOUNT,0,0))-1;
     choose(box,action);windowProc(app.window,WM_COMMAND,MAKEWPARAM(id,CBN_SELCHANGE),reinterpret_cast<LPARAM>(box));
 }
 void accept(HWND window){customProc(window,WM_COMMAND,IDOK,0);}
 void intervalAndCancellation(){
     HiddenFixture owned;setupCustom();const Settings original=app.settings;const int calls=lapse::configurationCalls;
-    for(auto kind:{CustomKind::Interval,CustomKind::Size,CustomKind::Limit}){
+    for(auto kind:{CustomKind::Interval,CustomKind::Size,CustomKind::Limit,CustomKind::Segment}){
         dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<CustomDraft*>(parameter);
             require(GetNextDlgTabItem(window,draft.first,FALSE)==(draft.second?draft.second:draft.units),"Custom dialog tab order skipped its second field.");
             SetWindowTextW(draft.first,L"invalid draft");customProc(window,WM_CLOSE,0,0);};
         invoke(kind);
     }
     require(app.settings.intervalMs==original.intervalMs && app.settings.width==original.width && app.settings.height==original.height &&
-        app.settings.recordingLimitSeconds==0 && lapse::configurationCalls==calls && choice(app.interval)==2 && choice(app.videoSize)==0 && choice(app.stopAfter)==0,
+        app.settings.recordingLimitSeconds==0 && app.settings.segmentDurationSeconds==0 && lapse::configurationCalls==calls && choice(app.interval)==2 && choice(app.videoSize)==0 && choice(app.stopAfter)==0 && choice(app.splitEvery)==0,
         "Cancel changed committed settings, selection or engine configuration.");
     dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<CustomDraft*>(parameter);
         SetWindowTextW(draft.first,(L"1"+std::wstring(110,L' ')+L"junk").c_str());accept(window);
@@ -96,8 +97,8 @@ void activeAndNight(){
     HiddenFixture owned;setupCustom();
     for(auto state:{State::Starting,State::Recording,State::Paused,State::Finishing}){
         app.status.state=state;const int calls=lapse::configurationCalls;
-        for(auto kind:{CustomKind::Interval,CustomKind::Size,CustomKind::Limit})invoke(kind);
-        require(!dialogCalls && lapse::configurationCalls==calls && app.settings.intervalMs==5000 && app.settings.width==1280 && app.settings.recordingLimitSeconds==0,
+        for(auto kind:{CustomKind::Interval,CustomKind::Size,CustomKind::Limit,CustomKind::Segment})invoke(kind);
+        require(!dialogCalls && lapse::configurationCalls==calls && app.settings.intervalMs==5000 && app.settings.width==1280 && app.settings.recordingLimitSeconds==0 && app.settings.segmentDurationSeconds==0 && choice(app.splitEvery)==0,
             "Active session accepted a forged custom command.");
     }
     app.status={};sourceMode(Mode::Camera);SendMessageW(app.nightEnabled,BM_SETCHECK,BST_CHECKED,0);choose(app.nightDuration,0);configure();
@@ -109,6 +110,37 @@ void activeAndNight(){
     failDialog=true;const int interval=app.settings.intervalMs;invoke(CustomKind::Interval);
     require(app.settings.intervalMs==interval && !app.customDialog && startupMessage.find(L"could not be opened")!=std::wstring::npos,"Dialog failure lost committed state or recovery message.");
     std::cout<<"PASS active command guards, camera-only subsecond Night validation and failed dialog recovery\n";
+}
+void segmentDurations(){
+    HiddenFixture owned;setupCustom();
+    require(!app.settings.segmentDurationSeconds && SendMessageW(app.splitEvery,CB_GETCOUNT,0,0)==6,"Splitting was enabled by default or lost Custom action.");
+    for(int i=0;i<5;++i){choose(app.splitEvery,i);windowProc(app.window,WM_COMMAND,MAKEWPARAM(SegmentBox,CBN_SELCHANGE),0);
+        require(app.settings.segmentDurationSeconds==SegmentDurations[i] && lapse::configured.segmentDurationSeconds==SegmentDurations[i],"Split preset did not reach exact engine setting.");}
+    dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<CustomDraft*>(parameter);
+        wchar_t help[512]{};GetWindowTextW(draft.help,help,512);
+        require(draft.kind==CustomKind::Segment && std::wstring(help).find(L"Shorter parts")!=std::wstring::npos,"Split dialog did not explain its active-time/overhead meaning.");
+        for(auto invalid:{L"0",L"0.5",L"1.001",L"2147483648",L"1x"}){SetWindowTextW(draft.first,invalid);accept(window);require(!dialogOutcome,"Invalid split duration was accepted.");}
+        const std::wstring pasted=L"1"+std::wstring(110,L' ')+L"junk";SendMessageW(draft.first,EM_SETSEL,0,-1);SendMessageW(draft.first,EM_REPLACESEL,FALSE,reinterpret_cast<LPARAM>(pasted.c_str()));
+        accept(window);require(!dialogOutcome && GetWindowTextLengthW(draft.first)==96,"Native split paste accepted a truncated prefix.");
+        SetWindowTextW(draft.first,L"2147483647");accept(window);};
+    invoke(CustomKind::Segment);require(app.settings.segmentDurationSeconds==INT_MAX && app.committedSegment==5 && app.hasCustomSegment,"Maximum whole-second split overflowed.");
+    dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<CustomDraft*>(parameter);require(caption(draft.first)==L"2147483647","Exact split value lost on reopen.");
+        SetWindowTextW(draft.first,L"1.5");choose(draft.units,1);accept(window);};
+    invoke(CustomKind::Segment);require(app.settings.segmentDurationSeconds==90 && caption(app.splitEvery)==L"1.5 min","Exact custom split unit conversion failed.");
+    sourceMode(static_cast<Mode>(SeparateFilesMode));SendMessageW(app.nightEnabled,BM_SETCHECK,BST_CHECKED,0);choose(app.nightDuration,0);choose(app.interval,2);
+    dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<CustomDraft*>(parameter);SetWindowTextW(draft.first,L"1");accept(window);};
+    invoke(CustomKind::Segment);record();
+    require(lapse::recorded.segmentDurationSeconds==1 && lapse::recorded.intervalMs==5000 && lapse::recorded.night.enabled && lapse::recorded.separateFiles,
+        "Short split was silently coerced or blocked paired/Night recording.");
+    for(State state:{State::Starting,State::Recording,State::Paused,State::Finishing}){
+        app.status.state=state;updateControls();const int calls=lapse::configurationCalls;choose(app.splitEvery,0);
+        windowProc(app.window,WM_COMMAND,MAKEWPARAM(SegmentBox,CBN_SELCHANGE),0);
+        require(!IsWindowEnabled(app.splitEvery) && choice(app.splitEvery)==5 && app.settings.segmentDurationSeconds==1 && lapse::configurationCalls==calls,"Active split setting changed or displayed a false selection.");}
+    app.status=lapse::fixtureStatus={};
+    dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<CustomDraft*>(parameter);SetWindowTextW(draft.first,L"6");choose(draft.units,2);accept(window);};
+    invoke(CustomKind::Segment);require(app.settings.segmentDurationSeconds==21600 && choice(app.splitEvery)==3 && !app.hasCustomSegment && SendMessageW(app.splitEvery,CB_GETCOUNT,0,0)==6,
+        "Preset-equivalent split retained a duplicate custom row.");
+    std::cout<<"PASS exact split presets/custom/native paste, short paired/Night split, active locks and preset normalization\n";
 }
 void dialogDpiAndLifecycle(){
     HiddenFixture owned;setupCustom();
@@ -125,7 +157,7 @@ void dialogDpiAndLifecycle(){
             customReveal(window,draft,draft.cancel);RECT bounds{},client{};GetWindowRect(draft.cancel,&bounds);MapWindowPoints(nullptr,window,reinterpret_cast<POINT*>(&bounds),2);GetClientRect(window,&client);
             require(bounds.left>=0 && bounds.top>=0 && bounds.right<=client.right && bounds.bottom<=client.bottom,"Constrained dialog cannot reveal its Cancel button.");
             customProc(window,WM_COMMAND,IDCANCEL,0);};
-        invoke(CustomKind::Interval);require(!app.customDialog,"Destroyed custom dialog retained its HWND.");
+        invoke(CustomKind::Interval);invoke(CustomKind::Segment);require(!app.customDialog,"Destroyed custom dialog retained its HWND.");
     }
     dialogScript=[](HWND,LPARAM){windowProc(app.window,WM_COMMAND,TrayExit,0);};invoke(CustomKind::Interval);
     require(!IsWindow(app.window) && !app.customDialog,"Tray Exit left an owned custom dialog or owner behind.");
@@ -149,7 +181,7 @@ void nativeNumericInsertion(){
 }
 }
 int main(){
-    try{intervalAndCancellation();dimensionsAndLimit();activeAndNight();nativeNumericInsertion();dialogDpiAndLifecycle();
+    try{intervalAndCancellation();dimensionsAndLimit();activeAndNight();segmentDurations();nativeNumericInsertion();dialogDpiAndLifecycle();
         std::cout<<"All custom UI cases passed with hidden controls and synthetic engine.\n";return 0;
     }catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
 }

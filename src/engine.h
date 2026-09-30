@@ -26,6 +26,9 @@ struct Settings {
     // Active recording time, excluding initial startup and pauses. Nonpositive
     // values keep recording until the user finishes or a capture/save fails.
     int recordingLimitSeconds = 0;
+    // Split at active recording-time boundaries; zero keeps one output set.
+    // Pauses/initial preparation are excluded; automatic saving stays active.
+    int segmentDurationSeconds = 0;
     // Best-effort room for finalization; query failure also stops admission.
     // Disable only for destinations that cannot report caller-available space.
     bool stopOnLowDiskSpace = true;
@@ -47,15 +50,20 @@ struct TimeSkipStatus {
 };
 struct Status {
     State state = State::Idle;
-    // Samples submitted to every active output; a failed second write can
-    // leave one additional desktop frame, reported in the final message.
+    // Session-wide samples submitted to every output, including closed parts.
+    // A failed second write can leave one additional desktop frame, reported
+    // in the final message. Never resets at a file boundary.
     uint64_t frames = 0;
     double elapsed = 0;
     std::wstring message = L"Choose a source, then record.";
     std::wstring savedPath;
-    // All finalized playable videos, including retained .recording.mp4 files.
+    // Latest finalized output set (at most two paths), including retained
+    // .recording.mp4 files. Earlier split parts remain in the session folder.
     // savedPath remains the first entry for existing single-file callers.
     std::vector<std::wstring> savedPaths;
+    // Fully published segment sets in a split session; zero when splitting is
+    // off. Paired desktop/camera files count as one set. Never resets at rollover.
+    uint64_t completedSegments = 0;
     bool error = false;
     // Preview errors do not change the outcome of the last recording attempt.
     bool recordingFailed = false;

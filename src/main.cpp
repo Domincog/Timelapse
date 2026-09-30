@@ -24,11 +24,14 @@ using namespace lapse;
 namespace {
 constexpr COLORREF Ink = RGB(25, 38, 45), Muted = RGB(88, 106, 113), Accent = RGB(0, 116, 113);
 constexpr COLORREF Background = RGB(247, 249, 250), Canvas = RGB(21, 28, 34);
-enum Id { ModeBox = 100, IntervalBox, SizeBox, EncodingQualityBox, MonitorBox, CameraBox, Refresh, Record, Pause, Finish, Folder, OpenFolder, Reset, Forward, Preview, EncodingModeBox, AdvancedToggle, StopAfterBox, LowDiskBox, NightBox, NightDurationBox, NightTargetBox, NightHint, NightDetail, SkipConfigure, SkipSummary, SkipDetail, RecoveryBox };
+enum Id { ModeBox = 100, IntervalBox, SizeBox, EncodingQualityBox, MonitorBox, CameraBox, Refresh, Record, Pause, Finish, Folder, OpenFolder, Reset, Forward, Preview, EncodingModeBox, AdvancedToggle, StopAfterBox, LowDiskBox, NightBox, NightDurationBox, NightTargetBox, NightHint, NightDetail, SkipConfigure, SkipSummary, SkipDetail, RecoveryBox, SegmentBox };
 constexpr int RecordingLimits[] = {0,900,3600,14400,28800,86400};
 constexpr int CaptureIntervals[] = {1000,2000,5000,10000,30000,60000};
 constexpr const wchar_t* RecordingLimitLabels[] = {L"Never",L"15 minutes",L"1 hour",L"4 hours",L"8 hours",L"24 hours"};
 constexpr const wchar_t* RecordingLimitShortLabels[] = {L"Never",L"15 min",L"1 hour",L"4 hours",L"8 hours",L"24 hours"};
+constexpr int SegmentDurations[] = {0,900,3600,21600,86400};
+constexpr const wchar_t* SegmentLabels[] = {L"Never",L"15 minutes",L"1 hour",L"6 hours",L"24 hours"};
+constexpr wchar_t SegmentHelp[] = L"Split by active recording time, not video length. Pauses and initial preparation do not count; automatic saving does. Empty periods create no files. Shorter parts add processing and file overhead. Paired desktop/camera files share each part. No crash or power-loss guarantee.";
 constexpr int NightDurations[] = {0,1000,2000,5000,10000,30000};
 constexpr const wchar_t* NightDurationLabels[] = {L"Auto",L"1 second",L"2 seconds",L"5 seconds",L"10 seconds",L"30 seconds"};
 constexpr int NightTargets[] = {64,96,128};
@@ -49,6 +52,7 @@ struct App {
     HWND skipConfigure{},skipSummary{},skipDetail{};
     HWND mode{}, interval{}, videoSize{}, encodingQuality{}, encodingMode{}, monitor{}, camera{}, refresh{}, record{}, pause{}, finish{}, folder{}, openFolder{}, reset{}, forward{};
     HWND advanced{}, stopAfter{}, lowDisk{}, recoveryMode{}, nightEnabled{}, nightDuration{}, nightTarget{}, nightHint{}, nightDetail{}, labels[10]{};
+    HWND segmentLabel{}, splitEvery{};
     HFONT font{}, titleFont{}, smallFont{};
     HBRUSH background = CreateSolidBrush(Background);
     int dpi = 96, selected = -1, modeIndex = 0;
@@ -62,9 +66,12 @@ struct App {
     State controlsState = State::Idle;
     bool advancedExpanded = false;
     int advancedLimitIndex = -1, advancedVisibility = -1, advancedNightState = -1, advancedRecoveryState = -1, nightVisibility = -1;
+    int advancedSegmentSeconds = -1;
     int customIntervalMs=5000, customWidth=1280, customHeight=720, customLimitSeconds=900;
     int committedInterval=2, committedSize=0, committedLimit=0;
     bool hasCustomInterval=false, hasCustomSize=false, hasCustomLimit=false;
+    int customSegmentSeconds=900, committedSegment=0;
+    bool hasCustomSegment=false;
     std::wstring advancedCaption, advancedTooltip;
     std::wstring skipSummaryCaption,skipDetailCaption;
     int skipRevision=0,advancedSkipRevision=-1,skipSummaryRevision=-1,skipVisibility=-1;
@@ -183,6 +190,10 @@ int selectedLimit() {
     const int selected=choice(app.stopAfter);
     return app.hasCustomLimit && selected==6 ? app.customLimitSeconds : RecordingLimits[std::clamp(selected,0,5)];
 }
+int selectedSegment() {
+    const int selected=app.splitEvery?choice(app.splitEvery):0;
+    return app.hasCustomSegment && selected==5 ? app.customSegmentSeconds : SegmentDurations[std::clamp(selected,0,4)];
+}
 std::wstring sizeText(int width,int height) { return std::to_wstring(width)+L" × "+std::to_wstring(height); }
 void customItems(HWND box,int presets,bool custom,const std::wstring& value,int selected) {
     while(SendMessageW(box,CB_GETCOUNT,0,0)>presets)SendMessageW(box,CB_DELETESTRING,presets,0);
@@ -193,6 +204,7 @@ void customItems() {
     customItems(app.interval,6,app.hasCustomInterval,formatDuration(app.customIntervalMs),app.committedInterval);
     customItems(app.videoSize,2,app.hasCustomSize,sizeText(app.customWidth,app.customHeight),app.committedSize);
     customItems(app.stopAfter,6,app.hasCustomLimit,formatDuration(int64_t(app.customLimitSeconds)*1000,true),app.committedLimit);
+    customItems(app.splitEvery,5,app.hasCustomSegment,formatDuration(int64_t(app.customSegmentSeconds)*1000,true),app.committedSegment);
 }
 void normalizeCustomSelections() {
     if(app.hasCustomInterval)for(int i=0;i<6;++i)if(CaptureIntervals[i]==app.customIntervalMs){app.hasCustomInterval=false;app.committedInterval=i;break;}
@@ -200,6 +212,7 @@ void normalizeCustomSelections() {
         app.hasCustomSize=false;app.committedSize=app.customWidth==1280?0:1;
     }
     if(app.hasCustomLimit)for(int i=1;i<6;++i)if(RecordingLimits[i]==app.customLimitSeconds){app.hasCustomLimit=false;app.committedLimit=i;break;}
+    if(app.hasCustomSegment)for(int i=0;i<5;++i)if(SegmentDurations[i]==app.customSegmentSeconds){app.hasCustomSegment=false;app.committedSegment=i;break;}
 }
 bool hasSource(Source source) { if(app.settings.separateFiles)return true;for (auto& l : app.settings.layers) if (l.source == source) return true; return false; }
 bool sameSourceId(const std::wstring& a, const std::wstring& b) {
@@ -317,10 +330,10 @@ void updateNightText(bool force=false) {
 }
 void updateAdvanced() {
     if(!app.advanced)return;
-    const int selection=selectedLimit();
+    const int selection=selectedLimit(),segment=selectedSegment();
     const int night=app.settings.night.enabled?(app.nightValidation.empty()?1:2):0;
     const int recovery=app.encodingValidation.empty()?(app.settings.recoveryMode?1:0):2;
-    if(selection!=app.advancedLimitIndex || night!=app.advancedNightState || recovery!=app.advancedRecoveryState || app.advancedSkipRevision!=app.skipRevision){
+    if(selection!=app.advancedLimitIndex || segment!=app.advancedSegmentSeconds || night!=app.advancedNightState || recovery!=app.advancedRecoveryState || app.advancedSkipRevision!=app.skipRevision){
         std::wstring caption=L"&Advanced";
         if(recovery==2)caption+=L" · check MP4";
         else if(night==2)caption+=L" · check blend";
@@ -328,23 +341,25 @@ void updateAdvanced() {
         else if(selection)caption+=L" · stop after "+(choice(app.stopAfter)<6?std::wstring(RecordingLimitLabels[std::clamp(choice(app.stopAfter),0,5)]):formatDuration(int64_t(selection)*1000,true));
         if(recovery==1 && night!=2)caption+=L" · recovery";
         if(skipEnabled() && night!=2 && recovery!=2)caption+=L" · "+std::to_wstring(app.settings.timeSkip.multiplier)+L"×";
+        if(segment && night!=2 && recovery!=2)caption+=L" · split "+formatDuration(int64_t(segment)*1000,true);
         RECT bounds{};GetClientRect(app.advanced,&bounds);
-        if((selection || skipEnabled() || recovery==1) && night!=2 && recovery!=2 && bounds.right>app.scale(40)) {
+        if((selection || segment || skipEnabled() || recovery==1) && night!=2 && recovery!=2 && bounds.right>app.scale(40)) {
             HDC dc=GetDC(app.advanced);if(dc){const auto previous=SelectObject(dc,app.font);SIZE size{};
                 GetTextExtentPoint32W(dc,caption.c_str(),static_cast<int>(caption.size()),&size);
                 SelectObject(dc,previous);ReleaseDC(app.advanced,dc);
-                if(size.cx+app.scale(18)>bounds.right)caption=recovery?L"&Advanced · recovery + options":skipEnabled()?L"&Advanced · "+std::wstring(night?L"night/":L"")+
+                if(size.cx+app.scale(18)>bounds.right)caption=segment?L"&Advanced · split + options":recovery?L"&Advanced · recovery + options":skipEnabled()?L"&Advanced · "+std::wstring(night?L"night/":L"")+
                     (selection?L"stop/":L"")+std::to_wstring(app.settings.timeSkip.multiplier)+L"×":night?L"&Advanced · night + stop":L"&Advanced · timed stop";
             }
         }
         if(caption!=app.advancedCaption){SetWindowTextW(app.advanced,caption.c_str());app.advancedCaption=caption;}
         app.advancedTooltip=L"Show or hide advanced options. Recording options can be changed before recording. Night mode applies only to camera content.";
         if(selection)app.advancedTooltip+=L" Stop after "+formatDuration(int64_t(selection)*1000)+L" of active recording; pauses and startup do not count.";
+        if(segment)app.advancedTooltip+=L" Split files every "+formatDuration(int64_t(segment)*1000)+L" of active recording. Shorter parts add processing and file overhead.";
         if(skipEnabled())app.advancedTooltip+=L" Time compression: "+skipSummary(app.settings.timeSkip,app.settings.intervalMs)+L".";
         if(skipPerson(app.settings.timeSkip.mode))app.advancedTooltip+=L" Person checks use only selected camera content and require the optional detector. Missing, uncertain or stale checks keep the normal capture interval.";
         if(app.settings.recoveryMode)app.advancedTooltip+=L" MP4 recovery mode (H.264) is on; recent frames can still be lost after interruption.";
         if(!app.encodingValidation.empty())app.advancedTooltip+=L" "+app.encodingValidation;
-        app.advancedLimitIndex=selection;app.advancedNightState=night;app.advancedRecoveryState=recovery;app.advancedSkipRevision=app.skipRevision;
+        app.advancedLimitIndex=selection;app.advancedSegmentSeconds=segment;app.advancedNightState=night;app.advancedRecoveryState=recovery;app.advancedSkipRevision=app.skipRevision;
     }
     const int visibleNight=app.advancedExpanded?nightRow():0;
     const int visibleSkip=app.advancedExpanded?(skipEnabled()?2:1):0;
@@ -356,7 +371,7 @@ void updateAdvanced() {
     const auto visible=[](HWND child,bool show){
         if(child && ((GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0)!=show)ShowWindow(child,show?SW_SHOWNA:SW_HIDE);
     };
-    for(HWND child:{app.labels[6],app.encodingMode,app.labels[7],app.stopAfter,app.lowDisk,app.recoveryMode})visible(child,app.advancedExpanded);
+    for(HWND child:{app.labels[6],app.encodingMode,app.labels[7],app.stopAfter,app.lowDisk,app.recoveryMode,app.segmentLabel,app.splitEvery})visible(child,app.advancedExpanded);
     for(HWND child:{app.skipConfigure,app.skipSummary})visible(child,visibleSkip!=0);
     visible(app.skipDetail,visibleSkip==2);
     if(!visibleNight && app.nightEnabled && GetFocus()==app.nightEnabled)SetFocus(app.advanced);
@@ -385,6 +400,8 @@ void configure() {
     app.settings.recoveryMode = app.recoveryMode && SendMessageW(app.recoveryMode,BM_GETCHECK,0,0)==BST_CHECKED;
     validateEncodingMode(app.settings.encodingMode,app.settings.recoveryMode,app.encodingValidation);
     app.settings.recordingLimitSeconds = selectedLimit();
+    app.settings.segmentDurationSeconds = selectedSegment();
+    app.committedSegment=app.splitEvery?std::clamp(choice(app.splitEvery),0,app.hasCustomSegment?5:4):0;
     app.settings.stopOnLowDiskSpace = !app.lowDisk || SendMessageW(app.lowDisk,BM_GETCHECK,0,0)!=BST_UNCHECKED;
     app.settings.night.enabled = app.nightEnabled && SendMessageW(app.nightEnabled,BM_GETCHECK,0,0)==BST_CHECKED && hasSource(Source::Camera);
     app.settings.night.durationMs = NightDurations[app.nightDuration?std::clamp(choice(app.nightDuration),0,5):0];
@@ -435,7 +452,7 @@ void refreshSources() {
 }
 void updateControls() {
     const bool idle = !app.active();
-    for (auto control : {app.mode,app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.lowDisk,app.recoveryMode,app.nightEnabled,app.nightDuration,app.nightTarget,app.refresh,app.folder}) EnableWindow(control,idle);
+    for (auto control : {app.mode,app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.splitEvery,app.lowDisk,app.recoveryMode,app.nightEnabled,app.nightDuration,app.nightTarget,app.refresh,app.folder}) EnableWindow(control,idle);
     EnableWindow(app.monitor,idle && hasSource(Source::Desktop));
     EnableWindow(app.camera,idle && hasSource(Source::Camera) && !app.cameras.empty());
     EnableWindow(app.record,idle && hasRequiredSources() && app.nightValidation.empty() && app.encodingValidation.empty());
@@ -460,7 +477,7 @@ void applyStatus(Status value,bool force=false) {
         else if(app.failureNotice==FailureNotice::None)app.failureNotice=FailureNotice::Pending;
     }
     const bool state=app.status.state!=value.state;
-    const bool stats=state || app.status.frames!=value.frames ||
+    const bool stats=state || app.status.frames!=value.frames || app.status.completedSegments!=value.completedSegments ||
         static_cast<uint64_t>(std::max(0.0,app.status.elapsed))!=static_cast<uint64_t>(std::max(0.0,value.elapsed));
     const bool message=app.status.message!=value.message,error=app.status.error!=value.error;
     const bool outcome=app.status.recordingFailed!=value.recordingFailed || app.status.savedPath.empty()!=value.savedPath.empty() ||
@@ -651,7 +668,7 @@ void layout() {
     const int minimumW=app.scale(830);
     const int night=nightRow();
     const int skipHeight=skipEnabled()?80:52;
-    const int previewTop=app.scale(app.advancedExpanded?(night==2?372:night==1?300:258)+skipHeight+36:190);
+    const int previewTop=app.scale(app.advancedExpanded?(night==2?372:night==1?300:258)+skipHeight+58:190);
     const int minimumH=previewTop+app.scale(160)+app.scale(191);
     bool horizontal=false, vertical=false;
     for(int i=0;i<3;++i) {
@@ -694,14 +711,15 @@ void layout() {
     move(app.labels[6],pad,app.scale(190),encodingW,app.scale(20));move(app.encodingMode,pad,app.scale(211),encodingW,app.scale(190));
     move(app.labels[7],stopX,app.scale(190),stopW,app.scale(20));move(app.stopAfter,stopX,app.scale(211),stopW,app.scale(210));
     move(app.lowDisk,diskX,app.scale(211),options-encodingW-stopW,ch);
-    move(app.recoveryMode,pad,app.scale(250),width,ch);
-    move(app.skipConfigure,pad,app.scale(294),app.scale(202),ch);
-    move(app.skipSummary,pad+app.scale(216),app.scale(294),width-app.scale(216),ch);
-    move(app.skipDetail,pad,app.scale(330),width,app.scale(21));
-    move(app.nightEnabled,pad,app.scale((night==2?314:294)+skipHeight),encodingW,ch);
-    move(app.labels[8],stopX,app.scale(293+skipHeight),stopW,app.scale(20));move(app.nightDuration,stopX,app.scale(314+skipHeight),stopW,app.scale(210));
-    move(app.labels[9],diskX,app.scale(293+skipHeight),options-encodingW-stopW,app.scale(20));move(app.nightTarget,diskX,app.scale(314+skipHeight),options-encodingW-stopW,app.scale(150));
-    move(app.nightHint,pad,app.scale(349+skipHeight),width,app.scale(21));move(app.nightDetail,pad,app.scale(373+skipHeight),width,app.scale(21));
+    move(app.recoveryMode,pad,app.scale(271),encodingW,ch);
+    move(app.segmentLabel,stopX,app.scale(250),width-encodingW-gap,app.scale(20));move(app.splitEvery,stopX,app.scale(271),width-encodingW-gap,app.scale(210));
+    move(app.skipConfigure,pad,app.scale(316),app.scale(202),ch);
+    move(app.skipSummary,pad+app.scale(216),app.scale(316),width-app.scale(216),ch);
+    move(app.skipDetail,pad,app.scale(352),width,app.scale(21));
+    move(app.nightEnabled,pad,app.scale((night==2?336:316)+skipHeight),encodingW,ch);
+    move(app.labels[8],stopX,app.scale(315+skipHeight),stopW,app.scale(20));move(app.nightDuration,stopX,app.scale(336+skipHeight),stopW,app.scale(210));
+    move(app.labels[9],diskX,app.scale(315+skipHeight),options-encodingW-stopW,app.scale(20));move(app.nightTarget,diskX,app.scale(336+skipHeight),options-encodingW-stopW,app.scale(150));
+    move(app.nightHint,pad,app.scale(371+skipHeight),width,app.scale(21));move(app.nightDetail,pad,app.scale(395+skipHeight),width,app.scale(21));
     move(app.refresh,r.right-pad-refreshW,row2,refreshW,ch);
     // The logical canvas retains a usable preview when the viewport is small.
     const int previewH=static_cast<int>(r.bottom)-previewTop-app.scale(191);
@@ -767,7 +785,7 @@ void revealFocusedControl() {
 }
 void toggleAdvanced() {
     const HWND focused=GetFocus();
-    if(app.advancedExpanded)for(HWND child:{app.encodingMode,app.stopAfter,app.lowDisk,app.recoveryMode,app.skipConfigure,app.nightEnabled,app.nightDuration,app.nightTarget})
+    if(app.advancedExpanded)for(HWND child:{app.encodingMode,app.stopAfter,app.splitEvery,app.lowDisk,app.recoveryMode,app.skipConfigure,app.nightEnabled,app.nightDuration,app.nightTarget})
         if(child && (focused==child || (focused && IsChild(child,focused)))){SetFocus(app.advanced);break;}
     app.advancedExpanded=!app.advancedExpanded;
     updateAdvanced();layout();revealFocusedControl();
@@ -781,7 +799,7 @@ bool scrollWheelMessage(const MSG& message) {
     if((horizontal?app.contentWidth:app.contentHeight)<=(horizontal?viewport.right:viewport.bottom))return false;
     // Open lists own their wheel input. Closed lists must not change recording
     // settings when the user's wheel gesture is scrolling the surrounding page.
-    for(HWND box:{app.mode,app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.nightDuration,app.nightTarget,app.monitor,app.camera})
+    for(HWND box:{app.mode,app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.splitEvery,app.nightDuration,app.nightTarget,app.monitor,app.camera})
         if(SendMessageW(box,CB_GETDROPPEDSTATE,0,0))return false;
     SendMessageW(app.window,message.message,message.wParam,message.lParam);
     return true;
@@ -795,7 +813,7 @@ void fonts() {
     for(HWND child:{app.statusText,app.nightHint,app.nightDetail,app.skipDetail})if(child)SendMessageW(child,WM_SETFONT,reinterpret_cast<WPARAM>(app.smallFont),TRUE);
 }
 
-enum class CustomKind { Interval, Size, Limit, Range };
+enum class CustomKind { Interval, Size, Limit, Range, Segment };
 enum CustomId { CustomFirst=5001, CustomSecond, CustomUnits, CustomHelp, CustomError, CustomFirstLabel, CustomSecondLabel };
 struct CustomDraft {
     CustomKind kind=CustomKind::Interval;
@@ -907,7 +925,7 @@ INT_PTR CALLBACK customProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             draft=reinterpret_cast<CustomDraft*>(lp);SetWindowLongPtrW(window,DWLP_USER,lp);draft->previousDialog=app.customDialog;app.customDialog=window;
             draft->dpi=static_cast<int>(GetDpiForWindow(window));if(draft->dpi<=0)draft->dpi=app.dpi;
             const bool range=draft->kind==CustomKind::Range,size=draft->kind==CustomKind::Size,interval=draft->kind==CustomKind::Interval;
-            SetWindowTextW(window,range?L"Compression range":size?L"Custom video size":interval?L"Custom capture interval":L"Custom stop time");
+            SetWindowTextW(window,range?L"Compression range":size?L"Custom video size":interval?L"Custom capture interval":draft->kind==CustomKind::Segment?L"Custom file split":L"Custom stop time");
             const auto child=[&](const wchar_t* type,const wchar_t* text,DWORD style,int id){return CreateWindowExW(std::wcscmp(type,L"EDIT")==0?WS_EX_CLIENTEDGE:0,
                 type,text,WS_CHILD|WS_VISIBLE|style,0,0,1,1,window,reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),GetModuleHandleW(nullptr),nullptr);};
             draft->firstLabel=child(L"STATIC",range?L"&Start after (seconds)":size?L"&Width (pixels)":L"&Value",0,CustomFirstLabel);
@@ -918,6 +936,7 @@ INT_PTR CALLBACK customProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
                 for(const auto* unit:{L"Seconds",L"Minutes",L"Hours"})add(draft->units,unit);if(!interval)add(draft->units,L"Days");choose(draft->units,0);}
             draft->help=child(L"STATIC",range?L"Use whole active seconds from 0 to 2,147,483,647. Pauses and initial preparation do not count. Start is included; end is excluded. Overlapping or touching ranges merge when you return to the schedule.":size?L"Use even dimensions from 48 to 4096 pixels, at most 8,847,360 pixels total. Sources fit inside the video without stretching.":
                 interval?L"Choose 0.1 seconds to 24 hours. Decimals use a point and must resolve to whole milliseconds. Playback stays at 30 fps.":
+                draft->kind==CustomKind::Segment?L"Choose 1 to 2,147,483,647 whole seconds of active recording per part. Pauses and initial preparation do not count; automatic saving does. Empty periods create no files. Shorter parts add processing and file overhead.":
                 L"Choose 1 to 2,147,483,647 seconds of active recording. Pauses and initial preparation do not count. Decimals must resolve to whole seconds.",SS_NOPREFIX,CustomHelp);
             draft->error=child(L"STATIC",L"",SS_NOPREFIX,CustomError);
             draft->okay=child(L"BUTTON",L"OK",WS_TABSTOP|BS_DEFPUSHBUTTON,IDOK);draft->cancel=child(L"BUTTON",L"Cancel",WS_TABSTOP|BS_PUSHBUTTON,IDCANCEL);
@@ -964,15 +983,17 @@ void commitCustom(const CustomDraft& draft) {
         for(int i=0;i<6;++i)if(CaptureIntervals[i]==draft.durationMs)app.committedInterval=i;}
     else if(draft.kind==CustomKind::Size){app.customWidth=draft.width;app.customHeight=draft.height;app.hasCustomSize=true;
         app.committedSize=draft.width==1280 && draft.height==720?0:draft.width==1920 && draft.height==1080?1:2;}
+    else if(draft.kind==CustomKind::Segment){app.customSegmentSeconds=static_cast<int>(draft.durationMs/1000);app.hasCustomSegment=true;app.committedSegment=5;}
     else {app.customLimitSeconds=static_cast<int>(draft.durationMs/1000);app.hasCustomLimit=true;app.committedLimit=6;
         for(int i=1;i<6;++i)if(RecordingLimits[i]==app.customLimitSeconds)app.committedLimit=i;}
     normalizeCustomSelections();customItems();configure();updateControls();layout();InvalidateRect(app.preview,nullptr,FALSE);InvalidateRect(app.window,nullptr,FALSE);
 }
 void editCustom(CustomKind kind) {
     if(app.active() || app.customDialog)return;
-    HWND box=kind==CustomKind::Interval?app.interval:kind==CustomKind::Size?app.videoSize:app.stopAfter;
-    choose(box,kind==CustomKind::Interval?app.committedInterval:kind==CustomKind::Size?app.committedSize:app.committedLimit);
-    CustomDraft draft;draft.kind=kind;draft.durationMs=kind==CustomKind::Interval?app.settings.intervalMs:int64_t(app.settings.recordingLimitSeconds?app.settings.recordingLimitSeconds:900)*1000;
+    HWND box=kind==CustomKind::Interval?app.interval:kind==CustomKind::Size?app.videoSize:kind==CustomKind::Segment?app.splitEvery:app.stopAfter;
+    choose(box,kind==CustomKind::Interval?app.committedInterval:kind==CustomKind::Size?app.committedSize:kind==CustomKind::Segment?app.committedSegment:app.committedLimit);
+    const int duration=kind==CustomKind::Segment?app.settings.segmentDurationSeconds:app.settings.recordingLimitSeconds;
+    CustomDraft draft;draft.kind=kind;draft.durationMs=kind==CustomKind::Interval?app.settings.intervalMs:int64_t(duration?duration:900)*1000;
     draft.width=app.settings.width;draft.height=app.settings.height;CustomTemplate resource;
     const auto outcome=DialogBoxIndirectParamW(GetModuleHandleW(nullptr),&resource.dialog,app.window,customProc,reinterpret_cast<LPARAM>(&draft));
     if(!IsWindow(app.window))return;
@@ -1317,6 +1338,7 @@ bool savePreferences() {
         const auto recordingLimit=std::to_wstring(std::clamp(choice(app.stopAfter),0,app.hasCustomLimit?6:5));
         const auto customInterval=std::to_wstring(app.customIntervalMs), customWidth=std::to_wstring(app.customWidth),customHeight=std::to_wstring(app.customHeight);
         const auto customLimit=std::to_wstring(app.customLimitSeconds);
+        const auto segmentDuration=std::to_wstring(selectedSegment());
         auto skipPolicy=app.settings.timeSkip;std::wstring skipError;
         if(!normalizeTimeSkipSettings(skipPolicy,skipError))return false;
         const auto skip=skipValues(skipPolicy);
@@ -1348,6 +1370,7 @@ bool savePreferences() {
             WritePrivateProfileStringW(L"Settings",L"VideoWidth",customWidth.c_str(),pending.path) &&
             WritePrivateProfileStringW(L"Settings",L"VideoHeight",customHeight.c_str(),pending.path) &&
             WritePrivateProfileStringW(L"Settings",L"RecordingLimitSeconds",customLimit.c_str(),pending.path) &&
+            WritePrivateProfileStringW(L"Settings",L"SegmentDurationSeconds",segmentDuration.c_str(),pending.path) &&
             WritePrivateProfileStringW(L"Settings",L"StopOnLowDiskSpace",!app.lowDisk || SendMessageW(app.lowDisk,BM_GETCHECK,0,0)!=BST_UNCHECKED?L"1":L"0",pending.path) &&
             WritePrivateProfileStringW(L"Settings",L"RecoveryMode",app.recoveryMode && SendMessageW(app.recoveryMode,BM_GETCHECK,0,0)==BST_CHECKED?L"1":L"0",pending.path) &&
             WritePrivateProfileStringW(L"Settings",L"NightEnabled",app.nightEnabled && SendMessageW(app.nightEnabled,BM_GETCHECK,0,0)==BST_CHECKED?L"1":L"0",pending.path) &&
@@ -1393,6 +1416,9 @@ void preferences(bool save) {
         };
         app.hasCustomInterval=app.hasCustomSize=app.hasCustomLimit=false;
         app.customIntervalMs=5000;app.customWidth=1280;app.customHeight=720;app.customLimitSeconds=900;
+        app.customSegmentSeconds=900;app.committedSegment=0;app.hasCustomSegment=false;
+        int segment=0;
+        if(exactInteger(L"SegmentDurationSeconds",0,INT_MAX,segment) && segment){app.customSegmentSeconds=segment;app.committedSegment=5;app.hasCustomSegment=true;}
         int exactSelector=0;
         if(interval==6){app.hasCustomInterval=exactInteger(L"Interval",6,6,exactSelector) && exactInteger(L"CaptureIntervalMs",MinCaptureIntervalMs,MaxCaptureIntervalMs,app.customIntervalMs);choose(app.interval,app.hasCustomInterval?6:2);}
         if(videoSize==2){std::wstring error;app.hasCustomSize=exactInteger(L"Quality",2,2,exactSelector) && exactInteger(L"VideoWidth",MinVideoDimension,MaxVideoDimension,app.customWidth) &&
@@ -1534,6 +1560,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
     }
     case WM_CREATE: {
         app.startupComplete=false;app.advancedExpanded=false;app.advancedLimitIndex=app.advancedVisibility=-1;
+        app.advancedSegmentSeconds=-1;
         app.failureNotice=FailureNotice::None;
         app.trayMenuOpen=app.trayMenuCanceled=false;
         app.advancedNightState=app.advancedRecoveryState=app.nightVisibility=-1;app.nightValidation.clear();app.encodingValidation.clear();app.statusCaption.clear();app.statusCaptionError=false;app.nightHintCaption.clear();app.nightDetailCaption.clear();
@@ -1545,6 +1572,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         app.hasCustomInterval=app.hasCustomSize=app.hasCustomLimit=false;
         app.customIntervalMs=5000;app.customWidth=1280;app.customHeight=720;app.customLimitSeconds=900;
         app.committedInterval=2;app.committedSize=app.committedLimit=0;
+        app.committedSegment=0;app.customSegmentSeconds=900;app.hasCustomSegment=false;
         app.visibleDirty=true;app.controlsUpdated=false;app.trayStateValid=false;
         try {
         app.window=w;app.dpi=static_cast<int>(GetDpiForWindow(w));fonts();
@@ -1572,6 +1600,8 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         app.stopAfter=combo(7,L"S&top after",StopAfterBox);for(auto label:RecordingLimitLabels)add(app.stopAfter,label);
         app.lowDisk=requiredControl(L"BUTTON",L"Stop on &low disk space",WS_TABSTOP|BS_AUTOCHECKBOX,LowDiskBox);
         app.recoveryMode=requiredControl(L"BUTTON",L"MP4 recover&y mode (H.264)",WS_TABSTOP|BS_AUTOCHECKBOX,RecoveryBox);
+        app.segmentLabel=requiredControl(L"STATIC",L"Split files e&very",0,211);
+        app.splitEvery=requiredControl(L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL,SegmentBox);for(auto label:SegmentLabels)add(app.splitEvery,label);
         app.skipConfigure=button(L"Time &compression...",SkipConfigure);
         app.skipSummary=requiredControl(L"STATIC",L"Off",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX,SkipSummary);
         app.skipDetail=requiredControl(L"STATIC",L"",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX,SkipDetail);
@@ -1608,6 +1638,8 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
         tip.uId=reinterpret_cast<UINT_PTR>(app.lowDisk);
         tip.lpszText=const_cast<LPWSTR>(L"Check free space in the save folder and try to finish and save before space runs out. Other programs or sudden disk changes can still cause a recording to fail. Turn this off to record when free space cannot be checked.");
+        SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
+        tip.uId=reinterpret_cast<UINT_PTR>(app.splitEvery);tip.lpszText=const_cast<LPWSTR>(SegmentHelp);
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
         tip.uId=reinterpret_cast<UINT_PTR>(app.recoveryMode);
         tip.lpszText=const_cast<LPWSTR>(L"After an unexpected app exit, completed portions may remain playable in the .recording.mp4 file. Recent frames can be lost; very early interruptions may leave no playable video. H.264 only. Larger files and extra processing; some players may not support this format. Finish normally to save. No recovery guarantee after power loss or drive failure.");
@@ -1710,17 +1742,18 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         if(app.failureNotice==FailureNotice::Presenting)return 0;
         const int id=LOWORD(wp),code=HIWORD(wp);
         if(code==CBN_SELCHANGE){
-            if(app.active() && (id==EncodingModeBox || id==NightDurationBox || id==NightTargetBox || id==IntervalBox || id==SizeBox || id==StopAfterBox)){
+            if(app.active() && (id==EncodingModeBox || id==NightDurationBox || id==NightTargetBox || id==IntervalBox || id==SizeBox || id==StopAfterBox || id==SegmentBox)){
                 if(id==EncodingModeBox)choose(app.encodingMode,static_cast<int>(app.settings.encodingMode));
                 if(id==IntervalBox)choose(app.interval,app.committedInterval);
                 if(id==SizeBox)choose(app.videoSize,app.committedSize);
                 if(id==StopAfterBox)choose(app.stopAfter,app.committedLimit);
+                if(id==SegmentBox)choose(app.splitEvery,app.committedSegment);
                 return 0;
             }
-            const HWND customBox=id==IntervalBox?app.interval:id==SizeBox?app.videoSize:id==StopAfterBox?app.stopAfter:nullptr;
-            const int customAction=id==IntervalBox?6+int(app.hasCustomInterval):id==SizeBox?2+int(app.hasCustomSize):6+int(app.hasCustomLimit);
+            const HWND customBox=id==IntervalBox?app.interval:id==SizeBox?app.videoSize:id==StopAfterBox?app.stopAfter:id==SegmentBox?app.splitEvery:nullptr;
+            const int customAction=id==IntervalBox?6+int(app.hasCustomInterval):id==SizeBox?2+int(app.hasCustomSize):id==SegmentBox?5+int(app.hasCustomSegment):6+int(app.hasCustomLimit);
             if(customBox && choice(customBox)==customAction && SendMessageW(customBox,CB_GETCOUNT,0,0)>customAction){
-                SendMessageW(customBox,CB_SHOWDROPDOWN,FALSE,0);editCustom(id==IntervalBox?CustomKind::Interval:id==SizeBox?CustomKind::Size:CustomKind::Limit);return 0;
+                SendMessageW(customBox,CB_SHOWDROPDOWN,FALSE,0);editCustom(id==IntervalBox?CustomKind::Interval:id==SizeBox?CustomKind::Size:id==SegmentBox?CustomKind::Segment:CustomKind::Limit);return 0;
             }
             if(id==ModeBox)changeLayout(false);
             else {
@@ -1805,6 +1838,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         else {wchar_t buf[140];const double videoSeconds=120000.0/std::max(MinCaptureIntervalMs,app.settings.intervalMs);
             swprintf_s(buf,L"  ·  1 hour becomes %.*f seconds of video",videoSeconds<1?3:videoSeconds<10?1:0,videoSeconds);
             detail=L"Every "+formatDuration(app.settings.intervalMs)+buf;}
+        if(app.status.completedSegments)detail+=L"  ·  "+std::to_wstring(app.status.completedSegments)+(app.status.completedSegments==1?L" part saved":L" parts saved");
         text(dc,detail,stats,Ink,app.font);
         RECT path={p,r.bottom-app.scale(92),r.right-p-app.scale(106),r.bottom-app.scale(66)};text(dc,L"Save to: "+app.settings.folder,path,Muted,app.smallFont,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_PATH_ELLIPSIS);
         EndPaint(w,&ps);return 0;

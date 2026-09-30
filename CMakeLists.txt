@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Timelapse VERSION 0.13.0 LANGUAGES CXX RC)
+project(Timelapse VERSION 0.14.0 LANGUAGES CXX RC)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -233,6 +233,20 @@ add_executable(engine_time_skip_tests tests/engine_time_skip_tests.cpp)
 target_link_libraries(engine_time_skip_tests PRIVATE lapse_core)
 add_test(NAME engine_time_skip_tests COMMAND engine_time_skip_tests)
 set_tests_properties(engine_time_skip_tests PROPERTIES TIMEOUT 90)
+
+add_executable(engine_segment_tests tests/engine_segment_tests.cpp)
+target_link_libraries(engine_segment_tests PRIVATE lapse_core)
+add_test(NAME engine_segment_tests COMMAND engine_segment_tests)
+set_tests_properties(engine_segment_tests PROPERTIES TIMEOUT 90)
+
+# Synthetic sources and identity-owned files exercise split failure transactions.
+add_executable(engine_segment_fault_tests tests/engine_segment_fault_tests.cpp
+    src/core.cpp src/config.cpp src/night.cpp src/time_skip.cpp)
+target_include_directories(engine_segment_fault_tests PRIVATE src)
+target_link_libraries(engine_segment_fault_tests PRIVATE mfplat mfreadwrite mfuuid mf
+    ole32 oleaut32 gdi32 user32 shlwapi shell32)
+add_test(NAME engine_segment_fault_tests COMMAND engine_segment_fault_tests)
+set_tests_properties(engine_segment_fault_tests PROPERTIES TIMEOUT 120)
 
 add_executable(engine_custom_tests tests/engine_custom_tests.cpp)
 target_link_libraries(engine_custom_tests PRIVATE lapse_core)

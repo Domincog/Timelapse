@@ -4,6 +4,7 @@
 #include "encoder.h"
 #include "camera_host.h"
 #include "capture.h"
+#include "engine_segment_decode.h"
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
@@ -195,6 +196,24 @@ void limitWindow(const std::filesystem::path& root) {
     require(resultPolls<=5,"Parent polled before expected completion too frequently");
     std::cout<<"PASS initial Auto startup excluded; deadline cancels longer next blend.\n";
 }
+void splitDuringWindow(const std::filesystem::path& root) {
+    reset(); auto s=config(root/L"split-during-window",true);
+    s.intervalMs=2000; s.night.durationMs=2000; s.segmentDurationSeconds=1; s.recordingLimitSeconds=5;
+    Engine engine; engine.configure(s); engine.record();
+    await(engine,[](const auto& value){return value.frames==1&&value.nightWaiting;});
+    const auto cancelled=cancellations.load();
+    const auto closed=await(engine,[](const auto& value){return value.completedSegments==1;},2500);
+    require(closed.state==State::Recording&&closed.frames==1&&closed.nightWaiting&&cancellations==cancelled,
+        "File boundary cancelled a full Night window or ended the session");
+    const auto result=await(engine,[](const auto& value){return value.state==State::Idle;},6500);
+    require(result.frames>=2&&result.completedSegments>=2&&result.elapsed>=5&&result.elapsed<6.5&&
+        result.message.find(L"time limit")!=std::wstring::npos,"Split Night session reset its clock or lost its limit");
+    const auto windows=observations();
+    require(windows.size()>=result.frames,"Split Night session lost exposure history");
+    for(const auto& window:windows)require(window.duration==2000,"File split shortened a Night exposure");
+    split_test::verify(s.folder,result,true);
+    std::cout<<"PASS deadline-only split preserves in-progress Night windows and paired playback.\n";
+}
 void pauseWindow(const std::filesystem::path& root) {
     reset();auto s=config(root/L"pause",true);s.preview=true;Engine engine;engine.configure(s);engine.record();
     await(engine,[](const auto& value){return value.frames==1&&observations().size()>=2;});
@@ -285,7 +304,7 @@ int main() {
     try {
         validation(root);preparingPreview(root);firstProcessedPreview(root);singleSource(root,Mode::Camera);singleSource(root,Mode::Overlay);
         pairedCadence(root,false);pairedCadence(root,true);
-        limitWindow(root);pauseWindow(root);lateResult(root,false);lateResult(root,true);
+        limitWindow(root);splitDuringWindow(root);pauseWindow(root);lateResult(root,false);lateResult(root,true);
         retainedFailure(root,false);retainedFailure(root,true);beginFailure(root);shutdownPending(root);
         std::filesystem::remove_all(root);std::cout<<"Night engine: all synthetic real-encoder scenarios passed.\n";
     }catch(const std::exception& error){std::cerr<<error.what()<<'\n';std::wcerr<<L"Artifacts kept at "<<root.wstring()<<L'\n';result=1;}

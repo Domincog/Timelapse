@@ -10,10 +10,22 @@
 #include <algorithm>
 #include <optional>
 #include <array>
+#include <limits>
+#include <stdexcept>
 
 namespace lapse {
 using Clock = std::chrono::steady_clock;
 namespace {
+uint64_t segmentFrameTotal(uint64_t closed, uint64_t current) {
+    if (current > UINT64_MAX - closed) throw std::overflow_error("Recording frame count exhausted");
+    return closed + current;
+}
+Clock::duration nextSegmentCut(Clock::duration active, int seconds) {
+    const auto span = std::chrono::duration_cast<Clock::duration>(std::chrono::seconds(seconds));
+    const auto bucket = active / span;
+    if (bucket >= Clock::duration::max() / span) throw std::overflow_error("Recording segment clock exhausted");
+    return span * (bucket + 1);
+}
 const wchar_t* recordingMessage(bool separateFiles) {
     return separateFiles ? L"Recording desktop and camera to separate files." : L"Recording. You can adjust the collage live.";
 }
@@ -142,6 +154,7 @@ void Engine::record() {
       stop_ = pauseRequested_ = pauseTarget_ = false;
       start_ = true; status_.state = State::Starting; status_.error = false; status_.recordingFailed = false;
       status_.message = L"Preparing recording..."; status_.frames = 0; status_.elapsed = 0; status_.savedPath.clear(); status_.savedPaths.clear();
+      status_.completedSegments = 0;
       status_.nightEnabled = usesNightCamera(settings_); status_.nightWaiting = status_.nightEnabled;
       status_.nightDurationMs = 0; status_.night = {};
       status_.timeSkip = {}; }
@@ -193,7 +206,11 @@ void Engine::run() {
         std::wstring activeCamera, temporary, finalPath, temporaryIO, finalPathIO, sourceError, recordingFolder, recordingFolderIO;
         std::wstring cameraTemporary, cameraFinalPath, cameraTemporaryIO, cameraFinalPathIO;
         bool cameraRunning = false, pending = false, writing = false, paused = false;
-        bool cameraWriting = false;
+        bool cameraWriting = false, segmentWriting = false, sessionStarted = false, segmentFailed = false;
+        uint64_t segmentOrdinal = 0, completedSegments = 0;
+        std::array<uint64_t, 2> closedFrames{};
+        Clock::duration nextSegmentBoundary{};
+        std::wstring sessionStem;
         bool nightMode = false, nightQueued = false, nightFrameReady = false;
         uint64_t nightToken = 0;
         int nightDurationMs = NightMinDurationMs, suggestedNightDurationMs = NightInitialDurationMs;
@@ -330,7 +347,7 @@ void Engine::run() {
                 tick - source.receivedTick <= person::SourceFreshnessMs && person::validGeometry(source);
         };
         auto observePeople = [&] {
-            if (!observing || !writing || paused || !encoder || !encoder->frames()) return;
+            if (!observing || !writing || paused || !sessionStarted) return;
             if (personFault) {
                 nextObservation = nextPersonPoll = Clock::time_point::max();
                 personProblem(personFailure[0] ? personFailure.data() :
@@ -500,6 +517,14 @@ void Engine::run() {
             return writing && !paused && session && session->recordingLimitSeconds > 0 &&
                 activeDuration >= std::chrono::seconds(session->recordingLimitSeconds);
         };
+        auto segmentDeadline = [&] {
+            return writing && !paused && session && session->segmentDurationSeconds > 0 && segmentWriting && encoder->frames()
+                ? lastTick + (nextSegmentBoundary - activeDuration) : Clock::time_point::max();
+        };
+        auto segmentExpired = [&] {
+            return writing && !paused && session && session->segmentDurationSeconds > 0 && segmentWriting &&
+                encoder->frames() && activeDuration >= nextSegmentBoundary;
+        };
         auto publishError = [&](const std::wstring& message, bool reset) {
             std::lock_guard<std::mutex> lock(mutex_);
             // An unconsumed Record command owns the next attempt's status.
@@ -521,19 +546,96 @@ void Engine::run() {
                 previewProblem_ = true;
             }
         };
-        auto closeRecording = [&](const std::wstring& reason) {
-            // Retire recording-sized native surfaces before any reporting can
-            // allocate. Visible preview recreates its small surface on demand.
-            releaseDesktopCaptureCache();
-            cancelNight(); nightMode = false;
-            cancelObservation(); skipping = observing = false;
-            observationDesktop = {};
-            if (writing) power.saving();
-            bool keepCamera;
-            { std::lock_guard<std::mutex> lock(mutex_); status_.state = State::Finishing; status_.nightWaiting = false; status_.message = L"Finishing MP4..."; keepCamera = settings_.preview; }
-            // Hidden idle workers have no next tick on which to release the
-            // device. Finish/cancel must stop it before returning to that wait.
-            if (!keepCamera && cameraRunning) { camera->stop(); cameraRunning = false; activeCamera.clear(); }
+        auto finishSegment = [&](const std::wstring& reason, bool terminal) -> bool {
+            if (session && session->segmentDurationSeconds > 0) {
+                const size_t count = session->separateFiles ? 2 : 1;
+                const std::array<bool, 2> opened{segmentWriting, cameraWriting};
+                const std::array<Encoder*, 2> writers{encoder ? &*encoder : nullptr, cameraEncoder ? &*cameraEncoder : nullptr};
+                const std::array<const std::wstring*, 2> temps{&temporary, &cameraTemporary}, finals{&finalPath, &cameraFinalPath};
+                const std::array<const std::wstring*, 2> tempIO{&temporaryIO, &cameraTemporaryIO}, finalIO{&finalPathIO, &cameraFinalPathIO};
+                std::array<std::wstring, 2> errors;
+                std::array<bool, 2> finalized{}, retained{};
+                std::array<uint64_t, 2> frames{}, totals = closedFrames;
+                bool hasCurrent = false;
+                for (size_t i = 0; i < count; ++i) if (opened[i]) {
+                    hasCurrent = true;
+                    frames[i] = writers[i]->frames();
+                    totals[i] = segmentFrameTotal(closedFrames[i], frames[i]);
+                    finalized[i] = writers[i]->finishForPublication(errors[i]);
+                    const DWORD attrs = !finalized[i] ? GetFileAttributesW(tempIO[i]->c_str()) : INVALID_FILE_ATTRIBUTES;
+                    retained[i] = attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+                }
+                // Automatic saving consumes active time, while a terminal save
+                // freezes elapsed at the terminal admission cutoff as before.
+                if (!terminal && sessionStarted) {
+                    advanceElapsed(Clock::now());
+                    if (limitExpired()) recordingLimitReached = true;
+                }
+                if (!hasCurrent && segmentFailed) return false; // Preserve the committed failing part's exact report.
+                std::wstring previousFiles;
+                if (completedSegments) {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    for (const auto& path : status_.savedPaths) previousFiles += L" Latest saved: " + path + L".";
+                }
+                struct Report { std::wstring first, message; std::vector<std::wstring> paths; bool error = false; uint64_t completed = 0; };
+                std::array<Report, 4> reports;
+                const size_t masks = size_t(1) << count;
+                for (size_t mask = 0; mask < masks; ++mask) {
+                    auto& report = reports[mask];
+                    report.error = !reason.empty();
+                    report.message = reason;
+                    if (recordingLimitReached) report.message += (report.message.empty() ? L"" : L" ") + std::wstring(L"Recording time limit reached.");
+                    bool complete = hasCurrent;
+                    for (size_t i = 0; i < count; ++i) {
+                        complete &= finalized[i] && (mask & (size_t(1) << i)) != 0;
+                        if (!opened[i]) continue;
+                        if (!report.message.empty()) report.message += L" ";
+                        if (count == 2) report.message += i == 0 ? L"Desktop: " : L"Camera: ";
+                        if (finalized[i]) {
+                            const bool renamed = (mask & (size_t(1) << i)) != 0;
+                            const auto& path = *(renamed ? finals[i] : temps[i]);
+                            report.paths.push_back(path);
+                            report.message += renamed ? L"Saved: " : L"Could not publish the final filename; finished video remains at: ";
+                            report.message += path + L" (" + std::to_wstring(frames[i]) + L" frames).";
+                            report.error |= !renamed;
+                        } else if (frames[i] || retained[i]) {
+                            report.error = true;
+                            report.message += L"Could not finish video: " + errors[i];
+                            if (retained[i]) report.message += L" Partial file: " + *temps[i];
+                        } else report.message += L"No frames saved in this part.";
+                    }
+                    if (complete && completedSegments == UINT64_MAX) throw std::overflow_error("Recording segment count exhausted");
+                    report.completed = completedSegments + (complete ? 1 : 0);
+                    if (!report.message.empty()) report.message += L" ";
+                    report.message += std::to_wstring(report.completed) + L" complete segment set(s) saved";
+                    if (!sessionStem.empty()) report.message += L" under " + (std::filesystem::path(recordingFolder) / sessionStem).wstring();
+                    report.message += L".";
+                    if (report.paths.empty()) report.message += previousFiles;
+                    if (!report.paths.empty()) report.first = report.paths.front();
+                }
+                // No allocations after the first rename. Each outcome includes
+                // the other writer's retained pathname if that rename throws.
+                size_t published = 0;
+                for (size_t i = 0; i < count; ++i) if (finalized[i]) {
+                    try { if (writers[i]->publish(*finalIO[i]) == ERROR_SUCCESS) published |= size_t(1) << i; }
+                    catch (const std::exception&) {}
+                }
+                auto& report = reports[published];
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    status_.elapsed = elapsed;
+                    status_.frames = count == 2 ? std::min(totals[0], totals[1]) : totals[0];
+                    status_.completedSegments = report.completed;
+                    status_.error = status_.recordingFailed = report.error;
+                    if (!report.paths.empty()) { status_.savedPath.swap(report.first); status_.savedPaths.swap(report.paths); }
+                    status_.message.swap(report.message);
+                    previewProblem_ = false;
+                }
+                closedFrames = totals; completedSegments = report.completed; segmentFailed = report.error;
+                for (size_t i = 0; i < count; ++i) if (writers[i]) writers[i]->releasePublication();
+                segmentWriting = cameraWriting = false;
+                return !segmentFailed;
+            }
             if (session && session->separateFiles) {
                 std::array<std::wstring, 2> errors;
                 const std::array<bool, 2> opened{writing, cameraWriting};
@@ -600,11 +702,11 @@ void Engine::run() {
                 status_.savedPath.swap(report.first); status_.savedPaths.swap(report.paths); status_.message.swap(report.message);
                 if (encoder) encoder->releasePublication();
                 if (cameraEncoder) cameraEncoder->releasePublication();
-                writing = cameraWriting = pending = paused = false; previewProblem_ = false;
+                writing = segmentWriting = cameraWriting = pending = paused = false; previewProblem_ = false;
                 recordingLimitReached = false;
                 desktop = {}; webcam = {}; composed = {}; cameraComposed = {};
                 power.update(false, false);
-                return;
+                return !report.error;
             }
             std::wstring error;
             const bool finalized = writing && encoder->finishForPublication(error);
@@ -643,9 +745,32 @@ void Engine::run() {
             if (finalized) { status_.savedPath.swap(savedPath); status_.savedPaths.swap(savedPaths); }
             status_.message.swap(message);
             if (encoder) encoder->releasePublication();
-            writing = pending = paused = false; previewProblem_ = false;
+            writing = segmentWriting = pending = paused = false; previewProblem_ = false;
             recordingLimitReached = false;
             desktop = {}; webcam = {}; composed = {};
+            power.update(false, false);
+            return !status_.error;
+        };
+        auto closeRecording = [&](const std::wstring& reason) {
+            releaseDesktopCaptureCache();
+            cancelNight(); nightMode = false;
+            cancelObservation(); skipping = observing = false; observationDesktop = {};
+            if (writing) power.saving();
+            bool keepCamera;
+            { std::lock_guard<std::mutex> lock(mutex_);
+              status_.state = State::Finishing; status_.nightWaiting = false;
+              if (!segmentFailed) status_.message = L"Finishing MP4...";
+              keepCamera = settings_.preview; }
+            if (!keepCamera && cameraRunning) { camera->stop(); cameraRunning = false; activeCamera.clear(); }
+            finishSegment(reason, true);
+            // Legacy Off reporting already commits Idle and all session state
+            // together. Do not overwrite a Record queued after that commit.
+            if (!session || session->segmentDurationSeconds <= 0) return;
+            { std::lock_guard<std::mutex> lock(mutex_);
+              stop_ = pauseRequested_ = pauseTarget_ = false; status_.state = State::Idle; status_.elapsed = elapsed; }
+            writing = segmentWriting = cameraWriting = pending = paused = false;
+            recordingLimitReached = false;
+            desktop = {}; webcam = {}; composed = {}; cameraComposed = {};
             power.update(false, false);
         };
         auto waitAfterFailure = [&](std::unique_lock<std::mutex>& lock) {
@@ -654,7 +779,7 @@ void Engine::run() {
             const auto generation = previewGeneration_;
             const auto revision = settingsRevision_;
             const bool start = start_, stop = stop_, pauseRequested = pauseRequested_, pauseTarget = pauseTarget_, retry = retrySources_;
-            wake_.wait_until(lock, std::min(Clock::now() + std::chrono::seconds(1), recordingDeadline()), [&] {
+            wake_.wait_until(lock, std::min({Clock::now() + std::chrono::seconds(1), recordingDeadline(), segmentDeadline()}), [&] {
                 return quit_ || previewGeneration_ != generation || settingsRevision_ != revision || start_ != start ||
                     stop_ != stop || pauseRequested_ != pauseRequested || pauseTarget_ != pauseTarget || retrySources_ != retry;
             });
@@ -688,7 +813,7 @@ void Engine::run() {
                       if (skipDecision.nextBoundaryMs > 0)
                           deadline = std::min(deadline, lastTick + (std::chrono::milliseconds(skipDecision.nextBoundaryMs) - activeDuration));
                   }
-                  deadline = std::min(deadline, recordingDeadline());
+                  deadline = std::min({deadline, recordingDeadline(), segmentDeadline()});
                   if (FAILED(com)) deadline = Clock::now() + std::chrono::seconds(1);
                   auto commanded = [&] {
                       return quit_ || start_ || stop_ || pauseRequested_ || retrySources_ || settingsRevision_ != settingsRevision;
@@ -702,7 +827,7 @@ void Engine::run() {
                   previewGeneration = previewGeneration_;
                   const auto requiredWork = nightMode ? (nightQueued ? nightPollAt : nightStartAt) : nextFrame;
                   previewOnlyWork = !start_ && !stop_ && !quit_ && !pending &&
-                      (!writing || paused || Clock::now() < requiredWork) && Clock::now() < recordingDeadline();
+                      (!writing || paused || Clock::now() < requiredWork) && Clock::now() < recordingDeadline() && Clock::now() < segmentDeadline();
                   if (!quit) {
                       snapshot.emplace(settings_);
                       settingsRevision = settingsRevision_;
@@ -723,12 +848,15 @@ void Engine::run() {
                     previewOnlyWork = false;
                     personFault = false; personFailure = {};
                     session.emplace(cfg); pending = true; elapsed = 0;
+                    segmentWriting = cameraWriting = sessionStarted = segmentFailed = false;
+                    closedFrames = {}; segmentOrdinal = completedSegments = 0; sessionStem.clear();
                     activeDuration = Clock::duration::zero(); recordingLimitReached = false;
                     cancelNight(); nightMode = usesNightCamera(cfg);
                     suggestedNightDurationMs = NightInitialDurationMs;
                     nightStartAt = now;
                     std::wstring validationError;
-                    if (!validateCaptureInterval(cfg.intervalMs, validationError) ||
+                    if (cfg.segmentDurationSeconds < 0) validationError = L"Split files every must be Off or a positive whole number of seconds.";
+                    if (!validationError.empty() || !validateCaptureInterval(cfg.intervalMs, validationError) ||
                         !validateVideoSize(cfg.width, cfg.height, validationError) ||
                         !validateEncodingMode(cfg.encodingMode, cfg.recoveryMode, validationError) ||
                         (nightMode && !validateNightCapture(cfg, validationError)) ||
@@ -767,6 +895,12 @@ void Engine::run() {
                     status_.elapsed = elapsed;
                     if (!previewProblem_)
                         status_.message = paused ? L"Paused. Resume when you are ready." : recordingMessage(session && session->separateFiles);
+                }
+                if (segmentExpired()) {
+                    previewOnlyWork = false;
+                    if (!finishSegment(L"", false) || recordingLimitReached) closeRecording(L"");
+                    // Preserve queued commands and all scheduler/source state.
+                    continue;
                 }
                 bool captureDue = pending || (writing && !paused && now >= nextFrame);
                 previewOnlyWork = !captureDue;
@@ -961,90 +1095,123 @@ void Engine::run() {
                     else publishPreviewError(error);
                     continue;
                 }
-                if (pending && captureDue) {
-                    std::error_code ec;
-                    if (cfg.folder.empty()) { closeRecording(L"Cannot create the save folder. Choose another folder."); continue; }
-                    // Resolve relative folders once. Both writers, publication
-                    // destinations and space checks use this session directory.
-                    const auto folder = std::filesystem::absolute(std::filesystem::path(cfg.folder), ec);
-                    if (ec) { closeRecording(L"Cannot resolve the save folder. Choose another folder."); continue; }
-                    recordingFolder = folder.lexically_normal().wstring();
-                    recordingFolderIO = recordingDirectoryIO(recordingFolder);
-                    std::filesystem::create_directories(recordingFolderIO, ec);
-                    if (ec) { closeRecording(L"Cannot create the save folder. Choose another folder."); continue; }
-                    if (cfg.stopOnLowDiskSpace) {
-                        const auto space = queryRecordingSpace(recordingFolderIO);
-                        if (!space.enough(cfg.separateFiles)) {
-                            closeRecording(L"Cannot start recording: " + recordingSpaceProblem(space, cfg.separateFiles) + L" Save folder: " + recordingFolder); continue;
+                if (captureDue && (pending || (writing && !paused))) {
+                    // Hold this prepared frame/pair through a rollover. A
+                    // command discards only unadmitted pixels at a checkpoint;
+                    // no preview or source refresh can overwrite them here.
+                    bool admit = true;
+                    Clock::time_point admittedAt;
+                    auto commandPending = [&] {
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        return quit_ || stop_ || pauseRequested_;
+                    };
+                    for (;;) {
+                        if (sessionStarted) advanceElapsed(Clock::now());
+                        if (limitExpired()) { recordingLimitReached = true; closeRecording(L""); admit = false; break; }
+                        if (commandPending()) { admit = false; break; }
+                        if (segmentExpired()) {
+                            if (!finishSegment(L"", false)) { closeRecording(L""); admit = false; break; }
+                            // A zero-frame successor cannot roll over, so this
+                            // loop retires at most one nonempty old segment.
+                            continue;
                         }
-                    }
-                    SYSTEMTIME t; GetLocalTime(&t);
-                    wchar_t name[100];
-                    swprintf_s(name, L"Timelapse-%04u%02u%02u-%02u%02u%02u-%03u-%lu", t.wYear,t.wMonth,t.wDay,t.wHour,t.wMinute,t.wSecond,t.wMilliseconds,GetCurrentProcessId());
-                    auto base = (std::filesystem::path(recordingFolder) / name).wstring();
-                    const auto desktopBase = cfg.separateFiles ? base + L"-desktop" : base;
-                    temporary = desktopBase + L".recording.mp4"; finalPath = desktopBase + L".mp4";
-                    // Cache I/O spellings before opening: successful save
-                    // publication must not allocate after the file is renamed.
-                    const auto ioBase = recordingFolderIO + name;
-                    const auto desktopIOBase = cfg.separateFiles ? ioBase + L"-desktop" : ioBase;
-                    temporaryIO = desktopIOBase + L".recording.mp4"; finalPathIO = desktopIOBase + L".mp4";
-                    if (cfg.separateFiles) {
-                        cameraTemporary = base + L"-camera.recording.mp4"; cameraFinalPath = base + L"-camera.mp4";
-                        cameraTemporaryIO = ioBase + L"-camera.recording.mp4"; cameraFinalPathIO = ioBase + L"-camera.mp4";
-                    }
-                    if (!encoder) encoder.emplace();
-                    if (!encoder->open(temporaryIO, cfg.width, cfg.height, 30, error, cfg.encodingQuality, cfg.encodingMode, cfg.recoveryMode)) {
-                        closeRecording((cfg.separateFiles ? L"Cannot start desktop recording: " : L"Cannot start recording: ") + error); continue;
-                    }
-                    writing = true;
-                    if (cfg.separateFiles) {
-                        if (!cameraEncoder) cameraEncoder.emplace();
-                        if (!cameraEncoder->open(cameraTemporaryIO, cfg.width, cfg.height, 30, error, cfg.encodingQuality, cfg.encodingMode, cfg.recoveryMode)) {
-                            closeRecording(L"Cannot start camera recording: " + error); continue;
+                        if (!segmentWriting) {
+                            if (pending) {
+                                std::error_code ec;
+                                if (cfg.folder.empty()) { closeRecording(L"Cannot create the save folder. Choose another folder."); admit = false; break; }
+                                const auto folder = std::filesystem::absolute(std::filesystem::path(cfg.folder), ec);
+                                if (ec) { closeRecording(L"Cannot resolve the save folder. Choose another folder."); admit = false; break; }
+                                recordingFolder = folder.lexically_normal().wstring();
+                                recordingFolderIO = recordingDirectoryIO(recordingFolder);
+                                std::filesystem::create_directories(recordingFolderIO, ec);
+                                if (ec) { closeRecording(L"Cannot create the save folder. Choose another folder."); admit = false; break; }
+                                SYSTEMTIME t; GetLocalTime(&t);
+                                wchar_t name[100];
+                                swprintf_s(name, L"Timelapse-%04u%02u%02u-%02u%02u%02u-%03u-%lu", t.wYear,t.wMonth,t.wDay,t.wHour,t.wMinute,t.wSecond,t.wMilliseconds,GetCurrentProcessId());
+                                sessionStem = name;
+                            }
+                            const auto space = cfg.stopOnLowDiskSpace ? queryRecordingSpace(recordingFolderIO) : RecordingSpace{};
+                            if (sessionStarted) advanceElapsed(Clock::now());
+                            if (limitExpired()) { recordingLimitReached = true; closeRecording(L""); admit = false; break; }
+                            if (commandPending()) { admit = false; break; }
+                            if (cfg.stopOnLowDiskSpace && !space.enough(cfg.separateFiles)) {
+                                closeRecording(L"Cannot start recording: " + recordingSpaceProblem(space, cfg.separateFiles) + L" Save folder: " + recordingFolder); admit = false; break;
+                            }
+                            auto name = sessionStem;
+                            if (cfg.segmentDurationSeconds > 0) {
+                                if (segmentOrdinal == UINT64_MAX) throw std::overflow_error("Recording part names exhausted");
+                                wchar_t part[40]; swprintf_s(part, L"-part-%06llu", static_cast<unsigned long long>(segmentOrdinal + 1));
+                                name += part;
+                            }
+                            const auto base = (std::filesystem::path(recordingFolder) / name).wstring();
+                            const auto desktopBase = cfg.separateFiles ? base + L"-desktop" : base;
+                            temporary = desktopBase + L".recording.mp4"; finalPath = desktopBase + L".mp4";
+                            const auto ioBase = recordingFolderIO + name;
+                            const auto desktopIOBase = cfg.separateFiles ? ioBase + L"-desktop" : ioBase;
+                            temporaryIO = desktopIOBase + L".recording.mp4"; finalPathIO = desktopIOBase + L".mp4";
+                            if (cfg.separateFiles) {
+                                cameraTemporary = base + L"-camera.recording.mp4"; cameraFinalPath = base + L"-camera.mp4";
+                                cameraTemporaryIO = ioBase + L"-camera.recording.mp4"; cameraFinalPathIO = ioBase + L"-camera.mp4";
+                            }
+                            if (!encoder) encoder.emplace();
+                            if (!encoder->open(temporaryIO, cfg.width, cfg.height, 30, error, cfg.encodingQuality, cfg.encodingMode, cfg.recoveryMode)) {
+                                closeRecording((cfg.separateFiles ? L"Cannot start desktop recording: " : L"Cannot start recording: ") + error); admit = false; break;
+                            }
+                            writing = segmentWriting = true;
+                            if (cfg.separateFiles) {
+                                if (sessionStarted) advanceElapsed(Clock::now());
+                                if (limitExpired()) { recordingLimitReached = true; closeRecording(L""); admit = false; break; }
+                                if (cfg.segmentDurationSeconds > 0 && commandPending()) {
+                                    // Do not launch the second codec after a
+                                    // queued command. Retire this owned empty
+                                    // prospective part before Pause is serviced.
+                                    if (!finishSegment(L"", false)) closeRecording(L"");
+                                    admit = false; break;
+                                }
+                                if (!cameraEncoder) cameraEncoder.emplace();
+                                if (!cameraEncoder->open(cameraTemporaryIO, cfg.width, cfg.height, 30, error, cfg.encodingQuality, cfg.encodingMode, cfg.recoveryMode)) {
+                                    closeRecording(L"Cannot start camera recording: " + error); admit = false; break;
+                                }
+                                cameraWriting = true;
+                            }
+                            pending = false;
+                            if (!sessionStarted) { lastTick = Clock::now(); nextFrame = lastTick; }
+                            power.update(true, needDesktop);
+                            { std::lock_guard<std::mutex> lock(mutex_);
+                              status_.state = State::Recording; status_.error = false; status_.message = recordingMessage(cfg.separateFiles); }
                         }
-                        cameraWriting = true;
+                        if (sessionStarted) advanceElapsed(Clock::now());
+                        if (limitExpired()) { recordingLimitReached = true; closeRecording(L""); admit = false; break; }
+                        if (commandPending()) { admit = false; break; }
+                        const auto space = cfg.stopOnLowDiskSpace ? queryRecordingSpace(recordingFolderIO) : RecordingSpace{};
+                        if (!sessionStarted) {
+                            activeDuration = Clock::duration::zero(); elapsed = 0;
+                            lastTick = Clock::now(); nextFrame = lastTick;
+                            if (observing) { observationStarted = GetTickCount64(); nextObservation = lastTick; }
+                        } else advanceElapsed(Clock::now());
+                        if (limitExpired()) { recordingLimitReached = true; closeRecording(L""); admit = false; break; }
+                        if (commandPending()) { admit = false; break; }
+                        if (cfg.stopOnLowDiskSpace && !space.enough(cfg.separateFiles)) {
+                            closeRecording(L"Recording stopped: " + recordingSpaceProblem(space, cfg.separateFiles) + L" Save folder: " + recordingFolder); admit = false; break;
+                        }
+                        // Expire existing evidence without new observation work
+                        // after a slow automatic save/open. Both writes share
+                        // the following admission instant and active bucket.
+                        if (skipping) inspectSkipping();
+                        if (commandPending()) { admit = false; break; }
+                        admittedAt = Clock::now();
+                        advanceElapsed(admittedAt);
+                        if (limitExpired()) { recordingLimitReached = true; closeRecording(L""); admit = false; break; }
+                        if (segmentExpired()) continue;
+                        break;
                     }
-                    pending = false;
-                    // Initial source warmup and opening either writer are
-                    // preparation, not active recording time. Anchor sampling
-                    // and the optional deadline to the first admitted frame.
-                    lastTick = Clock::now(); nextFrame = lastTick;
-                    power.update(true, needDesktop);
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    status_.state = State::Recording; status_.error = false; status_.message = recordingMessage(cfg.separateFiles);
-                }
-                if (captureDue && writing && !paused) {
-                    const bool firstSample = encoder->frames() == 0;
-                    if (!firstSample) advanceElapsed(Clock::now());
-                    // Preserve successful time-limit completion if capture
-                    // already used the remaining budget, without querying disk.
-                    if (!firstSample && limitExpired()) {
-                        recordingLimitReached = true; closeRecording(L""); continue;
+                    if (!admit) continue;
+                    if (cfg.segmentDurationSeconds > 0 && !encoder->frames()) {
+                        nextSegmentBoundary = nextSegmentCut(activeDuration, cfg.segmentDurationSeconds);
+                        ++segmentOrdinal;
                     }
-                    // Capture and writer startup can take time or consume
-                    // space. Recheck after both finish, before either sample
-                    // is submitted, and fail closed if the query is unavailable.
-                    // Read the result without allocating diagnostics. An expired
-                    // deadline wins even when a slow storage query fails.
-                    const auto space = cfg.stopOnLowDiskSpace ? queryRecordingSpace(recordingFolderIO) : RecordingSpace{};
-                    if (firstSample) {
-                        // The first space check after writer opening is still
-                        // startup. Start active time only when admission ends.
-                        activeDuration = Clock::duration::zero(); elapsed = 0;
-                        lastTick = Clock::now(); nextFrame = lastTick;
-                        if (observing) { observationStarted = GetTickCount64(); nextObservation = lastTick; }
-                    } else advanceElapsed(Clock::now());
-                    // A slow storage query may also cross the time limit.
-                    // Admit both separate writes together, or neither of them.
-                    if (limitExpired()) {
-                        recordingLimitReached = true; closeRecording(L""); continue;
-                    }
-                    if (cfg.stopOnLowDiskSpace && !space.enough(cfg.separateFiles)) {
-                        closeRecording(L"Recording stopped: " + recordingSpaceProblem(space, cfg.separateFiles) + L" Save folder: " + recordingFolder); continue;
-                    }
-                    const auto admittedAt = Clock::now();
-                    const auto admittedActiveMs = skipping ? activeMilliseconds() : 0;
+                    sessionStarted = true;
+                    const auto admittedActiveMs = std::chrono::duration_cast<std::chrono::milliseconds>(activeDuration).count();
                     if (!encoder->write(composed, error)) {
                         closeRecording((cfg.separateFiles ? L"Desktop recording stopped: " : L"Recording stopped: ") + error); continue;
                     }
@@ -1071,7 +1238,9 @@ void Engine::run() {
                     }
                     if (skipping) inspectSkipping();
                     std::lock_guard<std::mutex> lock(mutex_);
-                    status_.frames = encoder->frames(); status_.elapsed = elapsed;
+                    status_.frames = cfg.separateFiles ? std::min(segmentFrameTotal(closedFrames[0], encoder->frames()),
+                        segmentFrameTotal(closedFrames[1], cameraEncoder->frames())) : segmentFrameTotal(closedFrames[0], encoder->frames());
+                    status_.elapsed = elapsed;
                     if (nightMode) {
                         status_.night = completedNight.exposure;
                         status_.nightDurationMs = static_cast<uint32_t>(completedNight.endTick - completedNight.beginTick);
@@ -1146,7 +1315,7 @@ void Engine::run() {
                 cameraRunning = false;
                 nightMode = nightQueued = nightFrameReady = false;
                 cancelObservation(); skipping = observing = false; observationDesktop = {};
-                writing = cameraWriting = pending = paused = false;
+                writing = segmentWriting = cameraWriting = pending = paused = false;
                 desktop = {}; webcam = {}; composed = {}; cameraComposed = {}; previewBuffer.reset();
                 power.update(false, false);
                 std::unique_lock<std::mutex> lock(mutex_);

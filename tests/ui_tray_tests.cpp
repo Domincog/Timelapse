@@ -333,6 +333,11 @@ void scopedPaint(){Fixture f;probe::current.state=State::Recording;f.tick();app.
     require(probe::invalidated.size()==1&&!probe::invalidated[0].whole&&probe::invalidated[0].window==app.window&&EqualRect(&expected,&probe::invalidated[0].rect)&&probe::enables==0,"Frame update did not invalidate only the scrolled statistics region");
     probe::resetWork();probe::current.elapsed=.9;f.tick();require(probe::invalidated.empty(),"Fractional elapsed time repainted unchanged displayed seconds");
     probe::current.elapsed=1;f.tick();require(probe::invalidated.size()==1,"Displayed second did not repaint statistics");
+    probe::resetWork();probe::current.completedSegments=1;f.tick();
+    require(probe::invalidated.size()==1&&!probe::invalidated[0].whole&&EqualRect(&expected,&probe::invalidated[0].rect)&&
+        app.status.frames==1&&app.status.elapsed==1&&app.status.completedSegments==1&&probe::enables==0&&probe::textWrites==0,
+        "Segment completion without frame/time/message changes missed scoped cumulative-statistics repaint");
+    probe::resetWork();f.tick();require(probe::invalidated.empty(),"Unchanged saved-parts count repainted statistics");
     probe::resetWork();probe::current.message=L"New status";f.tick();require(probe::textWrites==1&&probe::invalidated.empty(),"Message update touched unrelated visuals");
     probe::resetWork();probe::current.error=true;f.tick();require(probe::invalidated.size()==1&&probe::invalidated[0].window==app.statusText,"Error color did not repaint status text");
     probe::resetWork();probe::current.preview=std::make_shared<Frame>();f.tick();require(probe::invalidated.size()==1&&probe::invalidated[0].window==app.preview,"New preview did not repaint only preview");

@@ -210,6 +210,7 @@ struct HiddenFixture {
             for(int i=0;i<count;++i)add(handle,std::to_wstring(i)); choose(handle,0); return handle;
         };
         app.mode=combo(6); app.interval=combo(6); app.videoSize=combo(2); app.encodingQuality=combo(3); app.encodingMode=combo(5);app.stopAfter=combo(6);
+        app.splitEvery=combo(5);app.segmentLabel=child(L"STATIC",0);app.hasCustomSegment=false;app.committedSegment=0;app.customSegmentSeconds=900;app.advancedSegmentSeconds=-1;
         app.lowDisk=child(L"BUTTON",BS_AUTOCHECKBOX);SendMessageW(app.lowDisk,BM_SETCHECK,BST_CHECKED,0);
         app.recoveryMode=child(L"BUTTON",BS_AUTOCHECKBOX);
         app.nightEnabled=child(L"BUTTON",BS_AUTOCHECKBOX);app.nightDuration=combo(6);app.nightTarget=combo(3);choose(app.nightTarget,1);
@@ -463,7 +464,7 @@ void activeControls() {
     seed(true);
     for(auto state:{State::Starting,State::Recording,State::Paused,State::Finishing}) {
         app.status.state=state; updateControls();
-        for(auto control:{app.refresh,app.mode,app.monitor,app.camera,app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.lowDisk,app.nightEnabled,app.nightDuration,app.nightTarget,app.folder,app.record})
+        for(auto control:{app.refresh,app.mode,app.monitor,app.camera,app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.splitEvery,app.lowDisk,app.nightEnabled,app.nightDuration,app.nightTarget,app.folder,app.record})
             require(!IsWindowEnabled(control),"An active-session source/settings control remained enabled.");
     }
     std::cout<<"PASS Refresh/source/settings controls disabled in Starting, Recording, Paused and Finishing.\n";

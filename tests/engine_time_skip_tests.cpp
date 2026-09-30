@@ -5,6 +5,7 @@
 #include "encoder.h"
 #include "camera_host.h"
 #include "capture.h"
+#include "engine_segment_decode.h"
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
@@ -251,6 +252,34 @@ void optionalSlowQueryLimit(const std::filesystem::path& root) {
     require(saved.frames==1&&saved.message.find(L"time limit")!=std::wstring::npos&&!saved.error,"Slow observation admitted a frame after the active deadline");decode(saved,160,120,1);
     std::cout<<"PASS automatic stop beats a slow optional observation.\n";
 }
+void splitPolicyContinuity(const std::filesystem::path& root) {
+    reset(); auto settings=config(root/L"split-manual",TimeSkipMode::Manual);
+    settings.segmentDurationSeconds=1; settings.recordingLimitSeconds=4;
+    settings.timeSkip.repeatSeconds=0; settings.timeSkip.ranges[0]={0,3};
+    {
+        Engine engine; engine.configure(settings); engine.record();
+        await(engine,[](const auto& s){return s.completedSegments>=1&&s.timeSkip.intervalMs>100;});
+        await(engine,[](const auto& s){return s.elapsed>=3&&s.timeSkip.reason==TimeSkipReason::Normal&&s.timeSkip.intervalMs==100;},4000);
+        const auto saved=await(engine,[](const auto& s){return s.state==State::Idle;},2500);
+        require(saved.elapsed>=4&&saved.elapsed<5.5&&checks==0&&observerCaptures==0,
+            "Split restarted the manual schedule clock or enabled observers");
+        spacing(submitted()); split_test::verify(settings.folder,saved,false);
+    }
+    reset(); settings=config(root/L"split-quiet"); settings.segmentDurationSeconds=1; settings.separateFiles=true;
+    {
+        Engine engine; engine.configure(settings); engine.record();
+        await(engine,[](const auto& s){return s.frames>=1;});
+        const auto cancelled=cancels.load();
+        const auto accelerated=await(engine,[](const auto& s){return s.completedSegments>=3&&s.timeSkip.intervalMs>=300;},9000);
+        require(starts==1&&cancels==cancelled&&checks<=unsigned(accelerated.elapsed)+2,
+            "Split restarted source/quiet evidence or oversampled checks");
+        cameraScene=1;
+        await(engine,[](const auto& s){return s.timeSkip.intervalMs==100&&s.timeSkip.reason==TimeSkipReason::Checking;},2000);
+        const auto saved=finish(engine);
+        spacing(submitted()); split_test::verify(settings.folder,saved,true);
+    }
+    std::cout<<"PASS file splits preserve manual schedule, quiet dwell and shared paired cadence.\n";
+}
 void combinedAndSourceReset(const std::filesystem::path& root) {
     reset();auto settings=config(root/L"combined",TimeSkipMode::QuietWithinSchedule);
     settings.timeSkip.repeatSeconds=0;settings.timeSkip.ranges[0]={3,30};
@@ -328,7 +357,7 @@ int main(){
     if(FAILED(MFStartup(MF_VERSION))){CoUninitialize();return 1;}
     const auto root=std::filesystem::current_path()/(L"engine-time-skip-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64()));
     int result=0;
-    try{validation(root);offAndManual(root);pairedActivity(root);unavailableAndPause(root);resetReceipt(root);scheduleAndLimit(root);optionalSlowQueryLimit(root);combinedAndSourceReset(root);nightWindows(root);nightSourceTransition(root);
+    try{validation(root);offAndManual(root);pairedActivity(root);unavailableAndPause(root);resetReceipt(root);scheduleAndLimit(root);optionalSlowQueryLimit(root);splitPolicyContinuity(root);combinedAndSourceReset(root);nightWindows(root);nightSourceTransition(root);
         std::filesystem::remove_all(root);std::cout<<"All synthetic time-skipping engine contracts passed.\n";
     }catch(const std::exception& error){std::cerr<<error.what()<<'\n';std::wcerr<<L"Artifacts retained at "<<root.wstring()<<L'\n';result=1;}
     MFShutdown();CoUninitialize();return result;
