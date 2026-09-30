@@ -21,6 +21,8 @@
 #include <climits>
 #include <system_error>
 #include <initializer_list>
+#include <atomic>
+#include <process.h>
 
 using namespace lapse;
 namespace {
@@ -43,6 +45,7 @@ constexpr int SkipMultipliers[] = {2,4,8,16,32,64}, SkipRamps[] = {15,30,60};
 constexpr int SeparateFilesMode = 5;
 constexpr wchar_t SeparateFilesLabel[] = L"Desktop + camera (2 files)";
 constexpr UINT TrayMessage = WM_APP + 1, ShowExistingMessage = WM_APP + 2;
+constexpr UINT CancelOwnedWorkMessage = WM_APP + 3;
 constexpr UINT TrayShow = 4001, TrayPause = 4002, TrayFinish = 4003, TrayExit = 4004;
 constexpr UINT ExitSystemCommand = 0x1000;
 constexpr wchar_t InstanceMutexName[] = L"Local\\Timelapse.Application.{DC32D155-1B8D-4880-9902-CE6245D34923}";
@@ -125,7 +128,7 @@ void cancelOwnedDialogs() {
     // EndDialog returns before destruction: walk ownership, not the global
     // pointer, so an open range editor and its settings dialog both terminate.
     for(HWND dialog=app.customDialog;dialog && dialog!=app.window;){
-        HWND owner=GetWindow(dialog,GW_OWNER);EndDialog(dialog,IDCANCEL);dialog=owner;
+        HWND owner=GetWindow(dialog,GW_OWNER);SendMessageW(dialog,CancelOwnedWorkMessage,0,0);EndDialog(dialog,IDCANCEL);dialog=owner;
     }
 }
 
@@ -1122,8 +1125,82 @@ void customFont(HWND window,CustomDraft& draft) {
     EnumChildWindows(window,[](HWND child,LPARAM font)->BOOL {SendMessageW(child,WM_SETFONT,font,TRUE);return TRUE;},reinterpret_cast<LPARAM>(draft.font));
     if(previous)DeleteObject(previous);
 }
-constexpr int StatusDetailsText=5401;
-struct StatusDetailsDraft : CustomDraft { std::wstring snapshot; HWND contents{}; };
+constexpr int StatusDetailsText=5401,StatusDetailsFiles=5402,StatusDetailsFilesStatus=5403;
+constexpr UINT_PTR StatusDetailsFilesTimer=2;
+enum class StatusFilesPhase { Resolving, Cancelled, Selecting };
+struct StatusFilesTask {
+    std::vector<std::wstring> files;
+    std::wstring folder;
+    std::atomic<StatusFilesPhase> phase{StatusFilesPhase::Resolving};
+    std::atomic<bool> done{false};
+    HRESULT result=E_PENDING;
+    void cancel() noexcept {auto expected=StatusFilesPhase::Resolving;phase.compare_exchange_strong(expected,StatusFilesPhase::Cancelled);}
+};
+std::atomic<bool> statusFilesBusy{false};
+std::vector<std::wstring> statusDetailsFiles(const Status& status,std::wstring& folder) {
+    folder.clear();
+    if(status.savedPaths.size()>2)return {};
+    auto files=status.savedPaths;
+    if(files.empty()&&!status.savedPath.empty())files.push_back(status.savedPath);
+    std::wstring parent;
+    for(const auto& file:files){
+        if(file.empty()||file.find(L'\0')!=std::wstring::npos)return {};
+        const std::filesystem::path path(file);
+        if(!path.is_absolute()||!path.has_filename()||path.filename()==L"."||path.filename()==L"..")return {};
+        const auto current=path.parent_path().wstring();
+        if(current.empty()||(!parent.empty()&&CompareStringOrdinal(parent.c_str(),-1,current.c_str(),-1,TRUE)!=CSTR_EQUAL))return {};
+        parent=current;
+    }
+    folder=std::move(parent);return files;
+}
+HRESULT selectStatusFiles(StatusFilesTask& task) {
+    // Shell parsing can block on storage/providers. This worker owns all inputs
+    // and resources and never reads App, a window, or the dialog's lifetime.
+    if(task.files.empty()||task.files.size()>2||task.folder.empty())return E_INVALIDARG;
+    struct Com {HRESULT result=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);~Com(){if(SUCCEEDED(result))CoUninitialize();}} com;
+    if(FAILED(com.result))return com.result;
+    const auto cancelled=[&]{return task.phase.load()==StatusFilesPhase::Cancelled;};
+    if(cancelled())return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+    struct Pidl {PIDLIST_ABSOLUTE value{};~Pidl(){CoTaskMemFree(value);}} folder,files[2];
+    SFGAOF attributes=0;
+    HRESULT result=SHParseDisplayName(task.folder.c_str(),nullptr,&folder.value,SFGAO_FILESYSTEM|SFGAO_FOLDER,&attributes);
+    if(FAILED(result))return result;
+    if(!folder.value||(attributes&(SFGAO_FILESYSTEM|SFGAO_FOLDER))!=(SFGAO_FILESYSTEM|SFGAO_FOLDER))return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
+    std::array<PCUITEMID_CHILD,2> children{};
+    for(size_t i=0;i<task.files.size();++i){
+        if(cancelled())return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+        attributes=0;result=SHParseDisplayName(task.files[i].c_str(),nullptr,&files[i].value,SFGAO_FILESYSTEM|SFGAO_FOLDER,&attributes);
+        if(FAILED(result))return result;
+        if(!files[i].value||!(attributes&SFGAO_FILESYSTEM)||(attributes&SFGAO_FOLDER))return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+        Pidl parent;parent.value=ILCloneFull(files[i].value);
+        if(!parent.value)return E_OUTOFMEMORY;
+        if(!ILRemoveLastID(parent.value)||!ILIsEqual(parent.value,folder.value))return E_INVALIDARG;
+        children[i]=ILFindLastID(files[i].value);
+    }
+    // Cancellation wins until this transition. An Explorer request already
+    // dispatched cannot be revoked by closing the dialog.
+    auto expected=StatusFilesPhase::Resolving;
+    if(!task.phase.compare_exchange_strong(expected,StatusFilesPhase::Selecting))return HRESULT_FROM_WIN32(ERROR_CANCELLED);
+    return SHOpenFolderAndSelectItems(folder.value,static_cast<UINT>(task.files.size()),children.data(),0);
+}
+unsigned __stdcall statusFilesWorker(void* argument) noexcept {
+    std::unique_ptr<std::shared_ptr<StatusFilesTask>> owned(static_cast<std::shared_ptr<StatusFilesTask>*>(argument));
+    const auto task=*owned;owned.reset();
+    try {task->result=selectStatusFiles(*task);}
+    catch(const std::bad_alloc&){task->result=E_OUTOFMEMORY;}
+    catch(...){task->result=E_FAIL;}
+    // All COM/PIDL resources are released before the next request may start.
+    statusFilesBusy.store(false,std::memory_order_release);
+    task->done.store(true,std::memory_order_release);return 0;
+}
+struct StatusDetailsDraft : CustomDraft {
+    std::wstring snapshot,filesFolder;
+    std::vector<std::wstring> files;
+    HWND contents{},showFiles{},filesStatus{};
+    std::shared_ptr<StatusFilesTask> filesTask;
+    bool filesTimer=false,compactHelp=false;
+    ~StatusDetailsDraft(){if(filesTask)filesTask->cancel();}
+};
 constexpr wchar_t StatusDetailsHelp[]=L"Snapshot when opened. Select text, or press Ctrl+A, then Ctrl+C to copy.";
 LRESULT CALLBACK statusDetailsEditProc(HWND window,UINT message,WPARAM wp,LPARAM lp,UINT_PTR,DWORD_PTR) {
     if((message==WM_KEYDOWN && wp=='A') || (message==WM_CHAR && wp==1)){
@@ -1135,19 +1212,93 @@ LRESULT CALLBACK statusDetailsEditProc(HWND window,UINT message,WPARAM wp,LPARAM
 void statusDetailsLayout(HWND window,StatusDetailsDraft& draft) {
     if(draft.layingOut)return;draft.layingOut=true;
     RECT client{};GetClientRect(window,&client);
-    const int width=std::max(1L,client.right),height=std::max(1L,client.bottom);
-    const int pad=std::min(draft.scale(18),std::max(1,std::min(width,height)/12)),gap=std::min(draft.scale(12),pad);
-    const int inner=std::max(1,width-2*pad),buttonH=draft.scale(28);
-    RECT measured{0,0,inner,0};HDC dc=GetDC(window);
-    if(dc){const auto previous=SelectObject(dc,draft.font?draft.font:GetStockObject(DEFAULT_GUI_FONT));
-        DrawTextW(dc,StatusDetailsHelp,-1,&measured,DT_CALCRECT|DT_WORDBREAK|DT_NOPREFIX);SelectObject(dc,previous);ReleaseDC(window,dc);}
-    const int helpH=std::max(draft.scale(32),static_cast<int>(measured.bottom));
-    const int buttonY=std::max(pad,height-pad-buttonH),textY=pad+helpH+gap;
-    MoveWindow(draft.help,pad,pad,inner,helpH,TRUE);
-    MoveWindow(draft.contents,pad,textY,inner,std::max(1,buttonY-gap-textY),TRUE);
-    const int buttonW=std::min(draft.scale(88),inner);
-    MoveWindow(draft.cancel,width-pad-buttonW,buttonY,buttonW,buttonH,TRUE);
+    const auto style=GetWindowLongPtrW(window,GWL_STYLE);
+    const int barW=GetSystemMetricsForDpi(SM_CXVSCROLL,draft.dpi),barH=GetSystemMetricsForDpi(SM_CYHSCROLL,draft.dpi);
+    const int availableW=client.right+((style&WS_VSCROLL)?barW:0),availableH=client.bottom+((style&WS_HSCROLL)?barH:0);
+    const int pad=draft.scale(18),gap=draft.scale(12),buttonH=draft.scale(28);
+    const bool compact=availableW<draft.scale(480);
+    const wchar_t* help=compact?L"Snapshot. Ctrl+A, Ctrl+C to copy.":StatusDetailsHelp;
+    if(compact!=draft.compactHelp){draft.compactHelp=compact;SetWindowTextW(draft.help,help);}
+    HDC dc=GetDC(window);const auto previous=dc?SelectObject(dc,draft.font?draft.font:GetStockObject(DEFAULT_GUI_FONT)):nullptr;
+    const auto buttonWidth=[&](const wchar_t* value,int minimum){SIZE size{};
+        if(dc)GetTextExtentPoint32W(dc,value,static_cast<int>(std::wcslen(value)),&size);
+        return std::max(draft.scale(minimum),int(size.cx)+draft.scale(32));};
+    const int closeW=buttonWidth(L"Close",88),showW=draft.showFiles?buttonWidth(L"Show files",112):0;
+    const int minimumW=std::max(closeW,showW)+2*pad;
+    const auto measure=[&](const wchar_t* value,int inner,int minimum){RECT measured{0,0,std::max(1,inner),0};
+        if(dc)DrawTextW(dc,value,-1,&measured,DT_CALCRECT|DT_WORDBREAK|DT_NOPREFIX);
+        return std::max(minimum,static_cast<int>(measured.bottom));};
+    wchar_t filesMessage[384]{};if(draft.filesStatus)GetWindowTextW(draft.filesStatus,filesMessage,static_cast<int>(std::size(filesMessage)));
+    const bool feedback=filesMessage[0]!=0;
+    if(draft.filesStatus)ShowWindow(draft.filesStatus,feedback?SW_SHOWNA:SW_HIDE);
+    bool horizontal=false,vertical=false,stacked=false;int helpH=0,filesH=0,minimumH=0;
+    const auto measureCanvas=[&](int width){const int inner=width-2*pad;
+        helpH=measure(help,inner,draft.scale(24));filesH=feedback?measure(filesMessage,inner,draft.scale(24)):0;
+        stacked=draft.showFiles&&showW+gap+closeW>inner;
+        minimumH=2*pad+helpH+gap+draft.scale(56)+gap+(feedback?filesH+gap:0)+buttonH+(stacked?buttonH+gap:0);};
+    for(int pass=0;pass<3;++pass){horizontal=availableW-(vertical?barW:0)<minimumW;
+        measureCanvas(std::max(minimumW,availableW-(vertical?barW:0)));vertical=availableH-(horizontal?barH:0)<minimumH;}
+    ShowScrollBar(window,SB_HORZ,horizontal);ShowScrollBar(window,SB_VERT,vertical);GetClientRect(window,&client);
+    const int width=std::max(minimumW,int(client.right));measureCanvas(width);
+    const int height=std::max(minimumH,int(client.bottom)),inner=width-2*pad;
+    if(dc){SelectObject(dc,previous);ReleaseDC(window,dc);}
+    if(width<=client.right)draft.wheelX=0;if(height<=client.bottom)draft.wheelY=0;
+    draft.scrollX=std::clamp(draft.scrollX,0,width-int(std::max(1L,client.right)));
+    draft.scrollY=std::clamp(draft.scrollY,0,height-int(std::max(1L,client.bottom)));
+    SCROLLINFO info{sizeof(info),SIF_RANGE|SIF_PAGE|SIF_POS};info.nMax=width-1;info.nPage=std::max(1L,client.right);info.nPos=draft.scrollX;SetScrollInfo(window,SB_HORZ,&info,TRUE);
+    info.nMax=height-1;info.nPage=std::max(1L,client.bottom);info.nPos=draft.scrollY;SetScrollInfo(window,SB_VERT,&info,TRUE);
+    const int closeY=height-pad-buttonH,showY=closeY-(stacked?buttonH+gap:0),actionsY=draft.showFiles?showY:closeY;
+    const int footerY=actionsY-gap-filesH,textY=pad+helpH+gap;
+    const auto move=[&](HWND child,int x,int y,int w,int h){if(child)MoveWindow(child,x-draft.scrollX,y-draft.scrollY,w,h,TRUE);};
+    move(draft.help,pad,pad,inner,helpH);move(draft.contents,pad,textY,inner,(feedback?footerY-gap:actionsY-gap)-textY);
+    if(feedback)move(draft.filesStatus,pad,footerY,inner,filesH);
+    move(draft.showFiles,pad,showY,showW,buttonH);move(draft.cancel,width-pad-closeW,closeY,closeW,buttonH);
     draft.layingOut=false;
+}
+void statusDetailsReveal(HWND window,StatusDetailsDraft& draft,HWND child) {
+    if(!child||!IsChild(window,child))return;
+    RECT bounds{},client{};GetWindowRect(child,&bounds);MapWindowPoints(nullptr,window,reinterpret_cast<POINT*>(&bounds),2);GetClientRect(window,&client);
+    if(bounds.left<0)draft.scrollX+=bounds.left;else if(bounds.right>client.right)draft.scrollX+=bounds.right-client.right;
+    if(bounds.top<0)draft.scrollY+=bounds.top;else if(bounds.bottom>client.bottom)draft.scrollY+=bounds.bottom-client.bottom;
+    statusDetailsLayout(window,draft);
+}
+void statusFilesFeedback(HWND window,StatusDetailsDraft& draft,const wchar_t* message) {
+    SetWindowTextW(draft.filesStatus,message);statusDetailsLayout(window,draft);statusDetailsReveal(window,draft,GetFocus());
+}
+void cancelStatusFiles(HWND window,StatusDetailsDraft& draft) noexcept {
+    if(draft.filesTask)draft.filesTask->cancel();
+    if(draft.filesTimer){KillTimer(window,StatusDetailsFilesTimer);draft.filesTimer=false;}
+}
+void startStatusFiles(HWND window,StatusDetailsDraft& draft) {
+    if(draft.files.empty()||draft.filesTask||!draft.showFiles||!IsWindowEnabled(draft.showFiles))return;
+    bool expected=false;
+    if(!statusFilesBusy.compare_exchange_strong(expected,true)){
+        statusFilesFeedback(window,draft,L"Another file request is finishing. Try again in a moment.");return;
+    }
+    std::shared_ptr<StatusFilesTask> task;
+    std::unique_ptr<std::shared_ptr<StatusFilesTask>> argument;
+    try {
+        task=std::make_shared<StatusFilesTask>();task->files=draft.files;task->folder=draft.filesFolder;
+        argument=std::make_unique<std::shared_ptr<StatusFilesTask>>(task);
+    } catch(...) {
+        statusFilesBusy.store(false,std::memory_order_release);
+        statusFilesFeedback(window,draft,L"Not enough memory to show the files. Try again.");return;
+    }
+    // Establish completion delivery before launch. Failure starts no worker.
+    if(!SetTimer(window,StatusDetailsFilesTimer,150,nullptr)){
+        statusFilesBusy.store(false,std::memory_order_release);
+        statusFilesFeedback(window,draft,L"Windows could not prepare the file request. Try again.");return;
+    }
+    draft.filesTimer=true;draft.filesTask=task;
+    const uintptr_t thread=_beginthreadex(nullptr,0,statusFilesWorker,argument.get(),0,nullptr);
+    if(!thread){
+        cancelStatusFiles(window,draft);draft.filesTask.reset();statusFilesBusy.store(false,std::memory_order_release);
+        statusFilesFeedback(window,draft,L"Windows could not start the file request. Try again.");return;
+    }
+    argument.release();CloseHandle(reinterpret_cast<HANDLE>(thread));
+    if(GetFocus()==draft.showFiles)SetFocus(draft.cancel);
+    EnableWindow(draft.showFiles,FALSE);
+    statusFilesFeedback(window,draft,L"Opening in Explorer...");
 }
 INT_PTR CALLBACK statusDetailsProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
     auto* draft=reinterpret_cast<StatusDetailsDraft*>(GetWindowLongPtrW(window,DWLP_USER));
@@ -1161,9 +1312,15 @@ INT_PTR CALLBACK statusDetailsProc(HWND window,UINT message,WPARAM wp,LPARAM lp)
                 type,label,WS_CHILD|WS_VISIBLE|style,0,0,1,1,window,reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),GetModuleHandleW(nullptr),nullptr);};
             draft->help=child(L"STATIC",StatusDetailsHelp,SS_NOPREFIX,5400);
             draft->contents=child(L"EDIT",L"",WS_TABSTOP|WS_VSCROLL|ES_MULTILINE|ES_AUTOVSCROLL|ES_READONLY,StatusDetailsText);
-            draft->cancel=child(L"BUTTON",L"Close",WS_TABSTOP|BS_DEFPUSHBUTTON,IDCANCEL);
+            if(!draft->files.empty()){
+                draft->filesStatus=child(L"STATIC",L"",SS_NOPREFIX,StatusDetailsFilesStatus);
+                draft->showFiles=child(L"BUTTON",L"Show &files",WS_TABSTOP|BS_PUSHBUTTON|BS_NOTIFY,StatusDetailsFiles);
+            }
+            draft->cancel=child(L"BUTTON",L"Close",WS_TABSTOP|BS_DEFPUSHBUTTON|BS_NOTIFY,IDCANCEL);
             if(!draft->help || !draft->contents || !draft->cancel ||
+                (!draft->files.empty()&&(!draft->showFiles||!draft->filesStatus)) ||
                 !SetWindowSubclass(draft->contents,statusDetailsEditProc,1,0)){EndDialog(window,-1);return TRUE;}
+            SendMessageW(window,DM_SETDEFID,IDCANCEL,0);
             SendMessageW(draft->contents,EM_SETLIMITTEXT,0,0);
             if(draft->snapshot.size()>INT_MAX || !SetWindowTextW(draft->contents,draft->snapshot.c_str()) ||
                 static_cast<size_t>(GetWindowTextLengthW(draft->contents))!=draft->snapshot.size()){EndDialog(window,-1);return TRUE;}
@@ -1179,7 +1336,16 @@ INT_PTR CALLBACK statusDetailsProc(HWND window,UINT message,WPARAM wp,LPARAM lp)
         }
         if(!draft)return FALSE;
         switch(message){
-        case WM_SIZE:statusDetailsLayout(window,*draft);return TRUE;
+        case WM_SIZE:statusDetailsLayout(window,*draft);statusDetailsReveal(window,*draft,GetFocus());return TRUE;
+        case WM_MOUSEWHEEL:case WM_MOUSEHWHEEL:{
+            const auto result=dialogWheel(window,*draft,message,wp);
+            if(result==DialogWheel::Scrolled)statusDetailsLayout(window,*draft);
+            if(result!=DialogWheel::Pass)return TRUE;break;}
+        case WM_HSCROLL:case WM_VSCROLL:{
+            if(lp)break;
+            const int bar=message==WM_HSCROLL?SB_HORZ:SB_VERT;SCROLLINFO info{sizeof(info),SIF_ALL};GetScrollInfo(window,bar,&info);int position=info.nPos;
+            switch(LOWORD(wp)){case SB_LINEUP:position-=draft->scale(24);break;case SB_LINEDOWN:position+=draft->scale(24);break;case SB_PAGEUP:position-=info.nPage;break;case SB_PAGEDOWN:position+=info.nPage;break;case SB_THUMBPOSITION:case SB_THUMBTRACK:position=info.nTrackPos;break;case SB_TOP:position=0;break;case SB_BOTTOM:position=info.nMax;break;default:return TRUE;}
+            (bar==SB_HORZ?draft->scrollX:draft->scrollY)=position;statusDetailsLayout(window,*draft);return TRUE;}
         case WM_GETMINMAXINFO:{RECT minimum{0,0,draft->scale(320),draft->scale(220)};
             AdjustWindowRectExForDpi(&minimum,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_STYLE)),FALSE,
                 static_cast<DWORD>(GetWindowLongPtrW(window,GWL_EXSTYLE)),draft->dpi);
@@ -1188,15 +1354,32 @@ INT_PTR CALLBACK statusDetailsProc(HWND window,UINT message,WPARAM wp,LPARAM lp)
         case WM_DPICHANGED:{draft->dpi=HIWORD(wp);customFont(window,*draft);
             RECT rect=*reinterpret_cast<RECT*>(lp);rect=fitWindow(rect,workArea(MonitorFromRect(&rect,MONITOR_DEFAULTTONEAREST)));
             SetWindowPos(window,nullptr,rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top,SWP_NOZORDER|SWP_NOACTIVATE);
-            statusDetailsLayout(window,*draft);return TRUE;}
-        case WM_COMMAND:if((LOWORD(wp)==IDCANCEL || LOWORD(wp)==IDOK) && HIWORD(wp)==BN_CLICKED){EndDialog(window,IDCANCEL);return TRUE;}break;
+            statusDetailsLayout(window,*draft);statusDetailsReveal(window,*draft,GetFocus());return TRUE;}
+        case WM_COMMAND:
+            if((LOWORD(wp)==StatusDetailsText&&HIWORD(wp)==EN_SETFOCUS)||
+                ((LOWORD(wp)==StatusDetailsFiles||LOWORD(wp)==IDCANCEL)&&HIWORD(wp)==BN_SETFOCUS)){
+                if(GetFocus()==reinterpret_cast<HWND>(lp))statusDetailsReveal(window,*draft,reinterpret_cast<HWND>(lp));return TRUE;}
+            if(HIWORD(wp)!=BN_CLICKED)break;
+            if(LOWORD(wp)==StatusDetailsFiles){startStatusFiles(window,*draft);return TRUE;}
+            if(LOWORD(wp)==IDCANCEL || LOWORD(wp)==IDOK){cancelStatusFiles(window,*draft);EndDialog(window,IDCANCEL);return TRUE;}break;
+        case WM_TIMER:
+            if(wp==StatusDetailsFilesTimer&&draft->filesTask&&draft->filesTask->done.load(std::memory_order_acquire)){
+                const HRESULT result=draft->filesTask->result;
+                cancelStatusFiles(window,*draft);draft->filesTask.reset();EnableWindow(draft->showFiles,TRUE);
+                if(SUCCEEDED(result))statusFilesFeedback(window,*draft,L"Selection requested in Explorer.");
+                else {wchar_t error[256]{};swprintf_s(error,L"Could not show files (0x%08X). They may have moved or be unavailable.",static_cast<unsigned>(result));
+                    statusFilesFeedback(window,*draft,error);}
+                return TRUE;
+            }
+            break;
+        case CancelOwnedWorkMessage:cancelStatusFiles(window,*draft);return TRUE;
         case WM_CTLCOLORSTATIC:if(reinterpret_cast<HWND>(lp)==draft->contents){SetTextColor(reinterpret_cast<HDC>(wp),Ink);
             SetBkColor(reinterpret_cast<HDC>(wp),GetSysColor(COLOR_WINDOW));return reinterpret_cast<INT_PTR>(GetSysColorBrush(COLOR_WINDOW));}break;
-        case WM_CLOSE:EndDialog(window,IDCANCEL);return TRUE;
-        case WM_DESTROY:if(draft->font){DeleteObject(draft->font);draft->font=nullptr;}
+        case WM_CLOSE:cancelStatusFiles(window,*draft);EndDialog(window,IDCANCEL);return TRUE;
+        case WM_DESTROY:cancelStatusFiles(window,*draft);if(draft->font){DeleteObject(draft->font);draft->font=nullptr;}
             if(app.customDialog==window)app.customDialog=IsWindow(draft->previousDialog)?draft->previousDialog:nullptr;return TRUE;
         }
-    } catch(...){EndDialog(window,-1);return TRUE;}
+    } catch(...){if(draft)cancelStatusFiles(window,*draft);EndDialog(window,-1);return TRUE;}
     return FALSE;
 }
 void showStatusDetails() {
@@ -1206,7 +1389,7 @@ void showStatusDetails() {
     try {
         // Own all text before entering a nested message loop. The native edit
         // receives this snapshot once, so timers cannot disturb selection.
-        StatusDetailsDraft draft;draft.snapshot=statusDetailsSnapshot();CustomTemplate resource;
+        StatusDetailsDraft draft;draft.snapshot=statusDetailsSnapshot();draft.files=statusDetailsFiles(app.status,draft.filesFolder);CustomTemplate resource;
         resource.dialog.style|=WS_THICKFRAME;
         failed=DialogBoxIndirectParamW(GetModuleHandleW(nullptr),&resource.dialog,owner,statusDetailsProc,reinterpret_cast<LPARAM>(&draft))==-1;
     } catch(...) {failed=true;}

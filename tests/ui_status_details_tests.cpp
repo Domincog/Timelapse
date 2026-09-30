@@ -1,4 +1,6 @@
 // Actual native controls and handlers, with an inert engine and owned windows.
+// Generated files, real bounded background threads, and intercepted Shell/PIDL
+// operations verify file selection without ever invoking Explorer or a player.
 // The native mnemonic case temporarily shows only a nonactivating tool window
 // wholly offscreen. No ordinary app entry, devices, profile I/O or clipboard.
 #include "engine.h"
@@ -13,22 +15,98 @@
 #include <array>
 #include <cstdlib>
 #include <cwchar>
+#include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <exception>
 #include <functional>
 #include <iostream>
 #include <new>
 #include <stdexcept>
 #include <utility>
+#include <atomic>
+#include <chrono>
+#include <mutex>
+#include <process.h>
+#include <thread>
 
 namespace detailsProbe {
 void require(bool value,const char* message){if(!value)throw std::runtime_error(message);}
-bool failAllocation=false,countAllocations=false,failDialog=false,routeFailed=false;
+thread_local bool failAllocation=false,countAllocations=false;
+bool failDialog=false,routeFailed=false;
 size_t allocations=0;
 int allocationFailures=0,dialogs=0,notices=0,records=0,finishes=0,pauses=0;
 int statusQueries=0,configures=0,enumerations=0,textWrites=0,focusCalls=0,invalidFocus=0;
 int trayCalls=0,shows=0,hides=0,foregrounds=0,quits=0,profileReads=0;
 int folderCalls=0,shellCalls=0;
+std::atomic<int> fileThreadStarts{0},fileThreadExits{0},fileThreadCloses{0},fileComStarts{0},fileComEnds{0},fileParses{0},fileSelections{0},filePidls{0},fileFrees{0};
+std::atomic<bool> blockFileParse{false},fileParseEntered{false},releaseFileParse{false},fileProbeError{false};
+bool failFileThread=false,failFileTimer=false;
+std::atomic<int> failFileParseAt{0};
+std::atomic<int> blockFileParseAt{1};
+std::atomic<bool> mismatchedFileParent{false},failFileClone{false};
+std::atomic<HRESULT> fileComResult{S_OK},fileSelectResult{S_OK};
+int fileTimers=0,fileTimerKills=0;
+DWORD ownerThread=0;
+std::mutex fileMutex;
+std::vector<std::wstring> parsedFiles,selectedFiles;
+std::wstring selectedFolder;
+HANDLE fileThread{};
+struct ThreadCall {unsigned (__stdcall* function)(void*);void* parameter;};
+unsigned __stdcall runFileThread(void* raw){
+    const auto call=*static_cast<ThreadCall*>(raw);delete static_cast<ThreadCall*>(raw);
+    const unsigned result=call.function(call.parameter);++fileThreadExits;return result;
+}
+uintptr_t __cdecl beginThread(void* security,unsigned stack,unsigned (__stdcall* function)(void*),void* parameter,unsigned flags,unsigned* id){
+    ++fileThreadStarts;if(failFileThread)return 0;
+    auto* call=new ThreadCall{function,parameter};
+    const auto result=_beginthreadex(security,stack,runFileThread,call,flags,id);
+    if(!result){delete call;return 0;}
+    // Retain a separate observer handle only in this fixture for bounded cleanup.
+    if(!DuplicateHandle(GetCurrentProcess(),reinterpret_cast<HANDLE>(result),GetCurrentProcess(),&fileThread,SYNCHRONIZE,FALSE,0))fileProbeError=true;
+    return result;
+}
+BOOL WINAPI closeHandle(HANDLE value){++fileThreadCloses;return CloseHandle(value);}
+HRESULT WINAPI comInitialize(LPVOID,DWORD flags){
+    if(GetCurrentThreadId()==ownerThread || flags!=COINIT_APARTMENTTHREADED)fileProbeError=true;
+    ++fileComStarts;return fileComResult;
+}
+void WINAPI comUninitialize(){++fileComEnds;}
+HRESULT WINAPI parseFile(PCWSTR path,IBindCtx*,PIDLIST_ABSOLUTE* output,SFGAOF requested,SFGAOF* attributes){
+    *output=nullptr;const int call=++fileParses;
+    if(GetCurrentThreadId()==ownerThread)fileProbeError=true;
+    if(blockFileParse&&call==blockFileParseAt&&blockFileParse.exchange(false)){
+        fileParseEntered=true;const auto until=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+        while(!releaseFileParse && std::chrono::steady_clock::now()<until)std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if(!releaseFileParse){fileProbeError=true;return E_ABORT;}
+    }
+    if(call==failFileParseAt)return E_ACCESSDENIED;
+    const DWORD nativeAttributes=path?GetFileAttributesW(path):INVALID_FILE_ATTRIBUTES;
+    if(nativeAttributes==INVALID_FILE_ATTRIBUTES)return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+    const bool directory=(nativeAttributes&FILE_ATTRIBUTE_DIRECTORY)!=0;
+    if(attributes)*attributes=requested&(SFGAO_FILESYSTEM|(directory?SFGAO_FOLDER:0));
+    const std::filesystem::path actual(path);
+    std::array<std::wstring,2> items{directory?actual.wstring():actual.parent_path().wstring(),directory?L"":actual.filename().wstring()};
+    if(!directory&&mismatchedFileParent)items[0]+=L"-wrong-parent";
+    const size_t count=directory?1:2;size_t total=sizeof(USHORT);
+    for(size_t i=0;i<count;++i){const auto bytes=sizeof(USHORT)+(items[i].size()+1)*sizeof(wchar_t);if(bytes>USHRT_MAX)return E_INVALIDARG;total+=bytes;}
+    auto* data=static_cast<BYTE*>(CoTaskMemAlloc(total));if(!data)return E_OUTOFMEMORY;
+    BYTE* destination=data;
+    for(size_t i=0;i<count;++i){const auto bytes=(items[i].size()+1)*sizeof(wchar_t);const USHORT length=static_cast<USHORT>(sizeof(USHORT)+bytes);std::memcpy(destination,&length,sizeof(length));std::memcpy(destination+sizeof(length),items[i].c_str(),bytes);destination+=length;}
+    const USHORT end=0;std::memcpy(destination,&end,sizeof(end));
+    *output=reinterpret_cast<PIDLIST_ABSOLUTE>(data);++filePidls;
+    {std::lock_guard<std::mutex> lock(fileMutex);parsedFiles.emplace_back(path);}
+    return S_OK;
+}
+void WINAPI freePidl(void* value){if(value)++fileFrees;CoTaskMemFree(value);}
+PIDLIST_ABSOLUTE clonePidl(PCIDLIST_ABSOLUTE value){if(failFileClone)return nullptr;auto* clone=ILCloneFull(value);if(clone)++filePidls;return clone;}
+BOOL WINAPI equalPidl(PCIDLIST_ABSOLUTE first,PCIDLIST_ABSOLUTE second){const auto bytes=ILGetSize(first);return bytes==ILGetSize(second)&&std::memcmp(first,second,bytes)==0;}
+std::wstring pidlPath(PCUIDLIST_RELATIVE value){return value?reinterpret_cast<const wchar_t*>(reinterpret_cast<const BYTE*>(value)+sizeof(USHORT)):L"";}
+HRESULT WINAPI selectFiles(PCIDLIST_ABSOLUTE folder,UINT count,PCUITEMID_CHILD_ARRAY children,DWORD flags){
+    if(GetCurrentThreadId()==ownerThread || count<1 || count>2 || flags)fileProbeError=true;
+    {std::lock_guard<std::mutex> lock(fileMutex);selectedFolder=pidlPath(folder);selectedFiles.clear();for(UINT i=0;i<count;++i)selectedFiles.push_back((std::filesystem::path(selectedFolder)/pidlPath(children[i])).wstring());}
+    ++fileSelections;return fileSelectResult;
+}
 lapse::Status current;
 lapse::Settings configured;
 std::wstring notice;
@@ -57,8 +135,8 @@ BOOL WINAPI notify(DWORD,PNOTIFYICONDATAW){++trayCalls;return TRUE;}
 int WINAPI message(HWND,LPCWSTR value,LPCWSTR,UINT){++notices;notice=value;return IDOK;}
 BOOL WINAPI setText(HWND window,LPCWSTR value){++textWrites;return SetWindowTextW(window,value);}
 HWND WINAPI focus(HWND window){++focusCalls;if(window&&!IsWindow(window))++invalidFocus;return SetFocus(window);}
-UINT_PTR WINAPI timer(HWND,UINT_PTR id,UINT,TIMERPROC){return id;}
-BOOL WINAPI killTimer(HWND,UINT_PTR){return TRUE;}
+UINT_PTR WINAPI timer(HWND,UINT_PTR id,UINT,TIMERPROC){if(id==2){++fileTimers;if(failFileTimer)return 0;}return id;}
+BOOL WINAPI killTimer(HWND,UINT_PTR id){if(id==2)++fileTimerKills;return TRUE;}
 void WINAPI quit(int){++quits;}
 BOOL WINAPI affinity(HWND,DWORD){return TRUE;}
 HMONITOR WINAPI monitor(HWND,DWORD){return reinterpret_cast<HMONITOR>(1);}
@@ -127,6 +205,17 @@ int runCameraHost(const wchar_t*){throw std::runtime_error("Unexpected normal ap
 #define WritePrivateProfileStringW detailsProbe::profileWrite
 #define CoCreateInstance detailsProbe::folderFactory
 #define ShellExecuteW detailsProbe::shell
+#define _beginthreadex detailsProbe::beginThread
+#define CloseHandle detailsProbe::closeHandle
+#define CoInitializeEx detailsProbe::comInitialize
+#define CoUninitialize detailsProbe::comUninitialize
+#define SHParseDisplayName detailsProbe::parseFile
+#define SHOpenFolderAndSelectItems detailsProbe::selectFiles
+#define CoTaskMemFree detailsProbe::freePidl
+#pragma push_macro("ILCloneFull")
+#undef ILCloneFull
+#define ILCloneFull detailsProbe::clonePidl
+#define ILIsEqual detailsProbe::equalPidl
 #pragma warning(push)
 #pragma warning(disable: 4702) // Deliberate normal-entry sentinel above.
 #include "ui_person_pack_stub.h"
@@ -155,6 +244,16 @@ int runCameraHost(const wchar_t*){throw std::runtime_error("Unexpected normal ap
 #undef WritePrivateProfileStringW
 #undef CoCreateInstance
 #undef ShellExecuteW
+#undef _beginthreadex
+#undef CloseHandle
+#undef CoInitializeEx
+#undef CoUninitialize
+#undef SHParseDisplayName
+#undef SHOpenFolderAndSelectItems
+#undef CoTaskMemFree
+#undef ILCloneFull
+#pragma pop_macro("ILCloneFull")
+#undef ILIsEqual
 
 INT_PTR WINAPI detailsProbe::modal(HINSTANCE instance,LPCDLGTEMPLATEW resource,HWND owner,DLGPROC procedure,LPARAM parameter){
     ++dialogs;if(failDialog)return -1;
@@ -210,6 +309,26 @@ HWND classChild(HWND window,const wchar_t* name){
 }
 bool ownVisible(HWND window){return (GetWindowLongPtrW(window,GWL_STYLE)&WS_VISIBLE)!=0;}
 RECT childRect(HWND window,HWND child){RECT value{};GetWindowRect(child,&value);MapWindowPoints(nullptr,window,reinterpret_cast<POINT*>(&value),2);return value;}
+void assertDetailsLayout(HWND window){
+    SCROLLINFO horizontal{sizeof(horizontal),SIF_RANGE|SIF_PAGE|SIF_POS},vertical=horizontal;
+    require(GetScrollInfo(window,SB_HORZ,&horizontal)&&GetScrollInfo(window,SB_VERT,&vertical),"Details did not expose bounded native scroll geometry.");
+    std::vector<RECT> rectangles;
+    for(HWND child=GetWindow(window,GW_CHILD);child;child=GetWindow(child,GW_HWNDNEXT))if(ownVisible(child)){
+        const auto rect=childRect(window,child);auto logical=rect;OffsetRect(&logical,horizontal.nPos,vertical.nPos);
+        require(logical.left>=0&&logical.top>=0&&logical.right<=horizontal.nMax+1&&logical.bottom<=vertical.nMax+1&&logical.right>logical.left&&logical.bottom>logical.top,"Details content escaped its nonnegative readable canvas.");
+        for(const auto& other:rectangles){RECT intersection{};require(!IntersectRect(&intersection,&rect,&other),"Visible Details controls overlap.");}rectangles.push_back(rect);
+        wchar_t type[40]{};GetClassNameW(child,type,_countof(type));
+        if(_wcsicmp(type,L"BUTTON")&&_wcsicmp(type,L"STATIC"))continue;
+        const auto label=textOf(child);if(label.empty())continue;
+        HDC dc=GetDC(child);require(dc!=nullptr,"Cannot measure native control text.");
+        const auto font=reinterpret_cast<HFONT>(SendMessageW(child,WM_GETFONT,0,0));const auto previous=SelectObject(dc,font?font:GetStockObject(DEFAULT_GUI_FONT));
+        RECT measured{0,0,rect.right-rect.left,0};const bool button=_wcsicmp(type,L"BUTTON")==0;
+        DrawTextW(dc,label.c_str(),static_cast<int>(label.size()),&measured,DT_CALCRECT|(button?DT_SINGLELINE:DT_WORDBREAK|DT_NOPREFIX));
+        SelectObject(dc,previous);ReleaseDC(child,dc);
+        require(measured.right<=rect.right-rect.left-(button?8:0)&&measured.bottom<=rect.bottom-rect.top-(button?2:0),"Native button/help/feedback text is clipped.");
+    }
+}
+void assertRevealed(HWND window,HWND child){RECT client{};GetClientRect(window,&client);const auto rect=childRect(window,child);require(rect.left>=0&&rect.top>=0&&rect.right<=client.right&&rect.bottom<=client.bottom,"Focused Details action is outside the visible viewport.");}
 Status retainedReport(bool paired){
     Status value;value.error=value.recordingFailed=true;value.frames=180;value.elapsed=123.4;value.completedSegments=paired?9:0;
     const auto base=L"C:\\Owned\\"+std::wstring(180,L'\u754c')+L"\\\u0417\u0430\u043f\u0438\u0441\u044c-\u65e5\u672c\u8a9e-\u00e9\U0001F4F7";
@@ -232,6 +351,53 @@ void nativeMnemonic(HWND start,wchar_t character){
     SetFocus(start);MSG message{};message.hwnd=start;message.message=WM_SYSCHAR;message.wParam=character;message.lParam=1L<<29;
     dispatchAppMessage(app.window,message);checkCallback();
 }
+void waitFileWorker(){
+    if(detailsProbe::fileThread){
+        require(WaitForSingleObject(detailsProbe::fileThread,6000)==WAIT_OBJECT_0,"Owned Shell worker failed to terminate.");
+        CloseHandle(detailsProbe::fileThread);detailsProbe::fileThread=nullptr;
+    }
+}
+template<class Predicate> void waitFiles(Predicate predicate){
+    const auto until=std::chrono::steady_clock::now()+std::chrono::seconds(3);
+    while(!predicate()){require(std::chrono::steady_clock::now()<until,"Expected Shell task state was not reached.");std::this_thread::sleep_for(std::chrono::milliseconds(1));}
+}
+struct OwnedFiles {
+    std::filesystem::path folder;
+    std::vector<std::wstring> files;
+    OwnedFiles(){
+        waitFileWorker();
+        detailsProbe::fileThreadStarts=detailsProbe::fileThreadExits=detailsProbe::fileThreadCloses=0;
+        detailsProbe::fileComStarts=detailsProbe::fileComEnds=detailsProbe::fileParses=detailsProbe::fileSelections=0;
+        detailsProbe::filePidls=detailsProbe::fileFrees=0;
+        detailsProbe::blockFileParse=detailsProbe::fileParseEntered=detailsProbe::releaseFileParse=detailsProbe::fileProbeError=false;
+        detailsProbe::mismatchedFileParent=detailsProbe::failFileClone=false;
+        detailsProbe::failFileThread=detailsProbe::failFileTimer=false;detailsProbe::failFileParseAt=0;
+        detailsProbe::blockFileParseAt=1;
+        detailsProbe::fileComResult=detailsProbe::fileSelectResult=S_OK;
+        detailsProbe::fileTimers=detailsProbe::fileTimerKills=0;
+        {std::lock_guard<std::mutex> lock(detailsProbe::fileMutex);detailsProbe::parsedFiles.clear();detailsProbe::selectedFiles.clear();detailsProbe::selectedFolder.clear();}
+        static unsigned ordinal=0;
+        folder=std::filesystem::current_path()/(L"owned-details-files-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64())+L"-"+std::to_wstring(++ordinal));
+        require(std::filesystem::create_directory(folder),"Cannot create owned output fixture.");
+        for(const wchar_t* name:{L"\u65e5\u672c\u8a9e-part-000042-desktop.recording.mp4",L"\u0417\u0430\u043f\u0438\u0441\u044c-part-000042-camera.mp4"}){
+            files.push_back((folder/name).wstring());std::ofstream output(std::filesystem::path(files.back()),std::ios::binary);output<<"Owned synthetic selection fixture; not a real recording.";require(output.good(),"Cannot create owned file fixture.");
+        }
+    }
+    ~OwnedFiles(){
+        detailsProbe::releaseFileParse=true;
+        if(detailsProbe::fileThread){WaitForSingleObject(detailsProbe::fileThread,6000);CloseHandle(detailsProbe::fileThread);detailsProbe::fileThread=nullptr;}
+        std::error_code ignored;std::filesystem::remove_all(folder,ignored);
+    }
+    Status report(bool paired=true)const{
+        Status value;value.error=value.recordingFailed=true;value.completedSegments=41;
+        value.savedPaths=paired?files:std::vector<std::wstring>{files.front()};value.savedPath=value.savedPaths.front();
+        value.message=L"Synthetic marker failure. Latest finalized output: "+value.savedPath+L". 41 earlier sets remain in the folder.";return value;
+    }
+    void assertClean(int successfulThreads)const{
+        require(!detailsProbe::fileProbeError&&detailsProbe::fileThreadExits==successfulThreads&&detailsProbe::fileThreadCloses==successfulThreads,"Worker escaped its thread or leaked its returned thread handle.");
+        require(detailsProbe::filePidls==detailsProbe::fileFrees,"Shell PIDL ownership did not balance.");
+    }
+};
 void exactSelectableReports(){
     for(bool paired:{false,true}){
         Fixture fixture;auto report=retainedReport(paired);
@@ -300,7 +466,7 @@ void keyboardAndCompactLayout(){
     ShowWindow(fixture.window,SW_SHOWNOACTIVATE);
     const HWND action=app.statusDetails;const auto label=textOf(action);const auto amp=label.find(L'&');
     require(amp!=std::wstring::npos&&amp+1<label.size(),"Details action has no mnemonic.");
-    for(int dpi:{96,192,288}){
+    for(int dpi:{96,144,192,288}){
         app.dpi=dpi;fonts();SetWindowPos(fixture.window,nullptr,0,0,640,480,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);layout();
         require(GetWindowLongPtrW(action,GWL_STYLE)&WS_TABSTOP,"Details missing native tab navigation.");
         HWND previous=GetNextDlgTabItem(fixture.window,action,TRUE);require(previous&&previous!=action,"Details absent from main tab order.");SetFocus(previous);
@@ -311,12 +477,16 @@ void keyboardAndCompactLayout(){
         RECT overlap{};const auto statusRect=childRect(fixture.window,app.statusText);
         require(!IntersectRect(&overlap,&actionRect,&statusRect),"Details overlaps the status message.");
         detailsProbe::script=[&](HWND window){
-            HWND edit=classChild(window,L"EDIT"),close=GetDlgItem(window,IDCANCEL);require(edit&&close,"Details navigation controls missing.");
+            HWND edit=classChild(window,L"EDIT"),files=GetDlgItem(window,StatusDetailsFiles),close=GetDlgItem(window,IDCANCEL);require(edit&&files&&close,"Details navigation controls missing.");
             RECT proposed{0,0,420,260};SendMessageW(window,WM_DPICHANGED,MAKELONG(dpi,dpi),reinterpret_cast<LPARAM>(&proposed));
             SetWindowPos(window,nullptr,0,0,420,260,SWP_NOZORDER|SWP_NOACTIVATE);SendMessageW(window,WM_SIZE,0,0);
-            RECT client{};GetClientRect(window,&client);for(HWND child:{edit,close}){const auto rect=childRect(window,child);require(rect.left>=0&&rect.top>=0&&rect.right<=client.right&&rect.bottom<=client.bottom&&rect.right>rect.left&&rect.bottom>rect.top,"Constrained Details edit/Close control clipped.");}
+            assertDetailsLayout(window);
+            require(!ownVisible(GetDlgItem(window,StatusDetailsFilesStatus)),"Idle file feedback reserves unnecessary visible content.");
             SendMessageW(window,WM_NEXTDLGCTL,reinterpret_cast<WPARAM>(edit),TRUE);
-            MSG next{};next.hwnd=edit;next.message=WM_KEYDOWN;next.wParam=VK_TAB;require(IsDialogMessageW(window,&next)!=FALSE&&GetFocus()==close,"Native Details Tab failed to reach Close.");
+            MSG next{};next.hwnd=edit;next.message=WM_KEYDOWN;next.wParam=VK_TAB;require(IsDialogMessageW(window,&next)!=FALSE&&GetFocus()==files,"Native Details Tab failed to reach Show files.");
+            assertRevealed(window,files);detailsProbe::failFileTimer=true;SendMessageW(files,BM_CLICK,0,0);detailsProbe::failFileTimer=false;checkCallback();
+            require(ownVisible(GetDlgItem(window,StatusDetailsFilesStatus)),"Failed request has no visible inline feedback.");assertDetailsLayout(window);assertRevealed(window,files);
+            next.hwnd=files;require(IsDialogMessageW(window,&next)!=FALSE&&GetFocus()==close,"Native Details Tab failed to reach Close after Show files.");assertRevealed(window,close);
             MSG escape{};escape.hwnd=close;escape.message=WM_KEYDOWN;escape.wParam=VK_ESCAPE;require(IsDialogMessageW(window,&escape)!=FALSE&&detailsProbe::modals.back().ended,"Native Escape did not close Details.");
         };
         MSG mnemonic{};mnemonic.hwnd=action;mnemonic.message=WM_SYSCHAR;mnemonic.wParam=towlower(label[amp+1]);mnemonic.lParam=1L<<29;const int before=detailsProbe::dialogs;dispatchAppMessage(fixture.window,mnemonic);checkCallback();
@@ -377,8 +547,10 @@ void failuresAndUnchangedTicks(){
     fixture.tick();fixture.tick();
     detailsProbe::countAllocations=true;detailsProbe::allocations=0;for(int i=0;i<100;++i){auto copied=detailsProbe::current;(void)copied;}const auto copyAllocations=detailsProbe::allocations;
     detailsProbe::allocations=0;detailsProbe::textWrites=0;const int dialogs=detailsProbe::dialogs,sourceCalls=detailsProbe::enumerations,queries=detailsProbe::statusQueries;
+    const int fileThreads=detailsProbe::fileThreadStarts,fileParses=detailsProbe::fileParses,fileTimers=detailsProbe::fileTimers;
     for(int i=0;i<100;++i)fixture.tick();const auto tickAllocations=detailsProbe::allocations;detailsProbe::countAllocations=false;
     require(detailsProbe::statusQueries==queries+100&&detailsProbe::dialogs==dialogs&&detailsProbe::enumerations==sourceCalls&&detailsProbe::textWrites==0&&tickAllocations==copyAllocations,"Unchanged ticks added Details work beyond existing Status copies.");
+    require(detailsProbe::fileThreadStarts==fileThreads&&detailsProbe::fileParses==fileParses&&detailsProbe::fileTimers==fileTimers,"Unchanged ticks started Shell/file polling work.");
     require(detailsProbe::records==0&&detailsProbe::finishes==0&&detailsProbe::invalidFocus==0,"Failure handling changed recording or focused dead UI.");
     std::cout<<"PASS snapshot/dialog failures preserve report; 100 unchanged ticks add no text, enumeration, modal or allocations beyond Status copies\n";
 }
@@ -433,10 +605,131 @@ void distinctMainMnemonics(){
     require(detailsProbe::records==0&&detailsProbe::finishes==0&&detailsProbe::pauses==0&&detailsProbe::notices==0&&!app.customDialog,"Main shortcuts dispatched recording, notices or left a modal owner.");
     std::cout<<"PASS distinct native Alt+H/Alt+C plus preserved Alt+O/Alt+I from multiple controls, collapsed/expanded and idle/recording/paused locks\n";
 }
+void clickFiles(HWND window){const HWND button=GetDlgItem(window,StatusDetailsFiles);require(button&&IsWindowEnabled(button),"Expected Show files action is unavailable.");SendMessageW(button,BM_CLICK,0,0);checkCallback();}
+void completeFiles(HWND window){waitFileWorker();SendMessageW(window,WM_TIMER,StatusDetailsFilesTimer,0);checkCallback();require(IsWindowEnabled(GetDlgItem(window,StatusDetailsFiles))&&!statusFilesBusy,"Completed task retained busy action/global slot.");}
+void fileSnapshotSelection(){
+    for(bool paired:{false,true}){
+        OwnedFiles files;Fixture fixture;const auto report=files.report(paired);fixture.publish(report);if(paired)detailsProbe::fileComResult=S_FALSE;
+        detailsProbe::script=[&](HWND window){
+            const auto snapshot=textOf(classChild(window,L"EDIT"));detailsProbe::blockFileParse=true;clickFiles(window);
+            waitFiles([]{return detailsProbe::fileParseEntered.load();});
+            require(!IsWindowEnabled(GetDlgItem(window,StatusDetailsFiles))&&detailsProbe::fileTimers==1,"Pending action was not disabled or lacked completion timer.");
+            SendMessageW(window,WM_COMMAND,MAKEWPARAM(StatusDetailsFiles,BN_CLICKED),0);require(detailsProbe::fileThreadStarts==1,"Duplicate pending action started another worker.");
+            auto later=report;later.savedPaths={L"C:\\Not the opened snapshot\\later.mp4"};later.savedPath=later.savedPaths.front();later.message=L"A later output set.";
+            detailsProbe::current=later;app.settings.folder=L"C:\\Unrelated current folder";fixture.tick();
+            require(textOf(classChild(window,L"EDIT"))==snapshot&&app.status.message==later.message,"Pending file action mutated snapshot or blocked main status updates.");
+            detailsProbe::releaseFileParse=true;completeFiles(window);
+            require(detailsProbe::fileSelections==1&&detailsProbe::selectedFiles==report.savedPaths&&detailsProbe::selectedFolder==files.folder.wstring(),"Shell selected current settings, earlier split parts, or an incomplete/reordered output pair.");
+            require(textOf(classChild(window,L"EDIT"))==snapshot&&textOf(GetDlgItem(window,StatusDetailsFilesStatus)).find(L"Selection requested")!=std::wstring::npos,"Successful selection overwrote report or omitted completion feedback.");
+            require(detailsProbe::fileComStarts==1&&detailsProbe::fileComEnds==1&&detailsProbe::fileTimerKills==1,"Success leaked COM or completion timer.");closeDetails(window);
+        };
+        fixture.command(StatusDetails);files.assertClean(1);
+        require(!detailsProbe::notices&&!detailsProbe::records&&!detailsProbe::shellCalls,"File action launched a player, recording, picker, or warning popup.");
+    }
+    std::cout<<"PASS worker selects immutable single/paired latest outputs including retained partial names while status/settings change\n";
+}
+void fileEligibility(){
+    OwnedFiles files;Fixture fixture;
+    for(int kind=0;kind<6;++kind){
+        auto report=files.report();
+        if(kind==0){report.savedPaths.clear();report.savedPath=files.files[0];}
+        if(kind==1){report.savedPaths.clear();report.savedPath.clear();report.message=L"Failure text mentions C:\\unfinalized.recording.mp4 only.";}
+        if(kind==2)report.savedPaths={L"relative.mp4"};
+        if(kind==3)report.savedPaths.push_back(files.files[0]);
+        if(kind==4)report.savedPaths[1]=(files.folder.parent_path()/L"other-folder/file.mp4").wstring();
+        if(kind==5)report.savedPaths[0]+=std::wstring(1,L'\0')+L"suffix";
+        fixture.publish(report);detailsProbe::script=[&](HWND window){
+            const HWND button=GetDlgItem(window,StatusDetailsFiles);require((button!=nullptr)==(kind==0),"Malformed/unfinalized status offered Show files or compatible savedPath fallback was lost.");
+            require(textOf(classChild(window,L"EDIT"))==nativeLines(report.message),"Selection eligibility changed the original report.");
+            if(kind==0){clickFiles(window);completeFiles(window);require(detailsProbe::selectedFiles==std::vector<std::wstring>{files.files[0]},"savedPath compatibility selected a different file.");}closeDetails(window);
+        };fixture.command(StatusDetails);
+    }
+    files.assertClean(1);require(detailsProbe::fileThreadStarts==1,"Opening Details itself started filesystem work.");
+    std::cout<<"PASS bounded finalized-path eligibility, single savedPath compatibility, and no text-parsed recovery guesses\n";
+}
+void fileFailures(){
+    for(int fault=0;fault<11;++fault){
+        OwnedFiles files;Fixture fixture;const auto report=files.report();fixture.publish(report);
+        detailsProbe::script=[&](HWND window){
+            const auto original=textOf(classChild(window,L"EDIT"));
+            if(fault==0)detailsProbe::failFileTimer=true;
+            if(fault==1)detailsProbe::failFileThread=true;
+            if(fault==2)detailsProbe::fileComResult=E_FAIL;
+            if(fault==3)detailsProbe::failFileParseAt=1;
+            if(fault==4)detailsProbe::failFileParseAt=3;
+            if(fault==5)detailsProbe::failFileClone=true;
+            if(fault==6)detailsProbe::mismatchedFileParent=true;
+            if(fault==7)detailsProbe::fileSelectResult=E_ACCESSDENIED;
+            if(fault==8)require(DeleteFileW(files.files[1].c_str())!=FALSE,"Cannot remove owned saved-file fixture.");
+            if(fault==9)detailsProbe::failAllocation=true;
+            if(fault==10)require(MoveFileW(files.files[0].c_str(),(files.folder/L"moved-output.mp4").c_str())!=FALSE,"Cannot move owned file fixture.");
+            clickFiles(window);if((fault>1&&fault<9)||fault==10)completeFiles(window);
+            require(!statusFilesBusy&&IsWindowEnabled(GetDlgItem(window,StatusDetailsFiles)),"Failed file request consumed the retry slot/action.");
+            require(textOf(classChild(window,L"EDIT"))==original&&app.status.message==report.message&&app.status.savedPaths==report.savedPaths,"File failure changed saved/recovery facts.");
+            require(!textOf(GetDlgItem(window,StatusDetailsFilesStatus)).empty()&&!detailsProbe::notices,"File failure lacked inline feedback or produced a modal warning.");
+            require(detailsProbe::fileSelections==(fault==7?1:0),"A failed prerequisite still issued Shell selection.");
+            if(fault==0||fault==9)require(detailsProbe::fileThreadStarts==0,"Timer/allocation failure launched a worker.");
+            if(fault==2)require(detailsProbe::fileComStarts==1&&detailsProbe::fileComEnds==0,"Failed COM startup was uninitialized.");
+            if((fault>=3&&fault<=8)||fault==10)require(detailsProbe::fileComStarts==1&&detailsProbe::fileComEnds==1,"Failure leaked a successful COM initialization.");
+            closeDetails(window);
+        };fixture.command(StatusDetails);files.assertClean((fault>=2&&fault<=8)||fault==10?1:0);
+    }
+    std::cout<<"PASS timer/thread/allocation/COM, parent/item/clone/identity, missing-file and Shell errors preserve report and release resources\n";
+}
+void filePendingLifecycle(){
+    for(int action=0;action<4;++action){
+        OwnedFiles files;Fixture fixture;auto report=files.report();report.state=State::Recording;fixture.publish(report);
+        detailsProbe::script=[&](HWND window){
+            detailsProbe::blockFileParseAt=action==0?3:1;detailsProbe::blockFileParse=true;clickFiles(window);waitFiles([]{return detailsProbe::fileParseEntered.load();});
+            const int reads=detailsProbe::statusQueries;for(int i=0;i<10;++i)fixture.tick();require(detailsProbe::statusQueries==reads+10,"Blocked Shell parse stopped main timer routing.");
+            const auto began=std::chrono::steady_clock::now();
+            if(action==0)closeDetails(window);
+            if(action==1)SendMessageW(fixture.window,WM_CLOSE,0,0);
+            if(action==2)fixture.command(TrayExit);
+            if(action==3)SendMessageW(fixture.window,WM_ENDSESSION,TRUE,0);
+            require(std::chrono::steady_clock::now()-began<std::chrono::seconds(1),"Closing/hiding/exiting waited for blocked Shell parsing.");
+            require(detailsProbe::modals.back().ended||!IsWindow(window),"Owned dialog survived Close/Hide/Exit/session end.");
+            require(statusFilesBusy&&detailsProbe::fileThreadExits==0&&detailsProbe::fileTimerKills==1,"Pending cancellation released global work early or retained dialog polling.");
+        };fixture.command(StatusDetails);
+        const int focus=detailsProbe::focusCalls;detailsProbe::releaseFileParse=true;waitFileWorker();
+        require(!statusFilesBusy&&detailsProbe::fileSelections==0&&!app.customDialog&&detailsProbe::focusCalls==focus,"Cancelled detached work selected files or touched a stale dialog/focus.");
+        require(detailsProbe::records==0&&detailsProbe::finishes==(action==2?1:0),"Pending file request changed recording lifecycle.");files.assertClean(1);
+    }
+    std::cout<<"PASS blocked parsing keeps status ticks and Close/Hide/Exit/session shutdown responsive; cancellation suppresses late selection\n";
+}
+void fileReopenedAndKeyboard(){
+    OwnedFiles files;Fixture fixture;fixture.publish(files.report());showOffscreen(fixture);
+    detailsProbe::script=[&](HWND window){detailsProbe::blockFileParse=true;clickFiles(window);waitFiles([]{return detailsProbe::fileParseEntered.load();});closeDetails(window);};
+    fixture.command(StatusDetails);
+    auto report=files.report(false);fixture.publish(report);
+    detailsProbe::script=[&](HWND window){
+        const auto original=textOf(classChild(window,L"EDIT"));clickFiles(window);
+        require(detailsProbe::fileThreadStarts==1&&IsWindowEnabled(GetDlgItem(window,StatusDetailsFiles)),"Reopened Details bypassed single global job slot or permanently disabled retry.");
+        require(textOf(GetDlgItem(window,StatusDetailsFilesStatus)).find(L"Another file request")!=std::wstring::npos,"Detached-busy state lacked retry explanation.");
+        const auto feedback=textOf(GetDlgItem(window,StatusDetailsFilesStatus));detailsProbe::releaseFileParse=true;waitFileWorker();require(detailsProbe::fileSelections==0&&!statusFilesBusy&&textOf(GetDlgItem(window,StatusDetailsFilesStatus))==feedback,"Old dialog's worker selected or changed newer feedback after cancellation.");
+        SetWindowPos(window,nullptr,-30000,-30000,640,380,SWP_NOZORDER|SWP_NOACTIVATE);ShowWindow(window,SW_SHOWNOACTIVATE);
+        HWND edit=classChild(window,L"EDIT"),button=GetDlgItem(window,StatusDetailsFiles),close=GetDlgItem(window,IDCANCEL);
+        SetFocus(edit);MSG mnemonic{};mnemonic.hwnd=edit;mnemonic.message=WM_SYSCHAR;mnemonic.wParam=L'f';mnemonic.lParam=1L<<29;
+        require(IsDialogMessageW(window,&mnemonic)!=FALSE,"Native Show files mnemonic was not routed.");
+        completeFiles(window);require(detailsProbe::fileThreadStarts==2&&detailsProbe::selectedFiles==report.savedPaths,"Reopened dialog selected stale pair or native Alt+F did not reach the action.");
+        require(textOf(edit)==original&&IsWindowEnabled(button),"Reopened completion changed text or action availability.");
+        SendMessageW(window,WM_NEXTDLGCTL,reinterpret_cast<WPARAM>(edit),TRUE);MSG enter{};enter.hwnd=edit;enter.message=WM_KEYDOWN;enter.wParam=VK_RETURN;
+        const auto defaultId=SendMessageW(window,DM_GETDEFID,0,0),keyCode=SendMessageW(edit,WM_GETDLGCODE,VK_RETURN,reinterpret_cast<LPARAM>(&enter));const int priorFocus=GetDlgCtrlID(GetFocus());const BOOL handled=IsDialogMessageW(window,&enter);
+        // The native multiline edit defers Return to its dialog. This owned
+        // modal seam must perform the same message dispatch as DialogBox.
+        MSG queued{};unsigned pumped=0;while(pumped<32&&PeekMessageW(&queued,window,0,0,PM_REMOVE)){if(!IsDialogMessageW(window,&queued)){TranslateMessage(&queued);DispatchMessageW(&queued);}++pumped;}
+        std::cout<<"  Enter handled="<<handled<<" ended="<<detailsProbe::modals.back().ended<<" workers="<<detailsProbe::fileThreadStarts<<" priorFocus="<<priorFocus<<" focus="<<GetDlgCtrlID(GetFocus())<<" default="<<LOWORD(defaultId)<<" dlgCode="<<keyCode<<" pumped="<<pumped<<'\n';
+        require(handled!=FALSE&&detailsProbe::modals.back().ended&&detailsProbe::fileThreadStarts==2,"Default Enter selected files instead of closing Details.");
+        (void)close;
+    };fixture.command(StatusDetails);files.assertClean(2);
+    std::cout<<"PASS stale/reopened dialog single-job bound, retry after retirement, native Alt+F and safe default Enter\n";
+}
 }
 
 int main(){try{
+    detailsProbe::ownerThread=GetCurrentThreadId();
     INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_WIN95_CLASSES};require(InitCommonControlsEx(&controls)!=FALSE,"Common controls unavailable.");
     exactSelectableReports();outcomeAndPrimaryPrecedence();keyboardAndCompactLayout();stableSnapshot();modalLifecycle();failuresAndUnchangedTicks();distinctMainMnemonics();cursorKeyboard();
-    std::cout<<"All eight status/keyboard groups passed with inert engine and owned native windows.\n";return 0;
+    fileSnapshotSelection();fileEligibility();fileFailures();filePendingLifecycle();fileReopenedAndKeyboard();
+    std::cout<<"All thirteen status/keyboard/file groups passed with inert engine, owned native windows and intercepted Shell selection.\n";return 0;
 }catch(const std::exception& error){std::cerr<<"STATUS DETAILS FAILURE: "<<error.what()<<'\n';return 1;}}
