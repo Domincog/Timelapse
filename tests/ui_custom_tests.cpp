@@ -179,9 +179,43 @@ void nativeNumericInsertion(){
     }
     std::cout<<"PASS actual native paste rejects truncated invalid interval, stop, width and height inputs while exact insertion remains valid\n";
 }
+void nativeButtonNavigation(){
+    HiddenFixture owned;setupCustom();
+    const auto visibleFocus=[](HWND window,HWND child){
+        RECT bounds{},client{};GetWindowRect(child,&bounds);MapWindowPoints(nullptr,window,reinterpret_cast<POINT*>(&bounds),2);GetClientRect(window,&client);
+        require(GetFocus()==child && bounds.left>=0 && bounds.top>=0 && bounds.right<=client.right && bounds.bottom<=client.bottom,
+            "Native modal focus remained outside the viewport.");
+    };
+    for(int dpi:{96,192})for(auto kind:{CustomKind::Interval,CustomKind::Size,CustomKind::Limit,CustomKind::Segment}){
+        dialogScript=[=](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<CustomDraft*>(parameter);
+            RECT suggested{0,0,320,210};customProc(window,WM_DPICHANGED,MAKELONG(dpi,dpi),reinterpret_cast<LPARAM>(&suggested));
+            SendMessageW(window,WM_NEXTDLGCTL,reinterpret_cast<WPARAM>(draft.first),TRUE);
+            // Use the dialog manager's real sequential focus route. Do not
+            // fabricate BN_SETFOCUS or call the production reveal helper.
+            for(HWND target:{draft.second?draft.second:draft.units,draft.okay,draft.cancel,draft.first}){
+                SendMessageW(window,WM_NEXTDLGCTL,FALSE,FALSE);visibleFocus(window,target);
+                require(!dialogOutcome,"Focus transition accepted or cancelled the custom draft.");
+            }
+            MSG key{};key.hwnd=GetFocus();key.message=WM_KEYDOWN;key.wParam=VK_ESCAPE;
+            require(IsDialogMessageW(window,&key) && dialogOutcome==IDCANCEL,"Native Escape did not cancel the custom dialog.");
+        };invoke(kind);
+    }
+    for(int activation=0;activation<3;++activation){
+        dialogScript=[activation](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<CustomDraft*>(parameter);
+            SetWindowTextW(draft.first,L"2");
+            SendMessageW(window,WM_NEXTDLGCTL,reinterpret_cast<WPARAM>(activation==2?draft.first:draft.okay),TRUE);
+            require(!dialogOutcome,"Focusing the custom default button activated it.");
+            if(activation==0)SendMessageW(draft.okay,BM_CLICK,0,0);
+            else if(activation==1){SendMessageW(draft.okay,WM_KEYDOWN,VK_SPACE,0);SendMessageW(draft.okay,WM_KEYUP,VK_SPACE,0);}
+            else {MSG key{};key.hwnd=GetFocus();key.message=WM_KEYDOWN;key.wParam=VK_RETURN;require(IsDialogMessageW(window,&key),"Native Enter was not handled.");}
+            require(dialogOutcome==IDOK,"Click, Space or default Enter failed to accept a valid custom value.");
+        };invoke(CustomKind::Interval);require(app.settings.intervalMs==2000,"Native activation did not commit the validated duration.");
+    }
+    std::cout<<"PASS native custom tab focus scrolls without activation at two DPIs; Click, Space, Enter and Escape retain their meanings\n";
+}
 }
 int main(){
-    try{intervalAndCancellation();dimensionsAndLimit();activeAndNight();segmentDurations();nativeNumericInsertion();dialogDpiAndLifecycle();
+    try{intervalAndCancellation();dimensionsAndLimit();activeAndNight();segmentDurations();nativeNumericInsertion();nativeButtonNavigation();dialogDpiAndLifecycle();
         std::cout<<"All custom UI cases passed with hidden controls and synthetic engine.\n";return 0;
     }catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
 }

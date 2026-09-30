@@ -170,11 +170,14 @@ bool compose(const Frame* desktop, const Frame* camera, const std::vector<Layer>
         target.width = width;
         target.height = height;
         clearRect(target, {0, 0, width, height});
+        bool firstLayer = true;
         for (const auto& layer : layers) {
             const Frame& source = *(layer.source == Source::Desktop ? desktop : camera);
             const auto bounds = pixelsFor(layer.rect, width, height);
-            // Each layer owns its full rectangle, including its letterbox bars.
-            clearRect(target, bounds);
+            // The initial clear already covers the first layer and its bars.
+            // Later layers still own their whole rectangle over earlier pixels.
+            if (!firstLayer) clearRect(target, bounds);
+            firstLayer = false;
             draw(source, target, bounds, horizontal);
         }
         if (&target != &output) output = std::move(temporary);

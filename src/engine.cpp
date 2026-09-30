@@ -503,6 +503,7 @@ void Engine::run() {
         };
         double elapsed = 0;
         bool recordingLimitReached = false;
+        bool terminalClockFrozen = false;
         auto advanceElapsed = [&](Clock::time_point now) {
             if (writing && !paused) activeDuration += now - lastTick;
             lastTick = now;
@@ -566,7 +567,7 @@ void Engine::run() {
                     retained[i] = attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
                 }
                 // Automatic saving consumes active time, while a terminal save
-                // freezes elapsed at the terminal admission cutoff as before.
+                // freezes elapsed at the observed terminal cutoff.
                 if (!terminal && sessionStarted) {
                     advanceElapsed(Clock::now());
                     if (limitExpired()) recordingLimitReached = true;
@@ -753,6 +754,14 @@ void Engine::run() {
             return !status_.error;
         };
         auto closeRecording = [&](const std::wstring& reason) {
+            // Snapshot the observed stop/failure time once, before helper or
+            // encoder cleanup. A reporting exception can retry this operation;
+            // that retry must not count the preceding terminal save as active.
+            if (!terminalClockFrozen) {
+                if (sessionStarted) advanceElapsed(Clock::now());
+                else { activeDuration = Clock::duration::zero(); elapsed = 0; }
+                terminalClockFrozen = true;
+            }
             releaseDesktopCaptureCache();
             cancelNight(); nightMode = false;
             cancelObservation(); skipping = observing = false; observationDesktop = {};
@@ -851,7 +860,7 @@ void Engine::run() {
                     session.emplace(cfg); pending = true; elapsed = 0;
                     segmentWriting = cameraWriting = sessionStarted = segmentFailed = false;
                     closedFrames = {}; segmentOrdinal = completedSegments = 0; sessionStem.clear();
-                    activeDuration = Clock::duration::zero(); recordingLimitReached = false;
+                    activeDuration = Clock::duration::zero(); recordingLimitReached = false; terminalClockFrozen = false;
                     cancelNight(); nightMode = usesNightCamera(cfg);
                     suggestedNightDurationMs = NightInitialDurationMs;
                     nightStartAt = now;
@@ -1311,6 +1320,7 @@ void Engine::run() {
                     if (!start_) {
                         previewProblem_ = false;
                         status_.state = State::Idle; status_.error = true;
+                        if (terminalClockFrozen && (writing || pending)) status_.elapsed = elapsed;
                         status_.nightWaiting = false;
                         status_.recordingFailed = true;
                         try { status_.message = L"Capture stopped. Check the save folder and try recording again."; } catch (...) {}

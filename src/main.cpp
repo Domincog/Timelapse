@@ -939,7 +939,7 @@ INT_PTR CALLBACK customProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
                 draft->kind==CustomKind::Segment?L"Choose 1 to 2,147,483,647 whole seconds of active recording per part. Pauses and initial preparation do not count; automatic saving does. Empty periods create no files. Shorter parts add processing and file overhead.":
                 L"Choose 1 to 2,147,483,647 seconds of active recording. Pauses and initial preparation do not count. Decimals must resolve to whole seconds.",SS_NOPREFIX,CustomHelp);
             draft->error=child(L"STATIC",L"",SS_NOPREFIX,CustomError);
-            draft->okay=child(L"BUTTON",L"OK",WS_TABSTOP|BS_DEFPUSHBUTTON,IDOK);draft->cancel=child(L"BUTTON",L"Cancel",WS_TABSTOP|BS_PUSHBUTTON,IDCANCEL);
+            draft->okay=child(L"BUTTON",L"OK",WS_TABSTOP|BS_DEFPUSHBUTTON|BS_NOTIFY,IDOK);draft->cancel=child(L"BUTTON",L"Cancel",WS_TABSTOP|BS_PUSHBUTTON|BS_NOTIFY,IDCANCEL);
             if(!draft->firstLabel || !draft->secondLabel || !draft->first || !((size || range)?draft->second:draft->units) || !draft->help || !draft->error || !draft->okay || !draft->cancel){EndDialog(window,-1);return TRUE;}
             // Native paste must reach the rejection threshold, never truncate
             // below it into a different valid numeric prefix.
@@ -961,16 +961,19 @@ INT_PTR CALLBACK customProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
         case WM_HSCROLL:case WM_VSCROLL:{const int bar=message==WM_HSCROLL?SB_HORZ:SB_VERT;SCROLLINFO info{sizeof(info),SIF_ALL};GetScrollInfo(window,bar,&info);int position=info.nPos;
             switch(LOWORD(wp)){case SB_LINEUP:position-=draft->scale(24);break;case SB_LINEDOWN:position+=draft->scale(24);break;case SB_PAGEUP:position-=info.nPage;break;case SB_PAGEDOWN:position+=info.nPage;break;case SB_THUMBPOSITION:case SB_THUMBTRACK:position=info.nTrackPos;break;case SB_TOP:position=0;break;case SB_BOTTOM:position=info.nMax;break;default:return TRUE;}
             (bar==SB_HORZ?draft->scrollX:draft->scrollY)=position;customLayout(window,*draft);return TRUE;}
-        case WM_COMMAND:
-            if(LOWORD(wp)==IDCANCEL){EndDialog(window,IDCANCEL);return TRUE;}
-            if(LOWORD(wp)==IDOK){
+        case WM_COMMAND:{const int id=LOWORD(wp),code=HIWORD(wp);
+            if(((id==IDOK || id==IDCANCEL) && code==BN_SETFOCUS) ||
+               ((id==CustomFirst || id==CustomSecond) && code==EN_SETFOCUS) || (id==CustomUnits && code==CBN_SETFOCUS)){
+                customReveal(window,*draft,reinterpret_cast<HWND>(lp));return TRUE;
+            }
+            if(LOWORD(wp)==IDCANCEL && HIWORD(wp)==BN_CLICKED){EndDialog(window,IDCANCEL);return TRUE;}
+            if(LOWORD(wp)==IDOK && HIWORD(wp)==BN_CLICKED){
                 if(app.active()){EndDialog(window,IDCANCEL);return TRUE;}
                 std::wstring error;HWND invalid{};
                 if(validateCustom(*draft,error,invalid)){EndDialog(window,IDOK);return TRUE;}
                 SetWindowTextW(draft->error,error.c_str());SetFocus(invalid);SendMessageW(invalid,EM_SETSEL,0,-1);customReveal(window,*draft,invalid);return TRUE;
             }
-            if(HIWORD(wp)==EN_SETFOCUS || HIWORD(wp)==CBN_SETFOCUS || HIWORD(wp)==BN_SETFOCUS)customReveal(window,*draft,reinterpret_cast<HWND>(lp));
-            return FALSE;
+            return FALSE;}
         case WM_CTLCOLORSTATIC:if(reinterpret_cast<HWND>(lp)==draft->error){SetTextColor(reinterpret_cast<HDC>(wp),RGB(164,40,40));SetBkColor(reinterpret_cast<HDC>(wp),GetSysColor(COLOR_BTNFACE));return reinterpret_cast<INT_PTR>(GetSysColorBrush(COLOR_BTNFACE));}break;
         case WM_CLOSE:EndDialog(window,IDCANCEL);return TRUE;
         case WM_DESTROY:if(draft->font){DeleteObject(draft->font);draft->font=nullptr;}if(app.customDialog==window)app.customDialog=IsWindow(draft->previousDialog)?draft->previousDialog:nullptr;return TRUE;
@@ -1163,7 +1166,7 @@ INT_PTR CALLBACK skipProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             draft->dpi=static_cast<int>(GetDpiForWindow(window));if(draft->dpi<=0)draft->dpi=app.dpi;SetWindowTextW(window,L"Time compression");
             const auto label=[&](int index,const wchar_t* text){return draft->labels[index]=skipChild(window,L"STATIC",text,0,5200+index);};
             const auto combo=[&](int id){return skipChild(window,L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL,id);};
-            const auto button=[&](const wchar_t* text,int id){return skipChild(window,L"BUTTON",text,WS_TABSTOP|BS_PUSHBUTTON,id);};
+            const auto button=[&](const wchar_t* text,int id){return skipChild(window,L"BUTTON",text,WS_TABSTOP|BS_PUSHBUTTON|BS_NOTIFY,id);};
             label(0,L"&Mode");draft->mode=combo(SkipMode);for(auto value:SkipModeLabels)add(draft->mode,value);choose(draft->mode,static_cast<int>(draft->policy.mode));
             label(1,L"Ma&ximum extra speed");draft->speed=combo(SkipSpeed);for(int value:SkipMultipliers)add(draft->speed,std::to_wstring(value)+L"×");
             label(2,L"&Transition (video time)");draft->ramp=combo(SkipRamp);for(auto value:{L"0.5 s (15 frames)",L"1 s (30 frames)",L"2 s (60 frames)"})add(draft->ramp,value);
@@ -1181,7 +1184,7 @@ INT_PTR CALLBACK skipProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             draft->packInfo=skipChild(window,L"STATIC",L"",SS_NOPREFIX,SkipPackInfo);
             draft->packManage=button(L"Manage &detector...",SkipPackManage);
             draft->help=skipChild(window,L"STATIC",L"",SS_NOPREFIX,SkipHelp);draft->error=skipChild(window,L"STATIC",L"",SS_NOPREFIX,SkipError);
-            draft->okay=skipChild(window,L"BUTTON",L"OK",WS_TABSTOP|BS_DEFPUSHBUTTON,IDOK);draft->cancel=button(draft->readOnly?L"Close":L"Cancel",IDCANCEL);
+            draft->okay=skipChild(window,L"BUTTON",L"OK",WS_TABSTOP|BS_DEFPUSHBUTTON|BS_NOTIFY,IDOK);draft->cancel=button(draft->readOnly?L"Close":L"Cancel",IDCANCEL);
             bool okay=true;for(HWND child:{draft->mode,draft->speed,draft->ramp,draft->quiet,draft->quietUnits,draft->ranges,draft->add,draft->edit,draft->remove,draft->repeat,draft->repeatUnits,draft->packInfo,draft->packManage,draft->help,draft->error,draft->okay,draft->cancel})if(!child)okay=false;
             for(HWND child:draft->labels)if(!child)okay=false;if(!okay){EndDialog(window,-1);return TRUE;}
             for(HWND child:{draft->quiet,draft->repeat})SendMessageW(child,EM_SETLIMITTEXT,96,0);
@@ -1201,27 +1204,32 @@ INT_PTR CALLBACK skipProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
         case WM_HSCROLL:case WM_VSCROLL:{const int bar=message==WM_HSCROLL?SB_HORZ:SB_VERT;SCROLLINFO info{sizeof(info),SIF_ALL};GetScrollInfo(window,bar,&info);int position=info.nPos;
             switch(LOWORD(wp)){case SB_LINEUP:position-=draft->scale(24);break;case SB_LINEDOWN:position+=draft->scale(24);break;case SB_PAGEUP:position-=info.nPage;break;case SB_PAGEDOWN:position+=info.nPage;break;case SB_THUMBPOSITION:case SB_THUMBTRACK:position=info.nTrackPos;break;case SB_TOP:position=0;break;case SB_BOTTOM:position=info.nMax;break;default:return TRUE;}
             (bar==SB_HORZ?draft->scrollX:draft->scrollY)=position;skipLayout(window,*draft);return TRUE;}
-        case WM_COMMAND:{const int id=LOWORD(wp);
-            if(id==IDCANCEL){EndDialog(window,IDCANCEL);return TRUE;}
-            if(id==SkipPackManage){
+        case WM_COMMAND:{const int id=LOWORD(wp),code=HIWORD(wp);
+            if(((id==IDOK || id==IDCANCEL || id==SkipAdd || id==SkipEdit || id==SkipRemove || id==SkipPackManage) && code==BN_SETFOCUS) ||
+               ((id==SkipQuiet || id==SkipRepeat) && code==EN_SETFOCUS) || (id==SkipRanges && code==LBN_SETFOCUS) ||
+               ((id==SkipMode || id==SkipSpeed || id==SkipRamp || id==SkipQuietUnits || id==SkipRepeatUnits) && code==CBN_SETFOCUS)){
+                skipReveal(window,*draft,reinterpret_cast<HWND>(lp));return TRUE;
+            }
+            if(id==IDCANCEL && code==BN_CLICKED){EndDialog(window,IDCANCEL);return TRUE;}
+            if(id==SkipPackManage && code==BN_CLICKED){
                 if(!draft->readOnly && !app.active() && skipPerson(skipMode(draft->mode))){
                     showPersonPackDialog(window);
                     if(IsWindow(window) && IsWindow(app.window)){skipPackInfo(*draft,true);skipLayout(window,*draft);skipFitHeight(window,*draft);skipReveal(window,*draft,draft->packManage);}
                 }
                 return TRUE;
             }
-            if(id==IDOK){if(draft->readOnly || app.active()){EndDialog(window,IDCANCEL);return TRUE;}TimeSkipSettings policy;std::wstring error;HWND invalid=draft->mode;
+            if(id==IDOK && code==BN_CLICKED){if(draft->readOnly || app.active()){EndDialog(window,IDCANCEL);return TRUE;}TimeSkipSettings policy;std::wstring error;HWND invalid=draft->mode;
                 if(validateSkip(*draft,policy,error,invalid)){draft->policy=policy;EndDialog(window,IDOK);return TRUE;}
                 SetWindowTextW(draft->error,error.c_str());skipLayout(window,*draft);skipFitHeight(window,*draft);SetFocus(invalid);skipReveal(window,*draft,invalid);return TRUE;}
-            if((id==SkipAdd || id==SkipEdit || (id==SkipRanges && HIWORD(wp)==LBN_DBLCLK)) && !draft->readOnly){skipRange(window,*draft,id!=SkipAdd);return TRUE;}
-            if(id==SkipRemove && !draft->readOnly && !app.active()){const int selected=static_cast<int>(SendMessageW(draft->ranges,LB_GETCURSEL,0,0));
+            if((((id==SkipAdd || id==SkipEdit) && code==BN_CLICKED) || (id==SkipRanges && code==LBN_DBLCLK)) && !draft->readOnly){skipRange(window,*draft,id!=SkipAdd);return TRUE;}
+            if(id==SkipRemove && code==BN_CLICKED && !draft->readOnly && !app.active()){const int selected=static_cast<int>(SendMessageW(draft->ranges,LB_GETCURSEL,0,0));
                 if(selected>=0 && selected<int(draft->policy.rangeCount)){for(unsigned i=selected+1;i<draft->policy.rangeCount;++i)draft->policy.ranges[i-1]=draft->policy.ranges[i];--draft->policy.rangeCount;skipList(*draft,selected);}return TRUE;}
             if(id==SkipMode && HIWORD(wp)==CBN_SELCHANGE){
                 auto policy=draft->policy;policy.mode=skipMode(draft->mode);
                 if(!draft->readOnly && skipClearInactiveRepeat(policy)){draft->policy.repeatSeconds=0;draft->repeatCleared=true;SetWindowTextW(draft->repeat,L"0");choose(draft->repeatUnits,0);}
                 skipPackInfo(*draft);skipHelp(*draft);SetWindowTextW(draft->error,L"");skipLayout(window,*draft);skipFitHeight(window,*draft);skipReveal(window,*draft,draft->mode);return TRUE;}
             if(id==SkipRanges && HIWORD(wp)==LBN_SELCHANGE){const bool selected=SendMessageW(draft->ranges,LB_GETCURSEL,0,0)!=LB_ERR;EnableWindow(draft->edit,!draft->readOnly && selected);EnableWindow(draft->remove,!draft->readOnly && selected);}
-            if(HIWORD(wp)==EN_SETFOCUS || HIWORD(wp)==CBN_SETFOCUS || HIWORD(wp)==BN_SETFOCUS || HIWORD(wp)==LBN_SETFOCUS)skipReveal(window,*draft,reinterpret_cast<HWND>(lp));return FALSE;}
+            return FALSE;}
         case WM_CTLCOLORSTATIC:if(reinterpret_cast<HWND>(lp)==draft->error){SetTextColor(reinterpret_cast<HDC>(wp),RGB(164,40,40));SetBkColor(reinterpret_cast<HDC>(wp),GetSysColor(COLOR_BTNFACE));return reinterpret_cast<INT_PTR>(GetSysColorBrush(COLOR_BTNFACE));}break;
         case WM_CLOSE:EndDialog(window,IDCANCEL);return TRUE;
         case WM_DESTROY:if(draft->font){DeleteObject(draft->font);draft->font=nullptr;}if(app.customDialog==window)app.customDialog=IsWindow(draft->previousDialog)?draft->previousDialog:nullptr;return TRUE;

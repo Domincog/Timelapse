@@ -20,7 +20,7 @@ When a camera source is selected and the camera list cannot be loaded, hover ove
 
 A recording failure received while hidden opens the window with its details. Opening the tray menu does not dismiss that notice. A fresh failure is shown before Hide or Exit can dismiss it; after it has been shown, those controls work normally.
 
-**Advanced options:** Expand Advanced (Alt + A) for the encoder selector and optional Stop after limit. Choose a preset or Custom for a positive active duration in seconds, minutes, hours, or days. Custom limits must equal a whole number of seconds, up to 2,147,483,647 seconds. Initial startup and paused time do not count. Timelapse automatically finishes and saves the video or pair of videos at the limit, including while hidden in the tray. Finishing may wait for a capture or encoding operation already in progress and for the files to save. The default is Never. The selected limit is remembered. The collapsed Advanced label shows active options, or a warning when Night blend or MP4 recovery settings need correction; recording settings remain locked while recording. Finishing a hidden recording also releases the camera.
+**Advanced options:** Expand Advanced (Alt + A) for the encoder selector and optional Stop after limit. Choose a preset or Custom for a positive active duration in seconds, minutes, hours, or days. Custom limits must equal a whole number of seconds, up to 2,147,483,647 seconds. Initial startup and paused time do not count. Reported elapsed time includes capture or encoding work up to the point recording stops; final saving is excluded. Timelapse automatically finishes and saves the video or pair of videos at the limit, including while hidden in the tray. Finishing may wait for a capture or encoding operation already in progress and for the files to save. The default is Never. The selected limit is remembered. The collapsed Advanced label shows active options, or a warning when Night blend or MP4 recovery settings need correction; recording settings remain locked while recording. Finishing a hidden recording also releases the camera.
 
 **Split files every:** Advanced can periodically save completed parts while the recording continues. Never is the default; choose 15 minutes, 1 hour, 6 hours, 24 hours, or a Custom duration in whole seconds. This measures active recording time, not video playback time: initial preparation and pauses are excluded, while saving and opening the next part count. Every part remains a separate 30 fps MP4. Very short parts require more encoder restarts, increase overhead, and may cause missed capture slots.
 
@@ -194,7 +194,7 @@ This also checks BT.709 limited-range color metadata. FFmpeg is used only by the
 
 After building and testing, run `./package.ps1` to create both archives in `packages/`. The release ZIP is intended for GitHub Releases. Extract the source ZIP into an empty folder, then run the build commands from that folder; build outputs, test recordings, and local settings are excluded.
 
-To also create `Timelapse-v0.15.0-windows-x64-setup.exe`, supply an installed or portable Inno Setup 7 compiler:
+To also create `Timelapse-v0.16.0-windows-x64-setup.exe`, supply an installed or portable Inno Setup 7 compiler:
 
 ```powershell
 .\package.ps1 -InstallerCompiler 'C:\Path\To\Inno Setup 7\ISCC.exe'

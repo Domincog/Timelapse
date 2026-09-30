@@ -23,21 +23,39 @@ std::atomic<int> desktopDelayMs{0}, cameraOpenDelayMs{0};
 std::atomic<int> previewAllocationDelayMs{0}, finalizeDelayMs{0};
 std::atomic<unsigned> previewAllocationFaults{0};
 std::atomic<bool> finalizeFailure{false};
+std::atomic<int> captureFailureDelayMs{0}, writeFailureDelayMs{0}, writeFailureSide{0};
+std::atomic<bool> cameraOpenFailure{false};
+std::atomic<unsigned> finalizeThrows{0};
+std::atomic<uint64_t> firstAdmissionTick{0}, failureObservedTick{0};
+std::atomic<unsigned> finalizeCalls{0};
 }
 namespace lapse {
 class LimitEncoder {
     Encoder real_;
+    bool camera_ = false;
 public:
     bool open(const std::wstring& path, int width, int height, int fps, std::wstring& error, EncodingQuality quality, EncodingMode mode, bool recoveryMode) {
-        if (path.find(L"-camera.recording.mp4") != std::wstring::npos)
+        camera_ = path.find(L"-camera.recording.mp4") != std::wstring::npos;
+        if (camera_) {
             std::this_thread::sleep_for(std::chrono::milliseconds(cameraOpenDelayMs.exchange(0)));
+            if (cameraOpenFailure.exchange(false)) { error = L"Injected initial camera writer failure."; return false; }
+        }
         return real_.open(path, width, height, fps, error, quality, mode, recoveryMode);
     }
-    bool write(const Frame& frame, std::wstring& error) { return real_.write(frame, error); }
+    bool write(const Frame& frame, std::wstring& error) {
+        uint64_t empty = 0; firstAdmissionTick.compare_exchange_strong(empty, GetTickCount64());
+        if (writeFailureSide == (camera_ ? 2 : 1)) if (const int delay = writeFailureDelayMs.exchange(0)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+            failureObservedTick = GetTickCount64(); error = L"Injected delayed writer failure."; return false;
+        }
+        return real_.write(frame, error);
+    }
     bool finish(std::wstring& error) { return real_.finish(error); }
     bool finishForPublication(std::wstring& error) {
+        ++finalizeCalls;
         std::this_thread::sleep_for(std::chrono::milliseconds(finalizeDelayMs.exchange(0)));
         const bool finished = real_.finishForPublication(error);
+        if (finished && finalizeThrows) { --finalizeThrows; throw std::bad_alloc(); }
         if (finished && finalizeFailure.exchange(false)) {
             error = L"Injected MP4 finalization failure.";
             return false;
@@ -268,6 +286,94 @@ void finalizationExcluded(const std::filesystem::path& root) {
         "Idle preview changed completed elapsed time or completion reason");
     std::cout << "PASS slow finalization and later preview do not extend completed elapsed time.\n";
 }
+void resetTerminalFaults() {
+    captureFailureDelayMs = writeFailureDelayMs = writeFailureSide = 0;
+    cameraOpenFailure = false; finalizeThrows = 0;
+    firstAdmissionTick = failureObservedTick = 0; finalizeCalls = 0;
+}
+void delayedFailureElapsed(const std::filesystem::path& root, int variant) {
+    resetTerminalFaults();
+    const bool splitPair = variant == 1 || variant == 3;
+    const bool writeFailure = variant >= 2;
+    auto cfg = settings(root / (L"failure-elapsed-" + std::to_wstring(variant)), lapse::Mode::Desktop, splitPair);
+    cfg.intervalMs = splitPair ? 1200 : 100; cfg.recordingLimitSeconds = variant == 0 ? 1 : 0;
+    cfg.segmentDurationSeconds = splitPair ? 1 : 0;
+    lapse::Engine engine; engine.configure(cfg); engine.record();
+    await(engine, [](const auto& s) { return s.frames == 1; });
+    if (writeFailure) { writeFailureSide = splitPair ? 2 : 1; writeFailureDelayMs = 600; }
+    else captureFailureDelayMs = variant == 0 ? 1100 : 600;
+    const auto result = await(engine, [](const auto& s) { return s.state == lapse::State::Idle; }, 5000);
+    require(result.recordingFailed && result.error && result.frames == 1 &&
+        result.message.find(writeFailure ? L"Injected delayed writer failure." : L"Injected delayed capture failure.") != std::wstring::npos,
+        "Elapsed correction changed the real failure or accepted frame count");
+    require(firstAdmissionTick && failureObservedTick > firstAdmissionTick, "Delayed operation timing was not observed");
+    const double expected = double(failureObservedTick - firstAdmissionTick) / 1000;
+    require(result.elapsed >= expected - .08 && result.elapsed < expected + .15,
+        "Terminal elapsed omitted the delayed failing operation or included saving");
+    if (variant == 0) require(result.elapsed >= 1 && result.message.find(L"time limit reached") == std::wstring::npos,
+        "Elapsed correction masked a real capture error with a new limit policy");
+    require(result.completedSegments == (splitPair ? 1u : 0u), "Failure changed earlier completed-segment accounting");
+    unsigned files = 0;
+    for (const auto& item : std::filesystem::directory_iterator(cfg.folder)) if (item.path().extension() == L".mp4") {
+        require(item.path().wstring().find(L".recording.mp4") == std::wstring::npos, "Delayed failure left an unfinished output");
+        verify(item.path().wstring(), 1); ++files;
+    }
+    require(files == (variant == 3 ? 3u : splitPair ? 2u : 1u), "Delayed paired failure lost prior or accepted current output");
+    std::cout << "PASS delayed capture/writer terminal elapsed variant=" << variant << ", observed=" << expected << ", reported=" << result.elapsed << ".\n";
+}
+void terminalClockControls(const std::filesystem::path& root) {
+    resetTerminalFaults();
+    auto cfg = settings(root / L"failed-startup-clock", lapse::Mode::Desktop, true);
+    cameraOpenDelayMs = 600; cameraOpenFailure = true;
+    { lapse::Engine engine; engine.configure(cfg); engine.record();
+      const auto result = await(engine, [](const auto& s) { return s.state == lapse::State::Idle; });
+      require(result.recordingFailed && result.elapsed == 0 && result.frames == 0 && !firstAdmissionTick,
+          "Failed initial writer preparation counted as active time"); }
+    resetTerminalFaults(); cfg = settings(root / L"failed-first-admission-clock"); cfg.recordingLimitSeconds = 0;
+    writeFailureSide = 1; writeFailureDelayMs = 600;
+    { lapse::Engine engine; engine.configure(cfg); engine.record();
+      const auto result = await(engine, [](const auto& s) { return s.state == lapse::State::Idle; });
+      const double expected = double(failureObservedTick - firstAdmissionTick) / 1000;
+      require(result.recordingFailed && result.frames == 0 && result.savedPaths.empty() && expected >= .55 &&
+          result.elapsed >= expected - .08 && result.elapsed < expected + .15,
+          "A slow failed first admitted write was mistaken for pre-admission startup"); }
+    resetTerminalFaults(); cfg = settings(root / L"paused-terminal-clock"); cfg.intervalMs = 60000; cfg.recordingLimitSeconds = 0;
+    { lapse::Engine engine; engine.configure(cfg); engine.record(); await(engine, [](const auto& s) { return s.frames == 1; });
+      std::this_thread::sleep_for(120ms); engine.setPaused(true);
+      const auto paused = await(engine, [](const auto& s) { return s.state == lapse::State::Paused; });
+      std::this_thread::sleep_for(400ms); finalizeDelayMs = 500; engine.finish();
+      const auto result = await(engine, [](const auto& s) { return s.state == lapse::State::Idle; });
+      require(!result.error && result.elapsed == paused.elapsed, "Paused wait or terminal saving extended elapsed time"); verify(result.savedPath, 1); }
+    resetTerminalFaults(); cfg = settings(root / L"terminal-retry-clock"); cfg.intervalMs = 100; cfg.recordingLimitSeconds = 0;
+    { lapse::Engine engine; engine.configure(cfg); engine.record(); await(engine, [](const auto& s) { return s.frames == 1; });
+      finalizeDelayMs = 700; finalizeThrows = 1;
+      const auto requested = GetTickCount64(); engine.finish();
+      const auto result = await(engine, [](const auto& s) { return s.state == lapse::State::Idle; });
+      const double cutoff = double(requested - firstAdmissionTick) / 1000;
+      require(result.recordingFailed && finalizeCalls >= 2 && result.elapsed >= cutoff - .05 && result.elapsed < cutoff + .15 &&
+          GetTickCount64() - requested >= 650, "Exception-driven close retry counted terminal finalization as active");
+      verify(result.savedPath, result.frames);
+      resetTerminalFaults(); engine.record(); await(engine, [](const auto& s) { return s.frames == 1; });
+      writeFailureSide = 1; writeFailureDelayMs = 600;
+      const auto second = await(engine, [](const auto& s) { return s.state == lapse::State::Idle; });
+      const double expected = double(failureObservedTick - firstAdmissionTick) / 1000;
+      require(second.recordingFailed && second.elapsed >= expected - .08 && second.elapsed < expected + .15,
+          "Next Record retained the previous session's terminal clock latch"); verify(second.savedPath, 1); }
+    resetTerminalFaults(); cfg = settings(root / L"terminal-report-fallback"); cfg.intervalMs = 100; cfg.recordingLimitSeconds = 0;
+    { lapse::Engine engine; engine.configure(cfg); engine.record(); await(engine, [](const auto& s) { return s.frames == 1; });
+      finalizeDelayMs = 500; finalizeThrows = 2; captureFailureDelayMs = 600;
+      const auto result = await(engine, [](const auto& s) { return s.state == lapse::State::Idle; });
+      const double expected = double(failureObservedTick - firstAdmissionTick) / 1000;
+      require(result.recordingFailed && finalizeCalls >= 2 && finalizeThrows == 0 && result.savedPath.empty() &&
+          result.elapsed >= expected - .08 && result.elapsed < expected + .15,
+          "Persistent terminal-report failure lost the frozen active elapsed time");
+      unsigned retained = 0;
+      for (const auto& item : std::filesystem::directory_iterator(cfg.folder)) if (item.path().extension() == L".mp4") {
+          verify(item.path().wstring(), 1); ++retained;
+      }
+      require(retained == 1, "Persistent reporting failure lost the previously accepted movie"); }
+    std::cout << "PASS initial preparation, paused Finish, terminal retry, and next Record clock controls.\n";
+}
 }
 namespace lapse {
 bool CameraClient::beginNight(uint64_t, uint32_t, const NightSettings&, std::wstring& error) {
@@ -299,6 +405,10 @@ bool captureMonitor(const std::wstring& id, int width, int height, bool, Frame& 
     if (width == 480 && height == 360) if (const int delay = previewAllocationDelayMs.exchange(0)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(delay)); ++previewAllocationFaults; throw std::bad_alloc();
     }
+    if (const int delay = captureFailureDelayMs.exchange(0)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+        failureObservedTick = GetTickCount64(); error = L"Injected delayed capture failure."; return false;
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(desktopDelayMs.exchange(0)));
     error.clear(); pixels(output, width, height); return true;
 }
@@ -312,6 +422,7 @@ int main(int argc, char** argv) {
         const std::string focused = argc > 1 ? argv[1] : "";
         if (focused == "single-collision") collision(root, false);
         else if (focused == "single-finalization") singleFinalizationFailure(root);
+        else if (focused == "elapsed") { for (int i = 0; i < 4; ++i) delayedFailureElapsed(root, i); terminalClockControls(root); }
         else {
         sourceMode(root, lapse::Mode::Desktop, false); sourceMode(root, lapse::Mode::Camera, false);
         sourceMode(root, lapse::Mode::Overlay, false); sourceMode(root, lapse::Mode::Desktop, true);
@@ -319,9 +430,10 @@ int main(int argc, char** argv) {
         unlimitedAndManualFinish(root, 0); unlimitedAndManualFinish(root, -1); collision(root);
         previewFailureDeadline(root); finalizationExcluded(root);
         collision(root, false); singleFinalizationFailure(root);
+        for (int i = 0; i < 4; ++i) delayedFailureElapsed(root, i); terminalClockControls(root);
         }
         std::filesystem::remove_all(root);
-        std::cout << "Recording limits: " << (focused.empty() ? "15 synthetic real-encoder cases" : "focused outcome case") << " passed.\n";
+        std::cout << "Recording limits: " << (focused.empty() ? "20 synthetic real-encoder case groups" : "focused outcome case") << " passed.\n";
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; std::wcerr << L"Artifacts kept at " << root.wstring() << L'\n'; result = 1; }
     MFShutdown(); CoUninitialize(); return result;
 }

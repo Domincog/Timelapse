@@ -249,6 +249,64 @@ void personLayoutAndStatus(){
     require(lapse::uiPersonPackInspections==inspections,"Person status polling hashed the pack.");
     app.status={};std::cout<<"PASS person modal DPI/wrap/focus/labels and truthful status without polling pack work\n";
 }
+void nativeModalButtons(){
+    HiddenFixture owned;setupSkip();
+    const auto focus=[](HWND window,HWND child){
+        SendMessageW(window,WM_NEXTDLGCTL,reinterpret_cast<WPARAM>(child),TRUE);
+        RECT bounds{},client{};GetWindowRect(child,&bounds);MapWindowPoints(nullptr,window,reinterpret_cast<POINT*>(&bounds),2);GetClientRect(window,&client);
+        if(GetFocus()!=child || bounds.left<0 || bounds.top<0 || bounds.right>client.right || bounds.bottom>client.bottom)
+            std::cerr<<"Native focus id="<<GetDlgCtrlID(child)<<" focused="<<(GetFocus()==child)<<" bounds="<<bounds.left<<","<<bounds.top<<","<<bounds.right<<","<<bounds.bottom<<" client="<<client.right<<","<<client.bottom<<"\n";
+        require(GetFocus()==child && bounds.left>=0 && bounds.top>=0 && bounds.right<=client.right && bounds.bottom<=client.bottom,
+            "Native compression button focus did not reveal the whole control.");
+    };
+    const auto key=[](HWND window,WPARAM value){MSG message{};message.hwnd=GetFocus();message.message=WM_KEYDOWN;message.wParam=value;
+        require(IsDialogMessageW(window,&message),"Native compression dialog key was not handled.");};
+    int nested=0;
+    skipScript=[&](HWND window,DLGPROC procedure,LPARAM parameter){
+        if(procedure==customProc){auto& draft=*reinterpret_cast<CustomDraft*>(parameter);++nested;
+            SetWindowTextW(draft.first,nested==1?L"30":L"31");SetWindowTextW(draft.second,L"40");
+            focus(window,draft.okay);require(!outcome(),"Nested range OK focus accepted the draft.");SendMessageW(draft.okay,BM_CLICK,0,0);return;}
+        auto& draft=*reinterpret_cast<SkipDraft*>(parameter);mode(window,draft,TimeSkipMode::NoPersonWithinSchedule);
+        draft.policy.rangeCount=1;draft.policy.ranges[0]={10,20};skipList(draft,0);
+        for(int dpi:{96,192}){
+            RECT suggested{0,0,380,230};skipProc(window,WM_DPICHANGED,MAKELONG(dpi,dpi),reinterpret_cast<LPARAM>(&suggested));
+            const unsigned dialogs=lapse::uiPersonPackDialogs,inspections=lapse::uiPersonPackInspections;
+            const int calls=skipDialogCalls;
+            for(HWND button:{draft.add,draft.edit,draft.remove,draft.packManage,draft.okay,draft.cancel}){
+                focus(window,button);
+                require(!outcome() && skipDialogCalls==calls && lapse::uiPersonPackDialogs==dialogs && lapse::uiPersonPackInspections==inspections &&
+                    draft.policy.rangeCount==1 && draft.policy.ranges[0].startSeconds==10 && draft.policy.ranges[0].endSeconds==20,
+                    "Compression focus activated a range, management, OK or Cancel action.");
+            }
+        }
+        SendMessageW(draft.add,BM_CLICK,0,0);require(nested==1 && draft.policy.rangeCount==2,"Actual Add click failed.");
+        SendMessageW(draft.edit,BM_CLICK,0,0);require(nested==2 && draft.policy.ranges[1].startSeconds==31,"Actual Edit click failed.");
+        focus(window,draft.remove);SendMessageW(draft.remove,WM_KEYDOWN,VK_SPACE,0);SendMessageW(draft.remove,WM_KEYUP,VK_SPACE,0);
+        require(draft.policy.rangeCount==1,"Actual Remove Space activation failed.");
+        const unsigned managed=lapse::uiPersonPackDialogs;SendMessageW(draft.packManage,BM_CLICK,0,0);
+        require(lapse::uiPersonPackDialogs==managed+1,"Explicit detector management click failed.");
+        SendMessageW(window,WM_NEXTDLGCTL,reinterpret_cast<WPARAM>(draft.mode),TRUE);
+        require(GetFocus()==draft.mode,"Native compression mode focus failed.");
+        key(window,VK_RETURN);require(outcome()==IDOK,"Native Enter failed to accept a valid compression draft.");
+    };
+    editSkip();require(app.settings.timeSkip.mode==TimeSkipMode::NoPersonWithinSchedule && app.settings.timeSkip.rangeCount==1,"Native dialog acceptance failed to commit policy.");
+    for(bool readOnly:{false,true}){
+        app.status.state=readOnly?State::Recording:State::Idle;
+        const auto policy=app.settings.timeSkip;const int configurationCount=lapse::configurationCalls;
+        skipScript=[&](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);
+            require(!outcome() && draft.readOnly==readOnly,"Read-only initialization activated Close on focus.");
+            RECT suggested{0,0,380,230};
+            skipProc(window,WM_DPICHANGED,MAKELONG(96,96),reinterpret_cast<LPARAM>(&suggested));
+            focus(window,draft.cancel);require(!outcome(),"Focusing Close/Cancel dismissed the dialog.");
+            if(readOnly){SendMessageW(draft.cancel,WM_KEYDOWN,VK_SPACE,0);SendMessageW(draft.cancel,WM_KEYUP,VK_SPACE,0);}
+            else key(window,VK_ESCAPE);
+            require(outcome()==IDCANCEL,"Read-only Close Space or idle Escape failed.");
+        };editSkip();
+        require(lapse::configurationCalls==configurationCount && app.settings.timeSkip.mode==policy.mode && app.settings.timeSkip.rangeCount==policy.rangeCount,
+            "Closing modal inspection changed recording options.");
+    }
+    app.status={};std::cout<<"PASS native compression button focus, safe actions, nested ranges, manager clicks, Enter/Escape/Space and read-only Close\n";
 }
-int main(){try{transactionalRanges();boundsAndFreeze();modalLayoutAndInactiveDraft();strictPolicy();nativeCompressionInsertion();statusAndNestedClose();personModesAndManagement();personLayoutAndStatus();std::cout<<"All eight time-compression UI groups passed using owned hidden windows only.\n";return 0;}
+}
+int main(){try{transactionalRanges();boundsAndFreeze();modalLayoutAndInactiveDraft();strictPolicy();nativeCompressionInsertion();statusAndNestedClose();personModesAndManagement();personLayoutAndStatus();nativeModalButtons();std::cout<<"All nine time-compression UI groups passed using owned hidden windows only.\n";return 0;}
 catch(const std::exception& error){std::cerr<<"TIME COMPRESSION UI FAILURE: "<<error.what()<<'\n';return 1;}}
