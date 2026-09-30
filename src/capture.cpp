@@ -10,6 +10,7 @@
 #include <cstring>
 #include <mutex>
 #include <new>
+#include <atomic>
 
 namespace lapse {
 namespace {
@@ -160,7 +161,8 @@ std::wstring attributeString(IMFAttributes* attributes, REFGUID key) {
     return result;
 }
 
-struct Format { UINT32 width = 0, height = 0; LONG stride = 0; };
+struct Format { UINT32 width = 0, height = 0; LONG stride = 0; UINT32 transferFunction = 0; };
+std::atomic<uint64_t> nextCameraEpoch{0};
 struct CameraState {
     std::mutex mutex;
     // Cleared under mutex before the owning reader reference is released.
@@ -171,6 +173,7 @@ struct CameraState {
     Format format;
     Clock::time_point started{}, received{};
     uint64_t receivedTick = 0;
+    CameraSampleInfo info{++nextCameraEpoch};
 };
 
 HRESULT readFormat(IMFSourceReader* reader, Format& format) {
@@ -192,7 +195,9 @@ HRESULT readFormat(IMFSourceReader* reader, Format& format) {
         stride = UINT32(computed);
     }
     if (std::abs(int64_t(LONG(stride))) < int64_t(width) * 4) return MF_E_INVALIDMEDIATYPE;
-    format = {width, height, LONG(stride)};
+    UINT32 transfer = 0;
+    type->GetUINT32(MF_MT_TRANSFER_FUNCTION, &transfer);
+    format = {width, height, LONG(stride), transfer};
     return S_OK;
 }
 
@@ -286,12 +291,14 @@ public:
         if (!remaining) delete this;
         return ULONG(remaining);
     }
-    HRESULT STDMETHODCALLTYPE OnReadSample(HRESULT status, DWORD, DWORD flags, LONGLONG, IMFSample* sample) override {
+    HRESULT STDMETHODCALLTYPE OnReadSample(HRESULT status, DWORD, DWORD flags, LONGLONG timestamp, IMFSample* sample) override {
         // A sample can own cleanup objects that report another callback event.
         // Acquire the incoming reference and retire old references outside the
         // state lock, including reset followed by replacement in one callback.
         ComPtr<IMFSample> incoming, retired;
         if (sample && SUCCEEDED(status) && !(flags & (MF_SOURCE_READERF_ERROR | MF_SOURCE_READERF_ENDOFSTREAM))) incoming = sample;
+        UINT32 discontinuity = FALSE;
+        if (incoming) incoming->GetUINT32(MFSampleExtension_Discontinuity, &discontinuity);
         ComPtr<IMFSourceReader> next;
         {
             std::lock_guard<std::mutex> guard(state_->mutex);
@@ -301,12 +308,20 @@ public:
             if (SUCCEEDED(status) && (flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED)) {
                 retired.Swap(state_->sample);
                 status = readFormat(state_->reader, state_->format);
+                state_->info.epoch = ++nextCameraEpoch;
             }
             if (FAILED(status)) { state_->failure = status; state_->running = false; }
             else {
                 if (sample) {
                     state_->sample.Swap(incoming); state_->received = Clock::now();
                     state_->receivedTick = GetTickCount64();
+                    if (discontinuity) state_->info.epoch = ++nextCameraEpoch;
+                    ++state_->info.sequence;
+                    state_->info.receivedTick = state_->receivedTick;
+                    state_->info.timestamp100ns = timestamp;
+                    state_->info.timestampValid = true;
+                    state_->info.discontinuity = discontinuity != FALSE;
+                    state_->info.transferFunction = state_->format.transferFunction;
                 }
                 next = state_->reader;
             }
@@ -534,6 +549,14 @@ bool Camera::latest(Frame& output, std::wstring& error) {
 }
 
 bool Camera::latest(Frame& output, std::wstring& error, uint64_t& receivedTick) {
+    CameraSampleInfo info;
+    const bool ready = latestNewer(output, error, info, {});
+    if (ready) receivedTick = info.receivedTick;
+    return ready;
+}
+
+bool Camera::latestNewer(Frame& output, std::wstring& error, CameraSampleInfo& info,
+                         const CameraSampleInfo& watermark) {
     error.clear();
     if (!impl_->state) { error = L"The camera is not running."; return false; }
     ComPtr<IMFSample> sample;
@@ -541,6 +564,7 @@ bool Camera::latest(Frame& output, std::wstring& error, uint64_t& receivedTick) 
     {
         std::lock_guard<std::mutex> guard(impl_->state->mutex);
         const auto& state = *impl_->state;
+        info = state.info;
         if (FAILED(state.failure)) {
             error = captureError(L"The camera stopped responding. Reconnect it and try again.", state.failure);
             return false;
@@ -553,7 +577,8 @@ bool Camera::latest(Frame& output, std::wstring& error, uint64_t& receivedTick) 
             return false;
         }
         if (!state.sample) return false;
-        sample = state.sample; format = state.format; receivedTick = state.receivedTick;
+        if (watermark.epoch && watermark.epoch == info.epoch && info.sequence <= watermark.sequence) return false;
+        sample = state.sample; format = state.format;
     }
     HRESULT hr = S_OK;
     try { hr = copySample(sample.Get(), format, output); }

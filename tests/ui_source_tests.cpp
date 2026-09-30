@@ -185,8 +185,10 @@ struct HiddenFixture {
         };
         app.mode=combo(6); app.interval=combo(6); app.videoSize=combo(2); app.encodingQuality=combo(3); app.encodingMode=combo(5);app.stopAfter=combo(6);
         app.lowDisk=child(L"BUTTON",BS_AUTOCHECKBOX);SendMessageW(app.lowDisk,BM_SETCHECK,BST_CHECKED,0);
+        app.nightEnabled=child(L"BUTTON",BS_AUTOCHECKBOX);app.nightDuration=combo(6);app.nightTarget=combo(3);choose(app.nightTarget,1);
         app.monitor=combo(0); app.camera=combo(0);
         app.preview=child(L"STATIC",0);
+        app.statusText=child(L"STATIC",0);
         for(auto target:{&app.refresh,&app.record,&app.pause,&app.finish,&app.folder,&app.openFolder,&app.reset,&app.forward})
             *target=child(L"BUTTON",BS_PUSHBUTTON);
         app.engine=std::make_unique<lapse::FixtureEngine>();
@@ -320,7 +322,7 @@ void activeControls() {
     seed(true);
     for(auto state:{State::Starting,State::Recording,State::Paused,State::Finishing}) {
         app.status.state=state; updateControls();
-        for(auto control:{app.refresh,app.mode,app.monitor,app.camera,app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.lowDisk,app.folder,app.record})
+        for(auto control:{app.refresh,app.mode,app.monitor,app.camera,app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.lowDisk,app.nightEnabled,app.nightDuration,app.nightTarget,app.folder,app.record})
             require(!IsWindowEnabled(control),"An active-session source/settings control remained enabled.");
     }
     std::cout<<"PASS Refresh/source/settings controls disabled in Starting, Recording, Paused and Finishing.\n";
@@ -456,6 +458,33 @@ void separateSources() {
     lapse::fixtureStatus=app.status={};sourceMode(Mode::Desktop);require(!app.settings.separateFiles,"Returning to desktop retained separate-file mode");
     std::cout<<"PASS separate-file mode requires both sources and prevents collage edits.\n";
 }
+void nightSettings(){
+    seed(true);choose(app.interval,2);choose(app.nightDuration,0);choose(app.nightTarget,1);
+    SendMessageW(app.nightEnabled,BM_SETCHECK,BST_CHECKED,0);windowProc(app.window,WM_COMMAND,NightBox,0);
+    require(app.settings.night.enabled&&lapse::configured.night.enabled&&app.settings.night.durationMs==0&&app.settings.night.targetBrightness==96&&IsWindowEnabled(app.record),"Night opt-in lost Auto/Balanced settings.");
+    for(int target=0;target<3;++target){choose(app.nightTarget,target);windowProc(app.window,WM_COMMAND,MAKEWPARAM(NightTargetBox,CBN_SELCHANGE),0);require(lapse::configured.night.targetBrightness==NightTargets[target],"Night target mapping failed.");}
+    choose(app.nightDuration,5);windowProc(app.window,WM_COMMAND,MAKEWPARAM(NightDurationBox,CBN_SELCHANGE),0);
+    require(app.settings.night.durationMs==30000&&!app.nightValidation.empty()&&!IsWindowEnabled(app.record)&&caption(app.statusText).find(L"Capture every")!=std::wstring::npos,"Invalid blend was silently shortened or failed to show validation.");
+    const auto records=lapse::recordCalls;windowProc(app.window,WM_COMMAND,Record,0);require(lapse::recordCalls==records,"Record admitted a blend longer than the capture interval.");
+    lapse::fixtureStatus.error=true;lapse::fixtureStatus.recordingFailed=true;lapse::fixtureStatus.message=L"Synthetic camera failure";windowProc(app.window,WM_TIMER,1,0);
+    require(caption(app.statusText)==lapse::fixtureStatus.message,"Night validation hid a capture failure.");
+    lapse::fixtureStatus.error=false;lapse::fixtureStatus.message=L"Ready to record.";windowProc(app.window,WM_TIMER,1,0);require(caption(app.statusText)==app.nightValidation,"A prior failed recording hid idle validation after its current error was acknowledged.");
+    choose(app.interval,4);windowProc(app.window,WM_COMMAND,MAKEWPARAM(IntervalBox,CBN_SELCHANGE),0);
+    require(app.nightValidation.empty()&&IsWindowEnabled(app.record)&&app.settings.night.durationMs==30000,"Equal duration/interval was rejected or coerced.");
+    record();require(lapse::recorded.night.enabled&&lapse::recorded.night.durationMs==30000&&lapse::recorded.night.targetBrightness==128,"Record did not freeze the chosen night policy.");
+    for(State state:{State::Starting,State::Recording,State::Paused,State::Finishing}){
+        app.status.state=state;updateControls();const int calls=lapse::configurationCalls;
+        require(!IsWindowEnabled(app.nightEnabled)&&!IsWindowEnabled(app.nightDuration)&&!IsWindowEnabled(app.nightTarget),"Active session allowed night edits.");
+        windowProc(app.window,WM_COMMAND,NightBox,0);windowProc(app.window,WM_COMMAND,MAKEWPARAM(NightDurationBox,CBN_SELCHANGE),0);windowProc(app.window,WM_COMMAND,MAKEWPARAM(NightTargetBox,CBN_SELCHANGE),0);
+        require(lapse::configurationCalls==calls,"Disabled night commands still configured active session.");
+    }
+    app.status=lapse::fixtureStatus={};sourceMode(Mode::Desktop);
+    require(!app.settings.night.enabled&&SendMessageW(app.nightEnabled,BM_GETCHECK,0,0)==BST_CHECKED&&IsWindowEnabled(app.record),"Desktop source applied camera processing or lost the saved camera preference.");
+    sourceMode(Mode::Camera);require(app.settings.night.enabled,"Camera source did not restore night preference.");
+    choose(app.mode,SeparateFilesMode);changeLayout(false);require(lapse::configured.night.enabled&&lapse::configured.separateFiles,"Separate output mode lost camera night settings.");
+    SendMessageW(app.nightEnabled,BM_SETCHECK,BST_UNCHECKED,0);windowProc(app.window,WM_COMMAND,NightBox,0);sourceMode(Mode::Desktop);
+    std::cout<<"PASS night Auto/manual/target mapping, equality, validation/error priority, active locks and camera-only scope\n";
+}
 }
 int main() {
     std::cout<<std::unitbuf; std::wcout<<std::unitbuf;
@@ -472,7 +501,7 @@ int main() {
             unavailableSelection(camera);emptyListRecovery(camera);explicitReplacement(camera);
             modeSwitchPreservesMissingChoice(camera);changedMetadata(camera);
         }
-        activeControls();indexLoads();separateSources();
+        activeControls();indexLoads();separateSources();nightSettings();
         require(!IsWindowVisible(app.window)&&!IsWindowVisible(app.preview),"Fixture became visible.");
         std::cout<<"All source selection and settings assertions passed with hidden controls. No actual source was opened.\n";
         return 0;

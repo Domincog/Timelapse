@@ -1,5 +1,6 @@
 #pragma once
 #include "core.h"
+#include "night.h"
 #include <mutex>
 #include <thread>
 #include <condition_variable>
@@ -26,6 +27,8 @@ struct Settings {
     // Best-effort room for finalization; query failure also stops admission.
     // Disable only for destinations that cannot report caller-available space.
     bool stopOnLowDiskSpace = true;
+    // Camera-only software exposure; all policy is frozen with the session.
+    NightSettings night;
 };
 struct Status {
     State state = State::Idle;
@@ -41,6 +44,11 @@ struct Status {
     bool error = false;
     // Preview errors do not change the outcome of the last recording attempt.
     bool recordingFailed = false;
+    // Facts about the most recently admitted camera blend. The original
+    // camera's shutter/exposure is not changed or inferred from these values.
+    bool nightEnabled = false, nightWaiting = false;
+    uint32_t nightDurationMs = 0;
+    NightResult night;
     std::shared_ptr<const Frame> preview;
 };
 class Engine {

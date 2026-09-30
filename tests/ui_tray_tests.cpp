@@ -107,6 +107,7 @@ struct Fixture {
         app.settings={};app.status=probe::current={};app.selected=-1;app.closeWhenDone=false;
         app.visibleDirty=true;app.controlsUpdated=app.trayStateValid=probe::iconic=false;
         app.advancedExpanded=false;app.advancedLimitIndex=app.advancedVisibility=-1;
+        app.advancedNightState=app.nightVisibility=-1;app.nightValidation.clear();
         app.scrollX=app.scrollY=0;app.contentWidth=920;app.contentHeight=720;
         app.hiddenToTray=app.trayRegistered=app.trayNoticeShown=app.trayVersion4=app.startupComplete=false;
         app.taskbarCreated=0;app.trayTooltip.clear();
@@ -119,6 +120,8 @@ struct Fixture {
         auto combo=[&](int count){auto w=child(L"COMBOBOX",CBS_DROPDOWNLIST);for(int i=0;i<count;++i)add(w,std::to_wstring(i));choose(w,0);return w;};
         app.mode=combo(6);app.interval=combo(6);app.videoSize=combo(2);app.encodingQuality=combo(3);app.encodingMode=combo(5);app.monitor=combo(1);app.camera=combo(1);
         app.stopAfter=combo(6);app.lowDisk=child(L"BUTTON",BS_AUTOCHECKBOX);SendMessageW(app.lowDisk,BM_SETCHECK,BST_CHECKED,0);
+        app.nightEnabled=child(L"BUTTON",BS_AUTOCHECKBOX);app.nightDuration=combo(6);app.nightTarget=combo(3);choose(app.nightTarget,1);
+        app.nightHint=child(L"STATIC",0);app.nightDetail=child(L"STATIC",0);
         app.monitors={{L"Synthetic display",{0,0,640,360},L"owned-display"}};app.cameras={{L"Synthetic camera",L"owned-camera"}};
         app.preview=child(L"STATIC",0);app.statusText=child(L"STATIC",0);
         for(auto p:{&app.refresh,&app.record,&app.pause,&app.finish,&app.folder,&app.openFolder,&app.reset,&app.forward})*p=child(L"BUTTON",BS_PUSHBUTTON);
@@ -221,9 +224,25 @@ void unchangedTrayTip(){Fixture f;f.close();probe::resetWork();app.settings.sepa
     probe::resetWork();app.status.recordingFailed=true;updateTray();
     require(app.trayFailure&&probe::notifications.empty(),"Equivalent active tray text did not cache its failure input");
 }
+void nightResultDetails(){Fixture f;app.settings.layers=preset(Mode::Camera);app.advancedExpanded=true;
+    SendMessageW(app.nightEnabled,BM_SETCHECK,BST_CHECKED,0);configure();updateControls();f.tick();
+    wchar_t value[300]{};GetWindowTextW(app.nightDetail,value,300);
+    require(std::wstring(value).find(L"during recording")!=std::wstring::npos,"Night help claims processed idle preview.");
+    probe::current.state=State::Starting;probe::current.nightEnabled=true;probe::current.nightWaiting=true;f.tick();GetWindowTextW(app.nightDetail,value,300);
+    require(std::wstring(value).find(L"first full blend")!=std::wstring::npos,"Initial night work lacks preparing detail.");
+    probe::current.state=State::Recording;probe::current.nightDurationMs=5000;probe::current.night.samples=17;probe::current.night.appliedGain=2.5;probe::current.night.targetLimited=true;f.tick();GetWindowTextW(app.nightDetail,value,300);
+    const std::wstring last=value;
+    require(last.find(L"5.0 s")!=std::wstring::npos&&last.find(L"17 camera frames")!=std::wstring::npos&&last.find(L"2.5")!=std::wstring::npos&&last.find(L"target limited")!=std::wstring::npos,"Night result lost admitted duration/count/gain/limit facts.");
+    probe::resetWork();for(int i=0;i<1000;++i)f.tick();require(probe::textWrites==0&&probe::enables==0&&probe::invalidated.empty(),"Unchanged night facts repeated visual work.");
+    f.close();probe::resetWork();probe::current.nightDurationMs=10000;probe::current.night.samples=31;probe::current.night.appliedGain=3;f.tick();
+    require(app.visibleDirty&&probe::textWrites==0&&probe::invalidated.empty(),"Hidden night results repainted the window.");
+    f.command(TrayShow);GetWindowTextW(app.nightDetail,value,300);require(std::wstring(value).find(L"10.0 s")!=std::wstring::npos&&std::wstring(value).find(L"31 camera frames")!=std::wstring::npos,"Restore lost deferred night facts.");
+    app.advancedExpanded=false;probe::resetWork();probe::current.night.samples=32;f.tick();require(probe::textWrites==0,"Collapsed night facts rewrote hidden detail.");
+    app.advancedExpanded=true;updateNightText();GetWindowTextW(app.nightDetail,value,300);require(std::wstring(value).find(L"32 camera frames")!=std::wstring::npos,"Expanding night details left stale facts.");
+}
 }
 int main(){std::cout<<std::unitbuf;try{
     hideAndShow();failedRegistration();restart(false);restart(true);legacyFallback();menuAndCommands();exitOutcome(false);exitOutcome(true);backgroundFailure();modifierFailure();cleanupAndStartup();
-    unchangedWork();scopedPaint();deferredVisuals(false);deferredVisuals(true);unchangedTrayTip();
-    std::cout<<"PASS 16 tray/status cases: owned hidden windows, synthetic engine, no tray icons, captures, input, or settings writes.\n";return 0;
+    unchangedWork();scopedPaint();deferredVisuals(false);deferredVisuals(true);unchangedTrayTip();nightResultDetails();
+    std::cout<<"PASS 17 tray/status cases: owned hidden windows, synthetic engine, no tray icons, captures, input, or settings writes.\n";return 0;
 }catch(const std::exception& error){std::cerr<<"FAIL: "<<error.what()<<'\n';return 1;}}

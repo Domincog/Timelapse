@@ -6,16 +6,19 @@
 #include <cstring>
 #include <cwchar>
 #include <new>
+#include <limits>
 
 namespace lapse {
 namespace {
 constexpr uint32_t protocolMagic = 0x4C43414D;
-constexpr uint32_t protocolVersion = 2;
+constexpr uint32_t protocolVersion = 3;
 constexpr uint32_t maxWidth = 1280, maxHeight = 720;
 constexpr size_t maxPixels = size_t(maxWidth) * maxHeight * 4;
 constexpr size_t idCapacity = 4096;
 constexpr wchar_t mappingPrefix[] = L"Local\\Timelapse.Camera.";
 enum class HostState : uint32_t { Starting = 1, Ready, Failed, Stopped };
+enum class PixelRequest : uint32_t { Preview, Night };
+enum class NightState : uint32_t { Idle, Waiting, Integrating, Complete, Failed };
 
 struct SharedFrame {
     uint32_t magic, version;
@@ -23,6 +26,22 @@ struct SharedFrame {
     uint32_t width, height, bytes;
     uint64_t generation, receivedTick;
     uint64_t requested, completed;
+    PixelRequest requestedKind, completedKind;
+    uint64_t requestedToken, completedToken;
+    // Completion also acknowledges a no-frame response. Bind the pixel slot
+    // separately to the exact request that actually supplied these bytes.
+    uint64_t publishedRequest, publishedToken;
+    PixelRequest publishedKind;
+    uint64_t nightCommand, nightToken;
+    alignas(8) volatile LONG64 nightCancelled;
+    uint32_t nightDuration;
+    NightSettings nightSettings;
+    uint64_t nightStateCommand;
+    uint64_t nightSourceTick;
+    uint64_t nightCompletedTick;
+    NightState nightState;
+    NightWindowResult nightResult;
+    wchar_t nightError[512];
     wchar_t id[idCapacity];
     wchar_t error[512];
     uint8_t pixels[maxPixels];
@@ -64,6 +83,9 @@ void setMessage(SharedFrame& shared, HostState state, const std::wstring& error)
 
 bool validHeader(const SharedFrame& shared) {
     return shared.magic == protocolMagic && shared.version == protocolVersion;
+}
+uint64_t cancelledNight(SharedFrame& shared) noexcept {
+    return static_cast<uint64_t>(InterlockedCompareExchange64(&shared.nightCancelled, 0, 0));
 }
 
 std::wstring modulePath() {
@@ -112,12 +134,41 @@ int hostMain(const wchar_t* mappingName) {
         if (WaitForSingleObject(stop.value, 0) == WAIT_OBJECT_0) result = 0;
         else if (!camera.start(id, error)) { publishError(error); result = 9; }
         else {
-            Frame frame;
+            Frame frame, nightFrame;
+            std::unique_ptr<NightAccumulator> accumulator;
+            const Frame* completedNight = nullptr;
+            CameraSampleInfo watermark, seen;
+            NightSettings nightSettings;
+            NightWindowResult nightResult;
+            NightState nightState = NightState::Idle;
+            uint64_t nightCommand = 0, nightToken = 0, nextNight = 0, nightSourceTick = 0, nightCompletedTick = 0;
+            uint32_t nightDuration = 0, duplicateTimes = 0;
+            int64_t lastTimestamp = 0;
+            bool trustedTimestamp = false;
+            std::wstring nightError;
             const HANDLE events[] = {stop.value, request.value};
-            // Camera callbacks retain the most recent MF sample. Converting
-            // and copying its pixels is useful only when the parent asks for it.
-            while (WaitForMultipleObjects(2, events, FALSE, INFINITE) == WAIT_OBJECT_0 + 1) {
-                uint64_t requested = 0;
+            auto cancel = [&] {
+                // Explicit cancellation releases the optional work buffers and
+                // gain history. Next ordinary preview has baseline memory/cost.
+                accumulator.reset(); nightFrame = {}; completedNight = nullptr;
+                nightState = NightState::Idle; nightResult = {}; nightCompletedTick = 0; nightError.clear();
+            };
+            auto nightFailed = [&](const wchar_t* message) {
+                nightState = NightState::Failed; nightError = message; completedNight = nullptr;
+                if (accumulator) accumulator->resetExposure();
+            };
+            for (;;) {
+                const bool accumulating = nightState == NightState::Waiting || nightState == NightState::Integrating;
+                const uint64_t before = GetTickCount64();
+                const DWORD delay = accumulating ? DWORD(nextNight > before ? std::min<uint64_t>(nextNight - before, NightCadenceMs) : 0) : INFINITE;
+                const DWORD wake = WaitForMultipleObjects(2, events, FALSE, delay);
+                if (wake == WAIT_OBJECT_0) break;
+                if (wake != WAIT_TIMEOUT && wake != WAIT_OBJECT_0 + 1) { result = 12; break; }
+                // Cancellation never waits for the sharing mutex. Even while
+                // it is held, the helper stops sampling and drops partial work.
+                if (nightCommand && cancelledNight(*view.value) >= nightCommand && nightState != NightState::Idle) cancel();
+                uint64_t requested = 0, requestedToken = 0;
+                PixelRequest requestedKind = PixelRequest::Preview;
                 {
                     SharedLock lock(mutex.value);
                     if (lock.result == WAIT_ABANDONED || lock.result == WAIT_FAILED) { result = 12; break; }
@@ -125,15 +176,110 @@ int hostMain(const wchar_t* mappingName) {
                         if (WaitForSingleObject(stop.value, 50) == WAIT_OBJECT_0) break;
                         SetEvent(request.value); continue;
                     }
+                    if (!validHeader(*view.value)) { result = 12; break; }
+                    if (view.value->nightCommand != nightCommand) {
+                        nightCommand = view.value->nightCommand;
+                        nightToken = view.value->nightToken;
+                        nightDuration = view.value->nightDuration;
+                        nightSettings = view.value->nightSettings;
+                        completedNight = nullptr; nightResult = {}; nightCompletedTick = 0; nightError.clear();
+                        watermark = {}; seen = {}; nightSourceTick = 0; duplicateTimes = 0; trustedTimestamp = false;
+                        nightState = NightState::Waiting; nextNight = GetTickCount64();
+                        if (cancelledNight(*view.value) >= nightCommand) cancel();
+                        else if (!nightToken || nightDuration < NightMinDurationMs || nightDuration > NightMaxDurationMs ||
+                                 !nightSettings.enabled || !validNightSettings(nightSettings))
+                            nightFailed(L"The camera received invalid night blend settings.");
+                    }
                     requested = view.value->requested;
-                    if (requested == view.value->completed) continue;
+                    requestedKind = view.value->requestedKind;
+                    requestedToken = view.value->requestedToken;
+                    if (requested == view.value->completed) requested = 0;
+                }
+                const uint64_t sampleAt = GetTickCount64();
+                if ((nightState == NightState::Waiting || nightState == NightState::Integrating) && sampleAt >= nextNight) {
+                    CameraSampleInfo info;
+                    const bool fresh = camera.latestNewer(nightFrame, error, info, seen);
+                    nightSourceTick = info.receivedTick;
+                    if (!error.empty()) { publishError(error); result = 10; break; }
+                    const uint64_t copiedAt = GetTickCount64();
+                    if (info.receivedTick > copiedAt) nightFailed(L"The camera returned invalid source freshness data.");
+                    else if (info.receivedTick && copiedAt - info.receivedTick > 3000)
+                        nightFailed(L"No fresh camera frame arrived for 3 seconds. Check the camera connection and try again.");
+                    if (nightState == NightState::Integrating && info.epoch && info.epoch != watermark.epoch)
+                        nightFailed(L"The camera format or source timeline changed during the night blend. Try recording again.");
+                    if (fresh && (!nightFrame.valid() || nightFrame.width > int(maxWidth) || nightFrame.height > int(maxHeight)))
+                        nightFailed(L"The camera returned an unsupported night blend frame size.");
+                    if (fresh && nightState == NightState::Waiting) {
+                        if (!accumulator) accumulator = std::make_unique<NightAccumulator>();
+                        if (!accumulator->prepare(nightFrame.width, nightFrame.height, error) || !accumulator->begin(nightSettings)) {
+                            nightFailed(L"The camera could not prepare the night blend.");
+                        } else {
+                            // This first fresh sample is only the watermark.
+                            // No pre-request measurement enters the new window.
+                            watermark = info; seen = info;
+                            trustedTimestamp = info.timestampValid; lastTimestamp = info.timestamp100ns;
+                            nightResult.timestampFallback = !trustedTimestamp;
+                            nightResult.beginTick = GetTickCount64();
+                            nightResult.endTick = nightResult.beginTick + nightDuration;
+                            nightState = NightState::Integrating;
+                        }
+                    } else if (fresh && nightState == NightState::Integrating && info.sequence > watermark.sequence &&
+                               info.receivedTick >= nightResult.beginTick && info.receivedTick < nightResult.endTick) {
+                        bool accept = true;
+                        if (!nightResult.timestampFallback) {
+                            if (!info.timestampValid || info.timestamp100ns < lastTimestamp) nightResult.timestampFallback = true;
+                            else if (trustedTimestamp && info.timestamp100ns == lastTimestamp) {
+                                // A zero timestamp is valid. Only repeated new
+                                // source deliveries establish an unusable clock.
+                                if (++duplicateTimes >= 3) nightResult.timestampFallback = true;
+                                else accept = false;
+                            } else { duplicateTimes = 0; lastTimestamp = info.timestamp100ns; trustedTimestamp = true; }
+                        }
+                        if (accept) {
+                            const auto added = accumulator->add(nightFrame, info.sequence);
+                            if (added == NightAdd::Added) {
+                                if (!nightResult.firstSampleTick) nightResult.firstSampleTick = info.receivedTick;
+                                nightResult.lastSampleTick = info.receivedTick;
+                            } else if (added == NightAdd::Invalid || added == NightAdd::Full)
+                                nightFailed(L"The camera night blend exceeded its supported sample bounds.");
+                        }
+                        seen = info;
+                    } else if (fresh) seen = info;
+                    const uint64_t after = GetTickCount64();
+                    nextNight = after + NightCadenceMs;
+                    if (nightState == NightState::Integrating) {
+                        nextNight = std::min(nextNight, nightResult.endTick);
+                        if (after >= nightResult.endTick) {
+                            completedNight = accumulator->finish(nightResult.exposure);
+                            nightCompletedTick = GetTickCount64();
+                            if (nightSourceTick && nightCompletedTick - nightSourceTick > 3000)
+                                nightFailed(L"No fresh camera frame arrived for 3 seconds. Check the camera connection and try again.");
+                            else if (completedNight && nightResult.exposure.samples) {
+                                // Aim for at least two actual source deliveries
+                                // on the next Auto window, even when bright slow
+                                // cameras would otherwise request only a second.
+                                const uint64_t samples = nightResult.exposure.samples;
+                                const uint64_t twoSamples = (2ULL * nightDuration + samples - 1) / samples;
+                                const uint64_t rounded = ((twoSamples + 999) / 1000) * 1000;
+                                nightResult.exposure.suggestedDurationMs = std::clamp(
+                                    std::max(nightResult.exposure.suggestedDurationMs, int(std::min<uint64_t>(rounded, NightMaxDurationMs))),
+                                    NightMinDurationMs, NightMaxDurationMs);
+                                nightState = NightState::Complete;
+                            } else nightFailed(L"No distinct camera samples arrived during the night blend. Choose a longer blend and capture interval, or reconnect the camera.");
+                        }
+                    }
+                    if (nightCommand && cancelledNight(*view.value) >= nightCommand) cancel();
                 }
                 uint64_t receivedTick = 0;
-                const bool ready = camera.latest(frame, error, receivedTick);
-                if (!ready) {
-                    if (!error.empty()) { publishError(error); result = 10; break; }
+                const Frame* publication = nullptr;
+                if (requested && requestedKind == PixelRequest::Preview) {
+                    if (camera.latest(frame, error, receivedTick)) publication = &frame;
+                    else if (!error.empty()) { publishError(error); result = 10; break; }
+                } else if (requested && requestedKind == PixelRequest::Night && requestedToken == nightToken &&
+                           nightState == NightState::Complete && cancelledNight(*view.value) < nightCommand) {
+                    publication = completedNight; receivedTick = nightResult.lastSampleTick;
                 }
-                if (ready && (!frame.valid() || frame.width > int(maxWidth) || frame.height > int(maxHeight))) {
+                if (publication && (!publication->valid() || publication->width > int(maxWidth) || publication->height > int(maxHeight))) {
                     publishError(L"The camera returned an unsupported frame size."); result = 11; break;
                 }
                 SharedLock lock(mutex.value);
@@ -142,19 +288,35 @@ int hostMain(const wchar_t* mappingName) {
                     if (WaitForSingleObject(stop.value, 50) == WAIT_OBJECT_0) break;
                     SetEvent(request.value); continue;
                 }
+                if (view.value->nightCommand == nightCommand) {
+                    view.value->nightStateCommand = nightCommand;
+                    view.value->nightSourceTick = nightSourceTick;
+                    view.value->nightCompletedTick = nightCompletedTick;
+                    view.value->nightState = nightState;
+                    view.value->nightResult = nightResult;
+                    const size_t count = std::min(nightError.size(), std::size(view.value->nightError) - 1);
+                    std::wmemcpy(view.value->nightError, nightError.data(), count); view.value->nightError[count] = L'\0';
+                }
                 // Odd means publication is in progress; only an even generation
                 // with a valid size can ever be copied by the client.
-                if (ready) {
+                if (publication) {
                     ++view.value->generation;
-                    view.value->width = uint32_t(frame.width); view.value->height = uint32_t(frame.height);
-                    view.value->bytes = static_cast<uint32_t>(frame.pixels.size());
-                    std::memcpy(view.value->pixels, frame.pixels.data(), frame.pixels.size());
+                    view.value->width = uint32_t(publication->width); view.value->height = uint32_t(publication->height);
+                    view.value->bytes = static_cast<uint32_t>(publication->pixels.size());
+                    std::memcpy(view.value->pixels, publication->pixels.data(), publication->pixels.size());
                     view.value->receivedTick = receivedTick;
+                    view.value->publishedRequest = requested;
+                    view.value->publishedKind = requestedKind;
+                    view.value->publishedToken = requestedToken;
                     setMessage(*view.value, HostState::Ready, L"");
                     ++view.value->generation;
                 }
-                view.value->completed = requested;
-                SetEvent(response.value);
+                if (requested) {
+                    view.value->completed = requested;
+                    view.value->completedKind = requestedKind;
+                    view.value->completedToken = requestedToken;
+                    SetEvent(response.value);
+                }
             }
             // A stuck driver shutdown affects only this helper. The parent owns
             // a kill-on-close job and bounds graceful shutdown to 500 ms.
@@ -179,6 +341,8 @@ struct CameraClient::Impl {
     View view;
     uint64_t started = 0, contentionSince = 0, generation = 0;
     uint64_t request = 0, requestedTick = 0, requestedGeneration = 0;
+    PixelRequest requestedKind = PixelRequest::Preview;
+    uint64_t nightCommand = 0, nightToken = 0, nightRequestedTick = 0, nightDeadline = 0;
     bool delivered = false, contended = false, activationFailed = false;
 };
 
@@ -268,6 +432,8 @@ void CameraClient::stop() {
     impl_->requestEvent.reset(); impl_->responseEvent.reset();
     impl_->started = impl_->contentionSince = impl_->generation = 0;
     impl_->request = impl_->requestedTick = impl_->requestedGeneration = 0;
+    impl_->nightCommand = impl_->nightToken = impl_->nightRequestedTick = impl_->nightDeadline = 0;
+    impl_->requestedKind = PixelRequest::Preview;
     impl_->delivered = impl_->contended = impl_->activationFailed = false;
 }
 
@@ -283,7 +449,7 @@ bool CameraClient::latest(Frame& output, std::wstring& error) {
     bool expiredRefresh = false;
     auto read = [&](bool& waiting) {
         waiting = false;
-        const uint64_t now = GetTickCount64();
+        uint64_t now = GetTickCount64();
         SharedLock lock(impl_->mutex.value);
         if (lock.result == WAIT_ABANDONED) { error = L"The camera helper stopped while sharing a frame. Try again."; return false; }
         if (lock.result == WAIT_FAILED) return fail(error, L"Windows could not read the camera frame.");
@@ -301,6 +467,7 @@ bool CameraClient::latest(Frame& output, std::wstring& error) {
             }
             return false;
         }
+        now = GetTickCount64();
         impl_->contended = false; impl_->contentionSince = 0;
         auto& shared = *impl_->view.value;
         if (!validHeader(shared)) { error = L"The camera helper returned invalid data. Try again."; return false; }
@@ -318,6 +485,8 @@ bool CameraClient::latest(Frame& output, std::wstring& error) {
         }
         auto requestFrame = [&] {
             impl_->request = ++shared.requested;
+            shared.requestedKind = impl_->requestedKind = PixelRequest::Preview;
+            shared.requestedToken = 0;
             impl_->requestedTick = now;
             impl_->requestedGeneration = shared.generation;
             expiredRefresh = !impl_->delivered && now - impl_->started > 8000;
@@ -325,6 +494,9 @@ bool CameraClient::latest(Frame& output, std::wstring& error) {
                 return fail(error, L"Windows could not request a camera frame.");
             return true;
         };
+        // A completed night result is read only by nightResult. Preview must
+        // not steal its typed response from the single shared pixel slot.
+        if (impl_->request && impl_->requestedKind == PixelRequest::Night) return false;
         if (!impl_->request && !requestFrame()) return false;
         if (shared.completed < impl_->request) {
             waiting = true;
@@ -338,6 +510,10 @@ bool CameraClient::latest(Frame& output, std::wstring& error) {
             }
             return false;
         }
+        if (shared.completedKind != PixelRequest::Preview || shared.completedToken) {
+            error = L"The camera helper returned the wrong preview response. Try again."; return false;
+        }
+        const uint64_t responseRequest = impl_->request;
         impl_->request = 0;
         if (shared.state == HostState::Starting) {
             if (now - impl_->started > 8000) {
@@ -352,7 +528,8 @@ bool CameraClient::latest(Frame& output, std::wstring& error) {
             }
             return false;
         }
-        if (shared.generation == impl_->requestedGeneration) {
+        if (shared.generation == impl_->requestedGeneration || shared.publishedRequest != responseRequest ||
+            shared.publishedKind != PixelRequest::Preview || shared.publishedToken) {
             if (now - shared.receivedTick > 3000)
                 error = L"No fresh camera frame arrived for 3 seconds. Check the camera connection and try again.";
             return false;
@@ -400,6 +577,161 @@ bool CameraClient::latest(Frame& output, std::wstring& error) {
     return false;
 }
 
+bool CameraClient::beginNight(uint64_t token, uint32_t durationMs, const NightSettings& settings, std::wstring& error) {
+    error.clear();
+    if (!token || durationMs < NightMinDurationMs || durationMs > NightMaxDurationMs || !settings.enabled || !validNightSettings(settings)) {
+        error = L"Choose a supported camera night blend duration and brightness."; return false;
+    }
+    if (!impl_->process.value || !impl_->view.value) { error = L"The camera is not running."; return false; }
+    if (WaitForSingleObject(impl_->process.value, 0) == WAIT_OBJECT_0) {
+        error = L"The camera helper stopped unexpectedly. Reconnect the camera and try again."; return false;
+    }
+    if (impl_->nightToken == token) return true;
+    const uint64_t now = GetTickCount64();
+    SharedLock lock(impl_->mutex.value);
+    if (!lock.acquired()) {
+        if (lock.result == WAIT_ABANDONED || lock.result == WAIT_FAILED) {
+            error = L"Windows could not request the camera night blend."; return false;
+        }
+        if (!impl_->contended) { impl_->contended = true; impl_->contentionSince = now; }
+        else if (now - impl_->contentionSince > (impl_->delivered ? 3000 : 8000))
+            error = L"Camera frame sharing stayed unavailable. Reconnect the camera and try again.";
+        return false;
+    }
+    impl_->contended = false; impl_->contentionSince = 0;
+    auto& shared = *impl_->view.value;
+    if (!validHeader(shared) || shared.nightCommand == std::numeric_limits<uint64_t>::max()) {
+        error = L"The camera helper returned invalid data. Try again."; return false;
+    }
+    impl_->nightCommand = ++shared.nightCommand;
+    impl_->nightToken = shared.nightToken = token;
+    shared.nightDuration = durationMs; shared.nightSettings = settings;
+    impl_->nightRequestedTick = now;
+    impl_->nightDeadline = now + durationMs + (impl_->delivered ? 3000 : 8000);
+    // A newer begin owns the result channel immediately, even when an older
+    // pixel response is still in transit. Preview commands remain independent.
+    if (impl_->requestedKind == PixelRequest::Night) impl_->request = 0;
+    if (!SetEvent(impl_->requestEvent.value)) {
+        cancelNight(); return fail(error, L"Windows could not request the camera night blend.");
+    }
+    return true;
+}
+
+void CameraClient::cancelNight() noexcept {
+    if (impl_->view.value && impl_->nightCommand) {
+        InterlockedExchange64(&impl_->view.value->nightCancelled, static_cast<LONG64>(impl_->nightCommand));
+        if (impl_->requestEvent.value) SetEvent(impl_->requestEvent.value);
+    }
+    impl_->nightToken = impl_->nightRequestedTick = impl_->nightDeadline = 0;
+    if (impl_->requestedKind == PixelRequest::Night) {
+        impl_->request = 0; impl_->requestedKind = PixelRequest::Preview;
+    }
+}
+
+bool CameraClient::nightResult(uint64_t token, Frame& output, NightWindowResult& result, std::wstring& error) {
+    error.clear();
+    if (!token || token != impl_->nightToken) { error = L"The camera night blend request was cancelled or replaced."; return false; }
+    if (!impl_->process.value || !impl_->view.value) { error = L"The camera is not running."; return false; }
+    auto read = [&](bool& waiting) {
+        waiting = false;
+        uint64_t now = GetTickCount64();
+        SharedLock lock(impl_->mutex.value);
+        if (!lock.acquired()) {
+            if (WaitForSingleObject(impl_->process.value, 0) == WAIT_OBJECT_0)
+                error = L"The camera helper stopped unexpectedly. Reconnect the camera and try again.";
+            else if (lock.result != WAIT_TIMEOUT) error = L"Windows could not read the camera night blend.";
+            else if (now > impl_->nightDeadline) error = L"The camera night blend was not delivered within its deadline. Reconnect it and try again.";
+            else if (!impl_->contended) { impl_->contended = true; impl_->contentionSince = now; }
+            else if (now - impl_->contentionSince > (impl_->delivered ? 3000 : 8000))
+                error = L"Camera frame sharing stayed unavailable. Reconnect the camera and try again.";
+            return false;
+        }
+        // A completion can be published while this short mutex wait is in
+        // progress. Validate its timestamps against time after acquisition.
+        now = GetTickCount64();
+        impl_->contended = false; impl_->contentionSince = 0;
+        auto& shared = *impl_->view.value;
+        if (!validHeader(shared) || shared.completed > shared.requested || impl_->request > shared.requested) {
+            error = L"The camera helper returned invalid night blend data. Try again."; return false;
+        }
+        if (shared.state == HostState::Failed || shared.state == HostState::Stopped) {
+            const wchar_t* end = static_cast<const wchar_t*>(std::wmemchr(shared.error, L'\0', std::size(shared.error)));
+            error = end && end != shared.error ? std::wstring(shared.error, size_t(end - shared.error))
+                : L"The camera helper stopped unexpectedly. Reconnect the camera and try again.";
+            return false;
+        }
+        if (WaitForSingleObject(impl_->process.value, 0) == WAIT_OBJECT_0) {
+            error = L"The camera helper stopped unexpectedly. Reconnect the camera and try again."; return false;
+        }
+        const bool current = shared.nightStateCommand == impl_->nightCommand && shared.nightToken == token;
+        if (current && shared.nightState == NightState::Failed) {
+            const wchar_t* end = static_cast<const wchar_t*>(std::wmemchr(shared.nightError, L'\0', std::size(shared.nightError)));
+            error = end && end != shared.nightError ? std::wstring(shared.nightError, size_t(end - shared.nightError))
+                : L"The camera could not complete its night blend.";
+            return false;
+        }
+        if (!current || shared.nightState != NightState::Complete) {
+            if (current && shared.nightSourceTick > now) error = L"The camera helper returned invalid source freshness data.";
+            else if (current && shared.nightSourceTick && now - shared.nightSourceTick > 3000)
+                error = L"No fresh camera frame arrived for 3 seconds. Check the camera connection and try again.";
+            else if ((!current || !shared.nightSourceTick) && now - impl_->nightRequestedTick > (impl_->delivered ? 3000 : 8000))
+                error = L"The camera did not prepare a fresh source for the night blend within its deadline.";
+            else if (now > impl_->nightDeadline) error = L"The camera night blend was not delivered within its deadline. Reconnect it and try again.";
+            return false;
+        }
+        if (now > impl_->nightDeadline) {
+            error = L"The camera night blend was not delivered within its deadline. Reconnect it and try again."; return false;
+        }
+        const auto& finished = shared.nightResult;
+        if (!finished.exposure.samples || finished.exposure.samples > NightMaxSamples ||
+            finished.beginTick < impl_->nightRequestedTick || finished.endTick > impl_->nightDeadline || finished.endTick > now ||
+            finished.endTick - finished.beginTick != shared.nightDuration || shared.nightCompletedTick < finished.endTick ||
+            shared.nightCompletedTick > now || shared.nightCompletedTick > impl_->nightDeadline ||
+            finished.firstSampleTick < finished.beginTick || finished.lastSampleTick < finished.firstSampleTick || finished.lastSampleTick >= finished.endTick) {
+            error = L"The camera helper returned an invalid night blend window. Try again."; return false;
+        }
+        // A prior preview response can be superseded; the reverse is prohibited
+        // in latest(), so frequent preview requests cannot starve result delivery.
+        if (!impl_->request || impl_->requestedKind != PixelRequest::Night) {
+            impl_->request = ++shared.requested;
+            shared.requestedKind = impl_->requestedKind = PixelRequest::Night;
+            shared.requestedToken = token;
+            impl_->requestedTick = now; impl_->requestedGeneration = shared.generation;
+            if (!ResetEvent(impl_->responseEvent.value) || !SetEvent(impl_->requestEvent.value))
+                return fail(error, L"Windows could not request the camera night result.");
+        }
+        if (shared.completed < impl_->request) {
+            waiting = true;
+            if (now - impl_->requestedTick > 3000) error = L"The camera did not answer the night result request for 3 seconds.";
+            return false;
+        }
+        if (shared.completedKind != PixelRequest::Night || shared.completedToken != token ||
+            shared.publishedRequest != impl_->request || shared.publishedKind != PixelRequest::Night || shared.publishedToken != token ||
+            !shared.width || !shared.height || shared.width > maxWidth || shared.height > maxHeight ||
+            uint64_t(shared.width) * shared.height * 4 != shared.bytes || !shared.generation || (shared.generation & 1) ||
+            shared.generation <= impl_->requestedGeneration || shared.generation < impl_->generation) {
+            error = L"The camera helper returned an invalid night result. Try again."; return false;
+        }
+        try {
+            output.pixels.resize(shared.bytes);
+            std::memcpy(output.pixels.data(), shared.pixels, shared.bytes);
+            output.width = int(shared.width); output.height = int(shared.height);
+            if (GetTickCount64() > impl_->nightDeadline) {
+                error = L"The camera night blend was not delivered within its deadline. Reconnect it and try again."; return false;
+            }
+            result = finished; impl_->request = 0; impl_->requestedKind = PixelRequest::Preview;
+            impl_->delivered = true; impl_->generation = shared.generation;
+            return true;
+        } catch (const std::bad_alloc&) { error = L"Not enough memory to read the camera night result."; return false; }
+    };
+    bool waiting = false;
+    if (read(waiting)) return true;
+    if (!waiting || !error.empty()) return false;
+    const DWORD response = WaitForSingleObject(impl_->responseEvent.value, 10);
+    if (response == WAIT_OBJECT_0 && read(waiting)) return true;
+    if (response == WAIT_FAILED) return fail(error, L"Windows could not receive the camera night result.");
+    return false;
+}
 int runCameraHost(const wchar_t*) {
     int count = 0;
     wchar_t** args = CommandLineToArgvW(GetCommandLineW(), &count);

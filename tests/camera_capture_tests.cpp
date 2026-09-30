@@ -356,6 +356,46 @@ void formatChangeFreshness() {
           "repeated format changes hid a genuinely stale established camera");
     std::cout << "PASS repeated format gaps retain the established three-second stale-frame limit\n";
 }
+void sourceSampleIdentity() {
+    FreshnessCamera source;
+    auto sample = generatedFreshnessSample(2, 2, 42);
+    check(SUCCEEDED(source.callback->OnReadSample(S_OK, 0, 0, 0, sample.Get())), "deliver zero-timestamp source sample");
+    lapse::Frame frame;
+    lapse::CameraSampleInfo first, repeated, second, changed;
+    std::wstring error;
+    check(source.camera.latestNewer(frame, error, first, {}) && first.epoch && first.sequence == 1 &&
+        first.timestampValid && first.timestamp100ns == 0 && freshnessPixels(frame, 2, 2, 42),
+        "first camera sample lacks unique source identity or valid zero timestamp");
+    ComPtr<IMFMediaBuffer> buffer;
+    check(SUCCEEDED(sample->GetBufferByIndex(0, &buffer)) && SUCCEEDED(buffer->SetCurrentLength(0)), "make already-consumed sample uncopyable");
+    const auto oldPixels = frame.pixels;
+    check(!source.camera.latestNewer(frame, error, repeated, first) && error.empty() && repeated.sequence == first.sequence &&
+        repeated.receivedTick == first.receivedTick && frame.pixels == oldPixels,
+        "repeated retained sample was converted or refreshed its identity");
+    check(SUCCEEDED(buffer->SetCurrentLength(16)), "restore owned source sample");
+    source.callback->OnReadSample(S_OK, 0, MF_SOURCE_READERF_STREAMTICK, 999, nullptr);
+    check(!source.camera.latestNewer(frame, error, repeated, first) && error.empty() && repeated.sequence == first.sequence &&
+        repeated.timestamp100ns == 0 && repeated.receivedTick == first.receivedTick,
+        "null stream tick manufactured a source sample or timestamp");
+    source.callback->OnReadSample(S_OK, 0, 0, 0, sample.Get());
+    check(source.camera.latestNewer(frame, error, second, first) && second.sequence == first.sequence + 1 &&
+        second.epoch == first.epoch && second.timestampValid && second.timestamp100ns == 0,
+        "genuine identical-pixel callback lost its new delivery sequence");
+    check(SUCCEEDED(sample->SetUINT32(MFSampleExtension_Discontinuity, TRUE)), "mark source timeline discontinuity");
+    source.callback->OnReadSample(S_OK, 0, 0, -100, sample.Get());
+    check(source.camera.latestNewer(frame, error, changed, second) && changed.epoch != second.epoch && changed.discontinuity &&
+        changed.sequence == second.sequence + 1 && changed.timestamp100ns == -100,
+        "source discontinuity failed to invalidate its epoch and retain media time");
+    check(SUCCEEDED(sample->SetUINT32(MFSampleExtension_Discontinuity, FALSE)), "clear synthetic discontinuity");
+    ComPtr<IMFMediaType> type;
+    check(SUCCEEDED(source.reader->GetCurrentMediaType(lapse::videoStream, &type)) &&
+        SUCCEEDED(type->SetUINT32(MF_MT_TRANSFER_FUNCTION, 7)), "set synthetic transfer provenance");
+    source.callback->OnReadSample(S_OK, 0, MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED, 100, sample.Get());
+    lapse::CameraSampleInfo transfer;
+    check(source.camera.latestNewer(frame, error, transfer, changed) && transfer.epoch != changed.epoch && transfer.transferFunction == 7 &&
+        !transfer.discontinuity, "same-size format/color change failed to invalidate the source epoch");
+    std::cout << "PASS source epoch/sequence, valid zero timestamps, null ticks, duplicate-copy suppression and transfer provenance\n";
+}
 }
 
 int main() {
@@ -369,6 +409,7 @@ int main() {
         for (const char* mode : {"stop", "replace", "format_change"})
             check(runCase(mode), "Sample cleanup could not reenter callback before Release returned");
         formatChangeFreshness();
+        sourceSampleIdentity();
         std::cout << "Synthetic native camera buffer and sample-lifetime checks passed.\n";
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; result = 1; }
     MFShutdown(); CoUninitialize(); return result;

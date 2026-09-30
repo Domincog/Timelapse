@@ -118,6 +118,9 @@ struct HiddenControls {
         app.mode=combo(6);app.interval=combo(6);app.videoSize=combo(2);app.encodingQuality=combo(3);app.encodingMode=combo(5);app.stopAfter=combo(6);
         app.lowDisk=CreateWindowExW(0,L"BUTTON",L"Stop on low disk space",WS_CHILD|BS_AUTOCHECKBOX,0,0,200,30,app.window,nullptr,nullptr,nullptr);
         require(app.lowDisk!=nullptr,"Cannot create owned low disk option.");SendMessageW(app.lowDisk,BM_SETCHECK,BST_CHECKED,0);
+        app.nightEnabled=CreateWindowExW(0,L"BUTTON",L"Night",WS_CHILD|BS_AUTOCHECKBOX,0,0,200,30,app.window,nullptr,nullptr,nullptr);
+        require(app.nightEnabled!=nullptr,"Cannot create owned night option.");
+        app.nightDuration=combo(6);app.nightTarget=combo(3);choose(app.nightTarget,1);
     }
     ~HiddenControls(){DestroyWindow(app.window);app.window=nullptr;}
 };
@@ -230,7 +233,7 @@ void newUnicodeFile(){
 }
 void existingUnicodeRewrite(){
     PreferencesFixture fixture;
-    const std::wstring initial=L"[Settings]\r\nFolder="+unicodeFolder+L"\r\nInterval=5\r\nQuality=1\r\nEncodingQuality=2\r\nEncodingMode=0\r\nRecordingLimit=0\r\nStopOnLowDiskSpace=1\r\n";
+    const std::wstring initial=L"[Settings]\r\nFolder="+unicodeFolder+L"\r\nInterval=5\r\nQuality=1\r\nEncodingQuality=2\r\nEncodingMode=0\r\nRecordingLimit=0\r\nStopOnLowDiskSpace=1\r\nNightEnabled=0\r\nNightDurationMs=0\r\nNightTargetBrightness=96\r\n";
     fixture.seed(utf16(initial));reload();expectOptions(unicodeFolder,5,1,2);
     const auto initialBytes=fixture.bytes();
     const std::wstring changed=L"C:\\Synthetic videos\\\u65e5\u672c\u8a9e-\U0001f3a5";
@@ -286,6 +289,23 @@ void diskSafety(){
         reload();require(SendMessageW(app.lowDisk,BM_GETCHECK,0,0)==BST_CHECKED,"Invalid low disk option disabled protection.");
     }
     fixture.onlySettingsRemain();std::cout<<"PASS low disk protection roundtrip; old and malformed settings keep protection enabled\n";
+}
+void nightOptions(){
+    PreferencesFixture fixture;fixture.seed(legacy);reload();
+    require(SendMessageW(app.nightEnabled,BM_GETCHECK,0,0)==BST_UNCHECKED&&choice(app.nightDuration)==0&&choice(app.nightTarget)==1,"Old preferences enabled night capture or changed Auto/Balanced defaults.");
+    SendMessageW(app.nightEnabled,BM_SETCHECK,BST_CHECKED,0);
+    for(int duration=0;duration<6;++duration)for(int target=0;target<3;++target){
+        choose(app.nightDuration,duration);choose(app.nightTarget,target);preferences(true);
+        SendMessageW(app.nightEnabled,BM_SETCHECK,BST_UNCHECKED,0);choose(app.nightDuration,0);choose(app.nightTarget,1);reload();
+        require(SendMessageW(app.nightEnabled,BM_GETCHECK,0,0)==BST_CHECKED&&choice(app.nightDuration)==duration&&choice(app.nightTarget)==target&&choice(app.mode)==0,"Night settings roundtrip lost an exact value or changed Desktop startup.");
+        require(GetPrivateProfileIntW(L"Settings",L"NightDurationMs",-1,app.preferences.c_str())==static_cast<UINT>(NightDurations[duration])&&GetPrivateProfileIntW(L"Settings",L"NightTargetBrightness",-1,app.preferences.c_str())==static_cast<UINT>(NightTargets[target]),"Night settings persisted indexes instead of policy values.");
+    }
+    for(const auto key:{L"NightEnabled",L"NightDurationMs",L"NightTargetBrightness"})for(const wchar_t* invalid:{L"",L"-1",L"2junk",L"999999999999999999999999999999999999999"}){
+        require(WritePrivateProfileStringW(L"Settings",key,invalid,app.preferences.c_str())!=FALSE,"Cannot seed invalid night option.");reload();
+        if(std::wcscmp(key,L"NightEnabled")==0)require(SendMessageW(app.nightEnabled,BM_GETCHECK,0,0)==BST_UNCHECKED,"Malformed night flag enabled capture.");
+        else require(choice(std::wcscmp(key,L"NightDurationMs")==0?app.nightDuration:app.nightTarget)==(std::wcscmp(key,L"NightDurationMs")==0?0:1),"Malformed night policy did not restore Auto/Balanced default.");
+    }
+    fixture.onlySettingsRemain();std::cout<<"PASS night enabled/duration/target values roundtrip atomically, malformed defaults and Desktop startup\n";
 }
 struct OwnedFile {
     HANDLE value=INVALID_HANDLE_VALUE;
@@ -397,10 +417,10 @@ int main(){
     try{
         std::cout<<std::unitbuf;std::cout<<"ACP="<<GetACP()<<'\n';
         HiddenControls controls;
-        newUnicodeFile();existingUnicodeRewrite();migrateAnsi();encodingModes();recordingLimits();diskSafety();readFailure();replacementFailure();
+        newUnicodeFile();existingUnicodeRewrite();migrateAnsi();encodingModes();recordingLimits();diskSafety();nightOptions();readFailure();replacementFailure();
         preparationAllocationFailure();partialKeyWriteFailure();stagedExceptionCleanup();
         preferencePathBoundary(248);preferencePathBoundary(278);
         require(!IsWindowVisible(app.window),"Fixture became visible.");
-        std::cout<<"All 13 preference cases passed; only owned hidden controls/settings were used.\n";return 0;
+        std::cout<<"All 14 preference cases passed; only owned hidden controls/settings were used.\n";return 0;
     }catch(const std::exception& error){std::cerr<<"PREFERENCES TEST FAILURE: "<<error.what()<<'\n';return 1;}
 }

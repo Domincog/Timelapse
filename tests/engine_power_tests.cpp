@@ -197,6 +197,7 @@ namespace lapse {
 struct Camera::Impl{}; Camera::Camera(){ExitProcess(76);} Camera::~Camera()=default;
 bool Camera::start(const std::wstring&,std::wstring&){ExitProcess(76);}void Camera::stop(){ExitProcess(76);}
 bool Camera::latest(Frame&,std::wstring&){ExitProcess(76);}bool Camera::latest(Frame&,std::wstring&,uint64_t&){ExitProcess(76);}
+bool Camera::latestNewer(Frame&,std::wstring&,CameraSampleInfo&,const CameraSampleInfo&){ExitProcess(76);}
 bool captureMonitor(const std::wstring& id,int,int,bool,Frame& out,std::wstring& error){if(id!=L"test"){error=L"Unknown synthetic display.";return false;}if(blockDesktop.exchange(false))gate(desktopEntered,desktopRelease);pattern(out);error.clear();return true;}
 }
 int main(){

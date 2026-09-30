@@ -127,6 +127,13 @@ bool Camera::latest(Frame& output, std::wstring& error, uint64_t& tick) {
     }
     return true;
 }
+bool Camera::latestNewer(Frame& output, std::wstring& error, CameraSampleInfo& info, const CameraSampleInfo&) {
+    uint64_t tick = 0;
+    if (!latest(output, error, tick)) return false;
+    info.epoch = 1; info.sequence = impl_->sequence; info.receivedTick = tick;
+    info.timestamp100ns = int64_t(tick) * 10000; info.timestampValid = true;
+    return true;
+}
 }
 
 namespace {
@@ -207,7 +214,7 @@ public:
         require(WaitForSingleObject(mutex.value, 1000) == WAIT_OBJECT_0, "inspect shared header under actual mutex");
         const SharedHeader result = *static_cast<const SharedHeader*>(view_.value);
         ReleaseMutex(mutex.value);
-        require(result.magic == 0x4C43414D && result.version == 2, "expected shared protocol");
+        require(result.magic == 0x4C43414D && result.version == 3, "expected shared protocol");
         return result;
     }
     LONG copies() {

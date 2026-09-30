@@ -149,7 +149,11 @@ LRESULT WINAPI fixtureDispatchMessage(const MSG* message){
 }
 std::vector<HWND> tabControls(){
     std::vector<HWND> result={app.mode,app.interval,app.videoSize,app.encodingQuality,app.monitor,app.camera,app.advanced,app.refresh};
-    if(app.advancedExpanded){result.push_back(app.encodingMode);result.push_back(app.stopAfter);result.push_back(app.lowDisk);}
+    if(app.advancedExpanded){
+        result.push_back(app.encodingMode);result.push_back(app.stopAfter);result.push_back(app.lowDisk);
+        if(nightRow())result.push_back(app.nightEnabled);
+        if(nightRow()==2){result.push_back(app.nightDuration);result.push_back(app.nightTarget);}
+    }
     for(HWND child:{app.record,app.pause,app.finish,app.folder,app.openFolder,app.reset,app.forward,app.preview})result.push_back(child);
     return result;
 }
@@ -158,6 +162,7 @@ struct HiddenWindow {
         app.dpi=dpi;app.scrollX=app.scrollY=app.wheelVertical=app.wheelHorizontal=0;
         app.contentWidth=app.contentHeight=0;app.layingOut=app.dragging=app.advancedExpanded=false;app.advancedLimitIndex=app.advancedVisibility=-1;
         app.visibleDirty=true;app.controlsUpdated=false;app.hiddenToTray=false;
+        app.settings={};app.status={};app.nightValidation.clear();app.advancedNightState=app.nightVisibility=-1;
         ownedFocus=ownedCapture=nullptr;
         app.window=CreateWindowExW(0,L"STATIC",L"Owned hidden scrolling fixture",WS_POPUP|WS_CLIPCHILDREN,0,0,width,height,nullptr,nullptr,nullptr,nullptr);
         require(app.window && !IsWindowVisible(app.window),"Hidden parent creation failed.");
@@ -171,6 +176,10 @@ struct HiddenWindow {
         app.encodingMode=combo(6,L"Encodin&g",EncodingModeBox);app.stopAfter=combo(7,L"S&top after",StopAfterBox);
         SendMessageW(app.stopAfter,CB_RESETCONTENT,0,0);for(auto name:RecordingLimitLabels)add(app.stopAfter,name);choose(app.stopAfter,0);
         app.lowDisk=child(L"BUTTON",L"Stop on &low disk space",WS_TABSTOP|BS_AUTOCHECKBOX,LowDiskBox);SendMessageW(app.lowDisk,BM_SETCHECK,BST_CHECKED,0);
+        app.nightEnabled=child(L"BUTTON",L"&Night camera (software blend)",WS_TABSTOP|BS_AUTOCHECKBOX,NightBox);
+        app.nightDuration=combo(8,L"Blend d&uration",NightDurationBox);SendMessageW(app.nightDuration,CB_RESETCONTENT,0,0);for(auto name:NightDurationLabels)add(app.nightDuration,name);choose(app.nightDuration,0);
+        app.nightTarget=combo(9,L"Auto &brightness",NightTargetBox);SendMessageW(app.nightTarget,CB_RESETCONTENT,0,0);for(auto name:{L"Dark",L"Balanced",L"Bright"})add(app.nightTarget,name);choose(app.nightTarget,1);
+        app.nightHint=child(L"STATIC",L"",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS,NightHint);app.nightDetail=child(L"STATIC",L"",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS,NightDetail);
         app.record=button(L"&Record",Record);app.pause=button(L"&Pause",Pause);app.finish=button(L"&Finish",Finish);
         app.folder=button(L"&Change...",Folder);app.openFolder=button(L"&Open folder",OpenFolder);app.reset=button(L"Reset layout",Reset);app.forward=button(L"Bring forward",Forward);
         app.preview=child(L"STATIC",L"Preview",WS_TABSTOP,Preview);app.statusText=child(L"STATIC",L"Ready",SS_LEFT|SS_CENTERIMAGE,210);
@@ -278,6 +287,35 @@ void advancedDisclosure(int dpi){
     app.status={};updateControls();
     std::cout<<"PASS Advanced disclosure dpi="<<dpi<<" default, finite summaries, expansion, focus transfer, native tab order, scroll clamp, active lock\n";
 }
+void nightDisclosure(int dpi){
+    HiddenWindow owned(MulDiv(500,dpi,96),MulDiv(400,dpi,96),dpi);
+    app.monitors={{L"Synthetic display",{0,0,640,360},L"owned-display"}};app.cameras={{L"Synthetic camera",L"owned-camera"}};
+    const auto visible=[](HWND child){return (GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0;};
+    const auto measure=[](HWND child,int padding){
+        wchar_t raw[250]{};GetWindowTextW(child,raw,250);std::wstring value=raw;value.erase(std::remove(value.begin(),value.end(),L'&'),value.end());
+        HDC dc=GetDC(child);auto prior=SelectObject(dc,app.font);SIZE extent{};GetTextExtentPoint32W(dc,value.c_str(),static_cast<int>(value.size()),&extent);SelectObject(dc,prior);ReleaseDC(child,dc);
+        require(extent.cx+app.scale(padding)<=bounds(child).right-bounds(child).left,"Night control text truncates at minimum width/DPI.");
+    };
+    windowProc(app.window,WM_COMMAND,AdvancedToggle,0);require(!visible(app.nightEnabled)&&!visible(app.nightDuration),"Desktop exposes irrelevant camera night controls.");
+    choose(app.mode,static_cast<int>(Mode::Camera));changeLayout(false);
+    require(visible(app.nightEnabled)&&!visible(app.nightDuration)&&!visible(app.nightTarget)&&GetNextDlgTabItem(app.window,app.lowDisk,FALSE)==app.nightEnabled,"Camera night opt-in visibility/tab order failed.");
+    const auto offHeight=app.contentHeight;
+    ownedFocus=app.nightEnabled;SendMessageW(app.nightEnabled,BM_SETCHECK,BST_CHECKED,0);windowProc(app.window,WM_COMMAND,NightBox,0);
+    require(visible(app.nightDuration)&&visible(app.nightTarget)&&visible(app.nightHint)&&visible(app.nightDetail)&&app.contentHeight==offHeight+app.scale(72),"Night options did not claim exactly their detail row space.");
+    require(GetNextDlgTabItem(app.window,app.nightEnabled,FALSE)==app.nightDuration&&GetNextDlgTabItem(app.window,app.nightDuration,FALSE)==app.nightTarget,"Night duration/brightness native tab order failed.");
+    measure(app.nightEnabled,26);measure(app.labels[8],0);measure(app.labels[9],0);measure(app.nightTarget,30);
+    require(!intersects(bounds(app.nightEnabled),bounds(app.nightDuration))&&!intersects(bounds(app.nightDuration),bounds(app.nightTarget))&&bounds(app.nightDetail).bottom<bounds(app.preview).top,"Night controls overlap or touch preview.");
+    for(int i=0;i<6;++i){choose(app.stopAfter,i);updateAdvanced();measure(app.advanced,18);}
+    checkLayout();checkFocusReachability();ownedFocus=app.nightTarget;windowProc(app.window,WM_COMMAND,AdvancedToggle,0);
+    require(ownedFocus==app.advanced&&!visible(app.nightEnabled)&&!visible(app.nightDuration)&&GetNextDlgTabItem(app.window,app.refresh,FALSE)==app.record,"Collapsing stranded night focus or tab stops.");
+    windowProc(app.window,WM_COMMAND,AdvancedToggle,0);choose(app.nightDuration,5);windowProc(app.window,WM_COMMAND,MAKEWPARAM(NightDurationBox,CBN_SELCHANGE),0);measure(app.advanced,18);
+    require(!app.nightValidation.empty()&&!IsWindowEnabled(app.record),"Invalid night duration lacks compact validation.");
+    ownedFocus=app.nightTarget;SendMessageW(app.nightEnabled,BM_SETCHECK,BST_UNCHECKED,0);windowProc(app.window,WM_COMMAND,NightBox,0);
+    require(ownedFocus==app.nightEnabled&&!visible(app.nightTarget)&&app.nightValidation.empty(),"Turning night off stranded focus or retained irrelevant validation.");
+    ownedFocus=app.nightEnabled;choose(app.mode,static_cast<int>(Mode::Desktop));changeLayout(false);
+    require(ownedFocus==app.advanced&&!visible(app.nightEnabled),"Changing to Desktop stranded hidden night checkbox focus.");
+    checkLayout();std::cout<<"PASS night disclosure dpi="<<dpi<<" camera-only visibility, compact captions, focus/tab order, native text extents, validation and scroll layout\n";
+}
 POINT beginDrag(){
     app.settings.layers={{Source::Desktop,{0,0,1,1}},{Source::Camera,{.2,.3,.3,.3}}};app.selected=-1;
     const auto r=layerRect(app.settings.layers[1]);POINT p{(r.left+r.right)/2,(r.top+r.bottom)/2};
@@ -355,7 +393,7 @@ void originalScenarios(){
 int main(){
     try{
         std::cout<<std::unitbuf;SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        for(int dpi:{96,144,192,288}){scenario(dpi,false);scenario(dpi,true);advancedDisclosure(dpi);}
-        dragChecks();barDependency();dpiAndRouting();originalScenarios();std::cout<<"PASS 18 hidden scrolling and disclosure cases\n";return 0;
+        for(int dpi:{96,144,192,288}){scenario(dpi,false);scenario(dpi,true);advancedDisclosure(dpi);nightDisclosure(dpi);}
+        dragChecks();barDependency();dpiAndRouting();originalScenarios();std::cout<<"PASS 22 hidden scrolling and disclosure cases\n";return 0;
     }catch(const std::exception& e){std::cerr<<"FIXTURE FAILURE: "<<e.what()<<'\n';return 1;}
 }

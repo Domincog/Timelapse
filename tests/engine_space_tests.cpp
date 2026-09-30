@@ -491,6 +491,13 @@ void pixels(lapse::Frame& frame, int width, int height, bool camera) {
 }
 }
 namespace lapse {
+bool CameraClient::beginNight(uint64_t, uint32_t, const NightSettings&, std::wstring& error) {
+    error = L"Unexpected night request in ordinary-mode fixture."; return false;
+}
+bool CameraClient::nightResult(uint64_t, Frame&, NightWindowResult&, std::wstring& error) {
+    error = L"Unexpected night result in ordinary-mode fixture."; return false;
+}
+void CameraClient::cancelNight() noexcept {}
 struct CameraClient::Impl { bool active = false; };
 CameraClient::CameraClient() : impl_(std::make_unique<Impl>()) {}
 CameraClient::~CameraClient() = default;

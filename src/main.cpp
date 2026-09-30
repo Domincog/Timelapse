@@ -21,9 +21,13 @@ using namespace lapse;
 namespace {
 constexpr COLORREF Ink = RGB(25, 38, 45), Muted = RGB(88, 106, 113), Accent = RGB(0, 116, 113);
 constexpr COLORREF Background = RGB(247, 249, 250), Canvas = RGB(21, 28, 34);
-enum Id { ModeBox = 100, IntervalBox, SizeBox, EncodingQualityBox, MonitorBox, CameraBox, Refresh, Record, Pause, Finish, Folder, OpenFolder, Reset, Forward, Preview, EncodingModeBox, AdvancedToggle, StopAfterBox, LowDiskBox };
+enum Id { ModeBox = 100, IntervalBox, SizeBox, EncodingQualityBox, MonitorBox, CameraBox, Refresh, Record, Pause, Finish, Folder, OpenFolder, Reset, Forward, Preview, EncodingModeBox, AdvancedToggle, StopAfterBox, LowDiskBox, NightBox, NightDurationBox, NightTargetBox, NightHint, NightDetail };
 constexpr int RecordingLimits[] = {0,900,3600,14400,28800,86400};
 constexpr const wchar_t* RecordingLimitLabels[] = {L"Never",L"15 minutes",L"1 hour",L"4 hours",L"8 hours",L"24 hours"};
+constexpr const wchar_t* RecordingLimitShortLabels[] = {L"Never",L"15 min",L"1 hour",L"4 hours",L"8 hours",L"24 hours"};
+constexpr int NightDurations[] = {0,1000,2000,5000,10000,30000};
+constexpr const wchar_t* NightDurationLabels[] = {L"Auto",L"1 second",L"2 seconds",L"5 seconds",L"10 seconds",L"30 seconds"};
+constexpr int NightTargets[] = {64,96,128};
 constexpr int SeparateFilesMode = 5;
 constexpr wchar_t SeparateFilesLabel[] = L"Desktop + camera (2 files)";
 constexpr UINT TrayMessage = WM_APP + 1, ShowExistingMessage = WM_APP + 2;
@@ -34,7 +38,7 @@ constexpr wchar_t SetupMutexName[] = L"Local\\Timelapse.Setup.{DC32D155-1B8D-488
 struct App {
     HWND window{}, preview{}, statusText{}, tooltip{};
     HWND mode{}, interval{}, videoSize{}, encodingQuality{}, encodingMode{}, monitor{}, camera{}, refresh{}, record{}, pause{}, finish{}, folder{}, openFolder{}, reset{}, forward{};
-    HWND advanced{}, stopAfter{}, lowDisk{}, labels[8]{};
+    HWND advanced{}, stopAfter{}, lowDisk{}, nightEnabled{}, nightDuration{}, nightTarget{}, nightHint{}, nightDetail{}, labels[10]{};
     HFONT font{}, titleFont{}, smallFont{};
     HBRUSH background = CreateSolidBrush(Background);
     int dpi = 96, selected = -1, modeIndex = 0;
@@ -45,7 +49,9 @@ struct App {
     bool visibleDirty = true, controlsUpdated = false;
     State controlsState = State::Idle;
     bool advancedExpanded = false;
-    int advancedLimitIndex = -1, advancedVisibility = -1;
+    int advancedLimitIndex = -1, advancedVisibility = -1, advancedNightState = -1, nightVisibility = -1;
+    std::wstring nightValidation, statusCaption, nightHintCaption, nightDetailCaption;
+    bool statusCaptionError = false;
     bool hiddenToTray = false, trayRegistered = false, trayNoticeShown = false, trayVersion4 = false;
     UINT taskbarCreated = 0;
     std::wstring trayTooltip;
@@ -149,20 +155,66 @@ bool hasRequiredSources() {
     return (!hasSource(Source::Desktop) || (m>=0 && m<static_cast<int>(app.monitors.size()))) &&
         (!hasSource(Source::Camera) || (c>=0 && c<static_cast<int>(app.cameras.size())));
 }
+void layout();
+int nightRow() { return hasSource(Source::Camera) ? (app.settings.night.enabled?2:1) : 0; }
+const std::wstring& statusCaption() {
+    return !app.active() && !app.status.error && !app.nightValidation.empty() ? app.nightValidation : app.status.message;
+}
+bool statusCaptionError() {
+    return app.status.error || (!app.active() && !app.nightValidation.empty());
+}
+void updateStatusText(bool force=false) {
+    const auto& caption=statusCaption();const bool error=statusCaptionError();
+    if(app.hiddenToTray || IsIconic(app.window)) {
+        if(force || caption!=app.statusCaption || error!=app.statusCaptionError)app.visibleDirty=true;
+        return;
+    }
+    if(force || caption!=app.statusCaption){SetWindowTextW(app.statusText,caption.c_str());app.statusCaption=caption;}
+    if(error!=app.statusCaptionError){InvalidateRect(app.statusText,nullptr,TRUE);app.statusCaptionError=error;}
+}
+void updateNightText(bool force=false) {
+    if(!app.nightDetail || !app.advancedExpanded || nightRow()!=2)return;
+    if(app.hiddenToTray || IsIconic(app.window)){app.visibleDirty=true;return;}
+    const std::wstring hint=app.nightValidation.empty()?L"Software frame blending; camera shutter is unchanged. Movement may blur.":app.nightValidation;
+    if(force || hint!=app.nightHintCaption){SetWindowTextW(app.nightHint,hint.c_str());app.nightHintCaption=hint;InvalidateRect(app.nightHint,nullptr,TRUE);}
+    std::wstring detail=L"Night effect appears during recording; idle preview is unchanged.";
+    if(app.status.nightEnabled && app.status.night.samples){
+        wchar_t value[240]{};
+        swprintf_s(value,L"Last blend: %.1f s · %u camera frames · %.1f× digital gain%s",
+            app.status.nightDurationMs/1000.0,app.status.night.samples,app.status.night.appliedGain,
+            app.status.night.targetLimited?L" · brightness target limited":L"");
+        detail=value;
+    } else if(app.status.nightEnabled && app.status.nightWaiting)detail=L"Collecting camera frames for the first full blend...";
+    if(force || detail!=app.nightDetailCaption){SetWindowTextW(app.nightDetail,detail.c_str());app.nightDetailCaption=std::move(detail);}
+}
 void updateAdvanced() {
     if(!app.advanced)return;
     const int selection=std::clamp(choice(app.stopAfter),0,5);
-    if(selection!=app.advancedLimitIndex){
+    const int night=app.settings.night.enabled?(app.nightValidation.empty()?1:2):0;
+    if(selection!=app.advancedLimitIndex || night!=app.advancedNightState){
         std::wstring caption=L"&Advanced";
-        if(selection)caption+=L" · stop after "+std::wstring(RecordingLimitLabels[selection]);
-        SetWindowTextW(app.advanced,caption.c_str());app.advancedLimitIndex=selection;
+        if(night==2)caption+=L" · check blend";
+        else if(night){caption+=L" · night";if(selection)caption+=L", "+std::wstring(RecordingLimitShortLabels[selection]);}
+        else if(selection)caption+=L" · stop after "+std::wstring(RecordingLimitLabels[selection]);
+        SetWindowTextW(app.advanced,caption.c_str());app.advancedLimitIndex=selection;app.advancedNightState=night;
     }
-    if(app.advancedVisibility==static_cast<int>(app.advancedExpanded))return;
+    const int visibleNight=app.advancedExpanded?nightRow():0;
+    if(app.advancedVisibility==static_cast<int>(app.advancedExpanded) && app.nightVisibility==visibleNight)return;
     app.advancedVisibility=static_cast<int>(app.advancedExpanded);
+    app.nightVisibility=visibleNight;
     SendMessageW(app.advanced,BM_SETCHECK,app.advancedExpanded?BST_CHECKED:BST_UNCHECKED,0);
-    for(HWND child:{app.labels[6],app.encodingMode,app.labels[7],app.stopAfter,app.lowDisk})
-        if(child && ((GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0)!=app.advancedExpanded)
-            ShowWindow(child,app.advancedExpanded?SW_SHOWNA:SW_HIDE);
+    const auto visible=[](HWND child,bool show){
+        if(child && ((GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0)!=show)ShowWindow(child,show?SW_SHOWNA:SW_HIDE);
+    };
+    for(HWND child:{app.labels[6],app.encodingMode,app.labels[7],app.stopAfter,app.lowDisk})visible(child,app.advancedExpanded);
+    if(!visibleNight && app.nightEnabled && GetFocus()==app.nightEnabled)SetFocus(app.advanced);
+    visible(app.nightEnabled,visibleNight!=0);
+    for(HWND child:{app.labels[8],app.nightDuration,app.labels[9],app.nightTarget,app.nightHint,app.nightDetail}){
+        const HWND focused=GetFocus();
+        if(visibleNight!=2 && child && (focused==child || (focused && IsChild(child,focused))))SetFocus(visibleNight?app.nightEnabled:app.advanced);
+        visible(child,visibleNight==2);
+    }
+    updateNightText(true);
 }
 
 void configure() {
@@ -174,6 +226,12 @@ void configure() {
     app.settings.encodingMode = static_cast<EncodingMode>(std::clamp(choice(app.encodingMode),0,4));
     app.settings.recordingLimitSeconds = RecordingLimits[std::clamp(choice(app.stopAfter),0,5)];
     app.settings.stopOnLowDiskSpace = !app.lowDisk || SendMessageW(app.lowDisk,BM_GETCHECK,0,0)!=BST_UNCHECKED;
+    app.settings.night.enabled = app.nightEnabled && SendMessageW(app.nightEnabled,BM_GETCHECK,0,0)==BST_CHECKED && hasSource(Source::Camera);
+    app.settings.night.durationMs = NightDurations[app.nightDuration?std::clamp(choice(app.nightDuration),0,5):0];
+    app.settings.night.targetBrightness = NightTargets[app.nightTarget?std::clamp(choice(app.nightTarget),0,2):1];
+    app.nightValidation.clear();
+    if(app.settings.night.enabled && app.settings.night.durationMs>app.settings.interval*1000)
+        app.nightValidation=L"Night blend duration must not exceed Capture every. Choose Auto, a shorter blend, or a longer capture interval.";
     int m = choice(app.monitor), c = choice(app.camera);
     if (m >= 0 && m < static_cast<int>(app.monitors.size())) {
         app.settings.monitor = app.monitors[m].bounds;
@@ -214,10 +272,10 @@ void refreshSources() {
 }
 void updateControls() {
     const bool idle = !app.active();
-    for (auto control : {app.mode,app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.lowDisk,app.refresh,app.folder}) EnableWindow(control,idle);
+    for (auto control : {app.mode,app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.lowDisk,app.nightEnabled,app.nightDuration,app.nightTarget,app.refresh,app.folder}) EnableWindow(control,idle);
     EnableWindow(app.monitor,idle && hasSource(Source::Desktop));
     EnableWindow(app.camera,idle && hasSource(Source::Camera) && !app.cameras.empty());
-    EnableWindow(app.record,idle && hasRequiredSources());
+    EnableWindow(app.record,idle && hasRequiredSources() && app.nightValidation.empty());
     EnableWindow(app.pause,app.status.state==State::Recording || app.status.state==State::Paused);
     EnableWindow(app.finish,app.status.state==State::Starting || app.status.state==State::Recording || app.status.state==State::Paused);
     if(!app.controlsUpdated || (app.controlsState==State::Paused)!=(app.status.state==State::Paused))
@@ -225,6 +283,7 @@ void updateControls() {
     bool collage = !app.settings.separateFiles && app.settings.layers.size() > 1;
     EnableWindow(app.reset,collage); EnableWindow(app.forward,collage && app.selected>=0);
     updateAdvanced();
+    updateNightText(!app.controlsUpdated);updateStatusText(!app.controlsUpdated);
     app.controlsState=app.status.state;app.controlsUpdated=true;
 }
 void invalidateCanvas(RECT rect) {
@@ -236,20 +295,23 @@ void applyStatus(Status value,bool force=false) {
         static_cast<uint64_t>(std::max(0.0,app.status.elapsed))!=static_cast<uint64_t>(std::max(0.0,value.elapsed));
     const bool message=app.status.message!=value.message,error=app.status.error!=value.error;
     const bool preview=app.status.preview!=value.preview;
+    const bool night=app.status.nightEnabled!=value.nightEnabled || app.status.nightWaiting!=value.nightWaiting ||
+        app.status.nightDurationMs!=value.nightDurationMs || app.status.night.samples!=value.night.samples ||
+        app.status.night.appliedGain!=value.night.appliedGain || app.status.night.targetLimited!=value.night.targetLimited;
     app.status=std::move(value);
     // Status and tray handling remain live while hidden; only visual work waits.
     if(app.hiddenToTray || IsIconic(app.window)) {
-        if(force || stats || message || error || preview)app.visibleDirty=true;
+        if(force || stats || message || error || preview || night)app.visibleDirty=true;
         return;
     }
     if(force || app.visibleDirty) {
-        updateControls();SetWindowTextW(app.statusText,app.status.message.c_str());
+        updateControls();updateNightText();updateStatusText();
         InvalidateRect(app.window,nullptr,FALSE);InvalidateRect(app.preview,nullptr,FALSE);InvalidateRect(app.statusText,nullptr,TRUE);
         app.visibleDirty=false;return;
     }
     if(!app.controlsUpdated || app.controlsState!=app.status.state)updateControls();
-    if(message)SetWindowTextW(app.statusText,app.status.message.c_str());
-    if(error)InvalidateRect(app.statusText,nullptr,TRUE);
+    if(message || error || state)updateStatusText();
+    if(night)updateNightText();
     if(preview)InvalidateRect(app.preview,nullptr,FALSE);
     if(state)invalidateCanvas({app.contentWidth-app.scale(280),app.scale(20),app.contentWidth-app.scale(26),app.scale(49)});
     if(stats)invalidateCanvas({app.scale(26),app.contentHeight-app.scale(147),app.contentWidth-app.scale(26),app.contentHeight-app.scale(123)});
@@ -262,7 +324,7 @@ void changeLayout(bool reset) {
         // Custom edits retain their preset; a newly seeded collage starts over.
         app.collagePreset = app.modeIndex == static_cast<int>(Mode::SideBySide) ? Mode::SideBySide : Mode::Overlay;
     }
-    app.selected = -1; configure(); if(app.engine && !app.active())app.engine->refreshSources(); updateControls(); InvalidateRect(app.preview,nullptr,FALSE);
+    app.selected = -1; configure(); if(app.engine && !app.active())app.engine->refreshSources(); updateControls();layout(); InvalidateRect(app.preview,nullptr,FALSE);
 }
 HICON trayIcon(int state) {
     if(app.trayIcons[state])return app.trayIcons[state];
@@ -375,7 +437,8 @@ void layout() {
     const int availableW=r.right+((style&WS_VSCROLL)?barW:0);
     const int availableH=r.bottom+((style&WS_HSCROLL)?barH:0);
     const int minimumW=app.scale(830);
-    const int previewTop=app.scale(app.advancedExpanded?258:190);
+    const int night=nightRow();
+    const int previewTop=app.scale(app.advancedExpanded?(night==2?372:night==1?300:258):190);
     const int minimumH=previewTop+app.scale(160)+app.scale(191);
     bool horizontal=false, vertical=false;
     for(int i=0;i<3;++i) {
@@ -418,6 +481,10 @@ void layout() {
     move(app.labels[6],pad,app.scale(190),encodingW,app.scale(20));move(app.encodingMode,pad,app.scale(211),encodingW,app.scale(190));
     move(app.labels[7],stopX,app.scale(190),stopW,app.scale(20));move(app.stopAfter,stopX,app.scale(211),stopW,app.scale(210));
     move(app.lowDisk,diskX,app.scale(211),options-encodingW-stopW,ch);
+    move(app.nightEnabled,pad,app.scale(night==2?278:258),encodingW,ch);
+    move(app.labels[8],stopX,app.scale(257),stopW,app.scale(20));move(app.nightDuration,stopX,app.scale(278),stopW,app.scale(210));
+    move(app.labels[9],diskX,app.scale(257),options-encodingW-stopW,app.scale(20));move(app.nightTarget,diskX,app.scale(278),options-encodingW-stopW,app.scale(150));
+    move(app.nightHint,pad,app.scale(313),width,app.scale(21));move(app.nightDetail,pad,app.scale(337),width,app.scale(21));
     move(app.refresh,r.right-pad-refreshW,row2,refreshW,ch);
     // The logical canvas retains a usable preview when the viewport is small.
     const int previewH=static_cast<int>(r.bottom)-previewTop-app.scale(191);
@@ -482,8 +549,8 @@ void revealFocusedControl() {
 }
 void toggleAdvanced() {
     const HWND focused=GetFocus();
-    if(app.advancedExpanded && (focused==app.encodingMode || focused==app.stopAfter || focused==app.lowDisk ||
-        (focused && (IsChild(app.encodingMode,focused) || IsChild(app.stopAfter,focused)))))SetFocus(app.advanced);
+    if(app.advancedExpanded)for(HWND child:{app.encodingMode,app.stopAfter,app.lowDisk,app.nightEnabled,app.nightDuration,app.nightTarget})
+        if(child && (focused==child || (focused && IsChild(child,focused)))){SetFocus(app.advanced);break;}
     app.advancedExpanded=!app.advancedExpanded;
     updateAdvanced();layout();revealFocusedControl();
 }
@@ -496,7 +563,7 @@ bool scrollWheelMessage(const MSG& message) {
     if((horizontal?app.contentWidth:app.contentHeight)<=(horizontal?viewport.right:viewport.bottom))return false;
     // Open lists own their wheel input. Closed lists must not change recording
     // settings when the user's wheel gesture is scrolling the surrounding page.
-    for(HWND box:{app.mode,app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.monitor,app.camera})
+    for(HWND box:{app.mode,app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.nightDuration,app.nightTarget,app.monitor,app.camera})
         if(SendMessageW(box,CB_GETDROPPEDSTATE,0,0))return false;
     SendMessageW(app.window,message.message,message.wParam,message.lParam);
     return true;
@@ -507,6 +574,7 @@ void fonts() {
     app.titleFont = CreateFontW(-app.scale(25),0,0,0,FW_SEMIBOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
     app.smallFont = CreateFontW(-app.scale(12),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
     EnumChildWindows(app.window,[](HWND w,LPARAM p)->BOOL { SendMessageW(w,WM_SETFONT,p,TRUE); return TRUE; },reinterpret_cast<LPARAM>(app.font));
+    for(HWND child:{app.statusText,app.nightHint,app.nightDetail})if(child)SendMessageW(child,WM_SETFONT,reinterpret_cast<WPARAM>(app.smallFont),TRUE);
 }
 void selectFolder() {
     try {
@@ -569,6 +637,8 @@ bool savePreferences() {
         const auto encodingQuality=std::to_wstring(choice(app.encodingQuality));
         const auto encodingMode=std::to_wstring(choice(app.encodingMode));
         const auto recordingLimit=std::to_wstring(std::clamp(choice(app.stopAfter),0,5));
+        const auto nightDuration=std::to_wstring(NightDurations[app.nightDuration?std::clamp(choice(app.nightDuration),0,5):0]);
+        const auto nightTarget=std::to_wstring(NightTargets[app.nightTarget?std::clamp(choice(app.nightTarget),0,2):1]);
         struct TemporaryFile {
             const wchar_t* path;
             HANDLE file=INVALID_HANDLE_VALUE;
@@ -591,7 +661,10 @@ bool savePreferences() {
             WritePrivateProfileStringW(L"Settings",L"EncodingQuality",encodingQuality.c_str(),pending.path) &&
             WritePrivateProfileStringW(L"Settings",L"EncodingMode",encodingMode.c_str(),pending.path) &&
             WritePrivateProfileStringW(L"Settings",L"RecordingLimit",recordingLimit.c_str(),pending.path) &&
-            WritePrivateProfileStringW(L"Settings",L"StopOnLowDiskSpace",!app.lowDisk || SendMessageW(app.lowDisk,BM_GETCHECK,0,0)!=BST_UNCHECKED?L"1":L"0",pending.path);
+            WritePrivateProfileStringW(L"Settings",L"StopOnLowDiskSpace",!app.lowDisk || SendMessageW(app.lowDisk,BM_GETCHECK,0,0)!=BST_UNCHECKED?L"1":L"0",pending.path) &&
+            WritePrivateProfileStringW(L"Settings",L"NightEnabled",app.nightEnabled && SendMessageW(app.nightEnabled,BM_GETCHECK,0,0)==BST_CHECKED?L"1":L"0",pending.path) &&
+            WritePrivateProfileStringW(L"Settings",L"NightDurationMs",nightDuration.c_str(),pending.path) &&
+            WritePrivateProfileStringW(L"Settings",L"NightTargetBrightness",nightTarget.c_str(),pending.path);
         // This cache-flush form returns zero even when successful.
         WritePrivateProfileStringW(nullptr,nullptr,nullptr,pending.path);
         if(!saved)return false;
@@ -623,6 +696,17 @@ void preferences(bool save) {
         wchar_t stopOnLowDiskSpace[16]{};
         GetPrivateProfileStringW(L"Settings",L"StopOnLowDiskSpace",L"1",stopOnLowDiskSpace,16,path);
         SendMessageW(app.lowDisk,BM_SETCHECK,std::wcscmp(stopOnLowDiskSpace,L"0")==0?BST_UNCHECKED:BST_CHECKED,0);
+        wchar_t nightEnabled[16]{};GetPrivateProfileStringW(L"Settings",L"NightEnabled",L"0",nightEnabled,16,path);
+        SendMessageW(app.nightEnabled,BM_SETCHECK,std::wcscmp(nightEnabled,L"1")==0?BST_CHECKED:BST_UNCHECKED,0);
+        const auto loadNightChoice=[&](const wchar_t* key,HWND box,const auto& values,int fallback){
+            const auto defaultValue=std::to_wstring(values[fallback]);wchar_t value[32]{};
+            GetPrivateProfileStringW(L"Settings",key,defaultValue.c_str(),value,32,path);
+            int selected=fallback;
+            for(size_t i=0;i<std::size(values);++i)if(std::to_wstring(values[i])==value){selected=static_cast<int>(i);break;}
+            choose(box,selected);
+        };
+        loadNightChoice(L"NightDurationMs",app.nightDuration,NightDurations,0);
+        loadNightChoice(L"NightTargetBrightness",app.nightTarget,NightTargets,1);
         // Launch on desktop: opening the app never silently turns on a camera.
         choose(app.mode,0);
         updateAdvanced();
@@ -721,6 +805,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
     }
     case WM_CREATE: {
         app.startupComplete=false;app.advancedExpanded=false;app.advancedLimitIndex=app.advancedVisibility=-1;
+        app.advancedNightState=app.nightVisibility=-1;app.nightValidation.clear();app.statusCaption.clear();app.statusCaptionError=false;app.nightHintCaption.clear();app.nightDetailCaption.clear();
         app.visibleDirty=true;app.controlsUpdated=false;app.trayStateValid=false;
         try {
         app.window=w;app.dpi=static_cast<int>(GetDpiForWindow(w));fonts();
@@ -747,6 +832,11 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         for(auto s:{L"Compatible H.264",L"Efficient H.264",L"Hardware H.264",L"Hardware HEVC",L"Quality H.264"})add(app.encodingMode,s);
         app.stopAfter=combo(7,L"S&top after",StopAfterBox);for(auto label:RecordingLimitLabels)add(app.stopAfter,label);
         app.lowDisk=requiredControl(L"BUTTON",L"Stop on &low disk space",WS_TABSTOP|BS_AUTOCHECKBOX,LowDiskBox);
+        app.nightEnabled=requiredControl(L"BUTTON",L"&Night camera (software blend)",WS_TABSTOP|BS_AUTOCHECKBOX,NightBox);
+        app.nightDuration=combo(8,L"Blend d&uration",NightDurationBox);for(auto label:NightDurationLabels)add(app.nightDuration,label);
+        app.nightTarget=combo(9,L"Auto &brightness",NightTargetBox);for(auto label:{L"Dark",L"Balanced",L"Bright"})add(app.nightTarget,label);
+        app.nightHint=requiredControl(L"STATIC",L"",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX,NightHint);
+        app.nightDetail=requiredControl(L"STATIC",L"",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX,NightDetail);
         app.record=button(L"●  &Record",Record);app.pause=button(L"&Pause",Pause);app.finish=button(L"&Finish",Finish);app.folder=button(L"&Change...",Folder);app.openFolder=button(L"&Open folder",OpenFolder);app.reset=button(L"Reset layout",Reset);app.forward=button(L"Bring forward",Forward);
         app.preview=requiredControl(L"LapsePreview",L"Collage preview. Space selects a layer. Arrow keys move it. Shift and arrow keys resize it.",WS_TABSTOP,Preview);
         app.statusText=requiredControl(L"STATIC",app.status.message.c_str(),SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX,210);
@@ -756,6 +846,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
             return -1;
         }
         SendMessageW(app.statusText,WM_SETFONT,reinterpret_cast<WPARAM>(app.smallFont),TRUE);
+        SendMessageW(app.nightHint,WM_SETFONT,reinterpret_cast<WPARAM>(app.smallFont),TRUE);SendMessageW(app.nightDetail,WM_SETFONT,reinterpret_cast<WPARAM>(app.smallFont),TRUE);
         app.tooltip=CreateWindowExW(WS_EX_TOPMOST,TOOLTIPS_CLASSW,nullptr,WS_POPUP|TTS_ALWAYSTIP|TTS_NOPREFIX,0,0,0,0,w,nullptr,nullptr,nullptr);
         TOOLINFOW tip{sizeof(tip)};tip.uFlags=TTF_IDISHWND|TTF_SUBCLASS;tip.hwnd=w;tip.uId=reinterpret_cast<UINT_PTR>(app.statusText);tip.lpszText=LPSTR_TEXTCALLBACKW;
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));SendMessageW(app.tooltip,TTM_SETMAXTIPWIDTH,0,app.scale(520));
@@ -766,7 +857,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         tip.lpszText=const_cast<LPWSTR>(L"Separate files records full-frame desktop and camera videos together. The side-by-side preview is only for monitoring; each source has its own MP4.");
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
         tip.uId=reinterpret_cast<UINT_PTR>(app.advanced);
-        tip.lpszText=const_cast<LPWSTR>(L"Show or hide advanced options. Checked means expanded. Encoding, the time limit, and low disk space protection can be changed before recording.");
+        tip.lpszText=const_cast<LPWSTR>(L"Show or hide advanced options. Checked means expanded. Recording options can be changed before recording. Night mode applies only to camera content.");
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
         tip.uId=reinterpret_cast<UINT_PTR>(app.stopAfter);
         tip.lpszText=const_cast<LPWSTR>(L"Finish and save automatically after this much active recording time. Pauses and initial startup do not count. Never records until you choose Finish.");
@@ -774,6 +865,17 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         tip.uId=reinterpret_cast<UINT_PTR>(app.lowDisk);
         tip.lpszText=const_cast<LPWSTR>(L"Check free space in the save folder and try to finish and save before space runs out. Other programs or sudden disk changes can still cause a recording to fail. Turn this off to record when free space cannot be checked.");
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
+        tip.uId=reinterpret_cast<UINT_PTR>(app.nightEnabled);
+        tip.lpszText=const_cast<LPWSTR>(L"Optional software blending and automatic digital brightness for camera recordings. It does not change camera shutter settings. Motion can blur; clipped or missing detail cannot be recovered. Idle preview is unchanged; the effect appears during recording.");
+        SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
+        tip.uId=reinterpret_cast<UINT_PTR>(app.nightDuration);
+        tip.lpszText=const_cast<LPWSTR>(L"Auto chooses a blend duration within the capture interval, up to 30 seconds. A manual duration keeps automatic brightness and must not exceed Capture every. Late blends retain their full duration and delay later captures instead of catching up.");
+        SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
+        tip.uId=reinterpret_cast<UINT_PTR>(app.nightTarget);
+        tip.lpszText=const_cast<LPWSTR>(L"Automatic camera brightness uses 8-bit brightness references: Dark 64/255, Balanced 96/255, Bright 128/255. This is processed image brightness, not sensor exposure. Gain and highlight limits can leave the target unmet.");
+        SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
+        tip.lpszText=LPSTR_TEXTCALLBACKW;
+        for(HWND child:{app.nightHint,app.nightDetail}){tip.uId=reinterpret_cast<UINT_PTR>(child);SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));}
         preferences(false);refreshSources();changeLayout(true);
         try {
             app.engine=std::make_unique<Engine>();
@@ -860,6 +962,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
     case WM_COMMAND: {
         const int id=LOWORD(wp),code=HIWORD(wp);
         if(code==CBN_SELCHANGE){
+            if(app.active() && (id==NightDurationBox || id==NightTargetBox))return 0;
             if(id==ModeBox)changeLayout(false);
             else {
                 if(id==MonitorBox || id==CameraBox) {
@@ -875,12 +978,13 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         switch(id) {
         case AdvancedToggle:toggleAdvanced();break;
         case LowDiskBox:if(!app.active())configure();break;
+        case NightBox:if(!app.active()){configure();updateControls();layout();revealFocusedControl();}break;
         case TrayShow:showWindow();break;
         case TrayPause:if(!app.closeWhenDone && (app.status.state==State::Recording || app.status.state==State::Paused))app.engine->setPaused(app.status.state!=State::Paused);break;
         case TrayFinish:if(!app.closeWhenDone)app.engine->finish();break;
         case TrayExit:exitApplication();break;
         case Refresh:refreshSources();app.engine->refreshSources();updateControls();break;
-        case Record:configure();if(hasRequiredSources())app.engine->record();applyStatus(app.engine->status(),true);break;
+        case Record:configure();if(hasRequiredSources() && app.nightValidation.empty())app.engine->record();applyStatus(app.engine->status(),true);break;
         case Pause:app.engine->setPaused(app.status.state!=State::Paused);break;
         case Finish:app.engine->finish();break;
         case Folder:selectFolder();break;
@@ -899,8 +1003,14 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         }return 0;
     }
     case WM_NOTIFY:
-        if(reinterpret_cast<NMHDR*>(lp)->code==TTN_GETDISPINFOW){reinterpret_cast<NMTTDISPINFOW*>(lp)->lpszText=const_cast<LPWSTR>(app.status.message.c_str());return 0;}break;
-    case WM_CTLCOLORSTATIC: SetBkColor(reinterpret_cast<HDC>(wp),Background);SetTextColor(reinterpret_cast<HDC>(wp),reinterpret_cast<HWND>(lp)==app.statusText && app.status.error?RGB(174,53,44):Muted);return reinterpret_cast<LRESULT>(app.background);
+        if(reinterpret_cast<NMHDR*>(lp)->code==TTN_GETDISPINFOW){
+            auto info=reinterpret_cast<NMTTDISPINFOW*>(lp);const auto child=reinterpret_cast<HWND>(info->hdr.idFrom);
+            info->lpszText=const_cast<LPWSTR>((child==app.nightHint?app.nightHintCaption:child==app.nightDetail?app.nightDetailCaption:statusCaption()).c_str());return 0;
+        }break;
+    case WM_CTLCOLORSTATIC: {
+        const auto child=reinterpret_cast<HWND>(lp);const bool warning=(child==app.statusText && statusCaptionError()) || (child==app.nightHint && !app.nightValidation.empty());
+        SetBkColor(reinterpret_cast<HDC>(wp),Background);SetTextColor(reinterpret_cast<HDC>(wp),warning?RGB(174,53,44):Muted);return reinterpret_cast<LRESULT>(app.background);
+    }
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
         PAINTSTRUCT ps;HDC dc=BeginPaint(w,&ps);RECT r;GetClientRect(w,&r);FillRect(dc,&ps.rcPaint,app.background);
