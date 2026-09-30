@@ -58,7 +58,7 @@ namespace {
 std::function<void()> beforePreferenceReplace;
 int replacementAttempts=0;
 DWORD replacementError=ERROR_SUCCESS;
-enum class WriteFault { None, DenySecond, DenyCompression, DenySegment, ThrowAfterFirst };
+enum class WriteFault { None, DenySecond, DenyCompression, DenySegment, DenyWatermark, ThrowAfterFirst };
 WriteFault writeFault=WriteFault::None;
 int keyWrites=0, failedKeyWrites=0, syntheticExceptions=0, saveDiagnostics=0;
 DWORD keyWriteError=ERROR_SUCCESS;std::wstring failedPreferenceKey;
@@ -69,7 +69,7 @@ BOOL WINAPI fixtureWriteProfile(LPCWSTR section,LPCWSTR key,LPCWSTR value,LPCWST
     if(section&&key){
         ++keyWrites;
         if(!result){++failedKeyWrites;keyWriteError=error;failedPreferenceKey=key;}
-        const int denyAt=writeFault==WriteFault::DenySecond?2:writeFault==WriteFault::DenyCompression?23:writeFault==WriteFault::DenySegment?11:0;
+        const int denyAt=writeFault==WriteFault::DenySecond?2:writeFault==WriteFault::DenyCompression?23:writeFault==WriteFault::DenySegment?11:writeFault==WriteFault::DenyWatermark?30:0;
         if(denyAt && keyWrites==denyAt-1 && result){
             deniedWrite=CreateFileW(path,GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
             if(deniedWrite==INVALID_HANDLE_VALUE)throw std::runtime_error("Cannot deny the next owned staging write.");
@@ -242,7 +242,7 @@ void newUnicodeFile(){
 }
 void existingUnicodeRewrite(){
     PreferencesFixture fixture;
-    const std::wstring initial=L"[Settings]\r\nFolder="+unicodeFolder+L"\r\nInterval=5\r\nQuality=1\r\nEncodingQuality=2\r\nEncodingMode=0\r\nRecordingLimit=0\r\nStopOnLowDiskSpace=1\r\nRecoveryMode=0\r\nNightEnabled=0\r\nNightDurationMs=0\r\nNightTargetBrightness=96\r\nCaptureIntervalMs=5000\r\nVideoWidth=1280\r\nVideoHeight=720\r\nRecordingLimitSeconds=900\r\nSegmentDurationSeconds=0\r\nTimeSkipMode=0\r\nTimeSkipMultiplier=4\r\nTimeSkipQuietAfterMs=120000\r\nTimeSkipRampFrames=30\r\nTimeSkipRepeatSeconds=0\r\nTimeSkipRanges=\r\nTimeSkipQuietSensitivity=1\r\n";
+    const std::wstring initial=L"[Settings]\r\nFolder="+unicodeFolder+L"\r\nInterval=5\r\nQuality=1\r\nEncodingQuality=2\r\nEncodingMode=0\r\nRecordingLimit=0\r\nStopOnLowDiskSpace=1\r\nRecoveryMode=0\r\nNightEnabled=0\r\nNightDurationMs=0\r\nNightTargetBrightness=96\r\nCaptureIntervalMs=5000\r\nVideoWidth=1280\r\nVideoHeight=720\r\nRecordingLimitSeconds=900\r\nSegmentDurationSeconds=0\r\nTimeSkipMode=0\r\nTimeSkipMultiplier=4\r\nTimeSkipQuietAfterMs=120000\r\nTimeSkipRampFrames=30\r\nTimeSkipRepeatSeconds=0\r\nTimeSkipRanges=\r\nTimeSkipQuietSensitivity=1\r\nWatermarkEnabled=0\r\nWatermarkShowTime=1\r\nWatermarkShowSpeed=1\r\nWatermarkTimeKind=0\r\nWatermarkX=10000\r\nWatermarkY=10000\r\nWatermarkTextSize=1\r\n";
     fixture.seed(utf16(initial));reload();expectOptions(unicodeFolder,5,1,2);
     const auto initialBytes=fixture.bytes();
     const std::wstring changed=L"C:\\Synthetic videos\\\u65e5\u672c\u8a9e-\U0001f3a5";
@@ -538,6 +538,28 @@ void preferencePathBoundary(size_t length){
     require(GetFileAttributesW(fileIOPath(ownedRoot.wstring()).c_str())==INVALID_FILE_ATTRIBUTES,"Owned long-path fixture was not cleaned.");
     std::cout<<"PASS settings path "<<length<<": real load/save, preserved values/content, locked replacement cleanup and retry\n";
 }
+void watermarkPreferences(){
+    PreferencesFixture fixture;fixture.seed(legacy);reload();require(!app.settings.watermark.enabled,"Old settings enabled a watermark.");
+    WatermarkSettings expected;expected.enabled=true;expected.showTime=true;expected.showSpeed=false;expected.timeKind=WatermarkTimeKind::RecordedLocal;
+    expected.x=1234;expected.y=10000;expected.textSize=WatermarkTextSize::Large;
+    app.settings.watermark=expected;preferences(true);reload();require(sameWatermarkSettings(expected,app.settings.watermark)&&choice(app.mode)==0,"Exact watermark options or Desktop startup lost real atomic roundtrip.");
+    const auto values=watermarkValues(expected);
+    const auto restore=[&](){for(size_t i=0;i<values.size();++i)require(WritePrivateProfileStringW(L"Settings",WatermarkKeys[i],values[i].c_str(),app.preferences.c_str())!=FALSE,"Cannot restore owned watermark group.");};
+    for(size_t i=0;i<values.size();++i){
+        restore();require(WritePrivateProfileStringW(L"Settings",WatermarkKeys[i],nullptr,app.preferences.c_str()),"Cannot delete owned watermark key.");reload();
+        require(sameWatermarkSettings(app.settings.watermark,WatermarkSettings{}),"Partial watermark group preserved a stale or partially enabled policy.");
+        for(const wchar_t* invalid:{L"",L"-1",L"01",L"1junk",L"999999999999999999999999999999999999999"}){restore();
+            require(WritePrivateProfileStringW(L"Settings",WatermarkKeys[i],invalid,app.preferences.c_str()),"Cannot seed invalid watermark field.");reload();
+            require(sameWatermarkSettings(app.settings.watermark,WatermarkSettings{}),"Malformed watermark key did not reject the complete group.");}
+    }
+    restore();require(WritePrivateProfileStringW(L"Settings",WatermarkKeys[1],L"0",app.preferences.c_str()),"Cannot seed empty enabled watermark.");reload();require(!app.settings.watermark.enabled,"Enabled watermark without fields survived load.");
+    restore();reload();const auto prior=fixture.bytes();app.settings.watermark={};keyWrites=failedKeyWrites=0;writeFault=WriteFault::DenyWatermark;preferences(true);writeFault=WriteFault::None;
+    require(keyWrites==30&&failedKeyWrites==1&&failedPreferenceKey==L"WatermarkTextSize"&&fixture.bytes()==prior,"Final watermark-key failure published partial settings.");
+    reload();require(sameWatermarkSettings(expected,app.settings.watermark),"Failed transaction lost existing watermark.");
+    app.settings.watermark.enabled=false;preferences(true);reload();expected.enabled=false;require(sameWatermarkSettings(expected,app.settings.watermark),"Disabled valid inactive choices failed persistence.");
+    expectUnknownContent(fixture);fixture.onlySettingsRemain();app.settings.watermark={};app.watermarkCheckValid=false;
+    std::cout<<"PASS complete watermark group atomic roundtrip, legacy/partial/malformed Off, exact coordinates, no-field rejection and final-key failure preservation\n";
+}
 void sizeCommandPreferences(){
     PreferencesFixture fixture;fixture.seed(legacy);reload();
     app.camera=CreateWindowExW(0,L"COMBOBOX",L"",WS_CHILD|CBS_DROPDOWNLIST,0,0,120,80,app.window,nullptr,nullptr,nullptr);
@@ -626,8 +648,8 @@ int main(){
         HiddenControls controls;
         newUnicodeFile();existingUnicodeRewrite();migrateAnsi();encodingModes();recordingLimits();segmentOptions();diskSafety();recoveryOptions();nightOptions();customOptions();readFailure();replacementFailure();
         preparationAllocationFailure();partialKeyWriteFailure();stagedExceptionCleanup();
-        preferencePathBoundary(248);preferencePathBoundary(278);timeCompressionPreferences();sizeCommandPreferences();checkpointBeforeRecording();
+        preferencePathBoundary(248);preferencePathBoundary(278);timeCompressionPreferences();watermarkPreferences();sizeCommandPreferences();checkpointBeforeRecording();
         require(!IsWindowVisible(app.window),"Fixture became visible.");
-        std::cout<<"All 20 preference cases passed; only owned hidden controls/settings were used.\n";return 0;
+        std::cout<<"All 21 preference cases passed; only owned hidden controls/settings were used.\n";return 0;
     }catch(const std::exception& error){std::cerr<<"PREFERENCES TEST FAILURE: "<<error.what()<<'\n';return 1;}
 }

@@ -4,6 +4,7 @@
 #include "config.h"
 #include "time_skip.h"
 #include "person_pack.h"
+#include "watermark.h"
 #include <mfapi.h>
 #include <commctrl.h>
 #include <shlobj.h>
@@ -24,7 +25,7 @@ using namespace lapse;
 namespace {
 constexpr COLORREF Ink = RGB(25, 38, 45), Muted = RGB(88, 106, 113), Accent = RGB(0, 116, 113);
 constexpr COLORREF Background = RGB(247, 249, 250), Canvas = RGB(21, 28, 34);
-enum Id { ModeBox = 100, IntervalBox, SizeBox, EncodingQualityBox, MonitorBox, CameraBox, Refresh, Record, Pause, Finish, Folder, OpenFolder, Reset, Forward, Preview, EncodingModeBox, AdvancedToggle, StopAfterBox, LowDiskBox, NightBox, NightDurationBox, NightTargetBox, NightHint, NightDetail, SkipConfigure, SkipSummary, SkipDetail, RecoveryBox, SegmentBox };
+enum Id { ModeBox = 100, IntervalBox, SizeBox, EncodingQualityBox, MonitorBox, CameraBox, Refresh, Record, Pause, Finish, Folder, OpenFolder, Reset, Forward, Preview, EncodingModeBox, AdvancedToggle, StopAfterBox, LowDiskBox, NightBox, NightDurationBox, NightTargetBox, NightHint, NightDetail, SkipConfigure, SkipSummary, SkipDetail, RecoveryBox, SegmentBox, WatermarkConfigure, WatermarkSummary };
 constexpr int RecordingLimits[] = {0,900,3600,14400,28800,86400};
 constexpr int CaptureIntervals[] = {1000,2000,5000,10000,30000,60000};
 constexpr const wchar_t* RecordingLimitLabels[] = {L"Never",L"15 minutes",L"1 hour",L"4 hours",L"8 hours",L"24 hours"};
@@ -57,6 +58,7 @@ struct App {
     HWND window{}, preview{}, statusText{}, tooltip{};
     HWND customDialog{};
     HWND skipConfigure{},skipSummary{},skipDetail{};
+    HWND watermarkConfigure{},watermarkSummary{};
     HWND mode{}, interval{}, videoSize{}, encodingQuality{}, encodingMode{}, monitor{}, camera{}, refresh{}, record{}, pause{}, finish{}, folder{}, openFolder{}, reset{}, forward{};
     HWND advanced{}, stopAfter{}, lowDisk{}, recoveryMode{}, nightEnabled{}, nightDuration{}, nightTarget{}, nightHint{}, nightDetail{}, labels[10]{};
     HWND segmentLabel{}, splitEvery{};
@@ -85,6 +87,10 @@ struct App {
     std::wstring skipSummaryCaption,skipDetailCaption;
     int skipRevision=0,advancedSkipRevision=-1,skipSummaryRevision=-1,skipVisibility=-1;
     uint64_t skipCheckAge=UINT64_MAX;
+    WatermarkSettings watermarkChecked;
+    bool watermarkCheckValid=false;
+    int watermarkWidth=0,watermarkHeight=0,watermarkRevision=0,advancedWatermarkRevision=-1;
+    std::wstring watermarkValidation,watermarkCaption;
     PersonPackInfo personPack{};
     bool personPackKnown=false;
     std::wstring nightValidation, encodingValidation, statusCaption, nightHintCaption, nightDetailCaption;
@@ -375,12 +381,13 @@ bool cameraListUnavailable() {
 const std::wstring& statusCaption() {
     if(!app.active() && !app.status.error && !app.encodingValidation.empty())return app.encodingValidation;
     if(!app.active() && !app.status.error && !app.nightValidation.empty())return app.nightValidation;
+    if(!app.active() && !app.status.error && !app.watermarkValidation.empty())return app.watermarkValidation;
     if(!app.status.error && !app.status.recordingFailed && app.status.savedPath.empty() && app.status.savedPaths.empty() && cameraListUnavailable())
         return app.cameraListError;
     return app.status.message;
 }
 bool statusCaptionError() {
-    return app.status.error || (!app.active() && (!app.nightValidation.empty() || !app.encodingValidation.empty() || &statusCaption()==&app.cameraListError));
+    return app.status.error || (!app.active() && (!app.nightValidation.empty() || !app.encodingValidation.empty() || !app.watermarkValidation.empty() || &statusCaption()==&app.cameraListError));
 }
 const wchar_t* statusTooltip() noexcept {
     const auto& caption=statusCaption();
@@ -421,26 +428,44 @@ void updateNightText(bool force=false) {
     } else if(app.status.nightEnabled && app.status.nightWaiting)detail=L"Collecting camera frames for the first full blend...";
     if(force || detail!=app.nightDetailCaption){SetWindowTextW(app.nightDetail,detail.c_str());app.nightDetailCaption=std::move(detail);}
 }
+std::wstring watermarkSummary(const WatermarkSettings& value) {
+    if(!value.enabled)return L"Off";
+    std::wstring text=value.showTime?(value.timeKind==WatermarkTimeKind::ActiveElapsed?L"Active elapsed":L"Recorded local date-time"):L"";
+    if(value.showSpeed){if(!text.empty())text+=L" + ";text+=L"target speed";}
+    return text;
+}
+void checkWatermark() {
+    if(app.watermarkCheckValid && app.watermarkWidth==app.settings.width && app.watermarkHeight==app.settings.height &&
+       sameWatermarkSettings(app.watermarkChecked,app.settings.watermark))return;
+    app.watermarkCheckValid=false;app.watermarkValidation.clear();
+    if(validateWatermarkSettings(app.settings.watermark,app.watermarkValidation) && app.settings.watermark.enabled){
+        WatermarkRenderer renderer;renderer.prepare(app.settings.watermark,app.settings.width,app.settings.height,app.watermarkValidation);
+    }
+    app.watermarkChecked=app.settings.watermark;app.watermarkWidth=app.settings.width;app.watermarkHeight=app.settings.height;
+    app.watermarkCheckValid=true;++app.watermarkRevision;
+}
 void updateAdvanced() {
     if(!app.advanced)return;
     const int selection=selectedLimit(),segment=selectedSegment();
     const int night=app.settings.night.enabled?(app.nightValidation.empty()?1:2):0;
     const int recovery=app.encodingValidation.empty()?(app.settings.recoveryMode?1:0):2;
-    if(selection!=app.advancedLimitIndex || segment!=app.advancedSegmentSeconds || night!=app.advancedNightState || recovery!=app.advancedRecoveryState || app.advancedSkipRevision!=app.skipRevision){
+    if(selection!=app.advancedLimitIndex || segment!=app.advancedSegmentSeconds || night!=app.advancedNightState || recovery!=app.advancedRecoveryState || app.advancedSkipRevision!=app.skipRevision || app.advancedWatermarkRevision!=app.watermarkRevision){
         std::wstring caption=L"&Advanced";
         if(recovery==2)caption+=L" · check MP4";
         else if(night==2)caption+=L" · check blend";
+        else if(!app.watermarkValidation.empty())caption+=L" · check watermark";
         else if(night){caption+=L" · night";if(selection)caption+=L", "+(choice(app.stopAfter)<6?std::wstring(RecordingLimitShortLabels[std::clamp(choice(app.stopAfter),0,5)]):formatDuration(int64_t(selection)*1000,true));}
         else if(selection)caption+=L" · stop after "+(choice(app.stopAfter)<6?std::wstring(RecordingLimitLabels[std::clamp(choice(app.stopAfter),0,5)]):formatDuration(int64_t(selection)*1000,true));
-        if(recovery==1 && night!=2)caption+=L" · recovery";
-        if(skipEnabled() && night!=2 && recovery!=2)caption+=L" · "+std::to_wstring(app.settings.timeSkip.multiplier)+L"×";
-        if(segment && night!=2 && recovery!=2)caption+=L" · split "+formatDuration(int64_t(segment)*1000,true);
+        if(recovery==1 && night!=2 && app.watermarkValidation.empty())caption+=L" · recovery";
+        if(skipEnabled() && night!=2 && recovery!=2 && app.watermarkValidation.empty())caption+=L" · "+std::to_wstring(app.settings.timeSkip.multiplier)+L"×";
+        if(segment && night!=2 && recovery!=2 && app.watermarkValidation.empty())caption+=L" · split "+formatDuration(int64_t(segment)*1000,true);
+        if(app.settings.watermark.enabled && app.watermarkValidation.empty() && night!=2 && recovery!=2)caption+=L" · watermark";
         RECT bounds{};GetClientRect(app.advanced,&bounds);
-        if((selection || segment || skipEnabled() || recovery==1) && night!=2 && recovery!=2 && bounds.right>app.scale(40)) {
+        if((selection || segment || skipEnabled() || recovery==1 || app.settings.watermark.enabled) && night!=2 && recovery!=2 && app.watermarkValidation.empty() && bounds.right>app.scale(40)) {
             HDC dc=GetDC(app.advanced);if(dc){const auto previous=SelectObject(dc,app.font);SIZE size{};
                 GetTextExtentPoint32W(dc,caption.c_str(),static_cast<int>(caption.size()),&size);
                 SelectObject(dc,previous);ReleaseDC(app.advanced,dc);
-                if(size.cx+app.scale(18)>bounds.right)caption=segment?L"&Advanced · split + options":recovery?L"&Advanced · recovery + options":skipEnabled()?L"&Advanced · "+std::wstring(night?L"night/":L"")+
+                if(size.cx+app.scale(18)>bounds.right)caption=app.settings.watermark.enabled?L"&Advanced · watermark + options":segment?L"&Advanced · split + options":recovery?L"&Advanced · recovery + options":skipEnabled()?L"&Advanced · "+std::wstring(night?L"night/":L"")+
                     (selection?L"stop/":L"")+std::to_wstring(app.settings.timeSkip.multiplier)+L"×":night?L"&Advanced · night + stop":L"&Advanced · timed stop";
             }
         }
@@ -452,6 +477,11 @@ void updateAdvanced() {
         if(skipPerson(app.settings.timeSkip.mode))app.advancedTooltip+=L" Person checks use only selected camera content and require the optional detector. Missing, uncertain or stale checks keep the normal capture interval.";
         if(app.settings.recoveryMode)app.advancedTooltip+=L" MP4 recovery mode (H.264) is on; recent frames can still be lost after interruption.";
         if(!app.encodingValidation.empty())app.advancedTooltip+=L" "+app.encodingValidation;
+        if(app.settings.watermark.enabled)app.advancedTooltip+=L" Watermark: "+watermarkSummary(app.settings.watermark)+L". Same placement in both files.";
+        if(!app.watermarkValidation.empty())app.advancedTooltip+=L" "+app.watermarkValidation;
+        const auto captionWatermark=watermarkSummary(app.settings.watermark);
+        if(captionWatermark!=app.watermarkCaption){SetWindowTextW(app.watermarkSummary,captionWatermark.c_str());app.watermarkCaption=captionWatermark;}
+        app.advancedWatermarkRevision=app.watermarkRevision;
         app.advancedLimitIndex=selection;app.advancedSegmentSeconds=segment;app.advancedNightState=night;app.advancedRecoveryState=recovery;app.advancedSkipRevision=app.skipRevision;
     }
     const int visibleNight=app.advancedExpanded?nightRow():0;
@@ -464,7 +494,7 @@ void updateAdvanced() {
     const auto visible=[](HWND child,bool show){
         if(child && ((GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0)!=show)ShowWindow(child,show?SW_SHOWNA:SW_HIDE);
     };
-    for(HWND child:{app.labels[6],app.encodingMode,app.labels[7],app.stopAfter,app.lowDisk,app.recoveryMode,app.segmentLabel,app.splitEvery})visible(child,app.advancedExpanded);
+    for(HWND child:{app.labels[6],app.encodingMode,app.labels[7],app.stopAfter,app.lowDisk,app.recoveryMode,app.segmentLabel,app.splitEvery,app.watermarkConfigure,app.watermarkSummary})visible(child,app.advancedExpanded);
     for(HWND child:{app.skipConfigure,app.skipSummary})visible(child,visibleSkip!=0);
     visible(app.skipDetail,visibleSkip==2);
     if(!visibleNight && app.nightEnabled && GetFocus()==app.nightEnabled)SetFocus(app.advanced);
@@ -505,6 +535,7 @@ void configure() {
         app.nightValidation=L"Night camera needs a capture interval of at least 1 second. Choose a longer interval or turn off Night camera.";
     else if(app.settings.night.enabled && app.settings.night.durationMs>app.settings.intervalMs)
         app.nightValidation=L"Night blend duration must not exceed Capture every. Choose Auto, a shorter blend, or a longer capture interval.";
+    checkWatermark();
     int m = choice(app.monitor), c = choice(app.camera);
     if (m >= 0 && m < static_cast<int>(app.monitors.size())) {
         app.settings.monitor = app.monitors[m].bounds;
@@ -549,7 +580,7 @@ void updateControls() {
     for (auto control : {app.mode,app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.splitEvery,app.lowDisk,app.recoveryMode,app.nightEnabled,app.nightDuration,app.nightTarget,app.refresh,app.folder}) EnableWindow(control,idle);
     EnableWindow(app.monitor,idle && hasSource(Source::Desktop));
     EnableWindow(app.camera,idle && hasSource(Source::Camera) && !app.cameras.empty());
-    EnableWindow(app.record,idle && hasRequiredSources() && app.nightValidation.empty() && app.encodingValidation.empty());
+    EnableWindow(app.record,idle && hasRequiredSources() && app.nightValidation.empty() && app.encodingValidation.empty() && app.watermarkValidation.empty());
     EnableWindow(app.pause,app.status.state==State::Recording || app.status.state==State::Paused);
     EnableWindow(app.finish,app.status.state==State::Starting || app.status.state==State::Recording || app.status.state==State::Paused);
     if(!app.controlsUpdated || (app.controlsState==State::Paused)!=(app.status.state==State::Paused))
@@ -761,7 +792,7 @@ void layout() {
     const int availableH=r.bottom+((style&WS_HSCROLL)?barH:0);
     const int minimumW=app.scale(830);
     const int night=nightRow();
-    const int skipHeight=skipEnabled()?80:52;
+    const int skipHeight=(skipEnabled()?80:52)+42;
     const int previewTop=app.scale(app.advancedExpanded?(night==2?372:night==1?300:258)+skipHeight+58:190);
     const int minimumH=previewTop+app.scale(160)+app.scale(191);
     bool horizontal=false, vertical=false;
@@ -810,6 +841,8 @@ void layout() {
     move(app.skipConfigure,pad,app.scale(316),app.scale(202),ch);
     move(app.skipSummary,pad+app.scale(216),app.scale(316),width-app.scale(216),ch);
     move(app.skipDetail,pad,app.scale(352),width,app.scale(21));
+    move(app.watermarkConfigure,pad,app.scale(274+skipHeight),app.scale(202),ch);
+    move(app.watermarkSummary,pad+app.scale(216),app.scale(274+skipHeight),width-app.scale(216),ch);
     move(app.nightEnabled,pad,app.scale((night==2?336:316)+skipHeight),encodingW,ch);
     move(app.labels[8],stopX,app.scale(315+skipHeight),stopW,app.scale(20));move(app.nightDuration,stopX,app.scale(336+skipHeight),stopW,app.scale(210));
     move(app.labels[9],diskX,app.scale(315+skipHeight),options-encodingW-stopW,app.scale(20));move(app.nightTarget,diskX,app.scale(336+skipHeight),options-encodingW-stopW,app.scale(150));
@@ -879,7 +912,7 @@ void revealFocusedControl() {
 }
 void toggleAdvanced() {
     const HWND focused=GetFocus();
-    if(app.advancedExpanded)for(HWND child:{app.encodingMode,app.stopAfter,app.splitEvery,app.lowDisk,app.recoveryMode,app.skipConfigure,app.nightEnabled,app.nightDuration,app.nightTarget})
+    if(app.advancedExpanded)for(HWND child:{app.encodingMode,app.stopAfter,app.splitEvery,app.lowDisk,app.recoveryMode,app.skipConfigure,app.watermarkConfigure,app.nightEnabled,app.nightDuration,app.nightTarget})
         if(child && (focused==child || (focused && IsChild(child,focused)))){SetFocus(app.advanced);break;}
     app.advancedExpanded=!app.advancedExpanded;
     updateAdvanced();layout();revealFocusedControl();
@@ -1373,6 +1406,191 @@ void editSkip() {
     if(outcome==-1)MessageBoxW(app.window,L"Time compression settings could not be opened. Try again.",L"Timelapse",MB_OK|MB_ICONERROR);
     if(!app.closeWhenDone && !app.hiddenToTray){SetFocus(app.skipConfigure);revealFocusedControl();}
 }
+enum WatermarkId { MarkEnabled=5301,MarkTime,MarkSpeed,MarkTimeKind,MarkPosition,MarkX,MarkY,MarkSize,MarkPreview };
+struct WatermarkDraft : CustomDraft {
+    WatermarkSettings policy;
+    WatermarkRenderer renderer;
+    Frame illustration;
+    bool readOnly=false,ready=false;
+    int naturalHeight=0;
+    HWND enabled{},time{},speed{},timeKind{},position{},x{},y{},size{},preview{},previewLabel{},labels[5]{};
+};
+int watermarkPosition(const WatermarkSettings& value) {
+    if(value.x==0 && value.y==0)return 0;
+    if(value.x==10000 && value.y==0)return 1;
+    if(value.x==0 && value.y==10000)return 2;
+    if(value.x==10000 && value.y==10000)return 3;
+    return 4;
+}
+bool watermarkDraftSettings(WatermarkDraft& draft,WatermarkSettings& value,std::wstring& error,HWND& invalid) {
+    value=draft.policy;value.enabled=SendMessageW(draft.enabled,BM_GETCHECK,0,0)==BST_CHECKED;invalid=draft.enabled;
+    // Off remains committable after invalid inactive edits without inventing values.
+    if(!value.enabled)return validateWatermarkSettings(value,error);
+    value.showTime=SendMessageW(draft.time,BM_GETCHECK,0,0)==BST_CHECKED;
+    value.showSpeed=SendMessageW(draft.speed,BM_GETCHECK,0,0)==BST_CHECKED;
+    if(!value.showTime && !value.showSpeed){invalid=draft.time;error=L"Choose Show time or Show target speed, or turn off the watermark.";return false;}
+    const int kind=choice(draft.timeKind),size=choice(draft.size),position=choice(draft.position);
+    if(kind>=0 && kind<2)value.timeKind=static_cast<WatermarkTimeKind>(kind);
+    else if(value.showTime){invalid=draft.timeKind;error=L"Choose a time value.";return false;}
+    if(size<0 || size>2){invalid=draft.size;error=L"Choose a text size.";return false;}
+    value.textSize=static_cast<WatermarkTextSize>(size);
+    if(position<0 || position>4){invalid=draft.position;error=L"Choose a position.";return false;}
+    if(position<4){value.x=position%2?10000:0;value.y=position>=2?10000:0;}
+    else {
+        const auto coordinate=[&](HWND edit,int& output){wchar_t text[96]{};invalid=edit;
+            if(GetWindowTextLengthW(edit)>=96){error=L"Enter a complete position from 0 to 100, with at most two decimal places.";return false;}
+            GetWindowTextW(edit,text,96);int64_t parsed=0;std::wstring detail;
+            if(!parseDuration(text,DurationUnit::Seconds,0,100000,10,parsed,detail)){error=L"Position must be 0 to 100 percent, with at most two decimal places.";return false;}
+            output=static_cast<int>(parsed/10);return true;
+        };
+        if(!coordinate(draft.x,value.x) || !coordinate(draft.y,value.y))return false;
+    }
+    invalid=draft.size;return validateWatermarkSettings(value,error);
+}
+void watermarkLayout(HWND window,WatermarkDraft& draft) {
+    if(draft.layingOut)return;draft.layingOut=true;
+    const bool enabled=SendMessageW(draft.enabled,BM_GETCHECK,0,0)==BST_CHECKED,custom=enabled && choice(draft.position)==4;
+    const auto show=[](HWND child,bool visible){ShowWindow(child,visible?SW_SHOWNA:SW_HIDE);};
+    for(HWND child:{draft.time,draft.speed,draft.labels[0],draft.timeKind,draft.labels[1],draft.position,draft.labels[4],draft.size})show(child,enabled);
+    for(HWND child:{draft.labels[2],draft.x,draft.labels[3],draft.y})show(child,custom);
+    for(HWND child:{draft.enabled,draft.time,draft.speed,draft.position,draft.x,draft.y,draft.size})EnableWindow(child,!draft.readOnly);
+    EnableWindow(draft.timeKind,!draft.readOnly && SendMessageW(draft.time,BM_GETCHECK,0,0)==BST_CHECKED);
+    RECT client{};GetClientRect(window,&client);const auto style=GetWindowLongPtrW(window,GWL_STYLE);
+    const int bw=GetSystemMetricsForDpi(SM_CXVSCROLL,draft.dpi),bh=GetSystemMetricsForDpi(SM_CYHSCROLL,draft.dpi);
+    const int availableW=client.right+((style&WS_VSCROLL)?bw:0),availableH=client.bottom+((style&WS_HSCROLL)?bh:0);
+    const int pad=draft.scale(18),gap=draft.scale(14),minimumWidth=draft.scale(360);
+    const auto wrap=[&](HWND child,int width,int minimum){wchar_t value[1024]{};GetWindowTextW(child,value,1024);RECT rect{0,0,std::max(1,width),0};
+        HDC dc=GetDC(window);auto old=SelectObject(dc,draft.font);DrawTextW(dc,value,-1,&rect,DT_CALCRECT|DT_WORDBREAK|DT_NOPREFIX);SelectObject(dc,old);ReleaseDC(window,dc);return std::max(minimum,int(rect.bottom));};
+    const int previewTop=draft.scale(enabled?(custom?264:202):58),previewHeight=draft.scale(152);
+    int helpTop=previewTop+previewHeight+draft.scale(30),helpHeight=0,errorTop=0,errorHeight=0,buttonTop=0,minHeight=0;
+    const auto measure=[&](int width){helpHeight=wrap(draft.help,width-2*pad,draft.scale(36));errorTop=helpTop+helpHeight+draft.scale(10);
+        errorHeight=wrap(draft.error,width-2*pad,draft.scale(20));buttonTop=errorTop+errorHeight+draft.scale(8);minHeight=buttonTop+draft.scale(44);};
+    bool horizontal=false,vertical=false;
+    for(int i=0;i<3;++i){horizontal=availableW-(vertical?bw:0)<minimumWidth;measure(std::max(minimumWidth,availableW-(vertical?bw:0)));vertical=availableH-(horizontal?bh:0)<minHeight;}
+    ShowScrollBar(window,SB_HORZ,horizontal);ShowScrollBar(window,SB_VERT,vertical);GetClientRect(window,&client);
+    const int width=std::max(minimumWidth,int(client.right));measure(width);const int height=std::max(minHeight,int(client.bottom));draft.naturalHeight=minHeight;
+    draft.scrollX=std::clamp(draft.scrollX,0,width-int(std::max(1L,client.right)));draft.scrollY=std::clamp(draft.scrollY,0,height-int(std::max(1L,client.bottom)));
+    SCROLLINFO info{sizeof(info),SIF_RANGE|SIF_PAGE|SIF_POS};info.nMax=width-1;info.nPage=std::max(1L,client.right);info.nPos=draft.scrollX;SetScrollInfo(window,SB_HORZ,&info,TRUE);
+    info.nMax=height-1;info.nPage=std::max(1L,client.bottom);info.nPos=draft.scrollY;SetScrollInfo(window,SB_VERT,&info,TRUE);
+    const int half=(width-2*pad-gap)/2,x2=pad+half+gap;
+    const auto move=[&](HWND child,int x,int y,int w,int h){MoveWindow(child,x-draft.scrollX,y-draft.scrollY,w,h,TRUE);};
+    move(draft.enabled,pad,draft.scale(16),width-2*pad,draft.scale(28));
+    move(draft.time,pad,draft.scale(56),half,draft.scale(28));move(draft.speed,x2,draft.scale(56),half,draft.scale(28));
+    move(draft.labels[0],pad,draft.scale(92),width-2*pad,draft.scale(20));move(draft.timeKind,pad,draft.scale(114),width-2*pad,draft.scale(140));
+    move(draft.labels[1],pad,draft.scale(150),half,draft.scale(20));move(draft.position,pad,draft.scale(172),half,draft.scale(190));
+    move(draft.labels[4],x2,draft.scale(150),half,draft.scale(20));move(draft.size,x2,draft.scale(172),half,draft.scale(140));
+    move(draft.labels[2],pad,draft.scale(212),half,draft.scale(20));move(draft.x,pad,draft.scale(234),half,draft.scale(28));
+    move(draft.labels[3],x2,draft.scale(212),half,draft.scale(20));move(draft.y,x2,draft.scale(234),half,draft.scale(28));
+    move(draft.preview,pad,previewTop,width-2*pad,previewHeight);move(draft.previewLabel,pad,previewTop+previewHeight+draft.scale(4),width-2*pad,draft.scale(20));
+    move(draft.help,pad,helpTop,width-2*pad,helpHeight);move(draft.error,pad,errorTop,width-2*pad,errorHeight);
+    move(draft.okay,width-pad-draft.scale(174),buttonTop,draft.scale(80),draft.scale(28));move(draft.cancel,width-pad-draft.scale(80),buttonTop,draft.scale(80),draft.scale(28));
+    draft.layingOut=false;
+}
+void watermarkFitHeight(HWND window,WatermarkDraft& draft) {
+    RECT rect{},client{};GetWindowRect(window,&rect);GetClientRect(window,&client);rect.bottom+=draft.naturalHeight-client.bottom;
+    rect=fitWindow(rect,workArea(MonitorFromWindow(window,MONITOR_DEFAULTTONEAREST)));
+    SetWindowPos(window,nullptr,rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top,SWP_NOZORDER|SWP_NOACTIVATE);watermarkLayout(window,draft);
+}
+void watermarkReveal(HWND window,WatermarkDraft& draft,HWND child) {
+    if(!child || !IsChild(window,child))return;RECT bounds{},client{};GetWindowRect(child,&bounds);MapWindowPoints(nullptr,window,reinterpret_cast<POINT*>(&bounds),2);GetClientRect(window,&client);
+    if(bounds.left<0)draft.scrollX+=bounds.left;else if(bounds.right>client.right)draft.scrollX+=bounds.right-client.right;
+    if(bounds.top<0)draft.scrollY+=bounds.top;else if(bounds.bottom>client.bottom)draft.scrollY+=bounds.bottom-client.bottom;watermarkLayout(window,draft);
+}
+void watermarkIllustration(WatermarkDraft& draft) {
+    WatermarkSettings value;std::wstring error;HWND invalid{};const bool valid=watermarkDraftSettings(draft,value,error,invalid);
+    const auto dimensions=previewDimensions(app.settings.width,app.settings.height);
+    draft.illustration.width=dimensions.first;draft.illustration.height=dimensions.second;
+    draft.illustration.pixels.resize(size_t(dimensions.first)*dimensions.second*4);
+    for(int y=0;y<dimensions.second;++y)for(int x=0;x<dimensions.first;++x){auto* p=draft.illustration.pixels.data()+(size_t(y)*dimensions.first+x)*4;
+        p[0]=uint8_t(70+60*x/dimensions.first);p[1]=uint8_t(75+50*y/dimensions.second);p[2]=uint8_t(35+35*x/dimensions.first);p[3]=255;}
+    if(valid && draft.renderer.prepare(value,app.settings.width,app.settings.height,error)){
+        WatermarkContext context;context.activeMs=192000;context.recordedLocal={2026,9,3,30,12,34,56,0};context.targetIntervalMs=app.settings.intervalMs;
+        draft.renderer.apply(draft.illustration,context,error);
+    }
+    SetWindowTextW(draft.error,error.c_str());InvalidateRect(draft.preview,nullptr,FALSE);
+}
+void watermarkPaint(const DRAWITEMSTRUCT& draw,const WatermarkDraft& draft) {
+    FillRect(draw.hDC,&draw.rcItem,GetSysColorBrush(COLOR_3DDKSHADOW));const auto& frame=draft.illustration;
+    if(frame.width<=0 || frame.height<=0 || frame.pixels.empty())return;
+    const int width=draw.rcItem.right-draw.rcItem.left,height=draw.rcItem.bottom-draw.rcItem.top;
+    const double scale=std::min(double(width)/frame.width,double(height)/frame.height);
+    const int w=std::max(1,int(frame.width*scale)),h=std::max(1,int(frame.height*scale));
+    BITMAPINFO info{};info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);info.bmiHeader.biWidth=frame.width;info.bmiHeader.biHeight=-frame.height;
+    info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;info.bmiHeader.biCompression=BI_RGB;
+    const int old=SetStretchBltMode(draw.hDC,HALFTONE);POINT origin{};SetBrushOrgEx(draw.hDC,0,0,&origin);
+    StretchDIBits(draw.hDC,draw.rcItem.left+(width-w)/2,draw.rcItem.top+(height-h)/2,w,h,0,0,frame.width,frame.height,frame.pixels.data(),&info,DIB_RGB_COLORS,SRCCOPY);
+    SetBrushOrgEx(draw.hDC,origin.x,origin.y,nullptr);SetStretchBltMode(draw.hDC,old);
+}
+INT_PTR CALLBACK watermarkProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
+    auto* draft=reinterpret_cast<WatermarkDraft*>(GetWindowLongPtrW(window,DWLP_USER));
+    try {
+        if(message==WM_INITDIALOG){
+            draft=reinterpret_cast<WatermarkDraft*>(lp);SetWindowLongPtrW(window,DWLP_USER,lp);draft->previousDialog=app.customDialog;app.customDialog=window;
+            draft->dpi=static_cast<int>(GetDpiForWindow(window));if(draft->dpi<=0)draft->dpi=app.dpi;SetWindowTextW(window,L"Watermark");
+            const auto checkbox=[&](const wchar_t* text,int id,bool checked){HWND child=skipChild(window,L"BUTTON",text,WS_TABSTOP|BS_AUTOCHECKBOX|BS_NOTIFY,id);SendMessageW(child,BM_SETCHECK,checked?BST_CHECKED:BST_UNCHECKED,0);return child;};
+            const auto combo=[&](int id){return skipChild(window,L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL,id);};
+            const auto label=[&](int i,const wchar_t* text){return draft->labels[i]=skipChild(window,L"STATIC",text,0,5400+i);};
+            draft->enabled=checkbox(L"&Enable watermark",MarkEnabled,draft->policy.enabled);
+            draft->time=checkbox(L"Show &time",MarkTime,draft->policy.showTime);draft->speed=checkbox(L"Show target &speed",MarkSpeed,draft->policy.showSpeed);
+            label(0,L"Time &value");draft->timeKind=combo(MarkTimeKind);for(auto value:{L"Active elapsed (excludes pauses)",L"Recorded local date/time"})add(draft->timeKind,value);choose(draft->timeKind,static_cast<int>(draft->policy.timeKind));
+            label(1,L"&Position");draft->position=combo(MarkPosition);for(auto value:{L"Top left",L"Top right",L"Bottom left",L"Bottom right",L"Custom"})add(draft->position,value);choose(draft->position,watermarkPosition(draft->policy));
+            label(4,L"Text si&ze");draft->size=combo(MarkSize);for(auto value:{L"Small",L"Medium (default)",L"Large"})add(draft->size,value);choose(draft->size,static_cast<int>(draft->policy.textSize));
+            label(2,L"&X position (%)");draft->x=skipChild(window,L"EDIT",secondsInput(int64_t(draft->policy.x)*10).c_str(),WS_TABSTOP|ES_AUTOHSCROLL,MarkX);
+            label(3,L"&Y position (%)");draft->y=skipChild(window,L"EDIT",secondsInput(int64_t(draft->policy.y)*10).c_str(),WS_TABSTOP|ES_AUTOHSCROLL,MarkY);
+            for(HWND edit:{draft->x,draft->y})SendMessageW(edit,EM_SETLIMITTEXT,96,0);
+            draft->preview=skipChild(window,L"STATIC",L"Watermark placement illustration",SS_OWNERDRAW,MarkPreview);
+            draft->previewLabel=skipChild(window,L"STATIC",L"Illustration only; values follow your recording.",SS_NOPREFIX,5410);
+            draft->help=skipChild(window,L"STATIC",L"",SS_NOPREFIX,5411);draft->error=skipChild(window,L"STATIC",L"",SS_NOPREFIX,5412);
+            draft->okay=skipChild(window,L"BUTTON",L"&Apply",WS_TABSTOP|BS_DEFPUSHBUTTON|BS_NOTIFY,IDOK);
+            draft->cancel=skipChild(window,L"BUTTON",draft->readOnly?L"Close":L"Cancel",WS_TABSTOP|BS_PUSHBUTTON|BS_NOTIFY,IDCANCEL);
+            for(HWND child:{draft->enabled,draft->time,draft->speed,draft->timeKind,draft->position,draft->x,draft->y,draft->size,draft->preview,draft->previewLabel,draft->help,draft->error,draft->okay,draft->cancel})if(!child){EndDialog(window,-1);return TRUE;}
+            for(HWND child:draft->labels)if(!child){EndDialog(window,-1);return TRUE;}
+            std::wstring help=draft->readOnly?L"Options are frozen for this recording. ":L"";
+            help+=L"Target speed is total planned playback acceleration, not extra compression or achieved speed. Recorded time is the local clock when a frame is accepted for saving; it may differ from camera exposure time. Clock/time-zone changes can affect it.\n\nBoth files use the same watermark. X/Y place the whole box inside the video; 0% is left/top, 100% right/bottom. Text scales with video size and may increase file size.";
+            SetWindowTextW(draft->help,help.c_str());if(draft->readOnly){ShowWindow(draft->okay,SW_HIDE);SendMessageW(window,DM_SETDEFID,IDCANCEL,0);}
+            customFont(window,*draft);draft->ready=true;watermarkIllustration(*draft);
+            RECT rect{0,0,draft->scale(540),draft->scale(540)};AdjustWindowRectExForDpi(&rect,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_STYLE)),FALSE,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_EXSTYLE)),draft->dpi);
+            RECT owner{};GetWindowRect(app.window,&owner);OffsetRect(&rect,(owner.left+owner.right-(rect.right-rect.left))/2-rect.left,(owner.top+owner.bottom-(rect.bottom-rect.top))/2-rect.top);
+            rect=fitWindow(rect,workArea(MonitorFromWindow(app.window,MONITOR_DEFAULTTONEAREST)));SetWindowPos(window,nullptr,rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top,SWP_NOZORDER|SWP_NOACTIVATE);
+            watermarkLayout(window,*draft);watermarkFitHeight(window,*draft);SetFocus(draft->readOnly?draft->cancel:draft->enabled);watermarkReveal(window,*draft,GetFocus());return FALSE;
+        }
+        if(draft && message==WM_DESTROY){draft->renderer.reset();if(draft->font){DeleteObject(draft->font);draft->font=nullptr;}if(app.customDialog==window)app.customDialog=IsWindow(draft->previousDialog)?draft->previousDialog:nullptr;return TRUE;}
+        if(!draft || !draft->ready)return FALSE;
+        switch(message){
+        case WM_SIZE:watermarkLayout(window,*draft);return TRUE;
+        case WM_DPICHANGED:{draft->dpi=HIWORD(wp);customFont(window,*draft);RECT rect=*reinterpret_cast<RECT*>(lp);rect=fitWindow(rect,workArea(MonitorFromRect(&rect,MONITOR_DEFAULTTONEAREST)));
+            SetWindowPos(window,nullptr,rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top,SWP_NOZORDER|SWP_NOACTIVATE);watermarkLayout(window,*draft);watermarkReveal(window,*draft,GetFocus());return TRUE;}
+        case WM_DRAWITEM:if(wp==MarkPreview){watermarkPaint(*reinterpret_cast<DRAWITEMSTRUCT*>(lp),*draft);return TRUE;}break;
+        case WM_HSCROLL:case WM_VSCROLL:{const int bar=message==WM_HSCROLL?SB_HORZ:SB_VERT;SCROLLINFO info{sizeof(info),SIF_ALL};GetScrollInfo(window,bar,&info);int position=info.nPos;
+            switch(LOWORD(wp)){case SB_LINEUP:position-=draft->scale(24);break;case SB_LINEDOWN:position+=draft->scale(24);break;case SB_PAGEUP:position-=info.nPage;break;case SB_PAGEDOWN:position+=info.nPage;break;case SB_THUMBPOSITION:case SB_THUMBTRACK:position=info.nTrackPos;break;case SB_TOP:position=0;break;case SB_BOTTOM:position=info.nMax;break;default:return TRUE;}
+            (bar==SB_HORZ?draft->scrollX:draft->scrollY)=position;watermarkLayout(window,*draft);return TRUE;}
+        case WM_COMMAND:{const int id=LOWORD(wp),code=HIWORD(wp);
+            if(((id==IDOK || id==IDCANCEL || id==MarkEnabled || id==MarkTime || id==MarkSpeed) && code==BN_SETFOCUS) ||
+               ((id==MarkX || id==MarkY) && code==EN_SETFOCUS) || ((id==MarkTimeKind || id==MarkPosition || id==MarkSize) && code==CBN_SETFOCUS)){
+                watermarkReveal(window,*draft,reinterpret_cast<HWND>(lp));return TRUE;
+            }
+            if(id==IDCANCEL && code==BN_CLICKED){EndDialog(window,IDCANCEL);return TRUE;}
+            if(id==IDOK && code==BN_CLICKED){if(draft->readOnly || app.active()){EndDialog(window,IDCANCEL);return TRUE;}WatermarkSettings value;std::wstring error;HWND invalid{};
+                if(watermarkDraftSettings(*draft,value,error,invalid) && draft->renderer.prepare(value,app.settings.width,app.settings.height,error)){draft->policy=value;EndDialog(window,IDOK);return TRUE;}
+                SetWindowTextW(draft->error,error.c_str());watermarkLayout(window,*draft);watermarkFitHeight(window,*draft);SetFocus(invalid);watermarkReveal(window,*draft,invalid);return TRUE;}
+            const bool changed=((id==MarkEnabled || id==MarkTime || id==MarkSpeed) && code==BN_CLICKED) ||
+                ((id==MarkTimeKind || id==MarkPosition || id==MarkSize) && code==CBN_SELCHANGE) || ((id==MarkX || id==MarkY) && code==EN_CHANGE);
+            if(changed && !draft->readOnly && !app.active()){watermarkIllustration(*draft);watermarkLayout(window,*draft);watermarkFitHeight(window,*draft);watermarkReveal(window,*draft,reinterpret_cast<HWND>(lp));return TRUE;}
+            return FALSE;}
+        case WM_CTLCOLORSTATIC:if(reinterpret_cast<HWND>(lp)==draft->error){SetTextColor(reinterpret_cast<HDC>(wp),RGB(164,40,40));SetBkColor(reinterpret_cast<HDC>(wp),GetSysColor(COLOR_BTNFACE));return reinterpret_cast<INT_PTR>(GetSysColorBrush(COLOR_BTNFACE));}break;
+        case WM_CLOSE:EndDialog(window,IDCANCEL);return TRUE;
+        }
+    } catch(...){EndDialog(window,-1);return TRUE;}return FALSE;
+}
+void editWatermark() {
+    if(app.customDialog)return;WatermarkDraft draft;draft.policy=app.settings.watermark;draft.readOnly=app.active();CustomTemplate resource;
+    const auto outcome=DialogBoxIndirectParamW(GetModuleHandleW(nullptr),&resource.dialog,app.window,watermarkProc,reinterpret_cast<LPARAM>(&draft));
+    if(!IsWindow(app.window))return;
+    if(outcome==IDOK && !draft.readOnly && !app.active()){app.settings.watermark=draft.policy;app.watermarkCheckValid=false;++app.watermarkRevision;configure();updateControls();layout();}
+    if(outcome==-1)MessageBoxW(app.window,L"Watermark settings could not be opened. Try again.",L"Timelapse",MB_OK|MB_ICONERROR);
+    if(!app.closeWhenDone && !app.hiddenToTray){SetFocus(app.watermarkConfigure);revealFocusedControl();}
+}
+
 void selectFolder() {
     try {
         Microsoft::WRL::ComPtr<IFileOpenDialog> dialog;
@@ -1436,6 +1654,24 @@ TimeSkipSettings loadSkip(const wchar_t* path) {
         if(count>=511 || std::wcscmp(value,L"?")==0)complete=false;values[i]=value;}
     TimeSkipSettings policy;if(!complete || !parseSkipValues(values,policy))return {};return policy;
 }
+constexpr const wchar_t* WatermarkKeys[]={L"WatermarkEnabled",L"WatermarkShowTime",L"WatermarkShowSpeed",L"WatermarkTimeKind",L"WatermarkX",L"WatermarkY",L"WatermarkTextSize"};
+std::array<std::wstring,7> watermarkValues(const WatermarkSettings& value) {
+    return {value.enabled?L"1":L"0",value.showTime?L"1":L"0",value.showSpeed?L"1":L"0",std::to_wstring(static_cast<int>(value.timeKind)),
+        std::to_wstring(value.x),std::to_wstring(value.y),std::to_wstring(static_cast<int>(value.textSize))};
+}
+bool parseWatermarkValues(const std::array<std::wstring,7>& values,WatermarkSettings& output) {
+    int64_t parsed[7]{};constexpr int maximum[]={1,1,1,1,10000,10000,2};
+    for(size_t i=0;i<values.size();++i)if(!skipInteger(values[i],0,maximum[i],parsed[i]))return false;
+    WatermarkSettings value;value.enabled=parsed[0]!=0;value.showTime=parsed[1]!=0;value.showSpeed=parsed[2]!=0;
+    value.timeKind=static_cast<WatermarkTimeKind>(parsed[3]);value.x=static_cast<int>(parsed[4]);value.y=static_cast<int>(parsed[5]);value.textSize=static_cast<WatermarkTextSize>(parsed[6]);
+    std::wstring error;if(!validateWatermarkSettings(value,error))return false;output=value;return true;
+}
+WatermarkSettings loadWatermark(const wchar_t* path) {
+    std::array<std::wstring,7> values;
+    for(size_t i=0;i<values.size();++i){wchar_t value[32]{};const DWORD count=GetPrivateProfileStringW(L"Settings",WatermarkKeys[i],L"?",value,32,path);
+        if(count>=31 || std::wcscmp(value,L"?")==0)return {};values[i]=value;}
+    WatermarkSettings value;if(!parseWatermarkValues(values,value))return {};return value;
+}
 bool savePreferences() {
     try {
         std::error_code ec;
@@ -1479,6 +1715,8 @@ bool savePreferences() {
         auto skipPolicy=app.settings.timeSkip;std::wstring skipError;
         if(!normalizeTimeSkipSettings(skipPolicy,skipError))return false;
         const auto skip=skipValues(skipPolicy);
+        if(!validateWatermarkSettings(app.settings.watermark,skipError))return false;
+        const auto watermark=watermarkValues(app.settings.watermark);
         const auto nightDuration=std::to_wstring(NightDurations[app.nightDuration?std::clamp(choice(app.nightDuration),0,5):0]);
         const auto nightTarget=std::to_wstring(NightTargets[app.nightTarget?std::clamp(choice(app.nightTarget),0,2):1]);
         struct TemporaryFile {
@@ -1514,6 +1752,7 @@ bool savePreferences() {
             WritePrivateProfileStringW(L"Settings",L"NightDurationMs",nightDuration.c_str(),pending.path) &&
             WritePrivateProfileStringW(L"Settings",L"NightTargetBrightness",nightTarget.c_str(),pending.path);
         for(size_t i=0;saved && i<skip.size();++i)saved=WritePrivateProfileStringW(L"Settings",SkipKeys[i],skip[i].c_str(),pending.path)!=FALSE;
+        for(size_t i=0;saved && i<watermark.size();++i)saved=WritePrivateProfileStringW(L"Settings",WatermarkKeys[i],watermark[i].c_str(),pending.path)!=FALSE;
         // This cache-flush form returns zero even when successful.
         WritePrivateProfileStringW(nullptr,nullptr,nullptr,pending.path);
         if(!saved)return false;
@@ -1585,6 +1824,7 @@ void preferences(bool save) {
         loadNightChoice(L"NightDurationMs",app.nightDuration,NightDurations,0);
         loadNightChoice(L"NightTargetBrightness",app.nightTarget,NightTargets,1);
         app.settings.timeSkip=loadSkip(path);++app.skipRevision;
+        app.settings.watermark=loadWatermark(path);app.watermarkCheckValid=false;++app.watermarkRevision;
         // Launch on desktop: opening the app never silently turns on a camera.
         choose(app.mode,0);
         updateAdvanced();
@@ -1706,6 +1946,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         app.skipRevision=0;app.advancedSkipRevision=app.skipSummaryRevision=app.skipVisibility=-1;app.skipCheckAge=UINT64_MAX;
         app.skipSummaryCaption.clear();app.skipDetailCaption.clear();app.settings.timeSkip={};
         app.personPack={};app.personPackKnown=false;
+        app.settings.watermark={};app.watermarkChecked={};app.watermarkCheckValid=false;app.watermarkRevision=0;app.advancedWatermarkRevision=-1;app.watermarkValidation.clear();app.watermarkCaption.clear();
         app.hasCustomInterval=app.hasCustomSize=app.hasCustomLimit=false;
         app.customIntervalMs=5000;app.customWidth=1280;app.customHeight=720;app.customLimitSeconds=900;
         app.committedInterval=2;app.committedSize=app.committedLimit=0;
@@ -1742,6 +1983,8 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         app.skipConfigure=button(L"Time &compression...",SkipConfigure);
         app.skipSummary=requiredControl(L"STATIC",L"Off",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX,SkipSummary);
         app.skipDetail=requiredControl(L"STATIC",L"",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX,SkipDetail);
+        app.watermarkConfigure=button(L"&Watermark...",WatermarkConfigure);
+        app.watermarkSummary=requiredControl(L"STATIC",L"Off",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX,WatermarkSummary);
         app.nightEnabled=requiredControl(L"BUTTON",L"&Night camera (software blend)",WS_TABSTOP|BS_AUTOCHECKBOX,NightBox);
         app.nightDuration=combo(8,L"Blend d&uration",NightDurationBox);for(auto label:NightDurationLabels)add(app.nightDuration,label);
         app.nightTarget=combo(9,L"Auto &brightness",NightTargetBox);for(auto label:{L"Dark",L"Balanced",L"Bright"})add(app.nightTarget,label);
@@ -1916,6 +2159,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         switch(id) {
         case AdvancedToggle:toggleAdvanced();break;
         case SkipConfigure:editSkip();break;
+        case WatermarkConfigure:if(code==BN_CLICKED)editWatermark();break;
         case LowDiskBox:if(!app.active())configure();break;
         case RecoveryBox:
             if(app.active())SendMessageW(app.recoveryMode,BM_SETCHECK,app.settings.recoveryMode?BST_CHECKED:BST_UNCHECKED,0);
@@ -1930,7 +2174,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         case Record:
             if(app.active())break;
             configure();
-            if(hasRequiredSources() && app.nightValidation.empty() && app.encodingValidation.empty()) {
+            if(hasRequiredSources() && app.nightValidation.empty() && app.encodingValidation.empty() && app.watermarkValidation.empty()) {
                 // A long session may end without WM_DESTROY after a crash or
                 // power loss. Checkpoint accepted options before capture starts.
                 // As on shutdown, preference failure must not prevent recording.

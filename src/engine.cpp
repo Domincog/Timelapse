@@ -121,6 +121,7 @@ void Engine::configure(const Settings& s) {
     { std::lock_guard<std::mutex> lock(mutex_);
       auto sources = [](const Settings& config) { int mask = config.separateFiles ? 3 : 0; for (const auto& layer : config.layers) mask |= layer.source == Source::Desktop ? 1 : 2; return mask; };
       const int mask = sources(s);
+      if (!sameWatermarkSettings(s.watermark, settings_.watermark)) retirePreview(true);
       if (mask != sources(settings_) || s.cameraId != settings_.cameraId || !s.preview) retireCameraInput();
       if (!s.preview || (status_.state == State::Idle && (s.width != settings_.width || s.height != settings_.height)) ||
           mask != sources(settings_) || ((mask & 2) && s.cameraId != settings_.cameraId) ||
@@ -134,8 +135,11 @@ void Engine::retireCameraInput() noexcept {
     if (++cameraInputGeneration_ == 0) ++cameraInputGeneration_;
     status_.cameraInput = {0, 0, cameraInputGeneration_};
 }
-void Engine::retirePreview() {
-    ++previewGeneration_;
+void Engine::retirePreview(bool watermarkOnly) {
+    // Overlay edits invalidate pixels without retiring camera source evidence
+    // or turning a failed camera attempt into an implicit device retry.
+    if (watermarkOnly) ++watermarkPreviewGeneration_;
+    else ++previewGeneration_;
     status_.preview.reset();
     if (!previewProblem_) return;
     previewProblem_ = false;
@@ -197,6 +201,28 @@ void Engine::run() {
         std::optional<Encoder> cameraEncoder;
         RecordingPower power;
         std::optional<Settings> session;
+        WatermarkRenderer watermark;
+        WatermarkSettings preparedWatermark;
+        int watermarkWidth = 0, watermarkHeight = 0;
+        bool watermarkPrepared = false, haveWatermarkContext = false;
+        WatermarkContext lastWatermarkContext;
+        int64_t incomingIntervalMs = 5000;
+        auto resetWatermark = [&]() noexcept {
+            watermark.reset(); watermarkPrepared = haveWatermarkContext = false;
+        };
+        auto prepareWatermark = [&](const Settings& cfg, std::wstring& error) {
+            if (!cfg.watermark.enabled) {
+                if (watermarkPrepared) { watermark.reset(); watermarkPrepared = false; }
+                return true;
+            }
+            if (watermarkPrepared && watermarkWidth == cfg.width && watermarkHeight == cfg.height &&
+                sameWatermarkSettings(preparedWatermark, cfg.watermark)) return true;
+            watermarkPrepared = false;
+            if (!watermark.prepare(cfg.watermark, cfg.width, cfg.height, error)) return false;
+            preparedWatermark = cfg.watermark; watermarkWidth = cfg.width; watermarkHeight = cfg.height;
+            watermarkPrepared = true;
+            return true;
+        };
         // Capture and encode storage belongs only to the worker. Retain its
         // allocation across samples instead of allocating several megabytes on
         // every refresh. Published preview frames never share this storage.
@@ -228,7 +254,7 @@ void Engine::run() {
             if (clearFrame) nightFrameReady = false;
             nightPollAt = nightExpectedAt = Clock::time_point::max();
         };
-        uint64_t previewGeneration = 0, cameraAttemptGeneration = 0, cameraInputGeneration = 0;
+        uint64_t previewGeneration = 0, watermarkPreviewGeneration = 0, cameraAttemptGeneration = 0, cameraInputGeneration = 0;
         auto clearCameraInput = [&]() {
             std::lock_guard<std::mutex> lock(mutex_);
             if (cameraInputGeneration != cameraInputGeneration_) return;
@@ -276,6 +302,7 @@ void Engine::run() {
         };
         auto resetSkipping = [&](const Settings& cfg, unsigned sourceMask) {
             cancelObservation();
+            incomingIntervalMs = cfg.intervalMs;
             skipping = cfg.timeSkip.mode != TimeSkipMode::Off;
             personMode = usesPersonChecks(cfg.timeSkip.mode);
             observing = skipping && cfg.timeSkip.mode != TimeSkipMode::Manual;
@@ -301,11 +328,12 @@ void Engine::run() {
                 // Never truncate an accepted integration window. If it has not
                 // started, bring forward a complete base-bounded window.
                 if (!nightQueued) {
+                    incomingIntervalMs = session->intervalMs;
                     const auto duration = std::chrono::milliseconds(nightWindowDuration(*session, suggestedNightDurationMs));
                     nextFrame = std::min(nextFrame, std::max(earliest, Clock::now() + duration));
                     nightStartAt = nextFrame - duration;
                 }
-            } else nextFrame = std::min(nextFrame, earliest);
+            } else { nextFrame = std::min(nextFrame, earliest); incomingIntervalMs = session->intervalMs; }
         };
         auto inspectSkipping = [&] {
             if (!skipping) return;
@@ -555,7 +583,7 @@ void Engine::run() {
         };
         auto publishPreviewError = [&](const std::wstring& message) {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (start_ || previewGeneration != previewGeneration_) return;
+            if (start_ || previewGeneration != previewGeneration_ || watermarkPreviewGeneration != watermarkPreviewGeneration_) return;
             status_.preview.reset();
             // A preview can recover on its next refresh, but it must not
             // replace a recording or resource error that the user needs to see.
@@ -781,6 +809,7 @@ void Engine::run() {
                 terminalClockFrozen = true;
             }
             releaseDesktopCaptureCache();
+            resetWatermark();
             cancelNight(); nightMode = false;
             cancelObservation(); skipping = observing = false; observationDesktop = {};
             if (writing) power.saving();
@@ -854,6 +883,7 @@ void Engine::run() {
                   // their settings snapshot has succeeded.
                   quit = quit_;
                   previewGeneration = previewGeneration_;
+                  watermarkPreviewGeneration = watermarkPreviewGeneration_;
                   cameraInputGeneration = cameraInputGeneration_;
                   const auto requiredWork = nightMode ? (nightQueued ? nightPollAt : nightStartAt) : nextFrame;
                   previewOnlyWork = !start_ && !stop_ && !quit_ && !pending &&
@@ -878,6 +908,7 @@ void Engine::run() {
                     previewOnlyWork = false;
                     personFault = false; personFailure = {};
                     session.emplace(cfg); pending = true; elapsed = 0;
+                    resetWatermark(); incomingIntervalMs = cfg.intervalMs;
                     segmentWriting = cameraWriting = sessionStarted = segmentFailed = false;
                     closedFrames = {}; segmentOrdinal = completedSegments = 0; sessionStem.clear();
                     activeDuration = Clock::duration::zero(); recordingLimitReached = false; terminalClockFrozen = false;
@@ -890,7 +921,9 @@ void Engine::run() {
                         !validateVideoSize(cfg.width, cfg.height, validationError) ||
                         !validateEncodingMode(cfg.encodingMode, cfg.recoveryMode, validationError) ||
                         (nightMode && !validateNightCapture(cfg, validationError)) ||
-                        !normalizeTimeSkipSettings(cfg.timeSkip, validationError)) {
+                        !normalizeTimeSkipSettings(cfg.timeSkip, validationError) ||
+                        !validateWatermarkSettings(cfg.watermark, validationError) ||
+                        !prepareWatermark(cfg, validationError)) {
                         closeRecording(validationError); continue;
                     }
                     session->timeSkip = cfg.timeSkip;
@@ -918,7 +951,7 @@ void Engine::run() {
                     const bool desktopNeeded = (session && session->separateFiles) || std::any_of(cfg.layers.begin(), cfg.layers.end(),
                         [](const Layer& layer) { return layer.source == Source::Desktop; });
                     power.update(!paused, desktopNeeded);
-                    if (!paused) { nextFrame = now; nightStartAt = now; retryFrameAt = Clock::time_point::min(); }
+                    if (!paused) { nextFrame = now; nightStartAt = now; retryFrameAt = Clock::time_point::min(); incomingIntervalMs = cfg.intervalMs; }
                     std::lock_guard<std::mutex> lock(mutex_);
                     status_.state = paused ? State::Paused : State::Recording;
                     status_.nightWaiting = nightMode && !paused;
@@ -977,6 +1010,10 @@ void Engine::run() {
                 }
                 power.update(writing && !paused, needDesktop);
                 const bool active = pending || (writing && !paused) || cfg.preview;
+                // An idle hidden/disabled overlay owns no reusable GDI cache.
+                // Keep paused session resources and its last context intact:
+                // a hidden resume must still stamp before its first write.
+                if (watermarkPrepared && (!cfg.watermark.enabled || (!writing && !pending && !active))) resetWatermark();
                 if (!cfg.preview) previewBuffer.reset();
                 if (!active || !needDesktop) releaseDesktopCaptureCache();
                 if (!active) { desktop = {}; webcam = {}; composed = {}; cameraComposed = {}; }
@@ -1256,6 +1293,19 @@ void Engine::run() {
                     }
                     sessionStarted = true;
                     const auto admittedActiveMs = std::chrono::duration_cast<std::chrono::milliseconds>(activeDuration).count();
+                    if (cfg.watermark.enabled) {
+                        // Both completed compositions share one admission context
+                        // and finish rendering before either writer accepts pixels.
+                        WatermarkContext context;
+                        context.activeMs = admittedActiveMs;
+                        context.targetIntervalMs = incomingIntervalMs;
+                        GetLocalTime(&context.recordedLocal);
+                        if (!watermark.apply(composed, context, error) ||
+                            (cfg.separateFiles && !watermark.apply(cameraComposed, context, error))) {
+                            closeRecording(L"Watermark stopped recording: " + error); continue;
+                        }
+                        lastWatermarkContext = context; haveWatermarkContext = true;
+                    }
                     if (!encoder->write(composed, error)) {
                         closeRecording((cfg.separateFiles ? L"Desktop recording stopped: " : L"Recording stopped: ") + error); continue;
                     }
@@ -1264,6 +1314,7 @@ void Engine::run() {
                     }
                     lastAdmission = admittedAt;
                     const auto interval = std::chrono::milliseconds(skipping ? timeSkip.onFrame(admittedActiveMs) : cfg.intervalMs);
+                    incomingIntervalMs = interval.count();
                     if (skipping) nextFrame = std::max(nextFrame, lastAdmission);
                     if (nightMode) {
                         suggestedNightDurationMs = completedNight.exposure.suggestedDurationMs;
@@ -1302,6 +1353,15 @@ void Engine::run() {
                         publishPreviewError(error);
                         continue;
                     }
+                    if (!prepareWatermark(cfg, error)) { publishPreviewError(error); continue; }
+                    if (cfg.watermark.enabled) {
+                        WatermarkContext context = lastWatermarkContext;
+                        if (!(writing || pending) || !haveWatermarkContext) {
+                            context.activeMs = 0; context.targetIntervalMs = cfg.intervalMs;
+                            GetLocalTime(&context.recordedLocal);
+                        }
+                        if (!watermark.apply(*previewBuffer, context, error)) { publishPreviewError(error); continue; }
+                    }
                 }
                 // A successful video admission is not evidence that a failed
                 // disposable preview recovered, nor does it own a new buffer.
@@ -1309,7 +1369,7 @@ void Engine::run() {
                 { std::lock_guard<std::mutex> lock(mutex_);
                   // A selection change, Refresh, or Record may have retired
                   // this disposable preview while capture was in flight.
-                  if (previewGeneration != previewGeneration_) continue;
+                  if (previewGeneration != previewGeneration_ || watermarkPreviewGeneration != watermarkPreviewGeneration_) continue;
                   if (cfg.preview && settings_.preview) {
                       auto previous = std::move(status_.preview);
                       status_.preview = previewBuffer;
@@ -1357,6 +1417,7 @@ void Engine::run() {
                     }
                 }
                 releaseDesktopCaptureCache();
+                resetWatermark();
                 clearCameraInput();
                 if (camera) camera->stop();
                 cameraRunning = false;

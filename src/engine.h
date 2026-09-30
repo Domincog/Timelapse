@@ -2,6 +2,7 @@
 #include "core.h"
 #include "night.h"
 #include "time_skip.h"
+#include "watermark.h"
 #include <mutex>
 #include <thread>
 #include <condition_variable>
@@ -35,6 +36,8 @@ struct Settings {
     // Camera-only software exposure; all policy is frozen with the session.
     NightSettings night;
     TimeSkipSettings timeSkip;
+    // Final-frame overlay; raw source analysis is unaffected. Frozen at Record.
+    WatermarkSettings watermark;
     // Optional fragmented H.264 MP4; ordinary MP4 remains the default.
     bool recoveryMode = false;
 };
@@ -96,7 +99,7 @@ public:
 private:
     void run();
     // Called with mutex_ held when a preview selection is retired.
-    void retirePreview();
+    void retirePreview(bool watermarkOnly = false);
     // Called with mutex_ held. Invalidates in-flight input-size publication.
     void retireCameraInput() noexcept;
     std::mutex mutex_;
@@ -104,6 +107,7 @@ private:
     Settings settings_;
     Status status_;
     uint64_t previewGeneration_ = 0;
+    uint64_t watermarkPreviewGeneration_ = 0;
     uint64_t cameraInputGeneration_ = 0;
     uint64_t settingsRevision_ = 0;
     bool previewProblem_ = false;
