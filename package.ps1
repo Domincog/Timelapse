@@ -1,4 +1,4 @@
-param([string]$Version = '0.2.0', [string]$BuildDirectory = 'build')
+param([string]$Version = '0.3.0', [string]$BuildDirectory = 'build', [string]$InstallerCompiler = '')
 $ErrorActionPreference = 'Stop'
 if ($Version -notmatch '^\d+\.\d+\.\d+([-.][A-Za-z0-9.-]+)?$') { throw 'Use a version such as 0.1.0 or 0.1.0-beta.1.' }
 $projectRoot = $PSScriptRoot
@@ -51,7 +51,8 @@ try {
     # An allowlist keeps recordings, build outputs, settings and internal notes
     # out of the source archive. Freeze every selected input before publishing.
     $sourceFiles = @()
-    foreach ($name in @('.gitignore', 'README.md', 'CMakeLists.txt', 'build.ps1', 'package.ps1', 'tools/verify-encoding-quality.ps1')) {
+    foreach ($name in @('.gitignore', 'README.md', 'CMakeLists.txt', 'build.ps1', 'package.ps1', 'tools/verify-encoding-quality.ps1',
+        'installer/Timelapse.iss', 'installer/build-installer.ps1', 'tests/installer_tests.ps1')) {
         $sourceFiles += @{ Path = (Join-Path $projectRoot $name); Name = $name }
     }
     foreach ($directory in @('src', 'tests')) {
@@ -79,11 +80,24 @@ try {
     )
     Write-Package $releaseZip $releaseFiles @{ 'SHA256SUMS.txt' = "$exeHash  Timelapse.exe`n" }
     Write-Package $sourceZip $sourceFiles
-    $hashes = Get-FileHash -Algorithm SHA256 -LiteralPath $releaseZip, $sourceZip
+    $artifactNames = @($releaseName, $sourceName)
+    if ($InstallerCompiler) {
+        # Compile from the same immutable payload as the portable ZIP. Only the
+        # resulting installer participates in publication; compiler tools stay out.
+        $payload = Join-Path $stage 'installer-payload'
+        Copy-PackageInput $frozenExecutable (Join-Path $payload 'Timelapse.exe')
+        Copy-PackageInput (Join-Path $inputs 'README.md') (Join-Path $payload 'README.md')
+        [System.IO.File]::WriteAllText((Join-Path $payload 'SHA256SUMS.txt'), "$exeHash  Timelapse.exe`n", (New-Object System.Text.UTF8Encoding($false)))
+        & (Join-Path $inputs 'installer/build-installer.ps1') -Compiler $InstallerCompiler -Version $Version -PayloadDirectory $payload -OutputDirectory $stage | Out-Null
+        $installerName = "Timelapse-v$Version-windows-x64-setup.exe"
+        if (-not (Test-Path -LiteralPath (Join-Path $stage $installerName) -PathType Leaf)) { throw 'Installer compiler produced no setup executable.' }
+        $artifactNames += $installerName
+    }
+    $hashes = Get-FileHash -Algorithm SHA256 -LiteralPath @($artifactNames | ForEach-Object { Join-Path $stage $_ })
     $hashes | ForEach-Object { $_.Hash.ToLowerInvariant() + '  ' + (Split-Path -Leaf $_.Path) } | Set-Content -LiteralPath (Join-Path $stage 'SHA256SUMS.txt') -Encoding ascii
 
     $outputs = @()
-    foreach ($name in @($releaseName, $sourceName, 'SHA256SUMS.txt')) {
+    foreach ($name in ($artifactNames + @('SHA256SUMS.txt'))) {
         $destination = Join-Path $packages $name
         if (Test-Path -LiteralPath $destination) {
             $item = Get-Item -LiteralPath $destination -Force
@@ -133,7 +147,7 @@ try {
         $keepStage = $false
         throw $publicationError
     }
-    Get-Item -LiteralPath (Join-Path $packages $releaseName), (Join-Path $packages $sourceName) | Select-Object Name,Length,FullName
+    Get-Item -LiteralPath @($artifactNames | ForEach-Object { Join-Path $packages $_ }) | Select-Object Name,Length,FullName
 } finally {
     try {
         if ($stageCreated -and -not $keepStage) {

@@ -18,13 +18,20 @@ struct Settings {
     EncodingMode encodingMode = EncodingMode::Compatible;
     std::wstring folder;
     bool preview = true;
+    // Capture both selected sources on one schedule into independent videos.
+    bool separateFiles = false;
 };
 struct Status {
     State state = State::Idle;
+    // Samples submitted to every active output; a failed second write can
+    // leave one additional desktop frame, reported in the final message.
     uint64_t frames = 0;
     double elapsed = 0;
     std::wstring message = L"Choose a source, then record.";
     std::wstring savedPath;
+    // All finalized playable videos, including retained .recording.mp4 files.
+    // savedPath remains the first entry for existing single-file callers.
+    std::vector<std::wstring> savedPaths;
     bool error = false;
     // Preview errors do not change the outcome of the last recording attempt.
     bool recordingFailed = false;

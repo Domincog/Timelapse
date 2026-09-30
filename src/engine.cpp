@@ -7,10 +7,14 @@
 #include <filesystem>
 #include <algorithm>
 #include <optional>
+#include <array>
 
 namespace lapse {
 using Clock = std::chrono::steady_clock;
 namespace {
+const wchar_t* recordingMessage(bool separateFiles) {
+    return separateFiles ? L"Recording desktop and camera to separate files." : L"Recording. You can adjust the collage live.";
+}
 // Applies only to this worker thread. Releasing the request restores normal
 // Windows sleep behavior; no persistent power settings are changed.
 class RecordingPower {
@@ -41,7 +45,7 @@ Engine::~Engine() {
 }
 void Engine::configure(const Settings& s) {
     { std::lock_guard<std::mutex> lock(mutex_);
-      auto sources = [](const Settings& config) { int mask = 0; for (const auto& layer : config.layers) mask |= layer.source == Source::Desktop ? 1 : 2; return mask; };
+      auto sources = [](const Settings& config) { int mask = config.separateFiles ? 3 : 0; for (const auto& layer : config.layers) mask |= layer.source == Source::Desktop ? 1 : 2; return mask; };
       const int mask = sources(s);
       if (!s.preview || mask != sources(settings_) || ((mask & 2) && s.cameraId != settings_.cameraId) ||
           ((mask & 1) && (CompareStringOrdinal(s.monitorId.c_str(), -1, settings_.monitorId.c_str(), -1, TRUE) != CSTR_EQUAL ||
@@ -56,7 +60,7 @@ void Engine::retirePreview() {
     if (!previewProblem_) return;
     previewProblem_ = false;
     status_.error = false;
-    status_.message = status_.state == State::Recording ? L"Recording. You can adjust the collage live."
+    status_.message = status_.state == State::Recording ? recordingMessage(settings_.separateFiles)
         : status_.state == State::Paused ? L"Paused. Resume when you are ready."
         : status_.state == State::Starting ? L"Preparing recording..."
         : status_.state == State::Finishing ? L"Finishing MP4..." : L"Ready to record.";
@@ -74,7 +78,7 @@ void Engine::record() {
       ++previewGeneration_; previewProblem_ = false;
       stop_ = pauseRequested_ = pauseTarget_ = false;
       start_ = true; status_.state = State::Starting; status_.error = false; status_.recordingFailed = false;
-      status_.message = L"Preparing recording..."; status_.frames = 0; status_.elapsed = 0; status_.savedPath.clear(); }
+      status_.message = L"Preparing recording..."; status_.frames = 0; status_.elapsed = 0; status_.savedPath.clear(); status_.savedPaths.clear(); }
     wake_.notify_one();
 }
 void Engine::pause() {
@@ -103,12 +107,14 @@ void Engine::run() {
         // needs them, so construction failure cannot escape this worker.
         std::optional<CameraClient> camera;
         std::optional<Encoder> encoder;
+        std::optional<Encoder> cameraEncoder;
         RecordingPower power;
         std::optional<Settings> session;
         // Capture and encode storage belongs only to the worker. Retain its
         // allocation across samples instead of allocating several megabytes on
         // every refresh. Published preview frames never share this storage.
-        Frame desktop, webcam, composed;
+        Frame desktop, webcam, composed, cameraComposed;
+        std::vector<Layer> desktopLayers, cameraLayers;
         std::shared_ptr<Frame> previewBuffer;
         auto preparePreviewBuffer = [&]() -> Frame& {
             // Keep at most one retired frame for reuse. A UI snapshot can keep
@@ -117,7 +123,9 @@ void Engine::run() {
             return *previewBuffer;
         };
         std::wstring activeCamera, temporary, finalPath, temporaryIO, finalPathIO, sourceError;
+        std::wstring cameraTemporary, cameraFinalPath, cameraTemporaryIO, cameraFinalPathIO;
         bool cameraRunning = false, pending = false, writing = false, paused = false;
+        bool cameraWriting = false;
         uint64_t previewGeneration = 0, cameraAttemptGeneration = 0;
         uint64_t settingsRevision = UINT64_MAX;
         auto lastPreview = Clock::time_point::min(), nextFrame = Clock::now();
@@ -148,19 +156,93 @@ void Engine::run() {
         auto closeRecording = [&](const std::wstring& reason) {
             if (writing) power.saving();
             { std::lock_guard<std::mutex> lock(mutex_); status_.state = State::Finishing; status_.message = L"Finishing MP4..."; }
+            if (session && session->separateFiles) {
+                std::array<std::wstring, 2> errors;
+                const std::array<bool, 2> opened{writing, cameraWriting};
+                const std::array<Encoder*, 2> writers{encoder ? &*encoder : nullptr, cameraEncoder ? &*cameraEncoder : nullptr};
+                const std::array<const std::wstring*, 2> temporaryNames{&temporary, &cameraTemporary};
+                const std::array<const std::wstring*, 2> finalNames{&finalPath, &cameraFinalPath};
+                const std::array<const std::wstring*, 2> temporaryNamesIO{&temporaryIO, &cameraTemporaryIO};
+                const std::array<const std::wstring*, 2> finalNamesIO{&finalPathIO, &cameraFinalPathIO};
+                std::array<bool, 2> finalized{}, partial{};
+                std::array<uint64_t, 2> frameCounts{};
+                for (size_t i = 0; i < writers.size(); ++i) if (opened[i]) {
+                    frameCounts[i] = writers[i]->frames();
+                    finalized[i] = writers[i]->finishForPublication(errors[i]);
+                    const DWORD attributes = !finalized[i] && frameCounts[i] ? GetFileAttributesW(temporaryNamesIO[i]->c_str()) : INVALID_FILE_ATTRIBUTES;
+                    partial[i] = attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
+                }
+                struct Report { std::wstring first, message; std::vector<std::wstring> paths; bool error = false; };
+                std::array<Report, 4> reports;
+                // Prepare every possible publication result before the first
+                // rename. A later writer's allocation failure can then report
+                // the first saved movie and the second retained movie without
+                // allocating or losing the identity-bound ownership guards.
+                for (size_t mask = 0; mask < reports.size(); ++mask) {
+                    auto& report = reports[mask];
+                    report.error = !reason.empty();
+                    report.message = reason;
+                    for (size_t i = 0; i < writers.size(); ++i) {
+                        if (!report.message.empty()) report.message += L" ";
+                        report.message += i == 0 ? L"Desktop: " : L"Camera: ";
+                        if (finalized[i]) {
+                            const bool renamed = (mask & (size_t(1) << i)) != 0;
+                            const auto& path = *(renamed ? finalNames[i] : temporaryNames[i]);
+                            report.paths.push_back(path);
+                            report.message += renamed ? L"saved " : L"could not publish the final filename; finished video remains at ";
+                            report.message += path + L" (" + std::to_wstring(frameCounts[i]) + L" frames).";
+                            report.error |= !renamed;
+                        } else if (frameCounts[i]) {
+                            report.error = true;
+                            report.message += L"could not finish video: " + errors[i];
+                            if (partial[i]) report.message += L" Partial file: " + *temporaryNames[i];
+                        } else {
+                            report.message += L"no frames saved.";
+                            report.error |= writing && !reason.empty();
+                        }
+                    }
+                    if (!report.paths.empty()) report.first = report.paths.front();
+                }
+                size_t publicationMask = 0;
+                for (size_t i = 0; i < writers.size(); ++i) if (finalized[i]) {
+                    try {
+                        if (writers[i]->publish(*finalNamesIO[i]) == ERROR_SUCCESS) publicationMask |= size_t(1) << i;
+                    } catch (const std::exception&) {
+                        // publish() allocates only before its native rename.
+                        // Both finalized files are still accurately described
+                        // by the precomputed retained-file result for this bit.
+                    }
+                }
+                auto& report = reports[publicationMask];
+                std::lock_guard<std::mutex> lock(mutex_);
+                stop_ = pauseRequested_ = pauseTarget_ = false;
+                status_.state = State::Idle; status_.elapsed = elapsed;
+                status_.frames = std::min(frameCounts[0], frameCounts[1]);
+                status_.error = status_.recordingFailed = report.error;
+                status_.savedPath.swap(report.first); status_.savedPaths.swap(report.paths); status_.message.swap(report.message);
+                if (encoder) encoder->releasePublication();
+                if (cameraEncoder) cameraEncoder->releasePublication();
+                writing = cameraWriting = pending = paused = false; previewProblem_ = false;
+                desktop = {}; webcam = {}; composed = {}; cameraComposed = {};
+                power.update(false, false);
+                return;
+            }
             std::wstring error;
             const bool finalized = writing && encoder->finishForPublication(error);
             bool ok = !writing;
             std::wstring savedPath, message;
+            std::vector<std::wstring> savedPaths;
             if (finalized) {
                 // Prepare every allocating success update before publishing the
                 // file. Once renamed, status publication below cannot allocate.
                 savedPath = finalPath;
+                savedPaths.push_back(finalPath);
                 message = reason.empty() ? L"Saved: " + finalPath : reason + L" Captured frames were saved.";
                 const DWORD renameError = encoder->publish(finalPathIO);
                 ok = renameError == ERROR_SUCCESS;
                 if (!ok) {
                     savedPath = temporary;
+                    savedPaths.front() = temporary;
                     message = L"Video finished, but could not rename it. Finished video remains at: " + temporary + L". " + errorText(HRESULT_FROM_WIN32(renameError));
                 }
             } else if (writing) {
@@ -176,7 +258,7 @@ void Engine::run() {
             status_.recordingFailed = status_.error;
             // Finalize and rename remain separate outcomes: a failed rename
             // advertises the complete playable movie at its temporary filename.
-            if (finalized) status_.savedPath.swap(savedPath);
+            if (finalized) { status_.savedPath.swap(savedPath); status_.savedPaths.swap(savedPaths); }
             status_.message.swap(message);
             if (encoder) encoder->releasePublication();
             writing = pending = paused = false; previewProblem_ = false;
@@ -245,13 +327,14 @@ void Engine::run() {
                 if (start) {
                     previewOnlyWork = false;
                     session.emplace(cfg); pending = true; elapsed = 0;
+                    if (cfg.separateFiles) { desktopLayers = preset(Mode::Desktop); cameraLayers = preset(Mode::Camera); }
                     nextFrame = now;
                     retryFrameAt = Clock::time_point::min();
                 }
                 if (stop && (pending || writing)) { previewOnlyWork = false; closeRecording(L""); continue; }
                 if (pauseRequested && writing && paused != pauseTarget) {
                     paused = pauseTarget;
-                    const bool desktopNeeded = std::any_of(cfg.layers.begin(), cfg.layers.end(),
+                    const bool desktopNeeded = (session && session->separateFiles) || std::any_of(cfg.layers.begin(), cfg.layers.end(),
                         [](const Layer& layer) { return layer.source == Source::Desktop; });
                     power.update(!paused, desktopNeeded);
                     if (!paused) { nextFrame = now; retryFrameAt = Clock::time_point::min(); }
@@ -259,20 +342,21 @@ void Engine::run() {
                     status_.state = paused ? State::Paused : State::Recording;
                     status_.elapsed = elapsed;
                     if (!previewProblem_)
-                        status_.message = paused ? L"Paused. Resume when you are ready." : L"Recording. You can adjust the collage live.";
+                        status_.message = paused ? L"Paused. Resume when you are ready." : recordingMessage(session && session->separateFiles);
                 }
                 const bool captureDue = pending || (writing && !paused && now >= nextFrame);
                 previewOnlyWork = !captureDue;
                 if (writing || pending) {
-                    session->layers = cfg.layers; session->preview = cfg.preview;
+                    if (!session->separateFiles) session->layers = cfg.layers;
+                    session->preview = cfg.preview;
                     cfg = *session;
                 }
-                bool needCamera = false, needDesktop = false;
+                bool needCamera = cfg.separateFiles, needDesktop = cfg.separateFiles;
                 for (auto& layer : cfg.layers) { needCamera |= layer.source == Source::Camera; needDesktop |= layer.source == Source::Desktop; }
                 power.update(writing && !paused, needDesktop);
                 const bool active = pending || (writing && !paused) || cfg.preview;
                 if (!cfg.preview) previewBuffer.reset();
-                if (!active) { desktop = {}; webcam = {}; composed = {}; }
+                if (!active) { desktop = {}; webcam = {}; composed = {}; cameraComposed = {}; }
                 else {
                     if (!needDesktop) desktop = {};
                     if (!needCamera) webcam = {};
@@ -330,7 +414,10 @@ void Engine::run() {
                 }
                 int width = captureDue ? cfg.width : 640, height = captureDue ? cfg.height : 360;
                 if (needDesktop && ready) ready = captureMonitor(cfg.monitorId, width, height, true, desktop, error);
-                if (ready) ready = compose(needDesktop ? &desktop : nullptr, needCamera ? &webcam : nullptr, cfg.layers,
+                if (ready && captureDue && cfg.separateFiles) {
+                    ready = compose(&desktop, nullptr, desktopLayers, width, height, composed, error) &&
+                        compose(nullptr, &webcam, cameraLayers, width, height, cameraComposed, error);
+                } else if (ready) ready = compose(needDesktop ? &desktop : nullptr, needCamera ? &webcam : nullptr, cfg.layers,
                     width, height, captureDue ? composed : preparePreviewBuffer(), error);
                 if (!ready) {
                     // Also allow warmup after resuming with preview disabled:
@@ -361,19 +448,39 @@ void Engine::run() {
                     wchar_t name[100];
                     swprintf_s(name, L"Timelapse-%04u%02u%02u-%02u%02u%02u-%03u-%lu", t.wYear,t.wMonth,t.wDay,t.wHour,t.wMinute,t.wSecond,t.wMilliseconds,GetCurrentProcessId());
                     auto base = (std::filesystem::path(cfg.folder) / name).wstring();
-                    temporary = base + L".recording.mp4"; finalPath = base + L".mp4";
+                    const auto desktopBase = cfg.separateFiles ? base + L"-desktop" : base;
+                    temporary = desktopBase + L".recording.mp4"; finalPath = desktopBase + L".mp4";
                     // Cache I/O spellings before opening: successful save
                     // publication must not allocate after the file is renamed.
                     temporaryIO = fileIOPath(temporary); finalPathIO = fileIOPath(finalPath);
+                    if (cfg.separateFiles) {
+                        cameraTemporary = base + L"-camera.recording.mp4"; cameraFinalPath = base + L"-camera.mp4";
+                        cameraTemporaryIO = fileIOPath(cameraTemporary); cameraFinalPathIO = fileIOPath(cameraFinalPath);
+                    }
                     if (!encoder) encoder.emplace();
-                    if (!encoder->open(temporaryIO, cfg.width, cfg.height, 30, error, cfg.encodingQuality, cfg.encodingMode)) { closeRecording(L"Cannot start recording: " + error); continue; }
-                    writing = true; pending = false;
+                    if (!encoder->open(temporaryIO, cfg.width, cfg.height, 30, error, cfg.encodingQuality, cfg.encodingMode)) {
+                        closeRecording((cfg.separateFiles ? L"Cannot start desktop recording: " : L"Cannot start recording: ") + error); continue;
+                    }
+                    writing = true;
+                    if (cfg.separateFiles) {
+                        if (!cameraEncoder) cameraEncoder.emplace();
+                        if (!cameraEncoder->open(cameraTemporaryIO, cfg.width, cfg.height, 30, error, cfg.encodingQuality, cfg.encodingMode)) {
+                            closeRecording(L"Cannot start camera recording: " + error); continue;
+                        }
+                        cameraWriting = true;
+                    }
+                    pending = false;
                     power.update(true, needDesktop);
                     std::lock_guard<std::mutex> lock(mutex_);
-                    status_.state = State::Recording; status_.error = false; status_.message = L"Recording. You can adjust the collage live.";
+                    status_.state = State::Recording; status_.error = false; status_.message = recordingMessage(cfg.separateFiles);
                 }
                 if (captureDue && writing && !paused) {
-                    if (!encoder->write(composed, error)) { closeRecording(L"Recording stopped: " + error); continue; }
+                    if (!encoder->write(composed, error)) {
+                        closeRecording((cfg.separateFiles ? L"Desktop recording stopped: " : L"Recording stopped: ") + error); continue;
+                    }
+                    if (cfg.separateFiles && !cameraEncoder->write(cameraComposed, error)) {
+                        closeRecording(L"Camera recording stopped: " + error); continue;
+                    }
                     const auto interval = std::chrono::seconds(std::clamp(cfg.interval, 1, 3600));
                     do { nextFrame += interval; } while (nextFrame <= Clock::now());
                     std::lock_guard<std::mutex> lock(mutex_);
@@ -403,7 +510,7 @@ void Engine::run() {
                   if (previewProblem_) {
                       status_.error = false;
                       status_.message = writing
-                          ? paused ? L"Paused. Resume when you are ready." : L"Recording. You can adjust the collage live."
+                          ? paused ? L"Paused. Resume when you are ready." : recordingMessage(cfg.separateFiles)
                           : L"Ready to record.";
                       previewProblem_ = false;
                   } }
@@ -429,6 +536,7 @@ void Engine::run() {
                     // allocate. Still release the encoder and leave a retryable
                     // state; the .recording.mp4 file may contain saved frames.
                     try { if (encoder) { std::wstring ignored; encoder->finish(ignored); } } catch (...) {}
+                    try { if (cameraEncoder) { std::wstring ignored; cameraEncoder->finish(ignored); } } catch (...) {}
                     std::lock_guard<std::mutex> lock(mutex_);
                     if (!start_) {
                         previewProblem_ = false;
@@ -439,8 +547,8 @@ void Engine::run() {
                 }
                 if (camera) camera->stop();
                 cameraRunning = false;
-                writing = pending = paused = false;
-                desktop = {}; webcam = {}; composed = {}; previewBuffer.reset();
+                writing = cameraWriting = pending = paused = false;
+                desktop = {}; webcam = {}; composed = {}; cameraComposed = {}; previewBuffer.reset();
                 power.update(false, false);
                 std::unique_lock<std::mutex> lock(mutex_);
                 previewProblem_ = false;

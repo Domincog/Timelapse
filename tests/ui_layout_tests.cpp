@@ -182,6 +182,11 @@ void checkLayout(){
     require(!intersects(bounds(app.finish),bounds(app.openFolder)),"Finish overlaps Open folder.");
     require(!intersects(bounds(app.monitor),bounds(app.camera)) && !intersects(bounds(app.camera),bounds(app.encodingMode)) &&
             !intersects(bounds(app.encodingMode),bounds(app.refresh)),"Source or encoding controls overlap.");
+    HDC textDc=GetDC(app.mode);auto oldFont=SelectObject(textDc,app.font);SIZE labelSize{};
+    GetTextExtentPoint32W(textDc,SeparateFilesLabel,static_cast<int>(std::wcslen(SeparateFilesLabel)),&labelSize);
+    SelectObject(textDc,oldFont);ReleaseDC(app.mode,textDc);
+    const RECT modeBounds=bounds(app.mode);
+    require(labelSize.cx+GetSystemMetricsForDpi(SM_CXVSCROLL,app.dpi)+app.scale(12)<=modeBounds.right-modeBounds.left,"Separate-files label truncates in the selected source control.");
     const auto preview=bounds(app.preview);
     require(preview.bottom-preview.top>=app.scale(160),"Preview is unusably short.");
     RECT local{};GetClientRect(app.preview,&local);require(equal(app.videoRect,previewVideoRect(local)),"Hit-test geometry was left waiting for paint.");

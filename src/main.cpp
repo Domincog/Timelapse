@@ -22,6 +22,13 @@ namespace {
 constexpr COLORREF Ink = RGB(25, 38, 45), Muted = RGB(88, 106, 113), Accent = RGB(0, 116, 113);
 constexpr COLORREF Background = RGB(247, 249, 250), Canvas = RGB(21, 28, 34);
 enum Id { ModeBox = 100, IntervalBox, SizeBox, EncodingQualityBox, MonitorBox, CameraBox, Refresh, Record, Pause, Finish, Folder, OpenFolder, Reset, Forward, Preview, EncodingModeBox };
+constexpr int SeparateFilesMode = 5;
+constexpr wchar_t SeparateFilesLabel[] = L"Desktop + camera (2 files)";
+constexpr UINT TrayMessage = WM_APP + 1, ShowExistingMessage = WM_APP + 2;
+constexpr UINT TrayShow = 4001, TrayPause = 4002, TrayFinish = 4003, TrayExit = 4004;
+constexpr UINT ExitSystemCommand = 0x1000;
+constexpr wchar_t InstanceMutexName[] = L"Local\\Timelapse.Application.{DC32D155-1B8D-4880-9902-CE6245D34923}";
+constexpr wchar_t SetupMutexName[] = L"Local\\Timelapse.Setup.{DC32D155-1B8D-4880-9902-CE6245D34923}";
 struct App {
     HWND window{}, preview{}, statusText{}, tooltip{};
     HWND mode{}, interval{}, videoSize{}, encodingQuality{}, encodingMode{}, monitor{}, camera{}, refresh{}, record{}, pause{}, finish{}, folder{}, openFolder{}, reset{}, forward{};
@@ -33,6 +40,10 @@ struct App {
     bool dragging = false, resizing = false, closeWhenDone = false, inspectUI = false;
     bool layingOut = false;
     bool startupComplete = false;
+    bool hiddenToTray = false, trayRegistered = false, trayNoticeShown = false, trayVersion4 = false;
+    UINT taskbarCreated = 0;
+    std::wstring trayTooltip;
+    HICON trayIcons[5]{};
     int contentWidth = 0, contentHeight = 0, scrollX = 0, scrollY = 0;
     int wheelVertical = 0, wheelHorizontal = 0;
     POINT dragStart{};
@@ -46,8 +57,9 @@ struct App {
     std::wstring preferences, selectedMonitorId;
     int scale(int value) const { return MulDiv(value, dpi, 96); }
     bool active() const { return status.state != State::Idle; }
-    ~App() { DeleteObject(font); DeleteObject(titleFont); DeleteObject(smallFont); DeleteObject(background); }
+    ~App() { for(auto icon:trayIcons)if(icon)DestroyIcon(icon);DeleteObject(font); DeleteObject(titleFont); DeleteObject(smallFont); DeleteObject(background); }
 } app;
+void removeTray();
 
 struct MediaRuntime {
     MediaRuntime() = default;
@@ -59,6 +71,7 @@ struct MediaRuntime {
         // Join the worker before releasing its media runtime, including when
         // startup or message retrieval exits without receiving WM_DESTROY.
         app.engine.reset();
+        removeTray();
         if (SUCCEEDED(media)) MFShutdown();
         if (SUCCEEDED(com)) CoUninitialize();
     }
@@ -119,7 +132,7 @@ HWND control(LPCWSTR cls, LPCWSTR name, DWORD style, int id) {
 void add(HWND box, const std::wstring& value) { SendMessageW(box, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(value.c_str())); }
 int choice(HWND box) { return static_cast<int>(SendMessageW(box,CB_GETCURSEL,0,0)); }
 void choose(HWND box, int i) { SendMessageW(box, CB_SETCURSEL, i, 0); }
-bool hasSource(Source source) { for (auto& l : app.settings.layers) if (l.source == source) return true; return false; }
+bool hasSource(Source source) { if(app.settings.separateFiles)return true;for (auto& l : app.settings.layers) if (l.source == source) return true; return false; }
 bool sameSourceId(const std::wstring& a, const std::wstring& b) {
     return !a.empty() && !b.empty() && CompareStringOrdinal(a.c_str(),-1,b.c_str(),-1,TRUE)==CSTR_EQUAL;
 }
@@ -143,7 +156,7 @@ void configure() {
     } else app.settings.monitor = {};
     app.settings.monitorId = app.selectedMonitorId;
     if (c >= 0 && c < static_cast<int>(app.cameras.size())) app.settings.cameraId = app.cameras[c].id;
-    app.settings.preview = !IsIconic(app.window);
+    app.settings.preview = !app.hiddenToTray && !IsIconic(app.window);
     if (app.engine) app.engine->configure(app.settings);
 }
 void refreshSources() {
@@ -183,17 +196,99 @@ void updateControls() {
     EnableWindow(app.pause,app.status.state==State::Recording || app.status.state==State::Paused);
     EnableWindow(app.finish,app.status.state==State::Starting || app.status.state==State::Recording || app.status.state==State::Paused);
     SetWindowTextW(app.pause,app.status.state==State::Paused ? L"&Resume" : L"&Pause");
-    bool collage = app.settings.layers.size() > 1;
+    bool collage = !app.settings.separateFiles && app.settings.layers.size() > 1;
     EnableWindow(app.reset,collage); EnableWindow(app.forward,collage && app.selected>=0);
 }
 void changeLayout(bool reset) {
     app.modeIndex = choice(app.mode);
+    app.settings.separateFiles = app.modeIndex == SeparateFilesMode;
     if (reset || app.modeIndex != static_cast<int>(Mode::Custom) || app.settings.layers.size() < 2) {
-        app.settings.layers = preset(static_cast<Mode>(app.modeIndex));
+        app.settings.layers = preset(app.settings.separateFiles ? Mode::SideBySide : static_cast<Mode>(app.modeIndex));
         // Custom edits retain their preset; a newly seeded collage starts over.
         app.collagePreset = app.modeIndex == static_cast<int>(Mode::SideBySide) ? Mode::SideBySide : Mode::Overlay;
     }
     app.selected = -1; configure(); if(app.engine && !app.active())app.engine->refreshSources(); updateControls(); InvalidateRect(app.preview,nullptr,FALSE);
+}
+HICON trayIcon(int state) {
+    if(app.trayIcons[state])return app.trayIcons[state];
+    // The colored circle remains recognizable at the notification area's size.
+    const COLORREF colors[]={RGB(70,100,110),RGB(210,60,50),RGB(220,156,30),RGB(40,126,187),RGB(160,40,40)};
+    BITMAPINFO info{};info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);info.bmiHeader.biWidth=16;
+    info.bmiHeader.biHeight=-16;info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;info.bmiHeader.biCompression=BI_RGB;
+    void* bits=nullptr;HBITMAP color=CreateDIBSection(nullptr,&info,DIB_RGB_COLORS,&bits,nullptr,0);
+    const BYTE maskBits[32]{};HBITMAP mask=CreateBitmap(16,16,1,1,maskBits);
+    if(color && mask && bits) {
+        auto pixels=static_cast<DWORD*>(bits);const auto c=colors[state];
+        for(int y=0;y<16;++y)for(int x=0;x<16;++x){const int dx=2*x-15,dy=2*y-15;
+            pixels[y*16+x]=dx*dx+dy*dy<=169 ? 0xff000000u|(DWORD(GetRValue(c))<<16)|(DWORD(GetGValue(c))<<8)|GetBValue(c) : 0;}
+        ICONINFO icon{};icon.fIcon=TRUE;icon.hbmColor=color;icon.hbmMask=mask;app.trayIcons[state]=CreateIconIndirect(&icon);
+    }
+    if(color)DeleteObject(color);if(mask)DeleteObject(mask);
+    return app.trayIcons[state] ? app.trayIcons[state] : LoadIconW(nullptr,IDI_APPLICATION);
+}
+bool updateTray(bool addIcon=false) {
+    if(!app.trayRegistered && !addIcon)return false;
+    if(addIcon && !app.taskbarCreated){app.taskbarCreated=RegisterWindowMessageW(L"TaskbarCreated");if(!app.taskbarCreated)return false;}
+    const wchar_t* state=app.status.state==State::Recording?L"Recording":app.status.state==State::Paused?L"Paused":
+        app.status.state==State::Starting?L"Preparing":app.status.state==State::Finishing?L"Saving":app.status.recordingFailed?L"Recording failed":L"Ready";
+    std::wstring tip=L"Timelapse - ";tip+=state;
+    if(app.active())tip+=app.settings.separateFiles?L" - desktop + camera files":L"";
+    if(!addIcon && tip==app.trayTooltip)return true;
+    const int icon=app.status.recordingFailed&&!app.active()?4:app.status.state==State::Recording?1:app.status.state==State::Paused?2:app.active()?3:0;
+    NOTIFYICONDATAW data{sizeof(data)};data.hWnd=app.window;data.uID=1;data.uFlags=NIF_MESSAGE|NIF_ICON|NIF_TIP|NIF_SHOWTIP;
+    data.uCallbackMessage=TrayMessage;data.hIcon=trayIcon(icon);wcscpy_s(data.szTip,tip.c_str());
+    if(!Shell_NotifyIconW(addIcon?NIM_ADD:NIM_MODIFY,&data)){
+        Shell_NotifyIconW(NIM_DELETE,&data);app.trayRegistered=false;app.trayVersion4=false;app.trayTooltip.clear();return false;
+    }
+    app.trayRegistered=true;app.trayTooltip=std::move(tip);
+    if(addIcon){data.uVersion=NOTIFYICON_VERSION_4;app.trayVersion4=Shell_NotifyIconW(NIM_SETVERSION,&data)!=FALSE;}
+    return true;
+}
+void removeTray() {
+    if(app.trayRegistered){NOTIFYICONDATAW data{sizeof(data)};data.hWnd=app.window;data.uID=1;Shell_NotifyIconW(NIM_DELETE,&data);}
+    app.trayRegistered=false;app.trayVersion4=false;app.trayTooltip.clear();
+}
+void showWindow() {
+    app.hiddenToTray=false;ShowWindow(app.window,SW_RESTORE);SetForegroundWindow(app.window);
+    if(app.engine)configure();
+}
+bool hideToTray() {
+    app.status=app.engine->status();
+    if(!updateTray(!app.trayRegistered)) {
+        showWindow();
+        MessageBoxW(app.window,L"Windows could not add Timelapse to the system tray. The window will stay open so you can control your recording.",L"Timelapse",MB_OK|MB_ICONWARNING);
+        return false;
+    }
+    app.hiddenToTray=true;configure();ShowWindow(app.window,SW_HIDE);
+    if(!app.trayNoticeShown) {
+        NOTIFYICONDATAW data{sizeof(data)};data.hWnd=app.window;data.uID=1;data.uFlags=NIF_INFO;data.dwInfoFlags=NIIF_INFO;
+        wcscpy_s(data.szInfoTitle,L"Timelapse is in the system tray");
+        wcscpy_s(data.szInfo,L"Recording continues when this window is closed. Right-click the tray icon to show Timelapse, finish, or exit.");
+        Shell_NotifyIconW(NIM_MODIFY,&data);app.trayNoticeShown=true;
+    }
+    return true;
+}
+void exitApplication() {
+    if(app.closeWhenDone)return;
+    app.status=app.engine->status();
+    if(app.active()) {
+        if(MessageBoxW(app.window,L"Finish the current recording and exit Timelapse?",L"Finish recording",MB_OKCANCEL|MB_ICONQUESTION)!=IDOK)return;
+        app.closeWhenDone=true;app.engine->finish();EnableWindow(app.window,FALSE);
+    } else DestroyWindow(app.window);
+}
+void trayMenu(POINT at={},bool usePoint=false) {
+    app.status=app.engine->status();updateControls();
+    HMENU menu=CreatePopupMenu();if(!menu){showWindow();return;}
+    AppendMenuW(menu,MF_STRING,TrayShow,L"&Show Timelapse");
+    const bool pauseAllowed=!app.closeWhenDone&&(app.status.state==State::Recording||app.status.state==State::Paused);
+    AppendMenuW(menu,MF_STRING|(pauseAllowed?MF_ENABLED:MF_GRAYED),TrayPause,app.status.state==State::Paused?L"&Resume recording":L"&Pause recording");
+    const bool finishAllowed=!app.closeWhenDone&&(pauseAllowed||app.status.state==State::Starting);
+    AppendMenuW(menu,MF_STRING|(finishAllowed?MF_ENABLED:MF_GRAYED),TrayFinish,L"&Finish recording");
+    AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING|(app.closeWhenDone?MF_GRAYED:MF_ENABLED),TrayExit,L"E&xit Timelapse");
+    SetMenuDefaultItem(menu,TrayShow,FALSE);if(!usePoint)GetCursorPos(&at);SetForegroundWindow(app.window);
+    const UINT command=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,at.x,at.y,0,app.window,nullptr);
+    DestroyMenu(menu);PostMessageW(app.window,WM_NULL,0,0);
+    if(command)SendMessageW(app.window,WM_COMMAND,command,0);
 }
 void endLayoutDrag() {
     // Keep the last applied edit, but never reuse a pointer origin after the
@@ -456,6 +551,7 @@ RECT layerRect(const Layer& l) {
     return {app.videoRect.left+static_cast<LONG>(l.rect.x*width),app.videoRect.top+static_cast<LONG>(l.rect.y*height),app.videoRect.left+static_cast<LONG>((l.rect.x+l.rect.w)*width),app.videoRect.top+static_cast<LONG>((l.rect.y+l.rect.h)*height)};
 }
 void customized() {
+    app.settings.separateFiles=false;
     app.modeIndex=static_cast<int>(Mode::Custom); choose(app.mode,app.modeIndex);
     configure(); updateControls(); InvalidateRect(app.preview,nullptr,FALSE);
 }
@@ -477,7 +573,7 @@ LRESULT CALLBACK previewProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
             RECT hint=app.videoRect; InflateRect(&hint,-app.scale(30),-app.scale(24));
             text(mem,hasSource(Source::Camera)?L"Waiting for camera preview...":L"Preparing desktop preview...",hint,RGB(192,205,212),app.font,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
         }
-        if(app.settings.layers.size()>1) for(size_t i=0;i<app.settings.layers.size();++i) {
+        if(!app.settings.separateFiles && app.settings.layers.size()>1) for(size_t i=0;i<app.settings.layers.size();++i) {
             RECT layer=layerRect(app.settings.layers[i]);
             bool selected=static_cast<int>(i)==app.selected;
             HPEN pen=CreatePen(PS_SOLID,app.scale(selected?2:1),selected?RGB(83,229,205):RGB(160,180,185));
@@ -491,7 +587,7 @@ LRESULT CALLBACK previewProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         BitBlt(dc,0,0,r.right,r.bottom,mem,0,0,SRCCOPY);SelectObject(mem,old);DeleteObject(bmp);DeleteDC(mem);EndPaint(w,&ps);return 0;
     }
     case WM_LBUTTONDOWN: {
-        SetFocus(w); if(app.settings.layers.size()<2) return 0;
+        SetFocus(w); if(app.settings.separateFiles || app.settings.layers.size()<2) return 0;
         POINT p{GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};app.selected=-1;
         for(int i=static_cast<int>(app.settings.layers.size())-1;i>=0;--i) {RECT r=layerRect(app.settings.layers[i]);if(PtInRect(&r,p)){app.selected=i;app.dragStart=p;app.dragRect=app.settings.layers[i].rect;app.resizing=p.x>=r.right-app.scale(18)&&p.y>=r.bottom-app.scale(18);app.dragging=true;SetCapture(w);break;}}
         updateControls();InvalidateRect(w,nullptr,FALSE);return 0;
@@ -505,7 +601,7 @@ LRESULT CALLBACK previewProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
     case WM_LBUTTONUP: app.dragging=false;ReleaseCapture();return 0;
     case WM_CAPTURECHANGED: app.dragging=false;return 0;
     case WM_KEYDOWN:
-        if(app.settings.layers.size()>1) {
+        if(!app.settings.separateFiles && app.settings.layers.size()>1) {
             const bool arrow=wp==VK_LEFT||wp==VK_RIGHT||wp==VK_UP||wp==VK_DOWN;
             if(app.dragging && (wp==VK_SPACE || (app.selected>=0 && arrow))) {
                 // Commit the pointer gesture before changing selection or
@@ -524,7 +620,20 @@ LRESULT CALLBACK previewProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
 }
 
 LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
+    if(app.taskbarCreated && msg==app.taskbarCreated) {
+        app.trayRegistered=false;app.trayVersion4=false;app.trayTooltip.clear();
+        if(!updateTray(true) && app.hiddenToTray)showWindow();
+        return 0;
+    }
     switch(msg) {
+    case WM_SYSCOMMAND:if((wp&0xfff0)==ExitSystemCommand){exitApplication();return 0;}break;
+    case ShowExistingMessage:showWindow();return 0;
+    case TrayMessage: {
+        const UINT event=app.trayVersion4?LOWORD(lp):static_cast<UINT>(lp);
+        if(event==WM_LBUTTONUP || event==WM_LBUTTONDBLCLK || event==NIN_SELECT || event==NIN_KEYSELECT || event==NIN_BALLOONUSERCLICK)showWindow();
+        else if(event==WM_RBUTTONUP || event==WM_CONTEXTMENU){POINT at{GET_X_LPARAM(wp),GET_Y_LPARAM(wp)};trayMenu(at,app.trayVersion4 && !(at.x==-1 && at.y==-1));}
+        return 0;
+    }
     case WM_CREATE: {
         app.startupComplete=false;
         try {
@@ -540,7 +649,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
             app.labels[index]=requiredControl(L"STATIC",label,0,200+index);
             return requiredControl(L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL,id);
         };
-        app.mode=combo(0,L"&Source",ModeBox);for(auto s:{L"Desktop",L"Camera",L"Desktop + camera",L"Side by side",L"Custom collage"})add(app.mode,s);
+        app.mode=combo(0,L"&Source",ModeBox);for(auto s:{L"Desktop",L"Camera",L"Desktop + camera",L"Side by side",L"Custom collage",SeparateFilesLabel})add(app.mode,s);
         app.interval=combo(1,L"Capture &every",IntervalBox);for(auto s:{L"1 second",L"2 seconds",L"5 seconds",L"10 seconds",L"30 seconds",L"60 seconds"})add(app.interval,s);
         app.videoSize=combo(2,L"Video si&ze",SizeBox);add(app.videoSize,L"720p");add(app.videoSize,L"1080p");
         app.encodingQuality=combo(3,L"Video &quality",EncodingQualityBox);for(auto s:{L"Smaller file",L"Balanced",L"More detail"})add(app.encodingQuality,s);
@@ -562,6 +671,9 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));SendMessageW(app.tooltip,TTM_SETMAXTIPWIDTH,0,app.scale(520));
         tip.uId=reinterpret_cast<UINT_PTR>(app.encodingMode);
         tip.lpszText=const_cast<LPWSTR>(L"Efficient H.264 targets a bitrate with less CPU work. Quality H.264 and hardware modes preserve detail but can make large files when the scene changes a lot. Hardware modes need a supported GPU encoder; HEVC playback needs a compatible player or decoder. Compatible keeps the original settings.");
+        SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
+        tip.uId=reinterpret_cast<UINT_PTR>(app.mode);
+        tip.lpszText=const_cast<LPWSTR>(L"Separate files records full-frame desktop and camera videos together. The side-by-side preview is only for monitoring; each source has its own MP4.");
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
         preferences(false);refreshSources();changeLayout(true);
         try {
@@ -629,7 +741,9 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         return 0;
     }
     case WM_TIMER: {
-        auto before=app.status.preview;auto oldMessage=app.status.message;bool oldError=app.status.error;app.status=app.engine->status();updateControls();
+        auto before=app.status.preview;auto oldMessage=app.status.message;bool oldError=app.status.error;
+        const bool oldRecordingFailed=app.status.recordingFailed;app.status=app.engine->status();updateControls();
+        if(app.trayRegistered && !updateTray() && app.hiddenToTray)showWindow();
         if(oldMessage!=app.status.message)SetWindowTextW(app.statusText,app.status.message.c_str());
         if(oldError!=app.status.error)InvalidateRect(app.statusText,nullptr,TRUE);
         if(before!=app.status.preview)InvalidateRect(app.preview,nullptr,FALSE);
@@ -640,9 +754,11 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
             if(app.status.recordingFailed) {
                 // Keep the recovery path visible if saving failed while the
                 // user was waiting for Finish and close.
-                EnableWindow(w,TRUE);SetForegroundWindow(w);
+                EnableWindow(w,TRUE);showWindow();
                 MessageBoxW(w,app.status.message.c_str(),L"Timelapse could not finish normally",MB_OK|MB_ICONERROR);
             } else DestroyWindow(w);
+        } else if(app.hiddenToTray && !oldRecordingFailed && app.status.recordingFailed) {
+            showWindow();MessageBoxW(w,app.status.message.c_str(),L"Timelapse could not finish normally",MB_OK|MB_ICONERROR);
         }return 0;
     }
     case WM_COMMAND: {
@@ -661,6 +777,10 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
             InvalidateRect(w,nullptr,FALSE);return 0;
         }
         switch(id) {
+        case TrayShow:showWindow();break;
+        case TrayPause:if(!app.closeWhenDone && (app.status.state==State::Recording || app.status.state==State::Paused))app.engine->setPaused(app.status.state!=State::Paused);break;
+        case TrayFinish:if(!app.closeWhenDone)app.engine->finish();break;
+        case TrayExit:exitApplication();break;
         case Refresh:refreshSources();app.engine->refreshSources();updateControls();break;
         case Record:configure();if(hasRequiredSources())app.engine->record();app.status=app.engine->status();updateControls();break;
         case Pause:app.engine->setPaused(app.status.state!=State::Paused);break;
@@ -676,8 +796,8 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
             }
             break;
         }
-        case Reset:choose(app.mode,static_cast<int>(app.collagePreset));changeLayout(false);break;
-        case Forward:if(app.selected>=0){auto layer=app.settings.layers[app.selected];app.settings.layers.erase(app.settings.layers.begin()+app.selected);app.settings.layers.push_back(layer);app.selected=static_cast<int>(app.settings.layers.size())-1;customized();}break;
+        case Reset:if(!app.settings.separateFiles){choose(app.mode,static_cast<int>(app.collagePreset));changeLayout(false);}break;
+        case Forward:if(!app.settings.separateFiles && app.selected>=0){auto layer=app.settings.layers[app.selected];app.settings.layers.erase(app.settings.layers.begin()+app.selected);app.settings.layers.push_back(layer);app.selected=static_cast<int>(app.settings.layers.size())-1;customized();}break;
         }return 0;
     }
     case WM_NOTIFY:
@@ -693,7 +813,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         std::wstring state=app.status.state==State::Recording?L"●  RECORDING":app.status.state==State::Paused?L"Ⅱ  PAUSED":app.status.state==State::Starting?L"PREPARING":app.status.state==State::Finishing?L"SAVING":L"DESKTOP + CAMERA";
         text(dc,state,badge,app.status.state==State::Recording?Accent:Muted,app.smallFont,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
         RECT hint={p,r.bottom-app.scale(180),r.right-p-app.scale(251),r.bottom-app.scale(150)};
-        text(dc,app.settings.layers.size()>1?L"Drag a layer to move it. Pull its corner to resize.":L"Preview · your recording is saved at 30 fps",hint,Muted,app.smallFont);
+        text(dc,app.settings.separateFiles?L"Desktop and camera each save to their own MP4.":app.settings.layers.size()>1?L"Drag a layer to move it. Pull its corner to resize.":L"Preview · your recording is saved at 30 fps",hint,Muted,app.smallFont);
         RECT stats={p,r.bottom-app.scale(147),r.right-p,r.bottom-app.scale(123)};
         std::wstring detail;
         if(app.active() || app.status.frames)detail=std::to_wstring(app.status.frames)+L" frames  ·  "+timeText(double(app.status.frames)/30,false)+L" video  ·  "+timeText(app.status.elapsed,true)+L" recording";
@@ -703,16 +823,14 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         EndPaint(w,&ps);return 0;
     }
     case WM_CLOSE:
-        app.status=app.engine->status();
-        if(app.active()){if(MessageBoxW(w,L"Finish the current video and close Timelapse?",L"Finish recording",MB_OKCANCEL|MB_ICONQUESTION)!=IDOK)return 0;app.closeWhenDone=true;app.engine->finish();EnableWindow(w,FALSE);return 0;}
-        DestroyWindow(w);return 0;
+        hideToTray();return 0;
     case WM_QUERYENDSESSION: return TRUE;
     case WM_ENDSESSION:
         // Confirmed session shutdown reaches WM_DESTROY and joins the engine,
         // giving the encoder a chance to finalize before Windows terminates us.
         if(wp)DestroyWindow(w);
         return 0;
-    case WM_DESTROY:KillTimer(w,1);if(app.startupComplete)preferences(true);app.startupComplete=false;app.engine.reset();PostQuitMessage(0);return 0;
+    case WM_DESTROY:removeTray();KillTimer(w,1);if(app.startupComplete)preferences(true);app.startupComplete=false;app.engine.reset();PostQuitMessage(0);return 0;
     }
     return DefWindowProcW(w,msg,wp,lp);
 }
@@ -726,6 +844,7 @@ void dispatchAppMessage(HWND window,MSG& msg) {
        (msg.message==WM_KEYDOWN && msg.wParam==VK_TAB)))revealFocusedControl();
 }
 int runGui(HINSTANCE instance,int show,bool& windowCreationFailed) {
+    struct InstanceHandle {HANDLE value{};~InstanceHandle(){if(value)CloseHandle(value);}} instanceHandle;
     const MediaRuntime runtime;
     if(FAILED(runtime.com) || FAILED(runtime.media)) {
         const bool comFailed=FAILED(runtime.com);
@@ -743,9 +862,32 @@ int runGui(HINSTANCE instance,int show,bool& windowCreationFailed) {
     }
     int argumentCount=0;
     if(auto arguments=CommandLineToArgvW(GetCommandLineW(),&argumentCount)) {
-        for(int i=1;i<argumentCount;++i)if(std::wcscmp(arguments[i],L"--inspect-ui")==0)app.inspectUI=true;
+        for(int i=1;i<argumentCount;++i){if(std::wcscmp(arguments[i],L"--inspect-ui")==0)app.inspectUI=true;
+            else if(std::wcscmp(arguments[i],L"--tray")==0)app.hiddenToTray=true;}
         LocalFree(arguments);
     }
+    // One GUI owns both the tray icon and the installed app's running marker.
+    // Camera helper processes return before reaching this path.
+    auto setupRunning=[] {
+        HANDLE setup=OpenMutexW(SYNCHRONIZE,FALSE,SetupMutexName);
+        if(setup){CloseHandle(setup);return true;}
+        return GetLastError()!=ERROR_FILE_NOT_FOUND;
+    };
+    auto setupMessage=[] {MessageBoxW(nullptr,L"Timelapse setup is running. Finish installing or uninstalling, then open Timelapse.",L"Timelapse",MB_OK|MB_ICONINFORMATION);};
+    if(setupRunning()){setupMessage();return 1;}
+    const HANDLE mutex=CreateMutexW(nullptr,FALSE,InstanceMutexName);
+    const DWORD mutexError=GetLastError();instanceHandle.value=mutex;
+    if(!mutex) {
+        MessageBoxW(nullptr,L"Timelapse could not reserve its application instance. Close any other Timelapse window and try again.",L"Timelapse",MB_OK|MB_ICONERROR);return 1;
+    }
+    if(setupRunning()){setupMessage();return 1;}
+    if(mutexError==ERROR_ALREADY_EXISTS) {
+        if(app.hiddenToTray)return 0; // Logon startup must not raise an existing recording window.
+        const HWND existing=FindWindowW(L"TimelapseWindow",nullptr);DWORD_PTR result=0;
+        if(existing && SendMessageTimeoutW(existing,ShowExistingMessage,0,0,SMTO_ABORTIFHUNG,2000,&result))return 0;
+        MessageBoxW(nullptr,L"Timelapse is already starting or is busy. Use its system tray icon, or try again in a moment.",L"Timelapse",MB_OK|MB_ICONINFORMATION);return 1;
+    }
+    app.taskbarCreated=RegisterWindowMessageW(L"TaskbarCreated");
     WNDCLASSEXW preview{sizeof(preview)};preview.lpfnWndProc=previewProc;preview.hInstance=instance;preview.hCursor=LoadCursorW(nullptr,IDC_ARROW);preview.lpszClassName=L"LapsePreview";RegisterClassExW(&preview);
     WNDCLASSEXW cls{sizeof(cls)};cls.lpfnWndProc=windowProc;cls.hInstance=instance;cls.hCursor=LoadCursorW(nullptr,IDC_ARROW);cls.hIcon=LoadIconW(nullptr,IDI_APPLICATION);cls.hbrBackground=app.background;cls.lpszClassName=L"TimelapseWindow";RegisterClassExW(&cls);
     app.dpi=static_cast<int>(GetDpiForSystem());
@@ -756,7 +898,11 @@ int runGui(HINSTANCE instance,int show,bool& windowCreationFailed) {
     const int height=std::min(app.scale(740),std::max(1,static_cast<int>(work.bottom-work.top)-2*margin));
     HWND window=CreateWindowExW(0,cls.lpszClassName,L"Timelapse",WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,work.left+(work.right-work.left-width)/2,work.top+(work.bottom-work.top-height)/2,width,height,nullptr,nullptr,instance,nullptr);
     if(!window){windowCreationFailed=true;return 1;}
-    ShowWindow(window,show);UpdateWindow(window);
+    if(const HMENU menu=GetSystemMenu(window,FALSE)){AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING,ExitSystemCommand,L"E&xit Timelapse");}
+    updateTray(true);
+    if(app.hiddenToTray && app.trayRegistered)ShowWindow(window,SW_HIDE);
+    else {app.hiddenToTray=false;ShowWindow(window,show==SW_HIDE?SW_SHOWNORMAL:show);configure();}
+    UpdateWindow(window);
     MSG msg{};
     BOOL messageResult=0;
     while((messageResult=GetMessageW(&msg,nullptr,0,0))>0) {

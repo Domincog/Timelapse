@@ -28,6 +28,11 @@ HWND dialogParent=nullptr;UINT dialogFlags=0;
 std::array<char,16> dialogCleanup{};size_t dialogCleanupSize=0;
 bool engineAlive=false,mediaStoppedAlive=false,invalidFolder=false,failWindow=false,loopError=false;
 bool normalDestroy=false,failPathCopy=false,failDiagnostic=false,failNextAllocation=false;
+bool mutexErrorPending=false;DWORD fixtureMutexError=ERROR_SUCCESS;
+int mutexOpens=0,mutexCreates=0,mutexCloses=0;
+bool setupPresent=false,setupRacing=false,instancePresent=false,instanceUnavailable=false;
+bool startInTray=false;int shows=0,lastShow=-1,existingSignals=0;
+bool markerClosedWithLiveEngine=false;
 std::array<char,16> cleanup{};size_t cleanupSize=0;
 std::array<wchar_t,1024> messageText{},debugText{};
 void capture(std::array<wchar_t,1024>& target,const wchar_t* text){
@@ -63,12 +68,22 @@ HWND WINAPI fakeWindow(DWORD,LPCWSTR,LPCWSTR,DWORD,int,int,int,int,HWND,HMENU,HI
     }
     createEngine();return reinterpret_cast<HWND>(1);
 }
-BOOL WINAPI fakeShow(HWND,int){return TRUE;}BOOL WINAPI fakeUpdate(HWND){return TRUE;}
+BOOL WINAPI fakeShow(HWND,int show){++shows;lastShow=show;return TRUE;}BOOL WINAPI fakeUpdate(HWND){return TRUE;}
 BOOL WINAPI fakeMessage(LPMSG msg,HWND,UINT,UINT){
     ++messages;if(loopError){if(failDiagnostic)failNextAllocation=true;return -1;}
     if(normalDestroy)destroyEngine();msg->message=WM_QUIT;msg->wParam=quitCode;return 0;
 }
-DWORD WINAPI fakeLastError(){++lastErrorReads;return ERROR_NOT_ENOUGH_MEMORY;}
+DWORD WINAPI fakeLastError(){if(std::exchange(mutexErrorPending,false))return fixtureMutexError;++lastErrorReads;return ERROR_NOT_ENOUGH_MEMORY;}
+HANDLE WINAPI fakeOpenMutex(DWORD,BOOL,LPCWSTR){++mutexOpens;mutexErrorPending=true;fixtureMutexError=ERROR_FILE_NOT_FOUND;return setupPresent||(setupRacing&&mutexOpens==2)?reinterpret_cast<HANDLE>(2):nullptr;}
+HANDLE WINAPI fakeCreateMutex(LPSECURITY_ATTRIBUTES,BOOL,LPCWSTR){++mutexCreates;mutexErrorPending=true;fixtureMutexError=instancePresent?ERROR_ALREADY_EXISTS:ERROR_SUCCESS;return reinterpret_cast<HANDLE>(1);}
+BOOL WINAPI fakeCloseHandle(HANDLE handle){++mutexCloses;if(handle==reinterpret_cast<HANDLE>(1)&&engineAlive)markerClosedWithLiveEngine=true;return TRUE;}
+HWND WINAPI fakeFindWindow(LPCWSTR,LPCWSTR){return instanceUnavailable?nullptr:reinterpret_cast<HWND>(3);}
+LRESULT WINAPI fakeSendTimeout(HWND,UINT,WPARAM,LPARAM,UINT,UINT,PDWORD_PTR){++existingSignals;return 1;}
+UINT WINAPI fakeRegisterMessage(LPCWSTR){return 0xc123;}
+BOOL WINAPI fakeTray(DWORD,PNOTIFYICONDATAW){return TRUE;}
+HBITMAP WINAPI fakeDib(HDC,const BITMAPINFO*,UINT,void**,HANDLE,DWORD){return nullptr;}
+HBITMAP WINAPI fakeBitmap(int,int,UINT,UINT,const void*){return nullptr;}
+HMENU WINAPI fakeSystemMenu(HWND,BOOL){return nullptr;}
 int WINAPI fakeDialog(HWND parent,LPCWSTR message,LPCWSTR,UINT flags){
     ++dialogs;dialogParent=parent;dialogFlags=flags;
     dialogComStops=comStops;dialogMediaStops=mediaStops;dialogEngineStops=engineStops;dialogEngineAlive=engineAlive;
@@ -83,7 +98,8 @@ UINT WINAPI fakeDpi(){return 96;}BOOL WINAPI fakePoint(LPPOINT p){*p={0,0};retur
 HMONITOR WINAPI fakeMonitor(POINT,DWORD){return reinterpret_cast<HMONITOR>(1);}
 BOOL WINAPI fakeMonitorInfo(HMONITOR,LPMONITORINFO info){info->rcMonitor=info->rcWork={0,0,1920,1080};return TRUE;}
 LPWSTR WINAPI fakeCommand(){static wchar_t command[]=L"synthetic.exe";return command;}
-LPWSTR* WINAPI fakeArguments(LPCWSTR,int* count){*count=0;return nullptr;}
+LPWSTR* WINAPI fakeArguments(LPCWSTR,int* count){static wchar_t exe[]=L"synthetic.exe",tray[]=L"--tray";static LPWSTR args[]={exe,tray};*count=startInTray?2:0;return startInTray?args:nullptr;}
+HLOCAL WINAPI fakeLocalFree(HLOCAL){return nullptr;}
 UINT WINAPI fakeProfileInt(LPCWSTR,LPCWSTR,INT,LPCWSTR){++profileCalls;throw std::runtime_error("Unexpected profile read");}
 DWORD WINAPI fakeProfileString(LPCWSTR,LPCWSTR,LPCWSTR,LPWSTR,DWORD,LPCWSTR){++profileCalls;throw std::runtime_error("Unexpected profile read");}
 BOOL WINAPI fakeProfileWrite(LPCWSTR,LPCWSTR,LPCWSTR,LPCWSTR){++profileCalls;throw std::runtime_error("Unexpected profile write");}
@@ -114,6 +130,16 @@ int runCameraHost(const wchar_t*){return helperResult;}
 #define UpdateWindow fakeUpdate
 #define GetMessageW fakeMessage
 #define GetLastError fakeLastError
+#define OpenMutexW fakeOpenMutex
+#define CreateMutexW fakeCreateMutex
+#define CloseHandle fakeCloseHandle
+#define FindWindowW fakeFindWindow
+#define SendMessageTimeoutW fakeSendTimeout
+#define RegisterWindowMessageW fakeRegisterMessage
+#define Shell_NotifyIconW fakeTray
+#define CreateDIBSection fakeDib
+#define CreateBitmap fakeBitmap
+#define GetSystemMenu fakeSystemMenu
 #define MessageBoxW fakeDialog
 #define OutputDebugStringW fakeDebug
 #define CreateSolidBrush fakeBrush
@@ -126,6 +152,7 @@ int runCameraHost(const wchar_t*){return helperResult;}
 #define GetMonitorInfoW fakeMonitorInfo
 #define GetCommandLineW fakeCommand
 #define CommandLineToArgvW fakeArguments
+#define LocalFree fakeLocalFree
 #define GetPrivateProfileIntW fakeProfileInt
 #define GetPrivateProfileStringW fakeProfileString
 #define WritePrivateProfileStringW fakeProfileWrite
@@ -144,6 +171,16 @@ int runCameraHost(const wchar_t*){return helperResult;}
 #undef UpdateWindow
 #undef GetMessageW
 #undef GetLastError
+#undef OpenMutexW
+#undef CreateMutexW
+#undef CloseHandle
+#undef FindWindowW
+#undef SendMessageTimeoutW
+#undef RegisterWindowMessageW
+#undef Shell_NotifyIconW
+#undef CreateDIBSection
+#undef CreateBitmap
+#undef GetSystemMenu
 #undef MessageBoxW
 #undef OutputDebugStringW
 #undef CreateSolidBrush
@@ -156,6 +193,7 @@ int runCameraHost(const wchar_t*){return helperResult;}
 #undef GetMonitorInfoW
 #undef GetCommandLineW
 #undef CommandLineToArgvW
+#undef LocalFree
 #undef GetPrivateProfileIntW
 #undef GetPrivateProfileStringW
 #undef WritePrivateProfileStringW
@@ -171,6 +209,10 @@ void reset(HRESULT com=S_OK,HRESULT media=S_OK){
     lastErrorReads=dialogComStops=dialogMediaStops=dialogEngineStops=0;
     forbidWindowFailureAllocation=residualWindowEngine=dialogEngineAlive=false;
     dialogParent=nullptr;dialogFlags=0;dialogCleanup={};dialogCleanupSize=0;
+    mutexOpens=mutexCreates=mutexCloses=0;setupPresent=setupRacing=instancePresent=instanceUnavailable=mutexErrorPending=false;
+    app.hiddenToTray=app.trayRegistered=false;app.taskbarCreated=0;app.trayTooltip.clear();
+    startInTray=false;shows=existingSignals=0;lastShow=-1;
+    markerClosedWithLiveEngine=false;
 }
 struct Outcome{int code;bool threw;bool unusedAllocation;};
 Outcome entry(bool direct=false){
@@ -185,6 +227,7 @@ bool order(const char* expected){const auto n=std::char_traits<char>::length(exp
 void clean(int com,int media,const char* events){
     require(comStops==com&&mediaStops==media&&!mediaStoppedAlive&&!app.engine&&order(events),"Initialization teardown ownership/order failed");
     require(profileCalls==0&&folderBuffers==0,"Probe touched profiles or leaked folder allocation");
+    require(!markerClosedWithLiveEngine,"Installer running marker was released before the recording engine joined");
 }
 void initialization(HRESULT com,HRESULT media,bool forbidAllocation=false){
     reset(com,media);failNextAllocation=forbidAllocation;const auto out=entry();
@@ -232,6 +275,14 @@ void diagnosticAllocation(bool direct=false){reset();loopError=failDiagnostic=tr
     std::cout<<"  diagnostic failure code="<<out.code<<" threw="<<out.threw<<" direct="<<direct<<" alloc="<<allocationFailures<<" stops="<<comStops<<','<<mediaStops<<" engine="<<engineAlive<<" order=";
     for(size_t i=0;i<cleanupSize;++i)std::cout<<cleanup[i];std::cout<<'\n';
     require(!out.threw&&out.code==1&&allocationFailures==1,"Actual message-error allocation failure was not contained");clean(1,1,"emc");fallback();}
+void installedLifecycle(int scenario) {
+    reset();setupPresent=scenario==0;setupRacing=scenario==1;instancePresent=scenario>=2&&scenario<=4;
+    instanceUnavailable=scenario==3;startInTray=scenario>=4;
+    const auto out=entry();require(!out.threw,"Installed lifecycle exception escaped");
+    if(scenario<2){require(out.code==1&&windows==0&&dialogs==1&&contains(L"setup is running")&&mutexCreates==(scenario==1?1:0),"Setup/app race did not refuse startup");clean(1,1,"mc");}
+    else if(scenario<=4){require(out.code==(scenario==3?1:0)&&windows==0&&mutexCreates==1&&mutexCloses==1&&existingSignals==(scenario==2?1:0),"Duplicate instance behavior changed");clean(1,1,"mc");}
+    else {require(out.code==27&&windows==1&&shows==1&&lastShow==SW_HIDE&&app.hiddenToTray&&!app.trayRegistered,"Tray startup became visible or leaked icon");clean(1,1,"emc");}
+}
 }
 void* operator new(size_t bytes){if(std::exchange(failNextAllocation,false)){++allocationFailures;throw std::bad_alloc();}if(void* p=std::malloc(bytes?bytes:1))return p;throw std::bad_alloc();}
 void* operator new[](size_t bytes){return ::operator new(bytes);}void operator delete(void* p)noexcept{std::free(p);}
@@ -260,5 +311,11 @@ int main(){
     test("actual error allocation is contained after engine/runtime cleanup",[]{diagnosticAllocation();});
     test("direct entry contains actual startup allocation",[]{pathAllocation(true);});
     test("direct entry contains actual error allocation",[]{diagnosticAllocation(true);});
+    test("setup blocks GUI startup",[]{installedLifecycle(0);});
+    test("setup racing application mutex blocks GUI startup",[]{installedLifecycle(1);});
+    test("second normal launch shows existing instance",[]{installedLifecycle(2);});
+    test("busy existing instance reports a recoverable startup message",[]{installedLifecycle(3);});
+    test("second tray launch never raises existing instance",[]{installedLifecycle(4);});
+    test("tray startup remains hidden and removes notification icon on exit",[]{installedLifecycle(5);});
     failNextAllocation=false;app.engine.reset();std::cout<<good<<'/'<<good+bad<<" passed; no real app window/COM/MF/profile/capture/input.\n";return bad?1:0;
 }

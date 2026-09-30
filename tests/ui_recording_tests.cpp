@@ -52,6 +52,8 @@ int WINAPI messageBox(HWND,LPCWSTR message,LPCWSTR title,UINT flags) {
 }
 BOOL WINAPI foreground(HWND) { ++foregroundCalls;return TRUE; }
 BOOL WINAPI destroy(HWND) { ++destroyCalls;return TRUE; }
+BOOL WINAPI show(HWND,int) { return TRUE; } // Keep every synthetic fixture hidden.
+BOOL WINAPI tray(DWORD,PNOTIFYICONDATAW) { return TRUE; } // No notification-area side effects.
 DWORD publishFile(HANDLE file,const std::wstring& path) {
     if(failRename)return ERROR_ACCESS_DENIED;
     const size_t nameBytes=path.size()*sizeof(wchar_t);
@@ -115,7 +117,11 @@ uint64_t Encoder::frames()const{return impl_->count;}
 #define MessageBoxW probe::messageBox
 #define SetForegroundWindow probe::foreground
 #define DestroyWindow probe::destroy
+#define ShowWindow probe::show
+#define Shell_NotifyIconW probe::tray
 #include "../src/main.cpp"
+#undef Shell_NotifyIconW
+#undef ShowWindow
 #undef DestroyWindow
 #undef SetForegroundWindow
 #undef MessageBoxW
@@ -139,18 +145,19 @@ struct HiddenFixture {
         probe::confirmations=probe::errorDialogs=probe::foregroundCalls=probe::destroyCalls=0;
         probe::dialogMessage.clear();
         app.settings={};app.status={};app.selected=-1;app.closeWhenDone=false;app.modeIndex=0;
+        app.hiddenToTray=app.trayRegistered=app.trayVersion4=app.trayNoticeShown=false;app.trayTooltip.clear();
         app.settings.folder=(ownedRoot/name).wstring();
         app.window=CreateWindowExW(0,L"STATIC",L"Owned pause review",WS_OVERLAPPED,0,0,920,720,nullptr,nullptr,nullptr,nullptr);
         require(app.window&&!IsWindowVisible(app.window),"Hidden parent creation failed");
         auto child=[&](const wchar_t* cls,DWORD style){auto w=CreateWindowExW(0,cls,L"",WS_CHILD|style,0,0,100,100,app.window,nullptr,nullptr,nullptr);require(w!=nullptr,"Hidden child failed");return w;};
         auto combo=[&](int count){auto w=child(L"COMBOBOX",CBS_DROPDOWNLIST);for(int i=0;i<count;++i)add(w,std::to_wstring(i));choose(w,0);return w;};
-        app.mode=combo(5);app.interval=combo(6);choose(app.interval,5);app.videoSize=combo(2);app.encodingQuality=combo(3);app.encodingMode=combo(5);
+        app.mode=combo(6);app.interval=combo(6);choose(app.interval,5);app.videoSize=combo(2);app.encodingQuality=combo(3);app.encodingMode=combo(5);
         app.monitor=combo(1);app.camera=combo(0);app.monitors={{L"Synthetic",{0,0,640,360},L"owned-display"}};app.cameras.clear();
         app.preview=child(L"STATIC",0);app.statusText=child(L"STATIC",0);
         for(auto p:{&app.refresh,&app.record,&app.pause,&app.finish,&app.folder,&app.openFolder,&app.reset,&app.forward})*p=child(L"BUTTON",BS_PUSHBUTTON);
         app.engine=std::make_unique<Engine>();configure();updateControls();
     }
-    ~HiddenFixture(){probe::finishGate.release();probe::captureGate.release();app.engine.reset();DestroyWindow(app.window);app.window=app.preview=app.statusText=nullptr;}
+    ~HiddenFixture(){probe::finishGate.release();probe::captureGate.release();removeTray();app.engine.reset();DestroyWindow(app.window);app.window=app.preview=app.statusText=nullptr;}
     void start(bool shortCadence=false){if(shortCadence){choose(app.interval,0);configure();}click(Record,app.record);waitState(State::Recording);tick();require(caption(app.pause)==L"&Pause","Recording caption");}
 };
 void settleCommand() {
@@ -218,8 +225,19 @@ template<class Predicate> Status waitFor(Predicate predicate,const char* message
     while(probe::elapsed(began)<1500){auto status=app.engine->status();if(predicate(status))return status;Sleep(1);}
     throw std::runtime_error(message);
 }
-void requestClose() {
+void recordingWhileHidden(){
+    HiddenFixture f(L"recording-in-tray");f.start(true);const auto original=app.engine->status().frames;
     windowProc(app.window,WM_CLOSE,0,0);
+    require(app.hiddenToTray&&app.trayRegistered&&!app.settings.preview&&!app.closeWhenDone&&probe::confirmations==0&&probe::destroyCalls==0,"Close failed to retain active worker in tray");
+    const auto recorded=waitFor([&](const Status& status){return status.state==State::Recording&&status.frames>original;},"Hidden worker did not record the next due frame");
+    require(recorded.frames==original+1,"Hidden transition duplicated recording capture");
+    click(Finish,app.finish);const auto saved=waitState(State::Idle);tick();
+    require(!saved.recordingFailed&&!saved.savedPath.empty()&&saved.frames==recorded.frames&&std::filesystem::file_size(saved.savedPath)==saved.frames*sizeof(DWORD),"Hidden recording did not finalize every captured frame");
+    require(app.hiddenToTray&&probe::destroyCalls==0,"Finish unexpectedly exited tray application");
+    std::cout<<"PASS actual worker continues due captures with preview disabled after Close and finishes in tray.\n";
+}
+void requestClose() {
+    windowProc(app.window,WM_COMMAND,TrayExit,0);
     require(probe::confirmations==1 && app.closeWhenDone && !IsWindowEnabled(app.window),
             "Actual close handler did not queue Finish-and-close and disable the window");
 }
@@ -294,6 +312,7 @@ int main(){
         require(ownedRoot.is_absolute()&&ownedRoot.parent_path()==std::filesystem::current_path()/L"fixtures","Fixture path escaped review");
         require(!std::filesystem::exists(ownedRoot),"Owned fixture directory already exists");
         repeatedPause();repeatedResume();finishThenRecord(false,false);finishThenRecord(false,true);finishThenRecord(true,false);
+        recordingWhileHidden();
         int closePassed=0;
         closePassed+=successfulClose(false);closePassed+=successfulClose(true);
         closePassed+=terminalFailure(0);closePassed+=terminalFailure(1);closePassed+=terminalFailure(2);
@@ -309,7 +328,7 @@ int main(){
             require(std::filesystem::remove(directory.path()),"Synthetic folder cleanup failed");
         }
         require(std::filesystem::remove(ownedRoot),"Owned fixture root cleanup failed");
-        std::cout<<"PASS all ten actual-handler/worker command and close-outcome cases; no visible UI, input, hardware or real encoding.\n";
+        std::cout<<"PASS all eleven actual-handler/worker command and exit/tray cases; no visible UI, input, hardware or real encoding.\n";
         return 0;
     }catch(const std::exception& error){std::cerr<<"FIXTURE_FAILURE: "<<error.what()<<'\n';return 1;}
 }

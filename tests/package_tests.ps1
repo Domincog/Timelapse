@@ -51,7 +51,7 @@ Set-Item -Path Function:Get-FileHash -Value (${function:Get-FileHash}.GetNewClos
 function New-Fixture([string]$Name, [string]$Script = $PackageScript) {
     $root = Join-Path $workRoot $Name
     New-Item -ItemType Directory -Path $root | Out-Null
-    foreach ($dir in @('build/release', 'src', 'tests', 'tools')) { New-Item -ItemType Directory -Path (Join-Path $root $dir) | Out-Null }
+    foreach ($dir in @('build/release', 'src', 'tests', 'tools', 'installer')) { New-Item -ItemType Directory -Path (Join-Path $root $dir) | Out-Null }
     Copy-Item -LiteralPath $Script -Destination (Join-Path $root 'package.ps1')
     Write-Text (Join-Path $root '.gitignore') "build/`npackages/`n"
     Write-Text (Join-Path $root 'README.md') "Owned synthetic package $Name.`n"
@@ -64,6 +64,15 @@ function New-Fixture([string]$Name, [string]$Script = $PackageScript) {
     Write-Text (Join-Path $root 'tests/package_tests.ps1') "# Selected packaging regression sentinel.`n"
     Write-Text (Join-Path $root 'tests/build_tests.ps1') "# Selected build distribution regression sentinel.`n"
     Write-Text (Join-Path $root 'tools/verify-encoding-quality.ps1') "# Selected encoding verification sentinel.`n"
+    Write-Text (Join-Path $root 'tests/installer_tests.ps1') "# Selected isolated installer regression sentinel.`n"
+    Write-Text (Join-Path $root 'installer/Timelapse.iss') "; Selected installer source sentinel.`n"
+    Write-Text (Join-Path $root 'installer/build-installer.ps1') @'
+param($Compiler, $Version, $PayloadDirectory, $OutputDirectory)
+if ($Compiler -eq 'FAIL') { throw 'Owned compiler failure.' }
+$payload = [System.IO.File]::ReadAllText((Join-Path $PayloadDirectory 'Timelapse.exe'))
+$hash = [System.IO.File]::ReadAllText((Join-Path $PayloadDirectory 'SHA256SUMS.txt'))
+[System.IO.File]::WriteAllText((Join-Path $OutputDirectory "Timelapse-v$Version-windows-x64-setup.exe"), $payload + "`n" + $hash)
+'@
     Write-Text (Join-Path $root 'tests/internal.ps1') "# Unselected internal script sentinel.`n"
     Write-Text (Join-Path $root 'src/local.txt') "Unselected local text sentinel.`n"
     Write-Text (Join-Path $root 'private-note.txt') "Unselected root note sentinel.`n"
@@ -71,14 +80,16 @@ function New-Fixture([string]$Name, [string]$Script = $PackageScript) {
     $root
 }
 
-function Invoke-Package([string]$Root, [string]$UseVersion = $version) {
-    & (Join-Path $Root 'package.ps1') -Version $UseVersion -BuildDirectory 'build' | Out-Null
+function Invoke-Package([string]$Root, [string]$UseVersion = $version, [string]$Compiler = '') {
+    $options = @{ Version = $UseVersion; BuildDirectory = 'build' }
+    if ($Compiler) { $options.InstallerCompiler = $Compiler }
+    & (Join-Path $Root 'package.ps1') @options | Out-Null
 }
 
 function Get-Inputs([string]$Root, [bool]$ExcludeExe = $false) {
     $map = @{}
     foreach ($file in (Get-ChildItem -LiteralPath $Root -File -Force)) { $map[$file.FullName.Substring($Root.Length + 1)] = File-Sha $file.FullName }
-    foreach ($dir in @('src', 'tests', 'build')) {
+    foreach ($dir in @('src', 'tests', 'build', 'tools', 'installer')) {
         foreach ($file in (Get-ChildItem -LiteralPath (Join-Path $Root $dir) -File -Recurse -Force)) {
             if ($ExcludeExe -and $file.Name -eq 'Timelapse.exe') { continue }
             $map[$file.FullName.Substring($Root.Length + 1)] = File-Sha $file.FullName
@@ -130,17 +141,17 @@ function Read-Release([string]$Root, [string]$UseVersion = $version) {
     } finally { $zip.Dispose() }
 }
 
-function Assert-Package([string]$Root, [string]$UseVersion = $version) {
+function Assert-Package([string]$Root, [string]$UseVersion = $version, [bool]$HasInstaller = $false) {
     $packages = Join-Path $Root 'packages'
     $release = Read-Release $Root $UseVersion
     Assert ($release.Embedded -eq ($release.ExeHash + '  Timelapse.exe')) 'Embedded hash differs from actual archived EXE bytes.'
     $lines = @(Get-Content -LiteralPath (Join-Path $packages 'SHA256SUMS.txt'))
-    Assert ($lines.Count -eq 2) 'External checksum index must contain two archives.'
+    Assert ($lines.Count -eq $(if ($HasInstaller) { 3 } else { 2 })) 'External checksum index has the wrong artifact count.'
     foreach ($line in $lines) {
         $parts = $line -split '  ', 2
         Assert ($parts.Count -eq 2 -and (File-Sha (Join-Path $packages $parts[1])) -eq $parts[0]) 'External archive checksum mismatch.'
     }
-    $expected = @('.gitignore', 'README.md', 'CMakeLists.txt', 'build.ps1', 'package.ps1', 'src/app.cpp', 'src/helper.h', 'tests/probe.cpp', 'tests/fixture.cmake', 'tests/package_tests.ps1', 'tests/build_tests.ps1', 'tools/verify-encoding-quality.ps1')
+    $expected = @('.gitignore', 'README.md', 'CMakeLists.txt', 'build.ps1', 'package.ps1', 'src/app.cpp', 'src/helper.h', 'tests/probe.cpp', 'tests/fixture.cmake', 'tests/package_tests.ps1', 'tests/build_tests.ps1', 'tools/verify-encoding-quality.ps1', 'installer/Timelapse.iss', 'installer/build-installer.ps1', 'tests/installer_tests.ps1')
     $zip = [System.IO.Compression.ZipFile]::OpenRead((Join-Path $packages "Timelapse-v$UseVersion-source.zip"))
     try {
         Assert ($zip.Entries.Count -eq $expected.Count) 'Source allowlist entry count changed.'
@@ -158,7 +169,7 @@ function Assert-Package([string]$Root, [string]$UseVersion = $version) {
 function Seed-Package([string]$Root) { Invoke-Package $Root; Assert-Package $Root }
 function Replace-FakeExe([string]$Root) { Write-Text (Join-Path $Root 'build/release/Timelapse.exe') 'FAKE EXE REPLACEMENT' }
 
-function Assert-StableFailure([string]$Root, [string]$LockedRelative = '', [string]$UseVersion = $version, [bool]$Exclusive = $false) {
+function Assert-StableFailure([string]$Root, [string]$LockedRelative = '', [string]$UseVersion = $version, [bool]$Exclusive = $false, [string]$Compiler = '') {
     $inputs = Get-Inputs $Root
     $outputs = Get-Outputs $Root
     $held = $null
@@ -169,7 +180,7 @@ function Assert-StableFailure([string]$Root, [string]$LockedRelative = '', [stri
         $held = [System.IO.File]::Open((Join-Path $Root $LockedRelative), [System.IO.FileMode]::Open, $access, $sharing)
     }
     $failure = $null
-    try { Invoke-Package $Root $UseVersion } catch { $failure = $_.Exception.Message }
+    try { Invoke-Package $Root $UseVersion $Compiler } catch { $failure = $_.Exception.Message }
     finally { if ($held) { $held.Dispose() } }
     Assert ($null -ne $failure) 'Expected packaging operation to fail.'
     Assert-SameMap $inputs (Get-Inputs $Root) 'Packaging altered source/input files'
@@ -179,6 +190,22 @@ function Assert-StableFailure([string]$Root, [string]$LockedRelative = '', [stri
 }
 
 $cases = @(
+    @{ Name = 'installer_atomic_publication'; Body = {
+        param($root)
+        $before = Get-Inputs $root
+        Invoke-Package $root $version 'OWNED-STUB'; Assert-Package $root $version $true
+        Assert-SameMap $before (Get-Inputs $root) 'Installer packaging altered inputs'
+        $release = Read-Release $root
+        $setup = [System.IO.File]::ReadAllText((Join-Path $root "packages/Timelapse-v$version-windows-x64-setup.exe"))
+        Assert ($setup -eq ($release.ExeText + "`n" + $release.Embedded + "`n")) 'Installer and portable payloads differ.'
+        Replace-FakeExe $root
+        Assert-StableFailure $root '' $version $false 'FAIL'
+        Assert-StableFailure $root "packages/Timelapse-v$version-windows-x64-setup.exe" $version $false 'OWNED-STUB'
+        Assert-StableFailure $root 'packages/SHA256SUMS.txt' $version $false 'OWNED-STUB'
+        Assert-StableFailure $root 'packages/SHA256SUMS.txt' $newVersion $false 'OWNED-STUB'
+        Assert (-not (Test-Path -LiteralPath (Join-Path $root "packages/Timelapse-v$newVersion-windows-x64-setup.exe"))) 'New installer survived failed publication.'
+        Assert-Package $root $version $true
+    } },
     @{ Name = 'success_and_allowlist'; Body = {
         param($root)
         $before = Get-Inputs $root; Seed-Package $root

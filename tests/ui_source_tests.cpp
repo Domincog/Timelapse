@@ -66,6 +66,10 @@ BOOL WINAPI fixtureCursorPosition(LPPOINT point){*point={0,0};return TRUE;}
 HMONITOR WINAPI fixtureMonitorFromPoint(POINT,DWORD){return reinterpret_cast<HMONITOR>(1);}
 BOOL WINAPI fixtureMonitorInfo(HMONITOR,LPMONITORINFO info){info->rcMonitor=info->rcWork={0,0,1920,1080};return TRUE;}
 BOOL WINAPI fixtureWriteProfile(LPCWSTR,LPCWSTR,LPCWSTR,LPCWSTR){throw std::runtime_error("Unexpected real preferences save.");}
+HANDLE WINAPI fixtureOpenMutex(DWORD,BOOL,LPCWSTR){SetLastError(ERROR_FILE_NOT_FOUND);return nullptr;}
+HANDLE WINAPI fixtureCreateMutex(LPSECURITY_ATTRIBUTES,BOOL,LPCWSTR){SetLastError(ERROR_SUCCESS);return reinterpret_cast<HANDLE>(1);}
+BOOL WINAPI fixtureCloseHandle(HANDLE){return TRUE;}
+UINT WINAPI fixtureRegisterMessage(LPCWSTR){return 0xc123;}
 }
 
 namespace lapse {
@@ -127,6 +131,10 @@ DWORD WINAPI fixtureProfileString(LPCWSTR,LPCWSTR,LPCWSTR fallback,LPWSTR target
 #define MonitorFromPoint fixtureMonitorFromPoint
 #define GetMonitorInfoW fixtureMonitorInfo
 #define WritePrivateProfileStringW fixtureWriteProfile
+#define OpenMutexW fixtureOpenMutex
+#define CreateMutexW fixtureCreateMutex
+#define CloseHandle fixtureCloseHandle
+#define RegisterWindowMessageW fixtureRegisterMessage
 #include "../src/main.cpp"
 #undef SHGetKnownFolderPath
 #undef CoTaskMemFree
@@ -144,6 +152,10 @@ DWORD WINAPI fixtureProfileString(LPCWSTR,LPCWSTR,LPCWSTR fallback,LPWSTR target
 #undef MonitorFromPoint
 #undef GetMonitorInfoW
 #undef WritePrivateProfileStringW
+#undef OpenMutexW
+#undef CreateMutexW
+#undef CloseHandle
+#undef RegisterWindowMessageW
 #undef Engine
 #undef GetPrivateProfileIntW
 #undef GetPrivateProfileStringW
@@ -168,7 +180,7 @@ struct HiddenFixture {
             auto handle=child(L"COMBOBOX",CBS_DROPDOWNLIST);
             for(int i=0;i<count;++i)add(handle,std::to_wstring(i)); choose(handle,0); return handle;
         };
-        app.mode=combo(5); app.interval=combo(6); app.videoSize=combo(2); app.encodingQuality=combo(3); app.encodingMode=combo(5);
+        app.mode=combo(6); app.interval=combo(6); app.videoSize=combo(2); app.encodingQuality=combo(3); app.encodingMode=combo(5);
         app.monitor=combo(0); app.camera=combo(0);
         app.preview=child(L"STATIC",0);
         for(auto target:{&app.refresh,&app.record,&app.pause,&app.finish,&app.folder,&app.openFolder,&app.reset,&app.forward})
@@ -414,6 +426,21 @@ void indexLoads() {
     savedEncodingMode=0;
     overrideIndexes=false; std::cout<<"PASS persisted defaults, valid indexes, high clamp and negative clamp; startup mode remains Desktop.\n";
 }
+void separateSources() {
+    seed(false);choose(app.mode,SeparateFilesMode);changeLayout(false);
+    require(app.settings.separateFiles&&lapse::configured.separateFiles&&hasSource(Source::Desktop)&&hasSource(Source::Camera),"Separate-file source mode did not configure both sources");
+    require(IsWindowEnabled(app.monitor)&&IsWindowEnabled(app.camera)&&IsWindowEnabled(app.record)&&!IsWindowEnabled(app.reset)&&!IsWindowEnabled(app.forward),"Separate-file source controls are incorrect");
+    const auto layers=app.settings.layers;app.selected=0;
+    windowProc(app.window,WM_COMMAND,Reset,0);windowProc(app.window,WM_COMMAND,Forward,0);
+    previewProc(app.preview,WM_KEYDOWN,VK_SPACE,0);previewProc(app.preview,WM_KEYDOWN,VK_RIGHT,0);
+    previewProc(app.preview,WM_LBUTTONDOWN,0,0);
+    require(app.settings.separateFiles&&app.modeIndex==SeparateFilesMode&&app.selected==0&&!app.dragging&&app.settings.layers[0].rect.x==layers[0].rect.x,"Separate-file preview accepted collage editing");
+    lapse::listedCameras.clear();refresh();require(!IsWindowEnabled(app.record),"Separate recording accepted missing camera");
+    lapse::listedCameras={cameraA};refresh();lapse::listedMonitors.clear();refresh();require(!IsWindowEnabled(app.record),"Separate recording accepted missing display");
+    lapse::listedMonitors={displayA,displayB};refresh();record();require(lapse::recorded.separateFiles&&lapse::recordCalls==1,"Record lost separate-file mode");
+    lapse::fixtureStatus=app.status={};sourceMode(Mode::Desktop);require(!app.settings.separateFiles,"Returning to desktop retained separate-file mode");
+    std::cout<<"PASS separate-file mode requires both sources and prevents collage edits.\n";
+}
 }
 int main() {
     std::cout<<std::unitbuf; std::wcout<<std::unitbuf;
@@ -430,7 +457,7 @@ int main() {
             unavailableSelection(camera);emptyListRecovery(camera);explicitReplacement(camera);
             modeSwitchPreservesMissingChoice(camera);changedMetadata(camera);
         }
-        activeControls();indexLoads();
+        activeControls();indexLoads();separateSources();
         require(!IsWindowVisible(app.window)&&!IsWindowVisible(app.preview),"Fixture became visible.");
         std::cout<<"All source selection and settings assertions passed with hidden controls. No actual source was opened.\n";
         return 0;
