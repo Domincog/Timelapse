@@ -1,4 +1,4 @@
-param([string]$Version = '0.31.0', [string]$BuildDirectory = 'build', [string]$InstallerCompiler = '', [string]$PersonWorker = '')
+param([string]$Version = '0.32.0', [string]$BuildDirectory = 'build', [string]$InstallerCompiler = '', [string]$PersonWorker = '')
 $ErrorActionPreference = 'Stop'
 if ($Version -notmatch '^\d+\.\d+\.\d+([-.][A-Za-z0-9.-]+)?$') { throw 'Use a version such as 0.1.0 or 0.1.0-beta.1.' }
 $projectRoot = $PSScriptRoot
@@ -52,7 +52,7 @@ try {
     # An allowlist keeps recordings, build outputs, settings and internal notes
     # out of the source archive. Freeze every selected input before publishing.
     $sourceFiles = @()
-    foreach ($name in @('.gitignore', 'README.md', 'CMakeLists.txt', 'build.ps1', 'package.ps1', 'tools/verify-encoding-quality.ps1',
+    foreach ($name in @('.gitignore', 'README.md', 'NIGHT_VALIDATION.md', 'media/night-v032-synthetic.png', 'CMakeLists.txt', 'build.ps1', 'package.ps1', 'tools/verify-encoding-quality.ps1', 'tools/night_camera_lab.cpp',
         'installer/Timelapse.iss', 'installer/build-installer.ps1', 'tests/installer_tests.ps1',
         'person-pack/README.md', 'person-pack/CMakeLists.txt', 'person-pack/build.ps1',
         'person-pack/model.cpp', 'person-pack/model.h', 'person-pack/model.rc.in', 'person-pack/resources.h', 'person-pack/worker.cpp',

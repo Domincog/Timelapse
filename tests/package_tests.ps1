@@ -73,10 +73,12 @@ function Pin-FakeWorker([string]$Root) {
 function New-Fixture([string]$Name, [string]$Script = $PackageScript) {
     $root = Join-Path $workRoot $Name
     New-Item -ItemType Directory -Path $root | Out-Null
-    foreach ($dir in @('build/release', 'src', 'tests', 'tools', 'installer', 'person-pack/tests', 'person-pack/build', 'third-party')) { New-Item -ItemType Directory -Path (Join-Path $root $dir) -Force | Out-Null }
+    foreach ($dir in @('build/release', 'src', 'tests', 'tools', 'media', 'installer', 'person-pack/tests', 'person-pack/build', 'third-party')) { New-Item -ItemType Directory -Path (Join-Path $root $dir) -Force | Out-Null }
     Copy-Item -LiteralPath $Script -Destination (Join-Path $root 'package.ps1')
     Write-Text (Join-Path $root '.gitignore') "build/`npackages/`n"
     Write-Text (Join-Path $root 'README.md') "Owned synthetic package $Name.`n"
+    Write-Text (Join-Path $root 'NIGHT_VALIDATION.md') "Owned public Night validation sentinel.`n"
+    Write-Text (Join-Path $root 'media/night-v032-synthetic.png') "Owned synthetic-only figure sentinel.`n"
     Write-Text (Join-Path $root 'CMakeLists.txt') "# Fixture only; never configured.`n"
     Write-Text (Join-Path $root 'build.ps1') "throw 'Fixture build must never run.'`n"
     Write-Text (Join-Path $root 'src/app.cpp') "// Owned synthetic app input.`n"
@@ -92,6 +94,7 @@ function New-Fixture([string]$Name, [string]$Script = $PackageScript) {
     Write-Text (Join-Path $root 'tests/package_tests.ps1') "# Selected packaging regression sentinel.`n"
     Write-Text (Join-Path $root 'tests/build_tests.ps1') "# Selected build distribution regression sentinel.`n"
     Write-Text (Join-Path $root 'tools/verify-encoding-quality.ps1') "# Selected encoding verification sentinel.`n"
+    Write-Text (Join-Path $root 'tools/night_camera_lab.cpp') "// Selected opt-in camera lab source sentinel.`n"
     Write-Text (Join-Path $root 'tests/installer_tests.ps1') "# Selected isolated installer regression sentinel.`n"
     Write-Text (Join-Path $root 'installer/Timelapse.iss') "; Selected installer source sentinel.`n"
     Write-Text (Join-Path $root 'installer/build-installer.ps1') @'
@@ -121,7 +124,7 @@ function Invoke-Package([string]$Root, [string]$UseVersion = $version, [string]$
 function Get-Inputs([string]$Root, [bool]$ExcludeExe = $false, [bool]$ExcludeWorker = $false) {
     $map = @{}
     foreach ($file in (Get-ChildItem -LiteralPath $Root -File -Force)) { $map[$file.FullName.Substring($Root.Length + 1)] = File-Sha $file.FullName }
-    foreach ($dir in @('src', 'tests', 'build', 'tools', 'installer', 'person-pack', 'third-party')) {
+    foreach ($dir in @('src', 'tests', 'build', 'tools', 'media', 'installer', 'person-pack', 'third-party')) {
         foreach ($file in (Get-ChildItem -LiteralPath (Join-Path $Root $dir) -File -Recurse -Force)) {
             if ($ExcludeExe -and $file.Name -eq 'Timelapse.exe') { continue }
             if ($ExcludeWorker -and $file.Name -eq 'PersonWorker.exe') { continue }
@@ -184,7 +187,7 @@ function Assert-Package([string]$Root, [string]$UseVersion = $version, [bool]$Ha
         $parts = $line -split '  ', 2
         Assert ($parts.Count -eq 2 -and (File-Sha (Join-Path $packages $parts[1])) -eq $parts[0]) 'External archive checksum mismatch.'
     }
-    $expected = @('.gitignore', 'README.md', 'CMakeLists.txt', 'build.ps1', 'package.ps1', 'src/app.cpp', 'src/helper.h', 'tests/probe.cpp', 'tests/fixture.cmake', 'tests/package_tests.ps1', 'tests/build_tests.ps1', 'tools/verify-encoding-quality.ps1', 'installer/Timelapse.iss', 'installer/build-installer.ps1', 'tests/installer_tests.ps1')
+    $expected = @('.gitignore', 'README.md', 'NIGHT_VALIDATION.md', 'media/night-v032-synthetic.png', 'CMakeLists.txt', 'build.ps1', 'package.ps1', 'src/app.cpp', 'src/helper.h', 'tests/probe.cpp', 'tests/fixture.cmake', 'tests/package_tests.ps1', 'tests/build_tests.ps1', 'tools/verify-encoding-quality.ps1', 'tools/night_camera_lab.cpp', 'installer/Timelapse.iss', 'installer/build-installer.ps1', 'tests/installer_tests.ps1')
     $expected += @('src/person_pack_metadata.h') + $personSources
     if ($HasWorker) {
         $metadata = [IO.File]::ReadAllText((Join-Path $Root 'src/person_pack_metadata.h'))

@@ -1,5 +1,6 @@
 // Pure synthetic image processing. No camera, capture, window or profile I/O.
 #include "night.h"
+#include "night_quality_fixture.h"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -178,11 +179,13 @@ void darkerSignalAndSampling() {
     render(8,1);require(result.appliedGain==1&&result.outputBrightness==8,"A lone near-black sample bypassed the noise floor");
     double previous=8;
     for(unsigned samples:{2u,4u,8u,16u,64u}) {
-        require(render(8,samples)&&result.samples==samples&&result.outputBrightness>=previous&&result.appliedGain<=16,
+        require(render(8,samples)&&result.samples==samples&&result.outputBrightness>=previous&&result.appliedGain<=64,
             "Averaged coherent shadows did not improve monotonically within the gain bound");
         previous=result.outputBrightness;
     }
-    require(previous>=40,"Repeated low-level detail remained too dark to use");
+    // Sixty-four clean contributions support the expanded shadow exposure,
+    // while the separate single-frame assertions retain their original cap.
+    require(previous>=85,"Well-averaged low-level detail remained too dark to use");
     for(uint8_t level:{uint8_t(24),uint8_t(32)}) {
         require(render(level,16)&&std::abs(result.outputBrightness-96)<=2&&!result.targetLimited&&result.appliedGain>8,
             "Well-averaged darker scene did not reach the available brightness target");
@@ -323,11 +326,107 @@ void averagedToneMonotonicity() {
     require(image->pixels[0]==0&&image->pixels[size_t(values-1)*4]==255,"Averaged tone curve lost endpoints");
     std::cout<<"PASS monotonic76755temporal gray means, preserved endpoints and no newly clipped highlights.\n";
 }
+void measuredNoiseAndDetail() {
+    // Compare the filtered output with the exact *same* temporal mean rendered
+    // at the *same* gain. A darker output cannot win this quality comparison.
+    const auto truth=night_quality::scene();auto sample=truth;
+    for(auto noise:{night_quality::Noise::IndependentColor,night_quality::Noise::BlockColor,
+                   night_quality::Noise::CorrelatedColor,night_quality::Noise::Luminance}) {
+        const unsigned samples=noise==night_quality::Noise::CorrelatedColor?64:16;
+        NightAccumulator accumulator;std::wstring message;NightResult result;
+        require(accumulator.prepare(truth.width,truth.height,message),"Scientific fixture prepare failed");
+        std::vector<uint32_t> sums(truth.pixels.size()/4*3,0);
+        allocations=0;countAllocations=true;
+        require(accumulator.begin(enabled()),"Scientific fixture begin failed");
+        for(unsigned n=0;n<samples;++n) {
+            night_quality::noisy(truth,sample,n,noise);
+            for(size_t p=0;p<sample.pixels.size()/4;++p)for(unsigned c=0;c<3;++c)sums[p*3+c]+=night_detail::linear(sample.pixels[p*4+c]);
+            require(accumulator.add(sample,n+1)==NightAdd::Added,"Scientific fixture add failed");
+        }
+        const auto* output=accumulator.finish(result);countAllocations=false;
+        require(output&&allocations==0,"Noise estimator or active chroma filter allocated");
+        const auto expected=night_quality::reference(truth,result.appliedGain,false);
+        const auto unfiltered=night_quality::renderedMean(truth,sums,samples,result.appliedGain);
+        const auto filteredScore=night_quality::metrics(*output,expected),rawScore=night_quality::metrics(unfiltered,expected);
+        require(result.outputBrightness>=93&&result.outputBrightness<=100,"Measured dark detail did not reach its supported target");
+        require(filteredScore.lineContrast>=rawScore.lineContrast*.95,"Chroma suppression erased one-pixel luminance detail");
+        if(noise==night_quality::Noise::Luminance) {
+            require(error(*output,unfiltered)<.1,"Chroma filter changed a scene carrying only luminance noise");
+        } else {
+            const double improvement=noise==night_quality::Noise::BlockColor?.96:.80;
+            require(filteredScore.rgb<rawScore.rgb*improvement&&filteredScore.chroma<rawScore.chroma*improvement,
+                "Measured color noise did not improve at identical brightness");
+            require(filteredScore.luma<rawScore.luma*1.10,"Chroma suppression increased visible luminance noise");
+        }
+        std::cout<<"PASS matched-gain noise "<<int(noise)<<": RGB MSE "<<filteredScore.rgb<<" vs "<<rawScore.rgb
+            <<", chroma "<<filteredScore.chroma<<" vs "<<rawScore.chroma<<", line contrast "<<filteredScore.lineContrast<<" vs "<<rawScore.lineContrast<<".\n";
+    }
+}
+void noisyEndpointsAndFlicker() {
+    NightAccumulator accumulator;std::wstring message;NightResult result;
+    auto truth=night_quality::scene(128,96),sample=truth;double previous=0;
+    require(accumulator.prepare(truth.width,truth.height,message),"Noisy endpoints prepare failed");
+    const size_t black=(size_t(32)*truth.width+64)*4,white=black+4,nearWhite=black+8;
+    for(unsigned window=0;window<12;++window) {
+        require(accumulator.begin(enabled()),"Noisy flicker begin failed");
+        for(unsigned n=0;n<16;++n) {
+            night_quality::noisy(truth,sample,n+window*37,night_quality::Noise::IndependentColor);
+            for(unsigned c=0;c<3;++c){sample.pixels[black+c]=0;sample.pixels[white+c]=255;sample.pixels[nearWhite+c]=254;}
+            require(accumulator.add(sample,n+1)==NightAdd::Added,"Noisy endpoints add failed");
+        }
+        const auto* image=accumulator.finish(result);require(image,"Noisy endpoint finish failed");
+        for(unsigned c=0;c<3;++c)require(image->pixels[black+c]==0&&image->pixels[white+c]==255&&image->pixels[nearWhite+c]<255,
+            "Active chroma reconstruction changed black/white endpoints or newly clipped a highlight");
+        if(window)require(std::abs(result.outputBrightness-previous)<=2,"Stationary stochastic scene caused exposure flicker");
+        previous=result.outputBrightness;
+    }
+    std::cout<<"PASS active-filter black/white endpoints, unsaturated highlights and12 independent noisy-window exposure stability.\n";
+}
+void correlatedEvidenceAndColorEdges() {
+    // Repeating each noisy observation eight times gives far less independent
+    // evidence even though all source sequence numbers are distinct.
+    auto truth=uniform(128,96,8),sample=truth;double gains[2]{},brightness[2]{};
+    for(unsigned held=0;held<2;++held) {
+        NightAccumulator accumulator;std::wstring message;NightResult result;
+        require(accumulator.prepare(128,96,message)&&accumulator.begin(enabled()),"Correlated confidence prepare failed");
+        for(unsigned n=0;n<64;++n){night_quality::noisy(truth,sample,n,held?night_quality::Noise::CorrelatedColor:night_quality::Noise::IndependentColor);accumulator.add(sample,n+1);}
+        require(accumulator.finish(result)&&result.samples==64,"Correlated confidence sample count changed");
+        gains[held]=result.appliedGain;brightness[held]=result.outputBrightness;
+    }
+    require(gains[0]>40&&brightness[0]>=90&&gains[1]<20&&brightness[1]<=60&&gains[0]>gains[1]*2.5,
+        "Held noisy observations were treated as equally strong independent evidence");
+
+    // These two colors have virtually equal encoded guide luminance (8552 vs
+    // 8557 before division by256). Luma guidance alone cannot protect this edge.
+    for(int y=0;y<truth.height;++y)for(int x=0;x<truth.width;++x) {
+        auto* p=&truth.pixels[(size_t(y)*truth.width+x)*4];p[0]=uint8_t(x<64?12:52);p[1]=28;p[2]=uint8_t(x<64?52:37);
+    }
+    NightAccumulator accumulator;std::wstring message;NightResult result;
+    require(accumulator.prepare(128,96,message)&&accumulator.begin(enabled()),"Color-edge prepare failed");
+    std::vector<uint32_t> sums(truth.pixels.size()/4*3,0);
+    for(unsigned n=0;n<16;++n) {
+        night_quality::noisy(truth,sample,n,night_quality::Noise::IndependentColor);
+        for(size_t p=0;p<sample.pixels.size()/4;++p)for(unsigned c=0;c<3;++c)sums[p*3+c]+=night_detail::linear(sample.pixels[p*4+c]);
+        accumulator.add(sample,n+1);
+    }
+    const auto* output=accumulator.finish(result);require(output,"Color-edge finish failed");
+    const auto raw=night_quality::renderedMean(truth,sums,16,result.appliedGain);
+    const auto contrast=[](const Frame& image) {
+        double sum=0;
+        for(int y=3;y<image.height-3;++y) {
+            const auto* left=&image.pixels[(size_t(y)*image.width+63)*4];const auto* right=left+4;
+            sum+=int(left[2])-left[0]-int(right[2])+right[0];
+        }
+        return sum/(image.height-6);
+    };
+    require(contrast(*output)>=contrast(raw)*.95,"Noise filtering bled a same-luminance color boundary");
+    std::cout<<"PASS independent/held64-sample confidence (gains "<<gains[0]<<"/"<<gains[1]<<") and equal-luminance color-edge contrast "<<contrast(*output)<<" vs "<<contrast(raw)<<".\n";
+}
 void highResolutionStorage() {
     NightAccumulator accumulator; std::wstring message; auto settings=enabled();
     require(accumulator.storageBytes()==0,"Cold accumulator allocated image storage");
-    require(accumulator.prepare(1280,720,message)&&accumulator.storageBytes()==14745600,"720p storage changed");
-    require(accumulator.prepare(1920,1080,message)&&accumulator.storageBytes()==33177600,"1080p storage exceeds exact sums+output budget");
+    require(accumulator.prepare(1280,720,message)&&accumulator.storageBytes()==14768640,"720p storage changed");
+    require(accumulator.prepare(1920,1080,message)&&accumulator.storageBytes()==33212160,"1080p storage exceeds sums+output+three-row guide budget");
     auto input=uniform(1920,1080,96); NightResult facts;
     allocations=0; countAllocations=true;
     require(accumulator.begin(settings)&&accumulator.add(input,1)==NightAdd::Added&&accumulator.add(input,2)==NightAdd::Added,"1080p accumulation failed");
@@ -336,7 +435,7 @@ void highResolutionStorage() {
     require(output&&output->width==1920&&output->height==1080&&facts.samples==2&&facts.appliedGain==1&&allocations==0,"1080p finish facts or steady allocation changed");
     for(size_t p=0;p<output->pixels.size();p+=4) require(output->pixels[p]==96&&output->pixels[p+1]==96&&output->pixels[p+2]==96&&output->pixels[p+3]==255,"1080p output pixel/alpha mismatch");
     require(!accumulator.prepare(1921,1080,message)&&accumulator.finish(facts)==output,"Over-budget preparation damaged the previous result");
-    require(accumulator.prepare(64,36,message)&&accumulator.storageBytes()==36864,"Smaller source retained high-tier image storage");
+    require(accumulator.prepare(64,36,message)&&accumulator.storageBytes()==38016,"Smaller source retained high-tier image storage");
     std::cout<<"PASS720/1080 exact storage, full output pixels, no warmed allocation and dimension-change retirement.\n";
 }
 }
@@ -344,6 +443,6 @@ void* operator new(size_t size) {if(countAllocations)++allocations;if(void* valu
 void operator delete(void* value) noexcept {std::free(value);}
 void operator delete(void* value,size_t) noexcept {std::free(value);}
 int main() {
-    try {contracts();stability();highlightsAndManual();actualNoiseReduction();periodicMetering();lowSignalStability();darkerSignalAndSampling();mixedDetailAndColor();lowSignalSampleJitter();mixedMeterContinuity();motionAverageContract();averagedToneMonotonicity();highResolutionStorage();std::cout<<"All night image contracts passed using synthetic frames.\n";return 0;}
+    try {contracts();stability();highlightsAndManual();actualNoiseReduction();periodicMetering();lowSignalStability();darkerSignalAndSampling();mixedDetailAndColor();lowSignalSampleJitter();mixedMeterContinuity();motionAverageContract();averagedToneMonotonicity();measuredNoiseAndDetail();noisyEndpointsAndFlicker();correlatedEvidenceAndColorEdges();highResolutionStorage();std::cout<<"All night image contracts passed using synthetic frames.\n";return 0;}
     catch(const std::exception& error){countAllocations=false;std::cerr<<error.what()<<'\n';return 1;}
 }
