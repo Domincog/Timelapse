@@ -1,5 +1,6 @@
 #pragma once
 #include "core.h"
+#include "config.h"
 #include "night.h"
 #include "time_skip.h"
 #include "watermark.h"
@@ -21,6 +22,8 @@ struct Settings {
     // Camera input uses a bounded 1080p tier only outside the 1280x720 box;
     // output dimensions (and therefore that request) freeze with the session.
     int width = 1280, height = 720;
+    // Saved playback rate, independent of capture cadence. Frozen at Record.
+    int outputFps = DefaultOutputFps;
     EncodingQuality encodingQuality = EncodingQuality::Balanced;
     EncodingMode encodingMode = EncodingMode::Compatible;
     std::wstring folder;
@@ -125,6 +128,7 @@ private:
     uint64_t cameraInputGeneration_ = 0;
     uint64_t settingsRevision_ = 0;
     bool requestedCursor_ = true;
+    int requestedOutputFps_ = DefaultOutputFps;
     std::optional<Settings> delayedSettings_;
     std::wstring delayedCancellationMessage_;
     uint64_t delayedWakeEpoch_ = 0;

@@ -2,6 +2,7 @@
 #include "capture.h"
 #include "camera_host.h"
 #include "config.h"
+#include "hotkeys.h"
 #include "time_skip.h"
 #include "person_pack.h"
 #include "watermark.h"
@@ -28,7 +29,7 @@ using namespace lapse;
 namespace {
 constexpr COLORREF Ink = RGB(25, 38, 45), Muted = RGB(88, 106, 113), Accent = RGB(0, 116, 113);
 constexpr COLORREF Background = RGB(247, 249, 250), Canvas = RGB(21, 28, 34);
-enum Id { ModeBox = 100, IntervalBox, SizeBox, EncodingQualityBox, MonitorBox, CameraBox, Refresh, Record, Pause, Finish, Folder, OpenFolder, Reset, Forward, Preview, EncodingModeBox, AdvancedToggle, StopAfterBox, LowDiskBox, NightBox, NightDurationBox, NightTargetBox, NightHint, NightDetail, SkipConfigure, SkipSummary, SkipDetail, RecoveryBox, SegmentBox, WatermarkConfigure, WatermarkSummary, StatusDetails, CursorBox, StartDelayBox };
+enum Id { ModeBox = 100, IntervalBox, SizeBox, EncodingQualityBox, MonitorBox, CameraBox, Refresh, Record, Pause, Finish, Folder, OpenFolder, Reset, Forward, Preview, EncodingModeBox, AdvancedToggle, StopAfterBox, LowDiskBox, NightBox, NightDurationBox, NightTargetBox, NightHint, NightDetail, SkipConfigure, SkipSummary, SkipDetail, RecoveryBox, SegmentBox, WatermarkConfigure, WatermarkSummary, StatusDetails, CursorBox, StartDelayBox, PlaybackConfigure };
 constexpr int StartDelays[] = {0,5,10,30,60,300};
 constexpr const wchar_t* StartDelayLabels[] = {L"None",L"5 seconds",L"10 seconds",L"30 seconds",L"1 minute",L"5 minutes"};
 constexpr int RecordingLimits[] = {0,900,3600,14400,28800,86400};
@@ -50,6 +51,7 @@ constexpr UINT TrayMessage = WM_APP + 1, ShowExistingMessage = WM_APP + 2;
 constexpr UINT CancelOwnedWorkMessage = WM_APP + 3;
 constexpr UINT TrayShow = 4001, TrayPause = 4002, TrayFinish = 4003, TrayExit = 4004, TrayProgress = 4005;
 constexpr UINT ExitSystemCommand = 0x1000;
+constexpr int FirstRecordingHotkeyId = 4401, LastRecordingHotkeyId = 4404;
 constexpr wchar_t InstanceMutexName[] = L"Local\\Timelapse.Application.{DC32D155-1B8D-4880-9902-CE6245D34923}";
 constexpr wchar_t SetupMutexName[] = L"Local\\Timelapse.Setup.{DC32D155-1B8D-4880-9902-CE6245D34923}";
 enum class FailureNotice { None, Pending, Presenting, Presented };
@@ -77,7 +79,10 @@ struct App {
     HWND window{}, preview{}, statusText{}, statusDetails{}, tooltip{};
     HWND customDialog{};
     HWND skipConfigure{},skipSummary{},skipDetail{};
-    HWND watermarkConfigure{},watermarkSummary{};
+    HWND watermarkConfigure{},watermarkSummary{},playbackConfigure{};
+    uint16_t pauseHotkey=0,stopHotkey=0;
+    int pauseHotkeyId=0,stopHotkeyId=0,recordedOutputFps=DefaultOutputFps;
+    std::wstring hotkeyWarning;
     HWND mode{}, interval{}, videoSize{}, encodingQuality{}, encodingMode{}, monitor{}, camera{}, refresh{}, record{}, pause{}, finish{}, folder{}, openFolder{}, reset{}, forward{};
     HWND advanced{}, stopAfter{}, lowDisk{}, recoveryMode{}, nightEnabled{}, nightDuration{}, nightTarget{}, nightHint{}, nightDetail{}, labels[10]{};
     HWND segmentLabel{}, splitEvery{}, captureCursor{};
@@ -97,7 +102,7 @@ struct App {
     State controlsState = State::Idle;
     bool advancedExpanded = false;
     int advancedLimitIndex = -1, advancedVisibility = -1, advancedNightState = -1, advancedRecoveryState = -1, nightVisibility = -1;
-    int advancedSegmentSeconds = -1;
+    int advancedSegmentSeconds = -1,advancedOutputFps=-1;
     int advancedCursorState = -1, advancedDelaySeconds = -1, committedStartDelay = 0;
     uint64_t waitingRemaining = UINT64_MAX;
     std::wstring waitingCaption;
@@ -146,6 +151,39 @@ struct App {
     ~App() { if(openFolderTask)openFolderTask->cancel();for(auto icon:trayIcons)if(icon)DestroyIcon(icon);DeleteObject(font); DeleteObject(titleFont); DeleteObject(smallFont); DeleteObject(background); }
 } app;
 void removeTray();
+void unregisterRecordingHotkeys() noexcept {
+    if(app.pauseHotkeyId)UnregisterHotKey(app.window,app.pauseHotkeyId);
+    if(app.stopHotkeyId)UnregisterHotKey(app.window,app.stopHotkeyId);
+    app.pauseHotkeyId=app.stopHotkeyId=0;
+}
+bool setRecordingHotkeys(uint16_t pause,uint16_t stop,std::wstring& error) {
+    if(!validateHotkeys(pause,stop,error))return false;
+    struct Binding {uint16_t value;int id;};
+    const Binding previous[]={{app.pauseHotkey,app.pauseHotkeyId},{app.stopHotkey,app.stopHotkeyId}};
+    Binding next[]={{pause,0},{stop,0}};
+    bool created[2]{};
+    // Reuse retained combinations, including a swap of the two actions. New
+    // combinations use spare ids until the whole draft succeeds, so a conflict
+    // never silently disables a user's previous working shortcut.
+    for(int action=0;action<2;++action){
+        if(!next[action].value)continue;
+        for(const auto& old:previous)if(old.id && hotkeyIdentity(old.value)==hotkeyIdentity(next[action].value)){next[action].id=old.id;break;}
+        if(next[action].id)continue;
+        for(int id=FirstRecordingHotkeyId;id<=LastRecordingHotkeyId;++id){
+            if(id==previous[0].id || id==previous[1].id || id==next[0].id || id==next[1].id)continue;
+            next[action].id=id;break;
+        }
+        if(!next[action].id || !RegisterHotKey(app.window,next[action].id,hotkeyRegistrationModifiers(next[action].value),LOBYTE(next[action].value))){
+            for(int i=0;i<2;++i)if(created[i])UnregisterHotKey(app.window,next[i].id);
+            error=std::wstring(action==0?L"Pause / resume":L"Stop and save")+L" shortcut is unavailable. Windows or another app may be using it. Choose another combination.";
+            return false;
+        }
+        created[action]=true;
+    }
+    for(const auto& old:previous)if(old.id && old.id!=next[0].id && old.id!=next[1].id)UnregisterHotKey(app.window,old.id);
+    app.pauseHotkey=pause;app.stopHotkey=stop;app.pauseHotkeyId=next[0].id;app.stopHotkeyId=next[1].id;
+    app.hotkeyWarning.clear();error.clear();return true;
+}
 void cancelOpenFolder() noexcept;
 void refreshOpenFolderControl();
 void pollOpenFolder();
@@ -169,6 +207,7 @@ struct MediaRuntime {
         // startup or message retrieval exits without receiving WM_DESTROY.
         app.engine.reset();
         removeTray();
+        unregisterRecordingHotkeys();
         if (SUCCEEDED(media)) MFShutdown();
         if (SUCCEEDED(com)) CoUninitialize();
     }
@@ -671,7 +710,7 @@ void updateAdvanced() {
     const int night=app.settings.night.enabled?(app.nightValidation.empty()?1:2):0;
     const int recovery=app.encodingValidation.empty()?(app.settings.recoveryMode?1:0):2;
     const int cursor=app.settings.captureCursor?0:hasSource(Source::Desktop)?1:2;
-    if(delay!=app.advancedDelaySeconds || selection!=app.advancedLimitIndex || segment!=app.advancedSegmentSeconds || night!=app.advancedNightState || recovery!=app.advancedRecoveryState || cursor!=app.advancedCursorState || app.advancedSkipRevision!=app.skipRevision || app.advancedWatermarkRevision!=app.watermarkRevision){
+    if(app.advancedOutputFps!=app.settings.outputFps || delay!=app.advancedDelaySeconds || selection!=app.advancedLimitIndex || segment!=app.advancedSegmentSeconds || night!=app.advancedNightState || recovery!=app.advancedRecoveryState || cursor!=app.advancedCursorState || app.advancedSkipRevision!=app.skipRevision || app.advancedWatermarkRevision!=app.watermarkRevision){
         std::wstring caption=L"&Advanced";
         if(recovery==2)caption+=L" · check MP4";
         else if(night==2)caption+=L" · check blend";
@@ -684,17 +723,21 @@ void updateAdvanced() {
         if(segment && night!=2 && recovery!=2 && app.watermarkValidation.empty())caption+=L" · split "+formatDuration(int64_t(segment)*1000,true);
         if(app.settings.watermark.enabled && app.watermarkValidation.empty() && night!=2 && recovery!=2)caption+=L" · watermark";
         if(cursor==1 && app.watermarkValidation.empty() && night!=2 && recovery!=2)caption+=L" · cursor off";
+        if(app.settings.outputFps!=DefaultOutputFps)caption+=L" · "+std::to_wstring(app.settings.outputFps)+L" fps";
+        if(!app.hotkeyWarning.empty())caption=L"&Advanced · check shortcuts";
         RECT bounds{};GetClientRect(app.advanced,&bounds);
-        if((delay || selection || segment || skipEnabled() || recovery==1 || app.settings.watermark.enabled || cursor==1) && night!=2 && recovery!=2 && app.watermarkValidation.empty() && bounds.right>app.scale(40)) {
+        if((delay || selection || segment || skipEnabled() || recovery==1 || app.settings.watermark.enabled || cursor==1 || app.settings.outputFps!=DefaultOutputFps) && app.hotkeyWarning.empty() && night!=2 && recovery!=2 && app.watermarkValidation.empty() && bounds.right>app.scale(40)) {
             HDC dc=GetDC(app.advanced);if(dc){const auto previous=SelectObject(dc,app.font);SIZE size{};
                 GetTextExtentPoint32W(dc,caption.c_str(),static_cast<int>(caption.size()),&size);
                 SelectObject(dc,previous);ReleaseDC(app.advanced,dc);
                 if(size.cx+app.scale(18)>bounds.right)caption=delay?L"&Advanced · delay "+formatDuration(int64_t(delay)*1000,true):cursor==1?L"&Advanced · cursor off + options":app.settings.watermark.enabled?L"&Advanced · watermark + options":segment?L"&Advanced · split + options":recovery?L"&Advanced · recovery + options":skipEnabled()?L"&Advanced · "+std::wstring(night?L"night/":L"")+
-                    (selection?L"stop/":L"")+std::to_wstring(app.settings.timeSkip.multiplier)+L"×":night?L"&Advanced · night + stop":L"&Advanced · timed stop";
+                    (selection?L"stop/":L"")+std::to_wstring(app.settings.timeSkip.multiplier)+L"×":night?L"&Advanced · night + stop":selection?L"&Advanced · timed stop":L"&Advanced · "+std::to_wstring(app.settings.outputFps)+L" fps";
             }
         }
         if(caption!=app.advancedCaption){SetWindowTextW(app.advanced,caption.c_str());app.advancedCaption=caption;}
         app.advancedTooltip=L"Show or hide advanced options. Recording options can be changed before recording. Night mode applies only to camera content. Show desktop cursor applies only to desktop content.";
+        app.advancedTooltip+=L" Playback: "+std::to_wstring(app.settings.outputFps)+L" fps. Global shortcuts can be configured in Playback & shortcuts.";
+        if(!app.hotkeyWarning.empty())app.advancedTooltip+=L" "+app.hotkeyWarning;
         if(delay)app.advancedTooltip+=L" After Record, wait "+formatDuration(int64_t(delay)*1000)+L" before preparation. Visible preview continues; Stop after counts active recording time. Sleep cancels the pending start.";
         if(cursor)app.advancedTooltip+=L" The added system cursor is hidden in desktop preview and recordings; pointers drawn into application pixels are unchanged.";
         if(selection)app.advancedTooltip+=L" Stop after "+formatDuration(int64_t(selection)*1000)+L" of active recording; pauses and startup do not count.";
@@ -709,6 +752,7 @@ void updateAdvanced() {
         if(captionWatermark!=app.watermarkCaption){SetWindowTextW(app.watermarkSummary,captionWatermark.c_str());app.watermarkCaption=captionWatermark;}
         app.advancedWatermarkRevision=app.watermarkRevision;
         app.advancedCursorState=cursor;app.advancedDelaySeconds=delay;
+        app.advancedOutputFps=app.settings.outputFps;
         app.advancedLimitIndex=selection;app.advancedSegmentSeconds=segment;app.advancedNightState=night;app.advancedRecoveryState=recovery;app.advancedSkipRevision=app.skipRevision;
     }
     const int visibleNight=app.advancedExpanded?nightRow():0;
@@ -721,7 +765,7 @@ void updateAdvanced() {
     const auto visible=[](HWND child,bool show){
         if(child && ((GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0)!=show)ShowWindow(child,show?SW_SHOWNA:SW_HIDE);
     };
-    for(HWND child:{app.labels[6],app.encodingMode,app.labels[7],app.stopAfter,app.lowDisk,app.recoveryMode,app.segmentLabel,app.splitEvery,app.captureCursor,app.startDelayLabel,app.startDelay,app.startDelayHint,app.watermarkConfigure,app.watermarkSummary})visible(child,app.advancedExpanded);
+    for(HWND child:{app.labels[6],app.encodingMode,app.labels[7],app.stopAfter,app.lowDisk,app.recoveryMode,app.segmentLabel,app.splitEvery,app.captureCursor,app.startDelayLabel,app.startDelay,app.startDelayHint,app.watermarkConfigure,app.watermarkSummary,app.playbackConfigure})visible(child,app.advancedExpanded);
     for(HWND child:{app.skipConfigure,app.skipSummary})visible(child,visibleSkip!=0);
     visible(app.skipDetail,visibleSkip==2);
     if(!visibleNight && app.nightEnabled && GetFocus()==app.nightEnabled)SetFocus(app.advanced);
@@ -1009,11 +1053,12 @@ bool trayProgressText(const Status& status,wchar_t (&value)[160]) noexcept {
     if(!std::isfinite(status.elapsed) || status.elapsed<0 ||
        status.elapsed>=static_cast<double>(UINT64_MAX))return false;
     const auto active=static_cast<uint64_t>(status.elapsed);
-    if(status.frames<30)
+    const auto fps=static_cast<uint64_t>(std::clamp(app.recordedOutputFps,MinOutputFps,MaxOutputFps));
+    if(status.frames<fps)
         return swprintf_s(value,L"%ls: %02llu:%02llu:%02llu active | %llu %ls total",
             state,active/3600,active/60%60,active%60,status.frames,
             status.frames==1?L"frame":L"frames")>=0;
-    const auto video=status.frames/30;
+    const auto video=status.frames/fps;
     return swprintf_s(value,L"%ls: %02llu:%02llu:%02llu active | %02llu:%02llu:%02llu video total",
         state,active/3600,active/60%60,active%60,video/3600,video/60%60,video%60)>=0;
 }
@@ -1122,7 +1167,8 @@ void layout() {
     move(app.skipSummary,pad+app.scale(216),app.scale(376),width-app.scale(216),ch);
     move(app.skipDetail,pad,app.scale(412),width,app.scale(21));
     move(app.watermarkConfigure,pad,app.scale(334+skipHeight),app.scale(202),ch);
-    move(app.watermarkSummary,pad+app.scale(216),app.scale(334+skipHeight),width-app.scale(216),ch);
+    move(app.watermarkSummary,pad+app.scale(216),app.scale(334+skipHeight),width-app.scale(432),ch);
+    move(app.playbackConfigure,pad+width-app.scale(202),app.scale(334+skipHeight),app.scale(202),ch);
     move(app.nightEnabled,pad,app.scale((night==2?396:376)+skipHeight),encodingW,ch);
     move(app.labels[8],stopX,app.scale(375+skipHeight),stopW,app.scale(20));move(app.nightDuration,stopX,app.scale(396+skipHeight),stopW,app.scale(210));
     move(app.labels[9],diskX,app.scale(375+skipHeight),options-encodingW-stopW,app.scale(20));move(app.nightTarget,diskX,app.scale(396+skipHeight),options-encodingW-stopW,app.scale(150));
@@ -1192,7 +1238,7 @@ void revealFocusedControl() {
 }
 void toggleAdvanced() {
     const HWND focused=GetFocus();
-    if(app.advancedExpanded)for(HWND child:{app.encodingMode,app.stopAfter,app.splitEvery,app.lowDisk,app.recoveryMode,app.captureCursor,app.startDelay,app.skipConfigure,app.watermarkConfigure,app.nightEnabled,app.nightDuration,app.nightTarget})
+    if(app.advancedExpanded)for(HWND child:{app.encodingMode,app.stopAfter,app.splitEvery,app.lowDisk,app.recoveryMode,app.captureCursor,app.startDelay,app.skipConfigure,app.watermarkConfigure,app.playbackConfigure,app.nightEnabled,app.nightDuration,app.nightTarget})
         if(child && (focused==child || (focused && IsChild(child,focused)))){SetFocus(app.advanced);break;}
     app.advancedExpanded=!app.advancedExpanded;
     updateAdvanced();layout();revealFocusedControl();
@@ -1660,7 +1706,7 @@ INT_PTR CALLBACK customProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             else {draft->units=child(L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL,CustomUnits);
                 add(draft->units,L"Seconds");if(!night){add(draft->units,L"Minutes");add(draft->units,L"Hours");if(!interval)add(draft->units,L"Days");}choose(draft->units,0);}
             draft->help=child(L"STATIC",range?L"Use whole active seconds from 0 to 2,147,483,647. Pauses and initial preparation do not count. Start is included; end is excluded. Overlapping or touching ranges merge when you return to the schedule.":size?L"Use even dimensions from 48 to 4096 pixels, at most 8,847,360 pixels total. Sources fit inside the video without stretching.":
-                interval?L"Choose 0.1 seconds to 24 hours. Decimals use a point and must resolve to whole milliseconds. Playback stays at 30 fps.":
+                interval?L"Choose 0.1 seconds to 24 hours. Decimals use a point and must resolve to whole milliseconds. Playback uses the frame rate set in Advanced > Playback & shortcuts.":
                 night?L"Request a software blend window from 1 to 30 seconds, in whole milliseconds (for example, 1.25). Automatic brightness continues; camera timing can vary. This does not change shutter settings. The duration must not exceed Capture every.":
                 draft->kind==CustomKind::Segment?L"Choose 1 to 2,147,483,647 whole seconds of active recording per part. Pauses and initial preparation do not count; automatic saving does. Empty periods create no files. Shorter parts add processing and file overhead.":
                 L"Choose 1 to 2,147,483,647 seconds of active recording. Pauses and initial preparation do not count. Decimals must resolve to whole seconds.",SS_NOPREFIX,CustomHelp);
@@ -1846,7 +1892,7 @@ void skipHelp(SkipDraft& draft) {
             text+=skipPerson(mode)?L" Detected people return to normal speed promptly, interrupting the transition.":L" Detected image changes return to normal speed promptly, interrupting the transition.";
             text+=L" Checks pause with recording and continue outside scheduled ranges.";
         }
-        text+=L"\n\nTransition uses saved video frames (30 fps); real wait depends on Capture every. Short ranges may reach a lower speed. No intermediate pictures are generated. Both files share a cadence. Night blends retain their full duration, bounded by the base interval.";
+        text+=L"\n\nTransition rounds to whole saved video frames ("+std::to_wstring(app.settings.outputFps)+L" fps); real wait depends on Capture every. Short ranges may reach a lower speed. No intermediate pictures are generated. Both files share a cadence. Night blends retain their full duration, bounded by the base interval.";
     }
     if(draft.readOnly)text=L"Recording options are frozen for this session. "+text;
     if(draft.repeatCleared)text+=L" The retained repeat was reset to Never because an edited range exceeded it; your ranges are retained.";
@@ -1943,7 +1989,8 @@ INT_PTR CALLBACK skipProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             exactDuration(draft->quiet,draft->quietUnits,draft->policy.quietAfterMs);
             exactDuration(draft->repeat,draft->repeatUnits,int64_t(draft->policy.repeatSeconds)*1000);
             draft->fine=button(L"Fine tuning",SkipFine);
-            label(2,L"&Transition (video time)");draft->ramp=combo(SkipRamp);for(auto value:{L"0.5 s (15 frames)",L"1 s (30 frames)",L"2 s (60 frames)"})add(draft->ramp,value);
+            label(2,L"&Transition (video time)");draft->ramp=combo(SkipRamp);for(int value:SkipRamps){const int frames=std::max(1,(value*app.settings.outputFps+DefaultOutputFps/2)/DefaultOutputFps);
+                add(draft->ramp,secondsInput(int64_t(value)*1000/DefaultOutputFps)+L" s ("+std::to_wstring(frames)+L" frames)");}
             choose(draft->ramp,1);for(int i=0;i<3;++i)if(SkipRamps[i]==draft->policy.rampFrames)choose(draft->ramp,i);
             draft->sensitivityLabel=skipChild(window,L"STATIC",L"Change &sensitivity",0,5210);draft->sensitivity=combo(SkipSensitivity);
             for(auto value:{L"Low",L"Standard (default)",L"High"})add(draft->sensitivity,value);choose(draft->sensitivity,static_cast<int>(draft->policy.quietSensitivity));
@@ -2118,7 +2165,7 @@ void watermarkIllustration(WatermarkDraft& draft) {
     for(int y=0;y<dimensions.second;++y)for(int x=0;x<dimensions.first;++x){auto* p=draft.illustration.pixels.data()+(size_t(y)*dimensions.first+x)*4;
         p[0]=uint8_t(70+60*x/dimensions.first);p[1]=uint8_t(75+50*y/dimensions.second);p[2]=uint8_t(35+35*x/dimensions.first);p[3]=255;}
     if(valid && draft.renderer.prepare(value,app.settings.width,app.settings.height,error)){
-        WatermarkContext context;context.activeMs=192000;context.recordedLocal={2026,9,3,30,12,34,56,0};context.targetIntervalMs=app.settings.intervalMs;
+        WatermarkContext context;context.activeMs=192000;context.recordedLocal={2026,9,3,30,12,34,56,0};context.targetIntervalMs=app.settings.intervalMs;context.outputFps=app.settings.outputFps;
         draft.renderer.apply(draft.illustration,context,error);
     }
     SetWindowTextW(draft.error,error.c_str());InvalidateRect(draft.preview,nullptr,FALSE);
@@ -2208,6 +2255,139 @@ void editWatermark() {
     if(outcome==IDOK && !draft.readOnly && !app.active()){app.settings.watermark=draft.policy;app.watermarkCheckValid=false;++app.watermarkRevision;configure();updateControls();layout();}
     if(outcome==-1)MessageBoxW(app.window,L"Watermark settings could not be opened. Try again.",L"Timelapse",MB_OK|MB_ICONERROR);
     if(!app.closeWhenDone && !app.hiddenToTray){SetFocus(app.watermarkConfigure);revealFocusedControl();}
+}
+
+enum PlaybackId { PlaybackFps=5501,PlaybackPause,PlaybackStop,PlaybackClearPause,PlaybackClearStop };
+struct PlaybackDraft : CustomDraft {
+    int fps=DefaultOutputFps,naturalHeight=0;
+    uint16_t pauseHotkey=0,stopHotkey=0;
+    HWND fpsHint{},pauseLabel{},stopLabel{},stop{},clearPause{},clearStop{};
+    bool readOnly=false;
+};
+LRESULT CALLBACK playbackFocusProc(HWND window,UINT message,WPARAM wp,LPARAM lp,UINT_PTR id,DWORD_PTR) {
+    const auto result=DefSubclassProc(window,message,wp,lp);
+    if(message==WM_SETFOCUS)SendMessageW(GetParent(window),WM_COMMAND,MAKEWPARAM(GetDlgCtrlID(window),EN_SETFOCUS),reinterpret_cast<LPARAM>(window));
+    if(message==WM_NCDESTROY)RemoveWindowSubclass(window,playbackFocusProc,id);
+    return result;
+}
+void playbackLayout(HWND window,PlaybackDraft& draft) {
+    if(draft.layingOut)return;draft.layingOut=true;
+    RECT client{};GetClientRect(window,&client);const auto style=GetWindowLongPtrW(window,GWL_STYLE);
+    const int bw=GetSystemMetricsForDpi(SM_CXVSCROLL,draft.dpi),bh=GetSystemMetricsForDpi(SM_CYHSCROLL,draft.dpi);
+    const int availableW=client.right+((style&WS_VSCROLL)?bw:0),availableH=client.bottom+((style&WS_HSCROLL)?bh:0),pad=draft.scale(18),gap=draft.scale(14);
+    const auto wrap=[&](HWND child,int width,int minimum){
+        wchar_t value[1024]{};GetWindowTextW(child,value,1024);RECT bounds{0,0,std::max(1,width),0};HDC dc=GetDC(window);
+        if(!dc)return minimum;const auto previous=SelectObject(dc,draft.font?draft.font:GetStockObject(DEFAULT_GUI_FONT));
+        DrawTextW(dc,value,-1,&bounds,DT_CALCRECT|DT_WORDBREAK|DT_NOPREFIX);SelectObject(dc,previous);ReleaseDC(window,dc);return std::max(minimum,int(bounds.bottom));
+    };
+    int fpsHintHeight=0,pauseTop=0,stopTop=0,helpTop=0,helpHeight=0,errorTop=0,errorHeight=0,buttonTop=0;
+    const auto measure=[&](int width){
+        fpsHintHeight=wrap(draft.fpsHint,width-2*pad,draft.scale(36));pauseTop=draft.scale(80)+fpsHintHeight+draft.scale(14);stopTop=pauseTop+draft.scale(66);
+        helpTop=stopTop+draft.scale(66);helpHeight=wrap(draft.help,width-2*pad,draft.scale(56));errorTop=helpTop+helpHeight+draft.scale(8);
+        errorHeight=wrap(draft.error,width-2*pad,draft.scale(36));buttonTop=errorTop+errorHeight+draft.scale(10);draft.naturalHeight=buttonTop+draft.scale(44);
+    };
+    bool horizontal=false,vertical=false;
+    for(int i=0;i<3;++i){horizontal=availableW-(vertical?bw:0)<draft.scale(360);measure(std::max(draft.scale(360),availableW-(vertical?bw:0)));vertical=availableH-(horizontal?bh:0)<draft.naturalHeight;}
+    ShowScrollBar(window,SB_HORZ,horizontal);ShowScrollBar(window,SB_VERT,vertical);GetClientRect(window,&client);
+    const int width=std::max(draft.scale(360),int(client.right));measure(width);const int height=std::max(draft.naturalHeight,int(client.bottom));
+    if(width<=client.right)draft.wheelX=0;if(height<=client.bottom)draft.wheelY=0;
+    draft.scrollX=std::clamp(draft.scrollX,0,width-int(std::max(1L,client.right)));draft.scrollY=std::clamp(draft.scrollY,0,height-int(std::max(1L,client.bottom)));
+    SCROLLINFO info{sizeof(info),SIF_RANGE|SIF_PAGE|SIF_POS};info.nMax=width-1;info.nPage=std::max(1L,client.right);info.nPos=draft.scrollX;SetScrollInfo(window,SB_HORZ,&info,TRUE);
+    info.nMax=height-1;info.nPage=std::max(1L,client.bottom);info.nPos=draft.scrollY;SetScrollInfo(window,SB_VERT,&info,TRUE);
+    const auto move=[&](HWND child,int x,int y,int w,int h){MoveWindow(child,x-draft.scrollX,y-draft.scrollY,w,h,TRUE);};
+    const int clearWidth=draft.scale(70),fieldWidth=width-2*pad-clearWidth-gap;
+    move(draft.firstLabel,pad,draft.scale(16),width-2*pad,draft.scale(20));move(draft.first,pad,draft.scale(38),draft.scale(130),draft.scale(180));
+    move(draft.fpsHint,pad,draft.scale(80),width-2*pad,fpsHintHeight);
+    move(draft.pauseLabel,pad,pauseTop,width-2*pad,draft.scale(20));move(draft.second,pad,pauseTop+draft.scale(22),fieldWidth,draft.scale(28));move(draft.clearPause,width-pad-clearWidth,pauseTop+draft.scale(22),clearWidth,draft.scale(28));
+    move(draft.stopLabel,pad,stopTop,width-2*pad,draft.scale(20));move(draft.stop,pad,stopTop+draft.scale(22),fieldWidth,draft.scale(28));move(draft.clearStop,width-pad-clearWidth,stopTop+draft.scale(22),clearWidth,draft.scale(28));
+    move(draft.help,pad,helpTop,width-2*pad,helpHeight);move(draft.error,pad,errorTop,width-2*pad,errorHeight);
+    move(draft.okay,width-pad-draft.scale(174),buttonTop,draft.scale(80),draft.scale(28));move(draft.cancel,width-pad-draft.scale(80),buttonTop,draft.scale(80),draft.scale(28));draft.layingOut=false;
+}
+void playbackReveal(HWND window,PlaybackDraft& draft,HWND child) {
+    if(!child || !IsChild(window,child))return;RECT bounds{},client{};GetWindowRect(child,&bounds);MapWindowPoints(nullptr,window,reinterpret_cast<POINT*>(&bounds),2);GetClientRect(window,&client);
+    if(bounds.left<0)draft.scrollX+=bounds.left;else if(bounds.right>client.right)draft.scrollX+=bounds.right-client.right;
+    if(bounds.top<0)draft.scrollY+=bounds.top;else if(bounds.bottom>client.bottom)draft.scrollY+=bounds.bottom-client.bottom;playbackLayout(window,draft);
+}
+void playbackFitHeight(HWND window,PlaybackDraft& draft) {
+    RECT bounds{},client{};GetWindowRect(window,&bounds);GetClientRect(window,&client);bounds.bottom+=draft.naturalHeight-client.bottom;
+    bounds=fitWindow(bounds,workArea(MonitorFromWindow(window,MONITOR_DEFAULTTONEAREST)));
+    SetWindowPos(window,nullptr,bounds.left,bounds.top,bounds.right-bounds.left,bounds.bottom-bounds.top,SWP_NOZORDER|SWP_NOACTIVATE);playbackLayout(window,draft);
+}
+bool validatePlaybackDraft(PlaybackDraft& draft,std::wstring& error,HWND& invalid) {
+    invalid=draft.first;wchar_t fps[96]{};
+    if(GetWindowTextLengthW(draft.first)>=96){error=L"Enter a shorter complete whole number of frames per second.";return false;}
+    GetWindowTextW(draft.first,fps,96);int parsed=DefaultOutputFps;
+    if(!parseOutputFps(fps,parsed,error))return false;
+    const auto pause=static_cast<uint16_t>(SendMessageW(draft.second,HKM_GETHOTKEY,0,0)),stop=static_cast<uint16_t>(SendMessageW(draft.stop,HKM_GETHOTKEY,0,0));
+    invalid=!validHotkey(pause)?draft.second:draft.stop;
+    if(!validateHotkeys(pause,stop,error))return false;
+    if(!setRecordingHotkeys(pause,stop,error)){invalid=error.find(L"Pause / resume")==0?draft.second:draft.stop;return false;}
+    draft.fps=parsed;draft.pauseHotkey=pause;draft.stopHotkey=stop;return true;
+}
+INT_PTR CALLBACK playbackProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
+    auto* draft=reinterpret_cast<PlaybackDraft*>(GetWindowLongPtrW(window,DWLP_USER));
+    try {
+        if(message==WM_INITDIALOG){
+            draft=reinterpret_cast<PlaybackDraft*>(lp);SetWindowLongPtrW(window,DWLP_USER,lp);draft->previousDialog=app.customDialog;app.customDialog=window;
+            draft->dpi=static_cast<int>(GetDpiForWindow(window));if(draft->dpi<=0)draft->dpi=app.dpi;SetWindowTextW(window,L"Playback & shortcuts");
+            const auto child=[&](const wchar_t* cls,const wchar_t* caption,DWORD style,int id){return CreateWindowExW(std::wcscmp(cls,HOTKEY_CLASSW)==0?WS_EX_CLIENTEDGE:0,cls,caption,
+                WS_CHILD|WS_VISIBLE|style,0,0,1,1,window,reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),GetModuleHandleW(nullptr),nullptr);};
+            draft->firstLabel=child(L"STATIC",L"Final video &frame rate (fps)",0,0);
+            draft->first=child(L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWN|WS_VSCROLL,PlaybackFps);
+            for(int fps:{24,25,30,60,120})add(draft->first,std::to_wstring(fps));SetWindowTextW(draft->first,std::to_wstring(draft->fps).c_str());SendMessageW(draft->first,CB_LIMITTEXT,96,0);
+            draft->fpsHint=child(L"STATIC",L"Choose a whole number from 1 to 120. Higher fps plays the captured frames faster and makes a shorter video. Capture every stays unchanged.",SS_NOPREFIX,0);
+            draft->pauseLabel=child(L"STATIC",L"Global &pause / resume",0,0);draft->second=child(HOTKEY_CLASSW,L"",WS_TABSTOP,PlaybackPause);draft->clearPause=child(L"BUTTON",L"C&lear",WS_TABSTOP|BS_PUSHBUTTON|BS_NOTIFY,PlaybackClearPause);
+            draft->stopLabel=child(L"STATIC",L"Global &stop and save",0,0);draft->stop=child(HOTKEY_CLASSW,L"",WS_TABSTOP,PlaybackStop);draft->clearStop=child(L"BUTTON",L"Cl&ear",WS_TABSTOP|BS_PUSHBUTTON|BS_NOTIFY,PlaybackClearStop);
+            draft->help=child(L"STATIC",draft->readOnly?L"These settings are frozen for the current recording. Shortcuts work while minimized, and are suspended while a Timelapse dialog or menu is open. Stop saves the recording; during preparation it cancels the start.":
+                L"Press a combination with Ctrl or Alt in a shortcut field. Alt with a letter also needs Ctrl to keep access keys available. Clear disables it. Shortcuts work while minimized, and are suspended while a Timelapse dialog or menu is open. Stop saves the recording; during preparation it cancels the start.",SS_NOPREFIX,CustomHelp);
+            draft->error=child(L"STATIC",app.hotkeyWarning.c_str(),SS_NOPREFIX,CustomError);
+            draft->okay=child(L"BUTTON",L"OK",WS_TABSTOP|BS_DEFPUSHBUTTON|BS_NOTIFY,IDOK);draft->cancel=child(L"BUTTON",draft->readOnly?L"Close":L"Cancel",WS_TABSTOP|BS_PUSHBUTTON|BS_NOTIFY,IDCANCEL);
+            if(!draft->firstLabel || !draft->first || !draft->fpsHint || !draft->pauseLabel || !draft->second || !draft->clearPause || !draft->stopLabel || !draft->stop || !draft->clearStop || !draft->help || !draft->error || !draft->okay || !draft->cancel){EndDialog(window,-1);return TRUE;}
+            if(!dialogWheelCombos({draft->first})){EndDialog(window,-1);return TRUE;}
+            if(!SetWindowSubclass(draft->second,playbackFocusProc,2,0) || !SetWindowSubclass(draft->stop,playbackFocusProc,2,0)){EndDialog(window,-1);return TRUE;}
+            SendMessageW(draft->second,HKM_SETHOTKEY,draft->pauseHotkey,0);SendMessageW(draft->stop,HKM_SETHOTKEY,draft->stopHotkey,0);
+            if(draft->readOnly)for(HWND field:{draft->first,draft->second,draft->stop,draft->clearPause,draft->clearStop,draft->okay})EnableWindow(field,FALSE);
+            customFont(window,*draft);RECT bounds{0,0,draft->scale(460),draft->scale(400)};
+            AdjustWindowRectExForDpi(&bounds,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_STYLE)),FALSE,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_EXSTYLE)),draft->dpi);
+            RECT owner{};GetWindowRect(app.window,&owner);OffsetRect(&bounds,(owner.left+owner.right-(bounds.right-bounds.left))/2-bounds.left,(owner.top+owner.bottom-(bounds.bottom-bounds.top))/2-bounds.top);
+            bounds=fitWindow(bounds,workArea(MonitorFromWindow(app.window,MONITOR_DEFAULTTONEAREST)));SetWindowPos(window,nullptr,bounds.left,bounds.top,bounds.right-bounds.left,bounds.bottom-bounds.top,SWP_NOZORDER|SWP_NOACTIVATE);
+            playbackLayout(window,*draft);playbackFitHeight(window,*draft);SetFocus(draft->readOnly?draft->cancel:draft->first);return FALSE;
+        }
+        if(!draft)return FALSE;
+        switch(message){
+        case WM_SIZE:playbackLayout(window,*draft);return TRUE;
+        case WM_MOUSEWHEEL:case WM_MOUSEHWHEEL:{const auto result=dialogWheel(window,*draft,message,wp);if(result==DialogWheel::Scrolled)playbackLayout(window,*draft);if(result!=DialogWheel::Pass)return TRUE;break;}
+        case WM_DPICHANGED:{draft->dpi=HIWORD(wp);customFont(window,*draft);RECT bounds=fitWindow(*reinterpret_cast<RECT*>(lp),workArea(MonitorFromRect(reinterpret_cast<RECT*>(lp),MONITOR_DEFAULTTONEAREST)));
+            SetWindowPos(window,nullptr,bounds.left,bounds.top,bounds.right-bounds.left,bounds.bottom-bounds.top,SWP_NOZORDER|SWP_NOACTIVATE);playbackLayout(window,*draft);playbackReveal(window,*draft,GetFocus());return TRUE;}
+        case WM_HSCROLL:case WM_VSCROLL:{const int bar=message==WM_HSCROLL?SB_HORZ:SB_VERT;SCROLLINFO info{sizeof(info),SIF_ALL};GetScrollInfo(window,bar,&info);int position=info.nPos;
+            switch(LOWORD(wp)){case SB_LINEUP:position-=draft->scale(24);break;case SB_LINEDOWN:position+=draft->scale(24);break;case SB_PAGEUP:position-=info.nPage;break;case SB_PAGEDOWN:position+=info.nPage;break;case SB_THUMBPOSITION:case SB_THUMBTRACK:position=info.nTrackPos;break;case SB_TOP:position=0;break;case SB_BOTTOM:position=info.nMax;break;default:return TRUE;}
+            (bar==SB_HORZ?draft->scrollX:draft->scrollY)=position;playbackLayout(window,*draft);return TRUE;}
+        case WM_COMMAND:{const int id=LOWORD(wp),code=HIWORD(wp);
+            if(code==BN_SETFOCUS || code==CBN_SETFOCUS || code==EN_SETFOCUS){playbackReveal(window,*draft,reinterpret_cast<HWND>(lp));return TRUE;}
+            if(id==IDCANCEL && code==BN_CLICKED){EndDialog(window,IDCANCEL);return TRUE;}
+            if(id==IDOK && code==BN_CLICKED){if(draft->readOnly || app.active()){EndDialog(window,IDCANCEL);return TRUE;}
+                std::wstring error;HWND invalid{};if(validatePlaybackDraft(*draft,error,invalid)){EndDialog(window,IDOK);return TRUE;}
+                SetWindowTextW(draft->error,error.c_str());playbackLayout(window,*draft);playbackFitHeight(window,*draft);SetFocus(invalid);playbackReveal(window,*draft,invalid);return TRUE;}
+            if((id==PlaybackClearPause || id==PlaybackClearStop) && code==BN_CLICKED && !draft->readOnly && !app.active()){
+                const HWND field=id==PlaybackClearPause?draft->second:draft->stop;SendMessageW(field,HKM_SETHOTKEY,0,0);SetFocus(field);playbackReveal(window,*draft,field);return TRUE;}
+            return FALSE;}
+        case WM_CTLCOLORSTATIC:if(reinterpret_cast<HWND>(lp)==draft->error){SetTextColor(reinterpret_cast<HDC>(wp),RGB(164,40,40));SetBkColor(reinterpret_cast<HDC>(wp),GetSysColor(COLOR_BTNFACE));return reinterpret_cast<INT_PTR>(GetSysColorBrush(COLOR_BTNFACE));}break;
+        case WM_CLOSE:EndDialog(window,IDCANCEL);return TRUE;
+        case WM_DESTROY:if(draft->font){DeleteObject(draft->font);draft->font=nullptr;}if(app.customDialog==window)app.customDialog=IsWindow(draft->previousDialog)?draft->previousDialog:nullptr;return TRUE;
+        }
+    } catch(...){EndDialog(window,-1);return TRUE;}return FALSE;
+}
+bool savePreferences();
+void editPlayback() {
+    if(app.customDialog)return;PlaybackDraft draft;draft.fps=app.settings.outputFps;draft.pauseHotkey=app.pauseHotkey;draft.stopHotkey=app.stopHotkey;draft.readOnly=app.active();CustomTemplate resource;
+    const auto outcome=DialogBoxIndirectParamW(GetModuleHandleW(nullptr),&resource.dialog,app.window,playbackProc,reinterpret_cast<LPARAM>(&draft));
+    if(!IsWindow(app.window))return;
+    if(outcome==IDOK && !draft.readOnly && !app.active()){
+        app.settings.outputFps=draft.fps;app.advancedOutputFps=-1;configure();updateControls();layout();InvalidateRect(app.window,nullptr,FALSE);
+        if(app.startupComplete && !savePreferences())MessageBoxW(app.window,L"Your settings apply for this session, but could not be saved. Check that the settings folder is writable.",L"Timelapse",MB_OK|MB_ICONWARNING);
+    }
+    if(outcome==-1)MessageBoxW(app.window,L"Playback and shortcut settings could not be opened. Try again.",L"Timelapse",MB_OK|MB_ICONERROR);
+    if(!app.closeWhenDone && !app.hiddenToTray){SetFocus(app.playbackConfigure);revealFocusedControl();}
 }
 
 void selectFolder() {
@@ -2332,6 +2512,8 @@ bool savePreferences() {
         const auto customLimit=std::to_wstring(app.customLimitSeconds);
         const auto segmentDuration=std::to_wstring(selectedSegment());
         const auto startDelay=std::to_wstring(selectedStartDelay());
+        const auto outputFps=std::to_wstring(app.settings.outputFps),pauseHotkey=std::to_wstring(app.pauseHotkey),stopHotkey=std::to_wstring(app.stopHotkey);
+        std::wstring playbackError;if(!validateOutputFps(app.settings.outputFps,playbackError) || !validateHotkeys(app.pauseHotkey,app.stopHotkey,playbackError))return false;
         auto skipPolicy=app.settings.timeSkip;std::wstring skipError;
         if(!normalizeTimeSkipSettings(skipPolicy,skipError))return false;
         const auto skip=skipValues(skipPolicy);
@@ -2375,6 +2557,9 @@ bool savePreferences() {
         for(size_t i=0;saved && i<skip.size();++i)saved=WritePrivateProfileStringW(L"Settings",SkipKeys[i],skip[i].c_str(),pending.path)!=FALSE;
         for(size_t i=0;saved && i<watermark.size();++i)saved=WritePrivateProfileStringW(L"Settings",WatermarkKeys[i],watermark[i].c_str(),pending.path)!=FALSE;
         if(saved)saved=WritePrivateProfileStringW(L"Settings",L"StartDelaySeconds",startDelay.c_str(),pending.path)!=FALSE;
+        if(saved)saved=WritePrivateProfileStringW(L"Settings",L"OutputFps",outputFps.c_str(),pending.path) &&
+            WritePrivateProfileStringW(L"Settings",L"PauseHotkey",pauseHotkey.c_str(),pending.path) &&
+            WritePrivateProfileStringW(L"Settings",L"StopHotkey",stopHotkey.c_str(),pending.path);
         // This cache-flush form returns zero even when successful.
         WritePrivateProfileStringW(nullptr,nullptr,nullptr,pending.path);
         if(!saved)return false;
@@ -2453,6 +2638,14 @@ void preferences(bool save) {
         loadNightChoice(L"NightTargetBrightness",app.nightTarget,NightTargets,1);
         loadNightChoice(L"StartDelaySeconds",app.startDelay,StartDelays,0);
         app.committedStartDelay=std::clamp(choice(app.startDelay),0,5);
+        app.settings.outputFps=DefaultOutputFps;
+        exactInteger(L"OutputFps",MinOutputFps,MaxOutputFps,app.settings.outputFps);
+        app.recordedOutputFps=app.settings.outputFps;
+        int pause=0,stop=0;exactInteger(L"PauseHotkey",0,UINT16_MAX,pause);exactInteger(L"StopHotkey",0,UINT16_MAX,stop);
+        if(!validHotkey(static_cast<uint16_t>(pause)))pause=0;if(!validHotkey(static_cast<uint16_t>(stop)) || (pause && hotkeyIdentity(static_cast<uint16_t>(pause))==hotkeyIdentity(static_cast<uint16_t>(stop))))stop=0;
+        unregisterRecordingHotkeys();app.pauseHotkey=static_cast<uint16_t>(pause);app.stopHotkey=static_cast<uint16_t>(stop);
+        std::wstring shortcutError;if(!setRecordingHotkeys(app.pauseHotkey,app.stopHotkey,shortcutError))app.hotkeyWarning=std::move(shortcutError);
+        app.advancedOutputFps=-1;
         app.settings.timeSkip=loadSkip(path);++app.skipRevision;
         app.settings.watermark=loadWatermark(path);app.watermarkCheckValid=false;++app.watermarkRevision;
         // Launch on desktop: opening the app never silently turns on a camera.
@@ -2581,6 +2774,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         app.skipSummaryCaption.clear();app.skipDetailCaption.clear();app.settings.timeSkip={};
         app.personPack={};app.personPackKnown=false;
         app.settings.watermark={};app.watermarkChecked={};app.watermarkCheckValid=false;app.watermarkRevision=0;app.advancedWatermarkRevision=-1;app.watermarkValidation.clear();app.watermarkCaption.clear();
+        unregisterRecordingHotkeys();app.pauseHotkey=app.stopHotkey=0;app.hotkeyWarning.clear();app.settings.outputFps=app.recordedOutputFps=DefaultOutputFps;app.advancedOutputFps=-1;
         app.hasCustomInterval=app.hasCustomSize=app.hasCustomLimit=false;
         app.customIntervalMs=5000;app.customWidth=1280;app.customHeight=720;app.customLimitSeconds=900;
         app.committedInterval=2;app.committedSize=app.committedLimit=0;
@@ -2626,6 +2820,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         app.skipDetail=requiredControl(L"STATIC",L"",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX,SkipDetail);
         app.watermarkConfigure=button(L"&Watermark...",WatermarkConfigure);
         app.watermarkSummary=requiredControl(L"STATIC",L"Off",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX,WatermarkSummary);
+        app.playbackConfigure=button(L"Playback && shortcuts...",PlaybackConfigure);
         app.nightEnabled=requiredControl(L"BUTTON",L"&Night camera (software blend)",WS_TABSTOP|BS_AUTOCHECKBOX,NightBox);
         app.nightDuration=combo(8,L"Blend d&uration",NightDurationBox);for(auto label:NightDurationLabels)add(app.nightDuration,label);
         app.nightTarget=combo(9,L"Auto &brightness",NightTargetBox);for(auto label:{L"Dark",L"Balanced",L"Bright"})add(app.nightTarget,label);
@@ -2661,6 +2856,9 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
         tip.uId=reinterpret_cast<UINT_PTR>(app.startDelay);
         tip.lpszText=const_cast<LPWSTR>(L"After Record, wait before preparing the recording. Camera startup and Night blending can add time before the first frame. Visible preview continues. Stop after excludes this wait. Closing hides to the tray and keeps the timer; Cancel start, Exit or sleep cancels it.");
+        SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
+        tip.uId=reinterpret_cast<UINT_PTR>(app.playbackConfigure);
+        tip.lpszText=const_cast<LPWSTR>(L"Set the final MP4 playback frame rate and optional global shortcuts for pause/resume and stop/save. Available before recording. Shortcuts work while minimized and pause while a Timelapse dialog or menu is open.");
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
         tip.uId=reinterpret_cast<UINT_PTR>(app.stopAfter);
         tip.lpszText=const_cast<LPWSTR>(L"Finish and save automatically after this much active recording time. Pauses and initial startup do not count. Never records until you choose Finish.");
@@ -2771,6 +2969,13 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         pollOpenFolder();
         return 0;
     }
+    case WM_HOTKEY: {
+        if(!app.engine || app.customDialog || app.trayMenuOpen || app.closeWhenDone || app.failureNotice==FailureNotice::Presenting || !IsWindowEnabled(w))return 0;
+        const int id=static_cast<int>(wp);const uint16_t binding=id==app.pauseHotkeyId?app.pauseHotkey:id==app.stopHotkeyId?app.stopHotkey:0;
+        if(!binding || HIWORD(lp)!=LOBYTE(binding) || LOWORD(lp)!=(hotkeyRegistrationModifiers(binding)&~MOD_NOREPEAT))return 0;
+        applyStatus(app.engine->status());
+        return windowProc(w,WM_COMMAND,id==app.pauseHotkeyId?Pause:Finish,0);
+    }
     case WM_COMMAND: {
         if(app.failureNotice==FailureNotice::Presenting)return 0;
         const int id=LOWORD(wp),code=HIWORD(wp);
@@ -2814,6 +3019,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         case AdvancedToggle:toggleAdvanced();break;
         case SkipConfigure:editSkip();break;
         case WatermarkConfigure:if(code==BN_CLICKED)editWatermark();break;
+        case PlaybackConfigure:if(code==BN_CLICKED)editPlayback();break;
         case LowDiskBox:if(!app.active())configure();break;
         case CursorBox:
             if(code!=BN_CLICKED)break;
@@ -2826,8 +3032,8 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
             break;
         case NightBox:if(!app.active()){configure();updateControls();layout();revealFocusedControl();}break;
         case TrayShow:showWindow(true);break;
-        case TrayPause:if(!app.closeWhenDone && (app.status.state==State::Recording || app.status.state==State::Paused))app.engine->setPaused(app.status.state!=State::Paused);break;
-        case TrayFinish:if(!app.closeWhenDone)app.engine->finish();break;
+        case TrayPause:case Pause:if(!app.closeWhenDone && (app.status.state==State::Recording || app.status.state==State::Paused))app.engine->setPaused(app.status.state!=State::Paused);break;
+        case TrayFinish:case Finish:if(!app.closeWhenDone && (app.status.state==State::Waiting || app.status.state==State::Starting || app.status.state==State::Recording || app.status.state==State::Paused))app.engine->finish();break;
         case TrayExit:exitApplication();break;
         case Refresh:refreshSources();app.engine->refreshSources();updateControls();break;
         case Record:
@@ -2838,11 +3044,10 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
                 // power loss. Checkpoint accepted options before capture starts.
                 // As on shutdown, preference failure must not prevent recording.
                 if(app.startupComplete)preferences(true);
+                app.recordedOutputFps=app.settings.outputFps;
                 app.engine->record();
             }
             applyStatus(app.engine->status(),true);acknowledgeVisibleFailure();break;
-        case Pause:app.engine->setPaused(app.status.state!=State::Paused);break;
-        case Finish:app.engine->finish();break;
         case Folder:selectFolder();break;
         case OpenFolder:startOpenFolder();break;
         case Reset:if(!app.settings.separateFiles){choose(app.mode,static_cast<int>(app.collagePreset));changeLayout(false);}break;
@@ -2870,12 +3075,12 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         std::wstring state=app.status.state==State::Recording?L"●  RECORDING":app.status.state==State::Paused?L"Ⅱ  PAUSED":app.status.state==State::Waiting?L"WAITING":app.status.state==State::Starting?L"PREPARING":app.status.state==State::Finishing?L"SAVING":L"DESKTOP + CAMERA";
         text(dc,state,badge,app.status.state==State::Recording?Accent:Muted,app.smallFont,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
         RECT hint={p,r.bottom-app.scale(180),r.right-p-app.scale(251),r.bottom-app.scale(150)};
-        text(dc,app.settings.separateFiles?L"Desktop and camera each save to their own MP4.":app.settings.layers.size()>1?L"Drag a layer to move it. Pull its corner to resize.":L"Preview · your recording is saved at 30 fps",hint,Muted,app.smallFont);
+        text(dc,app.settings.separateFiles?L"Desktop and camera each save to their own MP4.":app.settings.layers.size()>1?L"Drag a layer to move it. Pull its corner to resize.":L"Preview · your recording is saved at "+std::to_wstring(app.settings.outputFps)+L" fps",hint,Muted,app.smallFont);
         RECT stats={p,r.bottom-app.scale(147),r.right-p,r.bottom-app.scale(123)};
         std::wstring detail;
-        if((app.active() && app.status.state!=State::Waiting) || app.status.frames)detail=std::to_wstring(app.status.frames)+L" frames  ·  "+timeText(double(app.status.frames)/30,false)+L" video  ·  "+timeText(app.status.elapsed,true)+L" recording";
+        if((app.active() && app.status.state!=State::Waiting) || app.status.frames)detail=std::to_wstring(app.status.frames)+L" frames  ·  "+timeText(double(app.status.frames)/std::clamp(app.recordedOutputFps,MinOutputFps,MaxOutputFps),false)+L" video  ·  "+timeText(app.status.elapsed,true)+L" recording";
         else if(skipEnabled())detail=L"Base interval "+formatDuration(app.settings.intervalMs)+L" · time compression up to "+std::to_wstring(app.settings.timeSkip.multiplier)+L"×";
-        else {wchar_t buf[140];const double videoSeconds=120000.0/std::max(MinCaptureIntervalMs,app.settings.intervalMs);
+        else {wchar_t buf[140];const double videoSeconds=3600000.0/(double(std::max(MinCaptureIntervalMs,app.settings.intervalMs))*app.settings.outputFps);
             swprintf_s(buf,L"  ·  1 hour becomes %.*f seconds of video",videoSeconds<1?3:videoSeconds<10?1:0,videoSeconds);
             detail=L"Every "+formatDuration(app.settings.intervalMs)+buf;}
         if(app.status.completedSegments)detail+=L"  ·  "+std::to_wstring(app.status.completedSegments)+(app.status.completedSegments==1?L" part saved":L" parts saved");
@@ -2897,7 +3102,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         // giving the encoder a chance to finalize before Windows terminates us.
         if(wp){cancelOpenFolder();cancelOwnedDialogs();DestroyWindow(w);}
         return 0;
-    case WM_DESTROY:cancelOpenFolder();removeTray();KillTimer(w,1);if(app.startupComplete)preferences(true);app.startupComplete=false;app.engine.reset();PostQuitMessage(0);return 0;
+    case WM_DESTROY:cancelOpenFolder();removeTray();unregisterRecordingHotkeys();KillTimer(w,1);if(app.startupComplete)preferences(true);app.startupComplete=false;app.engine.reset();PostQuitMessage(0);return 0;
     }
     return DefWindowProcW(w,msg,wp,lp);
 }
@@ -2922,7 +3127,7 @@ int runGui(HINSTANCE instance,int show,bool& windowCreationFailed) {
             !comFailed && result==E_NOTIMPL ? L" On Windows N, install the Media Feature Pack, then try again." : L"");
         MessageBoxW(nullptr,error,L"Timelapse",MB_OK|MB_ICONERROR);return 1;
     }
-    INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_STANDARD_CLASSES};InitCommonControlsEx(&controls);
+    INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_STANDARD_CLASSES|ICC_HOTKEY_CLASS};InitCommonControlsEx(&controls);
     if(!defaultPaths(app.settings.folder,app.preferences)) {
         MessageBoxW(nullptr,L"Windows could not locate your Videos or application data folder. Check that your Windows user profile is available, then reopen Timelapse.",L"Timelapse",MB_OK|MB_ICONERROR);
         return 1;

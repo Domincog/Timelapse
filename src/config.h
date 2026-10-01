@@ -8,6 +8,9 @@ namespace lapse {
 enum class EncodingMode;
 inline constexpr int MinCaptureIntervalMs = 100;
 inline constexpr int MaxCaptureIntervalMs = 86400000;
+inline constexpr int MinOutputFps = 1;
+inline constexpr int MaxOutputFps = 120;
+inline constexpr int DefaultOutputFps = 30;
 inline constexpr int MinVideoDimension = 48;
 inline constexpr int MaxVideoDimension = 4096;
 inline constexpr int64_t MaxVideoPixels = int64_t(4096) * 2160;
@@ -21,6 +24,10 @@ bool parseDuration(std::wstring_view text, DurationUnit unit, int64_t minMs,
                    int64_t maxMs, int64_t quantumMs, int64_t& result,
                    std::wstring& error);
 bool parsePixelDimension(std::wstring_view text, int& result, std::wstring& error);
+// Whole frames per second, with optional surrounding ASCII whitespace.
+// Reject invalid drafts without changing the committed result.
+bool parseOutputFps(std::wstring_view text, int& result, std::wstring& error);
+bool validateOutputFps(int fps, std::wstring& error);
 bool validateCaptureInterval(int milliseconds, std::wstring& error);
 bool validateVideoSize(int width, int height, std::wstring& error);
 // A one-time source-size suggestion, never a following/recording policy.

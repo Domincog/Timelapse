@@ -108,7 +108,8 @@ Settings settings(const std::filesystem::path& folder) {
 Status finish(Engine& engine) {
     engine.finish(); return await(engine, [](const auto& value) { return value.state == State::Idle; });
 }
-void decode(const Status& result, int width, int height, unsigned count, bool failure = false) {
+void decode(const Status& result, int width, int height, unsigned count, bool failure = false,
+            int fps = DefaultOutputFps, bool recovery = false) {
     require(result.error == failure && result.recordingFailed == failure && result.savedPaths.size() == count && result.frames > 0,
         "Custom recording did not save the expected outputs");
     constexpr DWORD stream = static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM);
@@ -118,6 +119,24 @@ void decode(const Status& result, int width, int height, unsigned count, bool fa
         UINT32 actualWidth = 0, actualHeight = 0;
         checked(MFGetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, &actualWidth, &actualHeight), "Missing custom geometry");
         require(actualWidth == UINT32(width) && actualHeight == UINT32(height), "Encoded custom dimensions changed");
+        UINT32 rate = 0, denominator = 0;
+        checked(MFGetAttributeRatio(type.Get(), MF_MT_FRAME_RATE, &rate, &denominator), "Missing playback rate");
+        // The Windows reader reports 10000000/169491 for 59fps, deriving
+        // the rate from a quantized 100ns frame duration. Bound that duration
+        // to one tick rather than requiring an identical rational spelling.
+        const uint64_t reported = uint64_t(denominator) * 10000000 * fps;
+        const uint64_t expected = uint64_t(rate) * 10000000;
+        const uint64_t difference = reported > expected ? reported - expected : expected - reported;
+        require(rate && denominator && difference <= uint64_t(rate) * fps,
+            "Encoded playback FPS exceeds native metadata quantization");
+        if (!recovery) {
+            PROPVARIANT duration{};
+            checked(reader->GetPresentationAttribute(static_cast<DWORD>(MF_SOURCE_READER_MEDIASOURCE),MF_PD_DURATION,&duration), "Missing MP4 duration");
+            const bool valid = duration.vt == VT_UI8 &&
+                std::llabs(int64_t(duration.uhVal.QuadPart) - int64_t(result.frames) * 10000000 / fps) < 20000;
+            PropVariantClear(&duration);
+            require(valid, "MP4 duration does not match admitted frames / frozen playback FPS");
+        }
         checked(MFCreateMediaType(&type), "Cannot create decoded type");
         checked(type->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video), "Cannot select video");
         checked(type->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12), "Cannot select decoded pixels");
@@ -128,8 +147,15 @@ void decode(const Status& result, int width, int height, unsigned count, bool fa
             checked(reader->ReadSample(stream, 0, nullptr, &flags, &timestamp, &sample), "Cannot read custom MP4");
             require(!(flags & MF_SOURCE_READERF_ERROR), "Custom MP4 stream failed");
             if (sample) {
-                require(samples < result.frames && std::llabs(timestamp - LONGLONG(samples) * 10000000 / 30) <= 1,
-                    "Custom capture changed 30fps playback timestamps");
+                const int64_t tolerance = recovery ? (fps == DefaultOutputFps ? 334 : 1000) : 1;
+                require(samples < result.frames && std::llabs(timestamp - LONGLONG(samples) * 10000000 / fps) <= tolerance,
+                    "Custom capture changed configured playback timestamps");
+                if (!recovery) {
+                    LONGLONG duration = 0;
+                    checked(sample->GetSampleDuration(&duration), "Decoded playback sample has no duration");
+                    const auto expectedDuration = LONGLONG(samples + 1) * 10000000 / fps - LONGLONG(samples) * 10000000 / fps;
+                    require(std::llabs(duration - expectedDuration) <= 1, "Playback sample duration accumulated rounding drift");
+                }
                 ++samples;
             }
             if (flags & MF_SOURCE_READERF_ENDOFSTREAM) { ended = true; break; }
@@ -141,6 +167,9 @@ void invalidAdmission(const std::filesystem::path& root) {
     std::vector<Settings> cases;
     for (int interval : {-1, 0, 99, MaxCaptureIntervalMs + 1, INT_MAX}) {
         auto value = settings(L""); value.intervalMs = interval; cases.push_back(value);
+    }
+    for (int fps : {INT_MIN,-1,0,MaxOutputFps+1,INT_MAX}) {
+        auto value = settings(L""); value.outputFps = fps; cases.push_back(value);
     }
     for (const auto size : {std::pair<int, int>{0, 240}, {46, 240}, {49, 240}, {320, 47}, {4098, 48}, {4096, 2162}}) {
         auto value = settings(L""); value.width = size.first; value.height = size.second; cases.push_back(value);
@@ -186,6 +215,21 @@ void boundaryGeometry(const std::filesystem::path& root) {
         decode(finish(engine), config.width, config.height, separate ? 2 : 1);
     }
     std::cout << "PASS minimum 48px and square paired output preserve exact encoded dimensions.\n";
+}
+void playbackRates(const std::filesystem::path& root) {
+    for (int fps : {MinOutputFps,24,59,60,MaxOutputFps}) for (bool recovery : {false,true}) {
+        reset(); auto config = settings(root / (L"fps-" + std::to_wstring(fps) + (recovery ? L"-recovery" : L"")));
+        config.outputFps = fps; config.intervalMs = 137; config.separateFiles = true; config.recoveryMode = recovery;
+        Engine engine; engine.configure(config); engine.record();
+        await(engine, [](const auto& value) { return value.frames >= 1; });
+        auto changed = config; changed.outputFps = fps == 60 ? 24 : 60; engine.configure(changed);
+        await(engine, [](const auto& value) { return value.frames >= 5; }, 2200);
+        decode(finish(engine), config.width, config.height, 2, false, fps, recovery);
+        const auto observed = observations();
+        require(observed.size() >= 10 && observed[8].tick - observed[0].tick >= 400,
+            "Playback FPS shortened the independent capture cadence");
+    }
+    std::cout << "PASS 1/24/59/60/120 FPS are encoded and frozen in paired ordinary/recovery files with independent capture cadence.\n";
 }
 void slowWork(const std::filesystem::path& root) {
     reset(); auto config = settings(root / L"slow-work"); config.intervalMs = MinCaptureIntervalMs;
@@ -264,6 +308,23 @@ void idleAspectRetirement() {
     require(!captureTimedOut, "Preview fixture gate timed out");
     std::cout << "PASS idle aspect change retires both published and in-flight old preview.\n";
 }
+void playbackAcceptance(const std::filesystem::path& root) {
+    reset(); auto config = settings(root / L"fps-acceptance"); config.preview = true; config.outputFps = 24;
+    Engine engine; engine.configure(config);
+    struct Release { ~Release() { captureReleased = true; } } release;
+    await(engine, [](const auto& value) { return bool(value.preview); });
+    holdCapture = true;
+    const auto until = std::chrono::steady_clock::now() + 1500ms;
+    while (!captureEntered && std::chrono::steady_clock::now() < until) std::this_thread::sleep_for(1ms);
+    require(captureEntered, "Idle capture did not reach the acceptance barrier");
+    engine.record(); require(engine.status().state == State::Starting, "Record request was not accepted at the barrier");
+    auto changed = config; changed.outputFps = 120; engine.configure(changed);
+    captureReleased = true;
+    await(engine, [](const auto& value) { return value.frames == 1; });
+    decode(finish(engine), config.width, config.height, 1, false, 24);
+    require(!captureTimedOut, "Playback acceptance barrier timed out");
+    std::cout << "PASS Record freezes playback FPS before worker preparation even when an idle capture delays startup.\n";
+}
 }
 namespace lapse {
 bool CameraClient::observeActivity(uint64_t, CameraObservation&, std::wstring& error) {
@@ -306,8 +367,8 @@ int main() {
     const auto root = std::filesystem::current_path() / (L"engine-custom-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
     int result = 0;
     try {
-        invalidAdmission(root); fractionalFrozen(root); boundaryGeometry(root); slowWork(root); liveNightValidation(root);
-        previewCadence(root); longInterval(root); idleAspectRetirement();
+        invalidAdmission(root); fractionalFrozen(root); boundaryGeometry(root); playbackRates(root); slowWork(root); liveNightValidation(root);
+        previewCadence(root); longInterval(root); idleAspectRetirement(); playbackAcceptance(root);
         std::filesystem::remove_all(root); std::cout << "All synthetic custom settings engine contracts passed.\n";
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; std::wcerr << L"Artifacts retained at " << root.wstring() << L'\n'; result = 1; }
     MFShutdown(); CoUninitialize(); return result;

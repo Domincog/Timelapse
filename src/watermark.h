@@ -15,7 +15,8 @@ struct WatermarkSettings {
 struct WatermarkContext {
     int64_t activeMs = 0;
     SYSTEMTIME recordedLocal{}; // Local wall clock at admission, not source exposure.
-    int64_t targetIntervalMs = 5000; // Incoming scheduled interval, at 30 video fps.
+    int64_t targetIntervalMs = 5000; // Incoming scheduled capture interval.
+    int outputFps = 30; // Frozen saved playback rate.
 };
 constexpr int64_t WatermarkMaxIntervalMs = 86400000LL * 64;
 constexpr size_t WatermarkTextCapacity = 96;
@@ -23,7 +24,7 @@ bool validateWatermarkSettings(const WatermarkSettings&, std::wstring& error);
 bool sameWatermarkSettings(const WatermarkSettings&, const WatermarkSettings&) noexcept;
 // At most two lines: time then Target. Active time uses whole seconds, with
 // days capped by the explicit label "Elapsed >999999d". Recorded dates must be
-// valid Gregorian local dates in 1601..9999. Target preserves exact hundredths.
+// valid Gregorian local dates in 1601..9999. Target preserves exact thousandths.
 // Failure leaves output unchanged. Disabled settings produce an empty string.
 bool formatWatermarkText(const WatermarkSettings&, const WatermarkContext&,
                          std::array<wchar_t, WatermarkTextCapacity>& output, std::wstring& error);

@@ -123,6 +123,33 @@ bool parsePixelDimension(std::wstring_view text, int& result, std::wstring& erro
     result = value;
     return true;
 }
+bool validateOutputFps(int fps, std::wstring& error) {
+    error.clear();
+    if (fps < MinOutputFps || fps > MaxOutputFps) {
+        error = L"Playback FPS must be a whole number from 1 to 120.";
+        return false;
+    }
+    return true;
+}
+bool parseOutputFps(std::wstring_view text, int& result, std::wstring& error) {
+    error.clear();
+    text = trimmed(text);
+    int value = 0;
+    if (text.empty() || text.size() > 16) {
+        error = L"Playback FPS must be a whole number from 1 to 120.";
+        return false;
+    }
+    for (wchar_t c : text) {
+        if (c < L'0' || c > L'9' || value > (MaxOutputFps - (c - L'0')) / 10) {
+            error = L"Playback FPS must be a whole number from 1 to 120.";
+            return false;
+        }
+        value = value * 10 + (c - L'0');
+    }
+    if (!validateOutputFps(value, error)) return false;
+    result = value;
+    return true;
+}
 bool validateCaptureInterval(int milliseconds, std::wstring& error) {
     error.clear();
     if (milliseconds < MinCaptureIntervalMs || milliseconds > MaxCaptureIntervalMs) {

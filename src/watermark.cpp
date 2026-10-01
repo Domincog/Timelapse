@@ -62,15 +62,19 @@ bool formatWatermarkText(const WatermarkSettings& settings, const WatermarkConte
     if (settings.showSpeed) {
         if (context.targetIntervalMs < MinCaptureIntervalMs || context.targetIntervalMs > WatermarkMaxIntervalMs)
             return fail(error, L"The watermark target capture interval is invalid.");
+        if (context.outputFps < MinOutputFps || context.outputFps > MaxOutputFps)
+            return fail(error, L"The watermark playback FPS is invalid.");
         if (used) text[used++] = L'\n';
-        // interval * 30 / 1000 is exactly interval * 3 / 100. The accepted
-        // interval bound makes the integer product safe and preserves decimals.
-        const int64_t hundredths = context.targetIntervalMs * 3;
-        const int64_t whole = hundredths / 100;
-        const unsigned fraction = static_cast<unsigned>(hundredths % 100);
+        // Millisecond capture cadence times integer playback fps gives an exact
+        // speed with at most three decimal places. The accepted bounds keep the
+        // product below INT64_MAX, including accelerated time-compression rates.
+        const int64_t thousandths = context.targetIntervalMs * context.outputFps;
+        const int64_t whole = thousandths / 1000;
+        const unsigned fraction = static_cast<unsigned>(thousandths % 1000);
         const int written = !fraction ? swprintf_s(text.data() + used, text.size() - used, L"Target %lldx", whole) :
-            fraction % 10 == 0 ? swprintf_s(text.data() + used, text.size() - used, L"Target %lld.%ux", whole, fraction / 10) :
-            swprintf_s(text.data() + used, text.size() - used, L"Target %lld.%02ux", whole, fraction);
+            fraction % 100 == 0 ? swprintf_s(text.data() + used, text.size() - used, L"Target %lld.%ux", whole, fraction / 100) :
+            fraction % 10 == 0 ? swprintf_s(text.data() + used, text.size() - used, L"Target %lld.%02ux", whole, fraction / 10) :
+            swprintf_s(text.data() + used, text.size() - used, L"Target %lld.%03ux", whole, fraction);
         if (written <= 0) return fail(error, L"Windows could not format the watermark target speed.");
     }
     output = text; return true;
@@ -182,7 +186,7 @@ bool WatermarkRenderer::prepare(const WatermarkSettings& settings, int width, in
         if (characterWidth <= 0 || characterWidth > 512)
             return fail(error, L"Windows returned unsupported watermark character widths.");
         const int longestTime = settings.timeKind == WatermarkTimeKind::RecordedLocal ? 28 : 24;
-        const int longest = std::max(settings.showTime ? longestTime : 0, settings.showSpeed ? 20 : 0);
+        const int longest = std::max(settings.showTime ? longestTime : 0, settings.showSpeed ? 21 : 0);
         prepared->tileWidth = longest * characterWidth + metrics.tmOverhang + prepared->padding * 2;
         const int lines = int(settings.showTime) + int(settings.showSpeed);
         prepared->tileHeight = lines * prepared->lineHeight + (lines - 1) * prepared->gap + prepared->padding * 2;

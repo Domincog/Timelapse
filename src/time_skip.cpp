@@ -132,7 +132,7 @@ bool normalizeTimeSkipSettings(TimeSkipSettings& settings, std::wstring& error) 
         ? L"No-person time must be a whole number of seconds between 1 and 2147483647."
         : L"Quiet time must be a whole number of seconds between 1 and 2147483647."; break;
     case Invalid::Sensitivity: error = L"Choose a valid quiet-scene sensitivity."; break;
-    case Invalid::Ramp: error = L"Choose a transition of 15, 30, or 60 output frames."; break;
+    case Invalid::Ramp: error = L"Choose a transition of 0.5, 1, or 2 seconds of saved video."; break;
     case Invalid::Repeat: error = L"The schedule repeat duration cannot be negative."; break;
     case Invalid::Count: error = L"Use at most 16 time-compression ranges."; break;
     case Invalid::Range: error = L"Each range needs a nonnegative start and an end after its start."; break;
@@ -158,16 +158,21 @@ bool describeTimeSkipFrame(const Frame& input, TimeSkipDescriptor& output) noexc
     }
     return true;
 }
-bool TimeSkipController::reset(const TimeSkipSettings& settings, int64_t base, unsigned mask) noexcept {
+bool TimeSkipController::reset(const TimeSkipSettings& settings, int64_t base, unsigned mask, int fps) noexcept {
     settings_ = settings; valid_ = false; sourceMask_ = mask;
     baseMs_ = base >= 100 && base <= 86400000 ? base : 1000;
     phase_ = 0; descending_ = finished_ = returnPending_ = false;
     lastInspectMs_ = lastFrameMs_ = windowStartMs_ = -1; windowEndMs_ = 0;
     for (auto& source : sources_) { source.initialized = source.available = source.compared = false; source.observationMs = -1; source.weak = 0; }
     person_ = {};
-    if (base != baseMs_ || mask > 3 || normalize(settings_) != Invalid::None) { settings_.mode = TimeSkipMode::Off; return false; }
+    if (base != baseMs_ || mask > 3 || fps < MinOutputFps || fps > MaxOutputFps ||
+        normalize(settings_) != Invalid::None) { settings_.mode = TimeSkipMode::Off; return false; }
     if (automatic(settings_.mode) && !mask) { settings_.mode = TimeSkipMode::Off; return false; }
     if (personMode(settings_.mode) && !(mask & 2)) { settings_.mode = TimeSkipMode::Off; return false; }
+    // Preserve the selected duration in saved-video time, to the nearest whole
+    // output frame (at least one). The persisted values stay compatible with
+    // older preferences; only this owned runtime snapshot is scaled.
+    settings_.rampFrames = std::max(1, (settings_.rampFrames * fps + DefaultOutputFps / 2) / DefaultOutputFps);
     for (int i = 0; i <= settings_.rampFrames; ++i) {
         const double x = double(i) / settings_.rampFrames;
         const double eased = x * x * x * (10 + x * (-15 + 6 * x));

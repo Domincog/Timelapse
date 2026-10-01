@@ -58,6 +58,7 @@ bool validateRecordingSettings(Settings& settings, std::wstring& error) {
     else if (settings.segmentDurationSeconds < 0)
         error = L"Split files every must be Off or a positive whole number of seconds.";
     return error.empty() && validateCaptureInterval(settings.intervalMs, error) &&
+        validateOutputFps(settings.outputFps, error) &&
         validateVideoSize(settings.width, settings.height, error) &&
         validateEncodingMode(settings.encodingMode, settings.recoveryMode, error) &&
         (!usesNightCamera(settings) || validateNightCapture(settings, error)) &&
@@ -154,6 +155,7 @@ void Engine::configure(const Settings& s) {
       const bool cameraTierChanged = status_.state == State::Idle && (mask & 2) &&
           cameraResolutionForOutput(s.width, s.height) != cameraResolutionForOutput(settings_.width, settings_.height);
       if (!sameWatermarkSettings(s.watermark, settings_.watermark) ||
+          (status_.state == State::Idle && s.watermark.enabled && s.watermark.showSpeed && s.outputFps != settings_.outputFps) ||
           (status_.state == State::Idle && (mask & 1) && s.captureCursor != settings_.captureCursor)) retirePreview(true);
       if (mask != sources(settings_) || s.cameraId != settings_.cameraId || !s.preview || cameraTierChanged) retireCameraInput();
       if (!s.preview || (status_.state == State::Idle && (s.width != settings_.width || s.height != settings_.height)) ||
@@ -219,6 +221,7 @@ void Engine::record() {
       ++previewGeneration_; previewProblem_ = false;
       stop_ = pauseRequested_ = pauseTarget_ = false;
       requestedCursor_ = request ? request->captureCursor : settings_.captureCursor;
+      requestedOutputFps_ = request ? request->outputFps : settings_.outputFps;
       const bool rejected = request && !delayed;
       delayedSettings_ = delayed ? std::move(request) : std::nullopt;
       delayedCancellationMessage_ = std::move(cancellation);
@@ -389,7 +392,7 @@ void Engine::run() {
             if (++observationToken == 0) ++observationToken;
             desktopSequence = 0;
             if (skipping) {
-                skipControllerValid = timeSkip.reset(cfg.timeSkip, cfg.intervalMs, observedSources);
+                skipControllerValid = timeSkip.reset(cfg.timeSkip, cfg.intervalMs, observedSources, cfg.outputFps);
                 if (!skipControllerValid) observing = false;
                 skipDecision = timeSkip.inspect(activeMilliseconds());
                 skipStatus.reason = skipDecision.reason;
@@ -1052,9 +1055,12 @@ void Engine::run() {
                       snapshot->preview = settings_.preview;
                       settingsRevision = settingsRevision_;
                       start = start_; stop = stop_; pauseRequested = pauseRequested_; pauseTarget = pauseTarget_; retry = retrySources_;
-                      // Record fixes cursor policy at acceptance even if an idle
+                      // Record fixes cursor and playback FPS at acceptance even if an idle
                       // capture delays this worker and next-session edits arrive.
-                      if (start) snapshot->captureCursor = requestedCursor_;
+                      if (start) {
+                          snapshot->captureCursor = requestedCursor_;
+                          snapshot->outputFps = requestedOutputFps_;
+                      }
                       if (start && delayedSettings_) {
                           requestDeadline = status_.startDeadlineTick; requestEpoch = delayedWakeEpoch_;
                           delayedSettings_.reset();
@@ -1440,7 +1446,7 @@ void Engine::run() {
                                 cameraTemporaryIO = ioBase + L"-camera.recording.mp4"; cameraFinalPathIO = ioBase + L"-camera.mp4";
                             }
                             if (!encoder) encoder.emplace();
-                            if (!encoder->open(temporaryIO, cfg.width, cfg.height, 30, error, cfg.encodingQuality, cfg.encodingMode, cfg.recoveryMode)) {
+                            if (!encoder->open(temporaryIO, cfg.width, cfg.height, cfg.outputFps, error, cfg.encodingQuality, cfg.encodingMode, cfg.recoveryMode)) {
                                 closeRecording((cfg.separateFiles ? L"Cannot start desktop recording: " : L"Cannot start recording: ") + error); admit = false; break;
                             }
                             writing = segmentWriting = true;
@@ -1456,7 +1462,7 @@ void Engine::run() {
                                     admit = false; break;
                                 }
                                 if (!cameraEncoder) cameraEncoder.emplace();
-                                if (!cameraEncoder->open(cameraTemporaryIO, cfg.width, cfg.height, 30, error, cfg.encodingQuality, cfg.encodingMode, cfg.recoveryMode)) {
+                                if (!cameraEncoder->open(cameraTemporaryIO, cfg.width, cfg.height, cfg.outputFps, error, cfg.encodingQuality, cfg.encodingMode, cfg.recoveryMode)) {
                                     closeRecording(L"Cannot start camera recording: " + error); admit = false; break;
                                 }
                                 cameraWriting = true;
@@ -1508,6 +1514,7 @@ void Engine::run() {
                         WatermarkContext context;
                         context.activeMs = admittedActiveMs;
                         context.targetIntervalMs = incomingIntervalMs;
+                        context.outputFps = cfg.outputFps;
                         GetLocalTime(&context.recordedLocal);
                         if (!watermark.apply(composed, context, error) ||
                             (cfg.separateFiles && !watermark.apply(cameraComposed, context, error))) {
@@ -1591,6 +1598,7 @@ void Engine::run() {
                         WatermarkContext context = lastWatermarkContext;
                         if (!(writing || pending) || !haveWatermarkContext) {
                             context.activeMs = 0; context.targetIntervalMs = cfg.intervalMs;
+                            context.outputFps = cfg.outputFps;
                             GetLocalTime(&context.recordedLocal);
                         }
                         if (!watermark.apply(*previewBuffer, context, error)) { publishPreviewError(error); continue; }

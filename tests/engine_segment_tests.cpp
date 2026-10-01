@@ -85,7 +85,7 @@ lapse::Settings settings(const std::filesystem::path& root, int interval = 100, 
     cfg.intervalMs = interval; cfg.recordingLimitSeconds = limit; cfg.segmentDurationSeconds = 1;
     return cfg;
 }
-void verifyPixels(const std::wstring& path, const std::vector<unsigned>& expected, bool recovery) {
+void verifyPixels(const std::wstring& path, const std::vector<unsigned>& expected, bool recovery, int fps) {
     using Microsoft::WRL::ComPtr;
     constexpr DWORD stream = static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM);
     ComPtr<IMFSourceReader> reader;
@@ -100,7 +100,8 @@ void verifyPixels(const std::wstring& path, const std::vector<unsigned>& expecte
         require(SUCCEEDED(reader->ReadSample(stream, 0, nullptr, &flags, &timestamp, &sample)) &&
             !(flags & MF_SOURCE_READERF_ERROR), "Generated segment decode failed");
         if (sample) {
-            require(index < expected.size() && std::llabs(timestamp - static_cast<LONGLONG>(index) * 10000000 / 30) <= (recovery ? 334 : 1),
+            require(index < expected.size() && std::llabs(timestamp - static_cast<LONGLONG>(index) * 10000000 / fps) <=
+                (recovery ? (fps == lapse::DefaultOutputFps ? 334 : 1000) : 1),
                 "Segment timestamp did not restart from zero");
             ComPtr<IMFMediaBuffer> buffer;
             require(SUCCEEDED(sample->ConvertToContiguousBuffer(&buffer)), "Decoded sample has no pixels");
@@ -116,7 +117,7 @@ void verifyPixels(const std::wstring& path, const std::vector<unsigned>& expecte
     require(ended && index == expected.size(), "Segment changed accepted frame count");
 }
 void verify(const lapse::Settings& cfg, const lapse::Status& saved) {
-    split_test::verify(cfg.folder, saved, cfg.separateFiles, cfg.recoveryMode);
+    split_test::verify(cfg.folder, saved, cfg.separateFiles, cfg.recoveryMode, cfg.outputFps);
     std::lock_guard<std::mutex> lock(journalMutex);
     size_t nonempty = 0;
     for (const auto& part : journal) {
@@ -125,7 +126,7 @@ void verify(const lapse::Settings& cfg, const lapse::Status& saved) {
         const auto extension = path.rfind(L".recording.mp4"); require(extension != std::wstring::npos, "Unexpected encoder pathname");
         if (part.grey.empty()) { require(!std::filesystem::exists(path), "Empty prospective part was retained"); continue; }
         path.replace(extension, 14, L".mp4");
-        verifyPixels(path, part.grey, cfg.recoveryMode); ++nonempty;
+        verifyPixels(path, part.grey, cfg.recoveryMode, cfg.outputFps); ++nonempty;
     }
     require(nonempty == saved.completedSegments * (cfg.separateFiles ? 2u : 1u), "Published set count disagrees with writer journal");
 }
@@ -175,6 +176,17 @@ void exact(const std::filesystem::path& root) {
     verify(cfg, saved);
     require(saved.frames == 2 && saved.completedSegments == 2 && openCalls == 2, "Equal stop/split/capture boundary admitted a third sample");
     std::cout << "PASS half-open admission windows and terminal-limit precedence.\n";
+}
+void playbackParts(const std::filesystem::path& root, bool recovery) {
+    auto cfg = settings(root,137,2); cfg.outputFps = recovery ? 59 : 24;
+    cfg.separateFiles = true; cfg.recoveryMode = recovery;
+    lapse::Engine engine; engine.configure(cfg); engine.record();
+    await(engine, [](const auto& s) { return s.frames >= 2; });
+    auto changed = cfg; changed.outputFps = 120; engine.configure(changed);
+    const auto saved = await(engine, [](const auto& s) { return s.state == lapse::State::Idle; });
+    verify(cfg,saved);
+    require(saved.completedSegments == 2 && saved.frames >= 10, "Selected playback FPS changed split admission");
+    std::cout << "PASS selected playback FPS is frozen across paired " << (recovery ? "recovery" : "ordinary") << " parts.\n";
 }
 void slow(const std::filesystem::path& root, int variant) {
     auto cfg = settings(root, variant == 2 ? 1200 : 60000, variant == 0 ? 3 : 2);
@@ -251,6 +263,7 @@ int main() {
         regular(root / L"single", lapse::Mode::Desktop, false, false);
         regular(root / L"overlay", lapse::Mode::Overlay, false, false);
         regular(root / L"paired-recovery", lapse::Mode::Desktop, true, true);
+        playbackParts(root / L"fps-parts",false); playbackParts(root / L"fps-recovery-parts",true);
         sparse(root / L"sparse"); pause(root / L"pause"); exact(root / L"exact");
         for (int variant = 0; variant < 4; ++variant) slow(root / (L"slow-" + std::to_wstring(variant)), variant);
         std::filesystem::remove_all(root);

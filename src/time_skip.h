@@ -1,5 +1,6 @@
 #pragma once
 #include "core.h"
+#include "config.h"
 #include <array>
 
 namespace lapse {
@@ -15,6 +16,8 @@ struct TimeSkipSettings {
     int64_t quietAfterMs = 120000;
     // Image-change sensitivity applies only to Quiet modes, not person checks.
     QuietSensitivity quietSensitivity = QuietSensitivity::Standard;
+    // Canonical 30fps units: 15/30/60 select 0.5/1/2 seconds of saved video.
+    // The controller scales to whole output frames at the session playback FPS.
     int rampFrames = 30;
     int repeatSeconds = 0;
     unsigned rangeCount = 0;
@@ -48,7 +51,8 @@ class TimeSkipController {
 public:
     // sourceMask bits: desktop=1, camera=2. Settings must be normalized. Invalid
     // input returns false and leaves a safe disabled controller. No allocation.
-    bool reset(const TimeSkipSettings&, int64_t baseIntervalMs, unsigned sourceMask) noexcept;
+    bool reset(const TimeSkipSettings&, int64_t baseIntervalMs, unsigned sourceMask,
+               int outputFps = DefaultOutputFps) noexcept;
     // Only distinct, trusted source observations count. Active time excludes
     // pauses. The engine owns wall-clock freshness and marks stale input unavailable.
     bool observe(unsigned sourceIndex, const TimeSkipDescriptor&, uint64_t epoch,
@@ -83,7 +87,7 @@ private:
     TimeSkipSettings settings_;
     std::array<Detector, 2> sources_{};
     PersonDetector person_;
-    std::array<int64_t, 61> intervals_{}, returnSpans_{};
+    std::array<int64_t, 2 * MaxOutputFps + 1> intervals_{}, returnSpans_{};
     int64_t baseMs_ = 1000, lastInspectMs_ = -1, lastFrameMs_ = -1, windowStartMs_ = -1, windowEndMs_ = 0;
     unsigned sourceMask_ = 0, phase_ = 0;
     bool valid_ = false, descending_ = false, finished_ = false, returnPending_ = false;

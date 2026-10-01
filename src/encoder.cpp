@@ -169,10 +169,7 @@ bool Encoder::open(const std::wstring& path, int width, int height, int fps, std
         error = L"The output dimensions are too large.";
         return false;
     }
-    if (fps < 1 || fps > 120) {
-        error = L"Playback frame rate must be between 1 and 120.";
-        return false;
-    }
+    if (!validateOutputFps(fps, error)) return false;
     if (quality != EncodingQuality::Compact && quality != EncodingQuality::Balanced && quality != EncodingQuality::Detail) {
         error = L"Choose a valid video quality.";
         return false;

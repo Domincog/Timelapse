@@ -273,9 +273,35 @@ void delaysAndAllocation() {
     require(allocations.load() == count, "Steady descriptor/controller allocated");
     std::cout << "PASS delay/base fallback, duplicate admission, Off and 3000 allocation-free observations across sensitivities\n";
 }
+void playbackRampDurations() {
+    TimeSkipController controller;
+    auto settings = manual(INT_MAX); settings.multiplier = 64;
+    const auto count = allocations.load();
+    for (int fps : {MinOutputFps,24,DefaultOutputFps,59,60,MaxOutputFps}) for (int canonical : {15,30,60}) {
+        settings.rampFrames = canonical;
+        require(controller.reset(settings, 137, 0, fps), "Playback-aware ramp rejected supported rate");
+        const int runtimeFrames = std::max(1, (canonical * fps + 15) / 30);
+        int64_t now = 0;
+        for (int i = 1; i <= runtimeFrames; ++i) {
+            const double x = double(i) / runtimeFrames;
+            const double eased = x*x*x*(10+x*(-15+6*x));
+            const auto expected = int64_t(std::llround(137 * std::exp(std::log(64.) * eased)));
+            const auto actual = controller.onFrame(now);
+            require(actual == expected, "Transition duration was not scaled to whole playback frames");
+            now += actual;
+        }
+        require(controller.inspect(now).intervalMs == 137 * 64 && settings.rampFrames == canonical,
+            "Scaled ramp did not reach its endpoint or modified persisted settings");
+    }
+    require(allocations.load() == count, "Playback-rate ramp scaling allocated heap storage");
+    for (int fps : {INT_MIN,0,MaxOutputFps+1,INT_MAX})
+        require(!controller.reset(settings,137,0,fps) && controller.inspect(0).reason == TimeSkipReason::Off,
+            "Invalid playback rate left an active controller");
+    std::cout << "PASS transitions retain saved-video duration across 1/24/30/59/60/120fps without allocation.\n";
+}
 }
 int main() {
-    try { normalization(); manualProfiles(); scheduleBoundaries(); quietAndSources(); descriptorNoise(); quietSensitivity(); delaysAndAllocation();
+    try { normalization(); manualProfiles(); scheduleBoundaries(); quietAndSources(); descriptorNoise(); quietSensitivity(); delaysAndAllocation(); playbackRampDurations();
         std::cout << "All time-compression policy contracts passed. Controller bytes: " << sizeof(TimeSkipController) << '\n'; return 0;
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

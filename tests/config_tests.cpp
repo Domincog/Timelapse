@@ -120,6 +120,21 @@ void recordingFormats() {
         for (bool recovery : {false,true})
             check(!validateEncodingMode(mode,recovery,error) && !error.empty(), "invalid encoder rejected before file creation");
 }
+void playbackRates() {
+    using namespace lapse;
+    std::wstring error;
+    int fps = 77;
+    for (const auto* invalid : {L"",L" ",L"0",L"-1",L"+30",L"1.5",L"30.0",L"1e2",L"121",L"30 fps",L"1 0",L"9999999999999999"})
+        check(!parseOutputFps(invalid,fps,error) && fps == 77 && !error.empty(),
+              "invalid playback draft preserves the committed value");
+    for (int value : {MinOutputFps,24,30,59,60,MaxOutputFps}) {
+        check(parseOutputFps(L" \t" + std::to_wstring(value) + L"\r\n",fps,error) && fps == value && error.empty(),
+              "supported whole playback FPS roundtrips exactly");
+        check(validateOutputFps(value,error) && error.empty(), "shared playback bounds accept supported rates");
+    }
+    for (int value : {INT_MIN,-1,0,121,INT_MAX})
+        check(!validateOutputFps(value,error) && !error.empty(), "shared playback bounds reject unsafe rates");
+}
 void sourceSizeSuggestions() {
     using lapse::sourceVideoDimensions;
     for (auto size : {std::pair<int,int>{1280,720},{1920,1080},{3440,1440},{3840,2160},{2160,3840},{48,48}})
@@ -147,7 +162,7 @@ void sourceSizeSuggestions() {
 }
 }
 int main() {
-    durationParsing(); formatsAndBounds(); previewGeometry(); recordingFormats(); sourceSizeSuggestions();
+    durationParsing(); formatsAndBounds(); previewGeometry(); recordingFormats(); playbackRates(); sourceSizeSuggestions();
     if (failures) return 1;
     std::cout << "Exact custom settings and bounded geometry checks passed\n";
     return 0;

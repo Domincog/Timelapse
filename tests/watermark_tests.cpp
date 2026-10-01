@@ -173,6 +173,12 @@ void formatting() {
     ctx.recordedLocal = {9999,12,0,31,23,59,59,0}; formatted(settings,ctx,L"Recorded 9999-12-31 23:59:59");
     settings.showTime = false; settings.showSpeed = true; ctx.activeMs = -1; ctx.recordedLocal = {}; ctx.targetIntervalMs = 100;
     formatted(settings,ctx,L"Target 3x");
+    ctx.outputFps = 1; ctx.targetIntervalMs = 101; formatted(settings,ctx,L"Target 0.101x");
+    ctx.outputFps = 24; formatted(settings,ctx,L"Target 2.424x");
+    ctx.outputFps = 60; formatted(settings,ctx,L"Target 6.06x");
+    ctx.outputFps = 120; ctx.targetIntervalMs = WatermarkMaxIntervalMs-1;
+    formatted(settings,ctx,L"Target 663551999.88x");
+    ctx.outputFps = 119; formatted(settings,ctx,L"Target 658022399.881x");
     settings.enabled = false; ctx.targetIntervalMs = -1; formatted(settings,ctx,L"");
 }
 void invalidFormatting() {
@@ -181,6 +187,8 @@ void invalidFormatting() {
     const auto rejected = [&] { require(!formatWatermarkText(settings,ctx,output,error) && !error.empty() && output == original, "Invalid formatting changed output or succeeded"); };
     ctx.activeMs = -1; rejected(); ctx = context();
     for (int64_t interval : {int64_t(-1),int64_t(0),int64_t(99),WatermarkMaxIntervalMs+1,(std::numeric_limits<int64_t>::max)()}) { ctx.targetIntervalMs = interval; rejected(); }
+    ctx = context();
+    for (int fps : {INT_MIN,-1,0,121,INT_MAX}) { ctx.outputFps = fps; rejected(); }
     ctx = context(); settings.timeKind = WatermarkTimeKind::RecordedLocal;
     for (SYSTEMTIME bad : {SYSTEMTIME{},SYSTEMTIME{1900,2,0,29,0,0,0,0},SYSTEMTIME{2026,4,0,31,0,0,0,0},
         SYSTEMTIME{10000,1,0,1,0,0,0,0},SYSTEMTIME{2026,1,0,1,24,0,0,0},SYSTEMTIME{2026,1,0,1,0,60,0,0},
@@ -269,7 +277,7 @@ void longestText() {
     WatermarkRenderer renderer; auto settings = enabled(); auto ctx = context(); std::wstring error;
     for (auto kind : {WatermarkTimeKind::ActiveElapsed,WatermarkTimeKind::RecordedLocal}) {
         settings.timeKind = kind; ctx.activeMs = 999999LL*86400000+86399999;
-        ctx.recordedLocal = {9999,12,0,31,23,59,59,999}; ctx.targetIntervalMs = WatermarkMaxIntervalMs-1;
+        ctx.recordedLocal = {9999,12,0,31,23,59,59,999}; ctx.targetIntervalMs = WatermarkMaxIntervalMs-1; ctx.outputFps = 119;
         require(renderer.prepare(settings,1280,720,error), "Longest-text preflight failed");
         auto value = frame(1280,720); require(renderer.apply(value,ctx,error), "Preflight did not reserve the actual longest supported text"); pixels(value,renderer.lastBounds());
     }

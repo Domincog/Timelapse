@@ -47,6 +47,7 @@ std::vector<Event> events(Kind kind) {
 }
 bool sameContext(const lapse::WatermarkContext& a, const lapse::WatermarkContext& b) {
     return a.activeMs == b.activeMs && a.targetIntervalMs == b.targetIntervalMs &&
+        a.outputFps == b.outputFps &&
         std::memcmp(&a.recordedLocal, &b.recordedLocal, sizeof(SYSTEMTIME)) == 0;
 }
 void waitFlag(const std::atomic<bool>& flag) {
@@ -159,12 +160,14 @@ void off(const std::filesystem::path& root) {
 }
 void paired(const std::filesystem::path& root) {
     reset(); auto settings = config(root / L"paired", true); settings.watermark.timeKind = WatermarkTimeKind::RecordedLocal;
+    settings.outputFps = 24;
     Engine engine; engine.configure(settings); engine.record();
     await(engine, [](const Status& status) { return status.frames >= 2; });
     const auto result = finish(engine); require(!result.error && result.savedPaths.size() == 2, "Paired watermark recording failed");
     const auto renders = events(Kind::ApplyFull), writes = events(Kind::Write);
     require(renders.size() == writes.size() && renders.size() >= 4 && prepareCalls == 1, "Paired stamp count or preflight reuse wrong");
-    require(renders.front().context.activeMs == 0 && renders.front().context.targetIntervalMs == settings.intervalMs,
+    require(renders.front().context.activeMs == 0 && renders.front().context.targetIntervalMs == settings.intervalMs &&
+        renders.front().context.outputFps == settings.outputFps,
         "First frame includes startup time or wrong target");
     for (size_t i = 0; i < renders.size(); i += 2) {
         require(sameContext(renders[i].context, renders[i + 1].context), "Pair did not share immutable admission context");
@@ -206,11 +209,13 @@ void previewFailure(const std::filesystem::path& root) {
 }
 void pausedSession(const std::filesystem::path& root) {
     reset(); auto settings = config(root / L"pause"); settings.preview = true;
+    settings.outputFps = 59;
     Engine engine; engine.configure(settings); engine.record();
     await(engine, [](const Status& status) { return status.frames >= 2; });
     engine.setPaused(true); const auto paused = await(engine, [](const Status& status) { return status.state == State::Paused; });
     const auto last = events(Kind::ApplyFull).back(); const auto count = events(Kind::ApplyFull).size();
     settings.watermark.x = 0; settings.watermark.timeKind = WatermarkTimeKind::RecordedLocal; settings.watermark.showSpeed = false;
+    settings.outputFps = 120;
     engine.configure(settings);
     await(engine, [&](const Status&) { const auto previews = events(Kind::ApplyPreview); return !previews.empty() && sameContext(previews.back().context, last.context); });
     std::this_thread::sleep_for(350ms);
@@ -223,18 +228,20 @@ void pausedSession(const std::filesystem::path& root) {
     require(watermarkResets == resets, "Hidden pause discarded its prepared recording renderer");
     engine.setPaused(false); await(engine, [&](const Status&) { return events(Kind::ApplyFull).size() > count; });
     const auto resumed = events(Kind::ApplyFull)[count];
-    require(resumed.before != resumed.after && resumed.context.targetIntervalMs == 200 && resumed.context.activeMs - last.context.activeMs < 300,
+    require(resumed.before != resumed.after && resumed.context.targetIntervalMs == 200 && resumed.context.outputFps == 59 &&
+        resumed.context.activeMs - last.context.activeMs < 300,
         "Resume target or active time includes pause");
     require(!finish(engine).error, "Pause/resume recording failed");
     std::cout << "PASS settings and paused context freeze; resume uses base target.\n";
 }
 void manualRate(const std::filesystem::path& root) {
     reset(); auto settings = config(root / L"manual"); settings.intervalMs = 100;
+    settings.outputFps = 24;
     settings.timeSkip.mode = TimeSkipMode::Manual; settings.timeSkip.rangeCount = 1;
     settings.timeSkip.ranges[0] = {0, 60}; settings.timeSkip.multiplier = 4; settings.timeSkip.rampFrames = 15;
     Engine engine; engine.configure(settings); engine.record();
     await(engine, [](const Status& status) { return status.frames >= 9; }); require(!finish(engine).error, "Manual recording failed");
-    TimeSkipController reference; require(reference.reset(settings.timeSkip, 100, 1), "Reference controller invalid");
+    TimeSkipController reference; require(reference.reset(settings.timeSkip, 100, 1, settings.outputFps), "Reference controller invalid");
     int64_t incoming = 100; bool accelerated = false;
     for (const auto& event : events(Kind::ApplyFull)) {
         require(event.context.targetIntervalMs == incoming, "Watermark displays following interval instead of incoming target");

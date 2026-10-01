@@ -14,7 +14,8 @@ namespace split_test {
 inline void require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
-inline uint64_t decodedFrames(const std::filesystem::path& path, uint64_t upperBound, bool recovery = false) {
+inline uint64_t decodedFrames(const std::filesystem::path& path, uint64_t upperBound, bool recovery = false,
+                              int fps = lapse::DefaultOutputFps) {
     using Microsoft::WRL::ComPtr;
     constexpr DWORD stream = static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM);
     ComPtr<IMFSourceReader> reader;
@@ -33,10 +34,12 @@ inline uint64_t decodedFrames(const std::filesystem::path& path, uint64_t upperB
             !(flags & MF_SOURCE_READERF_ERROR), "Split MP4 decoder failed");
         if (sample) {
             // The Windows fragmented sink quantizes timestamps more coarsely
-            // than ordinary MP4. Match its established 33.4us bound only there.
+            // than ordinary MP4. Preserve the established 33.4us bound at30fps;
+            // allow at most one 0.1ms native tick at other tested rates.
             require(count < upperBound &&
-                std::llabs(timestamp - static_cast<LONGLONG>(count) * 10000000 / 30) <= (recovery ? 334 : 1),
-                "Split MP4 did not restart at zero with 30fps timestamps");
+                std::llabs(timestamp - static_cast<LONGLONG>(count) * 10000000 / fps) <=
+                    (recovery ? (fps == lapse::DefaultOutputFps ? 334 : 1000) : 1),
+                "Split MP4 did not restart at zero with configured playback timestamps");
             ++count;
         }
         if (flags & MF_SOURCE_READERF_ENDOFSTREAM) {
@@ -46,7 +49,8 @@ inline uint64_t decodedFrames(const std::filesystem::path& path, uint64_t upperB
     }
     throw std::runtime_error("Split MP4 has no bounded end of stream");
 }
-inline void verify(const std::filesystem::path& folder, const lapse::Status& result, bool paired, bool recovery = false) {
+inline void verify(const std::filesystem::path& folder, const lapse::Status& result, bool paired, bool recovery = false,
+                   int fps = lapse::DefaultOutputFps) {
     require(result.state == lapse::State::Idle && !result.error && !result.recordingFailed &&
         result.frames > 0 && result.completedSegments > 0 && result.savedPaths.size() == (paired ? 2u : 1u),
         "Split recording lost successful session facts");
@@ -61,7 +65,7 @@ inline void verify(const std::filesystem::path& folder, const lapse::Status& res
         const std::wstring suffix = paired ? (camera ? L"-camera.mp4" : L"-desktop.mp4") : L".mp4";
         require(name.size() > suffix.size() && name.substr(name.size() - suffix.size()) == suffix,
             "Unexpected split output suffix");
-        const auto frames = decodedFrames(item.path(), result.frames, recovery);
+        const auto frames = decodedFrames(item.path(), result.frames, recovery, fps);
         totals[camera ? 1 : 0] += frames;
         auto& pair = parts[name.substr(0, name.size() - suffix.size())];
         (camera ? pair.second : pair.first) = frames;

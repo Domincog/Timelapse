@@ -151,7 +151,7 @@ LRESULT WINAPI fixtureDispatchMessage(const MSG* message){
 std::vector<HWND> tabControls(){
     std::vector<HWND> result={app.mode,app.interval,app.videoSize,app.encodingQuality,app.monitor,app.camera,app.advanced,app.refresh};
     if(app.advancedExpanded){
-        result.push_back(app.encodingMode);result.push_back(app.stopAfter);result.push_back(app.lowDisk);result.push_back(app.recoveryMode);result.push_back(app.splitEvery);result.push_back(app.captureCursor);result.push_back(app.startDelay);result.push_back(app.skipConfigure);result.push_back(app.watermarkConfigure);
+        result.push_back(app.encodingMode);result.push_back(app.stopAfter);result.push_back(app.lowDisk);result.push_back(app.recoveryMode);result.push_back(app.splitEvery);result.push_back(app.captureCursor);result.push_back(app.startDelay);result.push_back(app.skipConfigure);result.push_back(app.watermarkConfigure);result.push_back(app.playbackConfigure);
         if(nightRow())result.push_back(app.nightEnabled);
         if(nightRow()==2){result.push_back(app.nightDuration);result.push_back(app.nightTarget);}
     }
@@ -193,6 +193,7 @@ struct HiddenWindow {
         app.startDelayHint=child(L"STATIC",L"Preparation starts after the delay. Visible preview continues; Stop after counts active time.",SS_LEFT|SS_NOPREFIX,213);
         app.skipConfigure=button(L"Time &compression...",SkipConfigure);app.skipSummary=child(L"STATIC",L"Off",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS,SkipSummary);app.skipDetail=child(L"STATIC",L"",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS,SkipDetail);
         app.watermarkConfigure=button(L"&Watermark...",WatermarkConfigure);app.watermarkSummary=child(L"STATIC",L"Off",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS,WatermarkSummary);
+        app.playbackConfigure=button(L"Playback && shortcuts...",PlaybackConfigure);
         app.nightEnabled=child(L"BUTTON",L"&Night camera (software blend)",WS_TABSTOP|BS_AUTOCHECKBOX,NightBox);
         app.nightDuration=combo(8,L"Blend d&uration",NightDurationBox);SendMessageW(app.nightDuration,CB_RESETCONTENT,0,0);for(auto name:NightDurationLabels)add(app.nightDuration,name);choose(app.nightDuration,0);
         app.nightTarget=combo(9,L"Auto &brightness",NightTargetBox);SendMessageW(app.nightTarget,CB_RESETCONTENT,0,0);for(auto name:{L"Dark",L"Balanced",L"Bright"})add(app.nightTarget,name);choose(app.nightTarget,1);
@@ -206,7 +207,7 @@ struct HiddenWindow {
     }
     ~HiddenWindow(){
         ownedFocus=ownedCapture=nullptr;SetWindowLongPtrW(app.window,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(DefWindowProcW));
-        DestroyWindow(app.window);app.window=app.preview=app.captureCursor=app.startDelay=app.startDelayLabel=app.startDelayHint=nullptr;app.engine.reset();
+        DestroyWindow(app.window);app.window=app.preview=app.captureCursor=app.startDelay=app.startDelayLabel=app.startDelayHint=app.playbackConfigure=nullptr;app.engine.reset();
     }
 };
 void checkLayout(){
@@ -218,6 +219,17 @@ void checkLayout(){
     require(!intersects(bounds(app.monitor),bounds(app.camera)) && !intersects(bounds(app.camera),bounds(app.advanced)) &&
             !intersects(bounds(app.advanced),bounds(app.refresh)),"Source or Advanced controls overlap.");
     if(app.advancedExpanded)require(bounds(app.watermarkConfigure).bottom<=bounds(app.preview).top && !intersects(bounds(app.watermarkConfigure),bounds(app.skipConfigure)) && !intersects(bounds(app.watermarkConfigure),bounds(app.watermarkSummary)),"Watermark controls overlap the other options or preview.");
+    if(app.advancedExpanded){
+        require(bounds(app.playbackConfigure).top==bounds(app.watermarkConfigure).top &&
+            bounds(app.playbackConfigure).bottom<=bounds(app.preview).top &&
+            !intersects(bounds(app.playbackConfigure),bounds(app.watermarkConfigure)) &&
+            !intersects(bounds(app.playbackConfigure),bounds(app.watermarkSummary)),"Playback disclosure adds height or overlaps the watermark row.");
+        wchar_t raw[100]{};GetWindowTextW(app.playbackConfigure,raw,100);std::wstring caption=raw;
+        const auto escapedAmpersand=caption.find(L"&&");if(escapedAmpersand!=std::wstring::npos)caption.erase(escapedAmpersand,1);
+        HDC dc=GetDC(app.playbackConfigure);auto previous=SelectObject(dc,app.font);SIZE extent{};
+        GetTextExtentPoint32W(dc,caption.c_str(),static_cast<int>(caption.size()),&extent);SelectObject(dc,previous);ReleaseDC(app.playbackConfigure,dc);
+        require(extent.cx+app.scale(18)<=bounds(app.playbackConfigure).right-bounds(app.playbackConfigure).left,"Playback disclosure caption truncates at this DPI.");
+    }
     if(app.advancedExpanded)require(!intersects(bounds(app.encodingMode),bounds(app.stopAfter))&&!intersects(bounds(app.stopAfter),bounds(app.lowDisk))&&bounds(app.lowDisk).bottom<bounds(app.preview).top,"Advanced options overlap each other or preview.");
     HDC textDc=GetDC(app.mode);auto oldFont=SelectObject(textDc,app.font);SIZE labelSize{};
     GetTextExtentPoint32W(textDc,SeparateFilesLabel,static_cast<int>(std::wcslen(SeparateFilesLabel)),&labelSize);
@@ -389,7 +401,7 @@ void nightDisclosure(int dpi){
     };
     windowProc(app.window,WM_COMMAND,AdvancedToggle,0);require(!visible(app.nightEnabled)&&!visible(app.nightDuration),"Desktop exposes irrelevant camera night controls.");
     choose(app.mode,static_cast<int>(Mode::Camera));changeLayout(false);
-    require(visible(app.nightEnabled)&&!visible(app.nightDuration)&&!visible(app.nightTarget)&&GetNextDlgTabItem(app.window,app.recoveryMode,FALSE)==app.splitEvery&&GetNextDlgTabItem(app.window,app.splitEvery,FALSE)==app.startDelay&&GetNextDlgTabItem(app.window,app.startDelay,FALSE)==app.skipConfigure&&GetNextDlgTabItem(app.window,app.skipConfigure,FALSE)==app.watermarkConfigure&&GetNextDlgTabItem(app.window,app.watermarkConfigure,FALSE)==app.nightEnabled,"Camera night opt-in visibility/tab order failed.");
+    require(visible(app.nightEnabled)&&!visible(app.nightDuration)&&!visible(app.nightTarget)&&GetNextDlgTabItem(app.window,app.recoveryMode,FALSE)==app.splitEvery&&GetNextDlgTabItem(app.window,app.splitEvery,FALSE)==app.startDelay&&GetNextDlgTabItem(app.window,app.startDelay,FALSE)==app.skipConfigure&&GetNextDlgTabItem(app.window,app.skipConfigure,FALSE)==app.watermarkConfigure&&GetNextDlgTabItem(app.window,app.watermarkConfigure,FALSE)==app.playbackConfigure&&GetNextDlgTabItem(app.window,app.playbackConfigure,FALSE)==app.nightEnabled,"Camera night opt-in visibility/tab order failed.");
     const auto offHeight=app.contentHeight;
     ownedFocus=app.nightEnabled;SendMessageW(app.nightEnabled,BM_SETCHECK,BST_CHECKED,0);windowProc(app.window,WM_COMMAND,NightBox,0);
     require(visible(app.nightDuration)&&visible(app.nightTarget)&&visible(app.nightHint)&&visible(app.nightDetail)&&app.contentHeight==offHeight+app.scale(72),"Night options did not claim exactly their detail row space.");

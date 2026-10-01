@@ -58,7 +58,7 @@ namespace {
 std::function<void()> beforePreferenceReplace;
 int replacementAttempts=0;
 DWORD replacementError=ERROR_SUCCESS;
-enum class WriteFault { None, DenySecond, DenyCompression, DenySegment, DenyWatermark, DenyCursor, DenyNightDuration, DenyStartDelay, ThrowAfterFirst };
+enum class WriteFault { None, DenySecond, DenyCompression, DenySegment, DenyWatermark, DenyCursor, DenyNightDuration, DenyStartDelay, DenyOutputFps, DenyPauseHotkey, DenyStopHotkey, ThrowAfterFirst };
 WriteFault writeFault=WriteFault::None;
 int keyWrites=0, failedKeyWrites=0, syntheticExceptions=0, saveDiagnostics=0;
 DWORD keyWriteError=ERROR_SUCCESS;std::wstring failedPreferenceKey;
@@ -69,7 +69,7 @@ BOOL WINAPI fixtureWriteProfile(LPCWSTR section,LPCWSTR key,LPCWSTR value,LPCWST
     if(section&&key){
         ++keyWrites;
         if(!result){++failedKeyWrites;keyWriteError=error;failedPreferenceKey=key;}
-        const int denyAt=writeFault==WriteFault::DenySecond?2:writeFault==WriteFault::DenyCompression?24:writeFault==WriteFault::DenySegment?11:writeFault==WriteFault::DenyWatermark?31:writeFault==WriteFault::DenyCursor?14:writeFault==WriteFault::DenyNightDuration?16:writeFault==WriteFault::DenyStartDelay?32:0;
+        const int denyAt=writeFault==WriteFault::DenySecond?2:writeFault==WriteFault::DenyCompression?24:writeFault==WriteFault::DenySegment?11:writeFault==WriteFault::DenyWatermark?31:writeFault==WriteFault::DenyCursor?14:writeFault==WriteFault::DenyNightDuration?16:writeFault==WriteFault::DenyStartDelay?32:writeFault==WriteFault::DenyOutputFps?33:writeFault==WriteFault::DenyPauseHotkey?34:writeFault==WriteFault::DenyStopHotkey?35:0;
         if(denyAt && keyWrites==denyAt-1 && result){
             deniedWrite=CreateFileW(path,GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
             if(deniedWrite==INVALID_HANDLE_VALUE)throw std::runtime_error("Cannot deny the next owned staging write.");
@@ -244,7 +244,7 @@ void newUnicodeFile(){
 }
 void existingUnicodeRewrite(){
     PreferencesFixture fixture;
-    const std::wstring initial=L"[Settings]\r\nFolder="+unicodeFolder+L"\r\nInterval=5\r\nQuality=1\r\nEncodingQuality=2\r\nEncodingMode=0\r\nRecordingLimit=0\r\nStopOnLowDiskSpace=1\r\nRecoveryMode=0\r\nShowDesktopCursor=1\r\nNightEnabled=0\r\nNightDurationMs=0\r\nNightTargetBrightness=96\r\nCaptureIntervalMs=5000\r\nVideoWidth=1280\r\nVideoHeight=720\r\nRecordingLimitSeconds=900\r\nSegmentDurationSeconds=0\r\nTimeSkipMode=0\r\nTimeSkipMultiplier=4\r\nTimeSkipQuietAfterMs=120000\r\nTimeSkipRampFrames=30\r\nTimeSkipRepeatSeconds=0\r\nTimeSkipRanges=\r\nTimeSkipQuietSensitivity=1\r\nWatermarkEnabled=0\r\nWatermarkShowTime=1\r\nWatermarkShowSpeed=1\r\nWatermarkTimeKind=0\r\nWatermarkX=10000\r\nWatermarkY=10000\r\nWatermarkTextSize=1\r\nStartDelaySeconds=0\r\n";
+    const std::wstring initial=L"[Settings]\r\nFolder="+unicodeFolder+L"\r\nInterval=5\r\nQuality=1\r\nEncodingQuality=2\r\nEncodingMode=0\r\nRecordingLimit=0\r\nStopOnLowDiskSpace=1\r\nRecoveryMode=0\r\nShowDesktopCursor=1\r\nNightEnabled=0\r\nNightDurationMs=0\r\nNightTargetBrightness=96\r\nCaptureIntervalMs=5000\r\nVideoWidth=1280\r\nVideoHeight=720\r\nRecordingLimitSeconds=900\r\nSegmentDurationSeconds=0\r\nTimeSkipMode=0\r\nTimeSkipMultiplier=4\r\nTimeSkipQuietAfterMs=120000\r\nTimeSkipRampFrames=30\r\nTimeSkipRepeatSeconds=0\r\nTimeSkipRanges=\r\nTimeSkipQuietSensitivity=1\r\nWatermarkEnabled=0\r\nWatermarkShowTime=1\r\nWatermarkShowSpeed=1\r\nWatermarkTimeKind=0\r\nWatermarkX=10000\r\nWatermarkY=10000\r\nWatermarkTextSize=1\r\nStartDelaySeconds=0\r\nOutputFps=30\r\nPauseHotkey=0\r\nStopHotkey=0\r\n";
     fixture.seed(utf16(initial));reload();expectOptions(unicodeFolder,5,1,2);
     const auto initialBytes=fixture.bytes();
     const std::wstring changed=L"C:\\Synthetic videos\\\u65e5\u672c\u8a9e-\U0001f3a5";
@@ -309,6 +309,20 @@ void startDelayOptions(){
     reload();configure();require(app.settings.startDelaySeconds==30 && lapse::recordCalls==records,"Preference loading armed a start or lost the prior delay after a failed save.");
     expectUnknownContent(fixture);fixture.onlySettingsRemain();
     std::cout<<"PASS self-timer exact presets/defaults/strict fallback, no armed-state persistence and final-key atomic failure\n";
+}
+void playbackStagingRollback(){
+    PreferencesFixture fixture;fixture.seed(legacy);reload();preferences(true);
+    const auto previous=fixture.bytes();
+    const WriteFault faults[]={WriteFault::DenyOutputFps,WriteFault::DenyPauseHotkey,WriteFault::DenyStopHotkey};
+    constexpr const wchar_t* keys[]={L"OutputFps",L"PauseHotkey",L"StopHotkey"};
+    for(int i=0;i<3;++i){
+        app.settings.outputFps=60;app.pauseHotkey=static_cast<uint16_t>('P'|((HOTKEYF_CONTROL|HOTKEYF_ALT)<<8));app.stopHotkey=static_cast<uint16_t>('S'|((HOTKEYF_CONTROL|HOTKEYF_ALT)<<8));
+        keyWrites=failedKeyWrites=0;failedPreferenceKey.clear();writeFault=faults[i];preferences(true);writeFault=WriteFault::None;
+        require(keyWrites==33+i && failedKeyWrites==1 && failedPreferenceKey==keys[i] && fixture.bytes()==previous,"Failed playback/shortcut staging key replaced prior preferences.");
+        reload();require(app.settings.outputFps==30 && !app.pauseHotkey && !app.stopHotkey,"Playback staging failure published partial new values.");
+        fixture.onlySettingsRemain();
+    }
+    std::cout<<"PASS atomic rollback at each playback/final shortcut key preserves the prior complete INI\n";
 }
 void segmentOptions(){
     PreferencesFixture fixture;fixture.seed(legacy);reload();configure();
@@ -717,10 +731,10 @@ int main(){
     try{
         std::cout<<std::unitbuf;std::cout<<"ACP="<<GetACP()<<'\n';
         HiddenControls controls;
-        newUnicodeFile();existingUnicodeRewrite();migrateAnsi();encodingModes();recordingLimits();startDelayOptions();segmentOptions();diskSafety();recoveryOptions();cursorOptions();nightOptions();customOptions();readFailure();replacementFailure();
+        newUnicodeFile();existingUnicodeRewrite();playbackStagingRollback();migrateAnsi();encodingModes();recordingLimits();startDelayOptions();segmentOptions();diskSafety();recoveryOptions();cursorOptions();nightOptions();customOptions();readFailure();replacementFailure();
         preparationAllocationFailure();partialKeyWriteFailure();stagedExceptionCleanup();
         preferencePathBoundary(248);preferencePathBoundary(278);timeCompressionPreferences();watermarkPreferences();sizeCommandPreferences();checkpointBeforeRecording();
         require(!IsWindowVisible(app.window),"Fixture became visible.");
-        std::cout<<"All 23 preference cases passed; only owned hidden controls/settings were used.\n";return 0;
+        std::cout<<"All 24 preference cases passed; only owned hidden controls/settings were used.\n";return 0;
     }catch(const std::exception& error){std::cerr<<"PREFERENCES TEST FAILURE: "<<error.what()<<'\n';return 1;}
 }
