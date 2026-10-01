@@ -74,6 +74,7 @@ public:
     bool finishForPublication(std::wstring& e){return real_.finishForPublication(e);}
     DWORD publish(const std::wstring& p){return real_.publish(p);}
     void releasePublication()noexcept{real_.releasePublication();}
+    bool emptyOutputDiscarded() const noexcept { return real_.emptyOutputDiscarded(); }
     uint64_t frames()const{return real_.frames();}
 };
 }

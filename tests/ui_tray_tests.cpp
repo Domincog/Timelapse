@@ -45,6 +45,8 @@ bool failAfterStatus=false;
 ULONGLONG now=1000000;
 ULONGLONG WINAPI ticks(){return now;}
 int statusQueries=0,enables=0,textWrites=0;
+int delayedCancels=0;
+bool delayedOrigin=false;
 struct Invalidated {HWND window;bool whole;RECT rect;};
 std::vector<Invalidated> invalidated;
 BOOL WINAPI enable(HWND window,BOOL value){++enables;return EnableWindow(window,value);}
@@ -101,6 +103,9 @@ public:
     void pause(){}
     void setPaused(bool paused){++probe::pauses;probe::current.state=paused?State::Paused:State::Recording;}
     void finish(){++probe::finishes;probe::current.state=State::Finishing;}
+    void cancelDelayedStart() noexcept {++probe::delayedCancels;if(probe::delayedOrigin &&
+        (probe::current.state==State::Waiting || probe::current.state==State::Starting)){
+        probe::current.state=State::Idle;probe::current.startDeadlineTick=0;probe::delayedOrigin=false;}}
     Status status(){++probe::statusQueries;Status value=probe::current;if(probe::failAfterStatus){probe::failAfterStatus=false;noticeAllocation::failNext=true;}return value;}
 };
 std::vector<Monitor> enumerateMonitors(){throw std::runtime_error("Unexpected display enumeration");}
@@ -173,6 +178,7 @@ struct Fixture {
         app.hiddenToTray=app.trayRegistered=app.trayNoticeShown=app.trayVersion4=app.startupComplete=false;
         app.taskbarCreated=0;app.trayTooltip.clear();
         probe::records=probe::finishes=probe::pauses=probe::shows=probe::hides=probe::foregrounds=probe::destroys=probe::dialogs=probe::quits=probe::confirmations=probe::menus=0;
+        probe::delayedCancels=0;probe::delayedOrigin=false;
         probe::failAdd=probe::failModify=probe::failVersion=false;probe::confirmation=IDOK;
         probe::notifications.clear();probe::tip.clear();probe::lastDialog.clear();
         app.window=CreateWindowExW(0,L"STATIC",L"Owned tray test",WS_OVERLAPPED,0,0,920,720,nullptr,nullptr,nullptr,nullptr);
@@ -180,7 +186,7 @@ struct Fixture {
         auto child=[&](const wchar_t* cls,DWORD style){auto w=CreateWindowExW(0,cls,L"",WS_CHILD|style,0,0,100,100,app.window,nullptr,nullptr,nullptr);require(w!=nullptr,"Child control creation failed");return w;};
         auto combo=[&](int count){auto w=child(L"COMBOBOX",CBS_DROPDOWNLIST);for(int i=0;i<count;++i)add(w,std::to_wstring(i));choose(w,0);return w;};
         app.mode=combo(6);app.interval=combo(6);app.videoSize=combo(2);app.encodingQuality=combo(3);app.encodingMode=combo(5);app.monitor=combo(1);app.camera=combo(1);
-        app.stopAfter=combo(6);app.lowDisk=child(L"BUTTON",BS_AUTOCHECKBOX);SendMessageW(app.lowDisk,BM_SETCHECK,BST_CHECKED,0);
+        app.stopAfter=combo(6);app.startDelay=combo(6);app.lowDisk=child(L"BUTTON",BS_AUTOCHECKBOX);SendMessageW(app.lowDisk,BM_SETCHECK,BST_CHECKED,0);
         app.nightEnabled=child(L"BUTTON",BS_AUTOCHECKBOX);app.nightDuration=combo(6);app.nightTarget=combo(3);choose(app.nightTarget,1);
         app.nightHint=child(L"STATIC",0);app.nightDetail=child(L"STATIC",0);
         app.skipConfigure=child(L"BUTTON",BS_PUSHBUTTON);app.skipSummary=child(L"STATIC",0);app.skipDetail=child(L"STATIC",0);
@@ -233,11 +239,11 @@ void inspectTrayActions(bool progress,State state){
     require(probe::menuItemCount==start+5 && probe::menuDefault==TrayShow,"Progress changed tray action count or the default Show command.");
     require(probe::menuItems[start].id==TrayShow && std::wstring(probe::menuItems[start].text)==L"&Show Timelapse" &&
         probe::menuItems[start+1].id==TrayPause && std::wstring(probe::menuItems[start+1].text)==(state==State::Paused?L"&Resume recording":L"&Pause recording") &&
-        probe::menuItems[start+2].id==TrayFinish && std::wstring(probe::menuItems[start+2].text)==L"&Finish recording" &&
+        probe::menuItems[start+2].id==TrayFinish && std::wstring(probe::menuItems[start+2].text)==((state==State::Waiting || state==State::Starting)?L"Cancel s&tart":L"&Finish recording") &&
         (probe::menuItems[start+3].type&MFT_SEPARATOR) && probe::menuItems[start+4].id==TrayExit && std::wstring(probe::menuItems[start+4].text)==L"E&xit Timelapse",
         "Progress changed native tray action identities, order, labels or separator.");
     const bool pause=state==State::Recording || state==State::Paused;
-    require(bool(probe::pauseFlags&MF_GRAYED)==!pause && bool(probe::finishFlags&MF_GRAYED)==!(pause || state==State::Starting) && !(probe::exitFlags&MF_GRAYED),
+    require(bool(probe::pauseFlags&MF_GRAYED)==!pause && bool(probe::finishFlags&MF_GRAYED)==!(pause || state==State::Starting || state==State::Waiting) && !(probe::exitFlags&MF_GRAYED),
         "Progress changed native Pause/Finish/Exit availability.");
     if(progress)require(probe::menuItems[0].id==4005 && (probe::menuItems[0].state&MFS_DISABLED) &&
         !(probe::menuItems[0].type&MFT_SEPARATOR) && (probe::menuItems[1].type&MFT_SEPARATOR),"Progress heading is actionable or missing its separate native row.");
@@ -290,6 +296,62 @@ void trayProgressFailureControls(){Fixture f;f.state(State::Recording);f.close()
     probe::menuResult=TrayPause;trayMenu();require(probe::pauses==2 && probe::current.state==State::Recording,"Returned native Resume command changed after adding progress.");
     probe::menuResult=TrayFinish;trayMenu();require(probe::finishes==1 && probe::current.state==State::Finishing && !probe::destroys,"Returned native Finish command exited or stopped dispatching.");
     std::cout<<"PASS invalid progress and optional menu append failures preserve native actions without orphan rows; native Pause/Resume/Finish dispatch recovers\n";
+}
+void waitingSnapshots(){Fixture f;f.state(State::Waiting);probe::delayedOrigin=true;
+    const auto deadline=probe::now+10001;probe::current.startDeadlineTick=deadline;f.tick();f.close();
+    const auto open=[&](const wchar_t* expected){const int queries=probe::statusQueries;trayMenu();
+        inspectTrayActions(true,State::Waiting);
+        require(probe::statusQueries==queries+1 && std::wstring(probe::menuItems[0].text)==expected,
+            "Waiting menu did not use one snapshot and a bounded rounded countdown.");};
+    open(L"Waiting to start: 00:11 remaining");++probe::now;open(L"Waiting to start: 00:10 remaining");
+    probe::now=deadline;open(L"Waiting to start: preparing shortly.");
+    probe::now+=600000;open(L"Waiting to start: preparing shortly.");
+    require(probe::current.startDeadlineTick==deadline && app.status.frames==0 && app.status.elapsed==0,
+        "Inspecting a self-timer changed its immutable deadline or invented recording progress.");
+    probe::current.startDeadlineTick=0;open(L"Waiting to start.");
+    probe::current.startDeadlineTick=probe::now+300000;f.tick();
+    const auto fixedDeadline=probe::current.startDeadlineTick;const auto fixedTip=probe::tip;const int menus=probe::menus;
+    probe::resetWork();for(int i=0;i<1000;++i){probe::now+=100;f.tick();}
+    require(probe::statusQueries==1000 && probe::menus==menus && probe::enables==0 && probe::textWrites==0 &&
+        probe::invalidated.empty() && probe::notifications.empty() && probe::tip==fixedTip &&
+        probe::current.startDeadlineTick==fixedDeadline && !probe::records && !probe::finishes && !probe::pauses,
+        "Hidden countdown added periodic visual work, rearmed the timer or dispatched recording commands.");
+    open(L"Waiting to start: 03:20 remaining");f.command(TrayShow);
+    wchar_t caption[160]{};GetWindowTextW(app.finish,caption,_countof(caption));
+    require(std::wstring(caption)==L"Cancel s&tart" && IsWindowEnabled(app.finish) &&
+        !IsWindowEnabled(app.pause) && !IsWindowEnabled(app.record) && !IsWindowEnabled(app.startDelay),
+        "Restoring Waiting lost the Cancel action or active settings locks.");
+    require(probe::delayedCancels==0,"Hide/restore canceled an explicitly armed request.");
+    std::cout<<"PASS sampled Waiting countdown, rounded/past/missing deadlines, stable hidden tray work and restore locks\n";
+}
+void waitingCommandsAndPower(){
+    for(State state:{State::Waiting,State::Starting}){Fixture f;f.state(state);probe::delayedOrigin=true;
+        probe::current.startDeadlineTick=state==State::Waiting?probe::now+5000:0;f.tick();f.close();
+        app.status.state=State::Idle;probe::menuResult=TrayFinish;trayMenu();inspectTrayActions(state==State::Waiting,state);
+        require(probe::finishes==1 && !probe::records && !probe::pauses && !probe::destroys && !app.closeWhenDone,
+            "Tray Cancel lost the current Waiting/Preparing snapshot or exited the application.");
+    }
+    for(UINT event:{PBT_APMSUSPEND,PBT_APMRESUMEAUTOMATIC,PBT_APMRESUMESUSPEND,PBT_APMRESUMECRITICAL}){
+        for(State state:{State::Waiting,State::Starting,State::Recording,State::Paused,State::Idle}){Fixture f;f.state(state);
+            probe::delayedOrigin=state==State::Waiting || state==State::Starting;
+            probe::current.startDeadlineTick=state==State::Waiting?probe::now+5000:0;
+            windowProc(app.window,WM_POWERBROADCAST,event,0);
+            require(probe::delayedCancels==1 && probe::current.state==((state==State::Waiting || state==State::Starting)?State::Idle:state) &&
+                !probe::records && !probe::finishes && !probe::pauses && !probe::dialogs,
+                "Power notification missed the narrow delayed-start cancellation route or changed normal recording.");
+            windowProc(app.window,WM_POWERBROADCAST,event,0);
+            require(probe::delayedCancels==2 && probe::current.state!=State::Waiting,"Repeated power notification rearmed a cancelled request.");
+        }
+    }
+    Fixture f;f.state(State::Starting);probe::delayedOrigin=true;f.tick();f.close();
+    probe::confirmation=IDCANCEL;f.command(TrayExit);
+    require(probe::confirmations==1 && !probe::finishes && !app.closeWhenDone && probe::current.state==State::Starting,
+        "Rejected Exit cancelled a Preparing request.");
+    probe::confirmation=IDOK;f.command(TrayExit);
+    require(probe::finishes==1 && app.closeWhenDone && !probe::destroys,
+        "Confirmed Exit did not retire Preparing through the existing worker completion path.");
+    probe::current={};f.tick();require(probe::destroys==1 && probe::dialogs==2,"Cancelled start raised a failure notice or failed to exit.");
+    std::cout<<"PASS native tray Cancel in Waiting/Preparing, narrow suspend/resume routing and explicit Exit cancellation\n";
 }
 void exitOutcome(bool fail){Fixture f;f.state(State::Recording);f.close();f.command(TrayExit);
     require(probe::finishes==1&&app.closeWhenDone&&!IsWindowEnabled(app.window)&&probe::destroys==0,"Exit did not wait for finalization");
@@ -403,7 +465,7 @@ void cleanupAndStartup(){Fixture f;app.hiddenToTray=true;configure();require(!pr
     require(!app.engine&&!app.trayRegistered&&f.notifications(NIM_DELETE)==1&&probe::quits==1,"Window destruction leaked notification icon or engine");
 }
 void unchangedWork(){Fixture f;
-    for(State state:{State::Idle,State::Starting,State::Recording,State::Paused,State::Finishing}){
+    for(State state:{State::Idle,State::Waiting,State::Starting,State::Recording,State::Paused,State::Finishing}){
         probe::current.state=state;f.tick();probe::resetWork();
         for(int i=0;i<1000;++i)f.tick();
         require(probe::statusQueries==1000&&probe::enables==0&&probe::textWrites==0&&probe::invalidated.empty()&&probe::notifications.empty(),"Unchanged visible status performed redundant visual work or lost observation");
@@ -477,9 +539,9 @@ void compressionResultWork(){Fixture f;app.advancedExpanded=true;app.settings.ti
 }
 }
 int main(){std::cout<<std::unitbuf;try{
-    hideAndShow();failedRegistration();restart(false);restart(true);legacyFallback();menuAndCommands();trayProgressSnapshots();trayProgressFailureControls();exitOutcome(false);exitOutcome(true);backgroundFailure();modifierFailure();cleanupAndStartup();
+    hideAndShow();failedRegistration();restart(false);restart(true);legacyFallback();menuAndCommands();trayProgressSnapshots();trayProgressFailureControls();waitingSnapshots();waitingCommandsAndPower();exitOutcome(false);exitOutcome(true);backgroundFailure();modifierFailure();cleanupAndStartup();
     unchangedWork();scopedPaint();deferredVisuals(false);deferredVisuals(true);unchangedTrayTip();nightResultDetails();compressionResultWork();
     for(int order=0;order<5;++order)failureOrdering(order);visibleFailure();obscuredFailure();for(int kind=0;kind<3;++kind)shownFailure(kind);nextFailedSession();previewOnlyError();
     for(bool duringShow:{false,true})for(bool finishing:{false,true})failureNoticeReentrancy(duringShow,finishing);trayLossWithFailure();failureInsideMenu();visibleFailureInsideMenu();failureMessageAllocation();
-    std::cout<<"PASS 40 tray/status cases: owned hidden windows, synthetic engine, no tray icons, captures, input, or settings writes.\n";return 0;
+    std::cout<<"PASS 42 tray/status groups: owned hidden windows, synthetic engine, no tray icons, captures, input, or settings writes.\n";return 0;
 }catch(const std::exception& error){std::cerr<<"FAIL: "<<error.what()<<'\n';return 1;}}

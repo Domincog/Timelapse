@@ -20,6 +20,7 @@ public:
     bool finishForPublication(std::wstring& error) { probe::beforeFinish(); return probe::afterFinish(real_.finishForPublication(error),error); }
     DWORD publish(const std::wstring& path) { return real_.publish(path); }
     void releasePublication() noexcept { real_.releasePublication(); }
+    bool emptyOutputDiscarded() const noexcept { return real_.emptyOutputDiscarded(); }
     uint64_t frames() const { return real_.frames(); }
 };
 }

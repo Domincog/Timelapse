@@ -24,7 +24,7 @@ public:
     void record() {}
     void pause() {}
     void setPaused(bool) {}
-    void finish() {}
+    void finish() {} void cancelDelayedStart() noexcept {}
     Status status() { return {}; }
 };
 std::vector<Monitor> enumerateMonitors() { throw std::runtime_error("Unexpected device enumeration."); }

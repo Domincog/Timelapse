@@ -12,6 +12,7 @@
 #include <array>
 #include <limits>
 #include <stdexcept>
+#include <cstring>
 
 namespace lapse {
 using Clock = std::chrono::steady_clock;
@@ -47,6 +48,35 @@ bool validateNightCapture(const Settings& settings, std::wstring& error) {
     }
     if (!validNightSettings(settings.night) || settings.night.durationMs > settings.intervalMs) {
         error = L"Night camera needs a valid brightness and a blend duration no longer than Capture every.";
+        return false;
+    }
+    return true;
+}
+bool validateRecordingSettings(Settings& settings, std::wstring& error) {
+    if (settings.startDelaySeconds < 0 || settings.startDelaySeconds > 300)
+        error = L"Delay next recording must be between 0 and 300 whole seconds.";
+    else if (settings.segmentDurationSeconds < 0)
+        error = L"Split files every must be Off or a positive whole number of seconds.";
+    return error.empty() && validateCaptureInterval(settings.intervalMs, error) &&
+        validateVideoSize(settings.width, settings.height, error) &&
+        validateEncodingMode(settings.encodingMode, settings.recoveryMode, error) &&
+        (!usesNightCamera(settings) || validateNightCapture(settings, error)) &&
+        normalizeTimeSkipSettings(settings.timeSkip, error) && validateWatermarkSettings(settings.watermark, error);
+}
+bool queryDelayedWakeEpoch(uint64_t& epoch, std::wstring& error) {
+    // No binding or query on the default immediate path. Own the system-only
+    // module for each of the three bounded self-timer checkpoints.
+    struct Module {
+        HMODULE value;
+        ~Module() { if (value) FreeLibrary(value); }
+    } module{LoadLibraryExW(L"powrprof.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32)};
+    using Query = LONG (WINAPI*)(POWER_INFORMATION_LEVEL, PVOID, ULONG, PVOID, ULONG);
+    Query query{};
+    const auto address = module.value ? GetProcAddress(module.value, "CallNtPowerInformation") : nullptr;
+    static_assert(sizeof(query) == sizeof(address));
+    std::memcpy(&query, &address, sizeof(query));
+    if (!query || query(LastWakeTime, nullptr, 0, &epoch, sizeof(epoch)) != 0) {
+        error = L"Cannot safely delay recording because Windows wake information is unavailable. Choose None to record immediately.";
         return false;
     }
     return true;
@@ -150,6 +180,7 @@ void Engine::retirePreview(bool visualOnly) {
     status_.message = status_.state == State::Recording ? recordingMessage(settings_.separateFiles)
         : status_.state == State::Paused ? L"Paused. Resume when you are ready."
         : status_.state == State::Starting ? L"Preparing recording..."
+        : status_.state == State::Waiting ? L"Waiting to start recording..."
         : status_.state == State::Finishing ? L"Finishing MP4..." : L"Ready to record.";
 }
 void Engine::refreshSources() {
@@ -167,14 +198,38 @@ void Engine::refreshSources() {
     wake_.notify_one();
 }
 void Engine::record() {
-    { std::lock_guard<std::mutex> lock(mutex_); if (status_.state != State::Idle) return;
+    { std::unique_lock<std::mutex> lock(mutex_); if (status_.state != State::Idle) return;
+      std::optional<Settings> request;
+      std::wstring rejection;
+      uint64_t wakeEpoch = 0;
+      if (settings_.startDelaySeconds != 0) {
+          // Build and check the request before replacing the previous result.
+          request.emplace(settings_);
+          lock.unlock();
+          if (validateRecordingSettings(*request, rejection)) queryDelayedWakeEpoch(wakeEpoch, rejection);
+          lock.lock();
+          if (status_.state != State::Idle) return;
+      }
+      const bool delayed = request && rejection.empty();
+      const int delay = request ? request->startDelaySeconds : 0;
+      std::wstring message;
+      if (request) message = !rejection.empty() ? std::move(rejection) : L"Waiting to start recording...";
+      std::wstring cancellation;
+      if (delayed) cancellation = L"Delayed start cancelled.";
       ++previewGeneration_; previewProblem_ = false;
       stop_ = pauseRequested_ = pauseTarget_ = false;
-      requestedCursor_ = settings_.captureCursor;
-      start_ = true; status_.state = State::Starting; status_.error = false; status_.recordingFailed = false;
-      status_.message = L"Preparing recording..."; status_.frames = 0; status_.elapsed = 0; status_.savedPath.clear(); status_.savedPaths.clear();
+      requestedCursor_ = request ? request->captureCursor : settings_.captureCursor;
+      const bool rejected = request && !delayed;
+      delayedSettings_ = delayed ? std::move(request) : std::nullopt;
+      delayedCancellationMessage_ = std::move(cancellation);
+      delayedWakeEpoch_ = wakeEpoch; delayedStartPending_ = delayed; delayedCancel_ = false;
+      start_ = !rejected; status_.state = rejected ? State::Idle : delayed ? State::Waiting : State::Starting;
+      status_.error = status_.recordingFailed = rejected;
+      status_.startDeadlineTick = delayed ? GetTickCount64() + uint64_t(delay) * 1000 : 0;
+      if (request || rejected) status_.message = std::move(message); else status_.message = L"Preparing recording...";
+      status_.frames = 0; status_.elapsed = 0; status_.savedPath.clear(); status_.savedPaths.clear();
       status_.completedSegments = 0;
-      status_.nightEnabled = usesNightCamera(settings_); status_.nightWaiting = status_.nightEnabled;
+      status_.nightEnabled = !delayed && !rejected && usesNightCamera(settings_); status_.nightWaiting = status_.nightEnabled;
       status_.nightDurationMs = 0; status_.night = {};
       status_.timeSkip = {}; }
     wake_.notify_one();
@@ -193,8 +248,14 @@ void Engine::setPaused(bool paused) {
 }
 void Engine::finish() {
     { std::lock_guard<std::mutex> lock(mutex_);
-      if (status_.state != State::Starting && status_.state != State::Recording && status_.state != State::Paused) return;
+      if (status_.state != State::Waiting && status_.state != State::Starting && status_.state != State::Recording && status_.state != State::Paused) return;
       stop_ = true; }
+    wake_.notify_one();
+}
+void Engine::cancelDelayedStart() noexcept {
+    { std::lock_guard<std::mutex> lock(mutex_);
+      if (!delayedStartPending_) return;
+      delayedCancel_ = true; stop_ = true; }
     wake_.notify_one();
 }
 Status Engine::status() { std::lock_guard<std::mutex> lock(mutex_); return status_; }
@@ -210,6 +271,10 @@ void Engine::run() {
         std::optional<Encoder> cameraEncoder;
         RecordingPower power;
         std::optional<Settings> session;
+        std::optional<Settings> delayedRequest;
+        uint64_t delayedDeadline = 0, delayedEpoch = 0;
+        bool delayedOrigin = false;
+        bool delayedLayersFrozen = false;
         WatermarkRenderer watermark;
         WatermarkSettings preparedWatermark;
         int watermarkWidth = 0, watermarkHeight = 0;
@@ -561,7 +626,7 @@ void Engine::run() {
         bool recordingLimitReached = false;
         bool terminalClockFrozen = false;
         auto advanceElapsed = [&](Clock::time_point now) {
-            if (writing && !paused) activeDuration += now - lastTick;
+            if (writing && !paused && (!delayedOrigin || sessionStarted)) activeDuration += now - lastTick;
             lastTick = now;
             elapsed = std::chrono::duration<double>(activeDuration).count();
         };
@@ -810,6 +875,9 @@ void Engine::run() {
             return !status_.error;
         };
         auto closeRecording = [&](const std::wstring& reason) {
+            delayedRequest.reset(); delayedDeadline = 0; delayedOrigin = false; delayedLayersFrozen = false;
+            { std::lock_guard<std::mutex> lock(mutex_);
+              delayedSettings_.reset(); delayedStartPending_ = delayedCancel_ = false; status_.startDeadlineTick = 0; }
             // Snapshot the observed stop/failure time once, before helper or
             // encoder cleanup. A reporting exception can retry this operation;
             // that retry must not count the preceding terminal save as active.
@@ -845,13 +913,66 @@ void Engine::run() {
             desktop = {}; webcam = {}; composed = {}; cameraComposed = {};
             power.update(false, false);
         };
+        auto endDelayedRequest = [&](const std::wstring& problem, bool failed) {
+            std::wstring message = problem.empty() ? L"Delayed start cancelled." : problem;
+            // The delayed request has not admitted any frame. Finish each
+            // owned empty writer, retaining typed cleanup failures; ordinary
+            // finish's false result alone also denotes successful empty discard.
+            if (writing && !sessionStarted) {
+                std::wstring cleanup;
+                bool discarded = true;
+                const std::array<Encoder*, 2> writers{segmentWriting && encoder ? &*encoder : nullptr,
+                    cameraWriting && cameraEncoder ? &*cameraEncoder : nullptr};
+                for (auto* writer : writers) if (writer) {
+                    std::wstring error;
+                    writer->finish(error);
+                    if (!writer->emptyOutputDiscarded()) {
+                        discarded = false;
+                        if (!cleanup.empty()) cleanup += L" ";
+                        cleanup += error;
+                    }
+                    writer->releasePublication();
+                }
+                if (!discarded) { failed = true; message += L" Empty output cleanup failed: " + cleanup; }
+                writing = segmentWriting = cameraWriting = false;
+            }
+            if (pending || delayedOrigin) {
+                cancelNight(); nightMode = false;
+                cancelObservation(); skipping = observing = false; observationDesktop = {};
+                resetWatermark(); releaseDesktopCaptureCache();
+                pending = paused = false; sessionStarted = false; delayedLayersFrozen = false;
+                desktop = {}; webcam = {}; composed = {}; cameraComposed = {};
+            }
+            bool keepCamera;
+            { std::lock_guard<std::mutex> lock(mutex_); keepCamera = settings_.preview; }
+            if (!keepCamera && cameraRunning) { clearCameraInput(); camera->stop(); cameraRunning = false; activeCamera.clear(); }
+            {
+                delayedRequest.reset(); delayedDeadline = 0; delayedOrigin = false;
+                power.update(false, false);
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (start_) return;
+                delayedSettings_.reset(); delayedStartPending_ = delayedCancel_ = false;
+                stop_ = pauseRequested_ = pauseTarget_ = false;
+                status_.state = State::Idle; status_.startDeadlineTick = 0;
+                status_.frames = 0; status_.elapsed = 0; status_.completedSegments = 0;
+                status_.nightEnabled = status_.nightWaiting = false; status_.timeSkip = {};
+                status_.error = status_.recordingFailed = failed; previewProblem_ = false;
+                status_.message.swap(message);
+            }
+        };
+        auto waitingDeadline = [&] {
+            if (!delayedDeadline) return Clock::time_point::max();
+            const auto tick = GetTickCount64();
+            return Clock::now() + std::chrono::milliseconds(delayedDeadline > tick ? delayedDeadline - tick : 0);
+        };
         auto waitAfterFailure = [&](std::unique_lock<std::mutex>& lock) {
+            if (stop_ && delayedStartPending_ && status_.state == State::Waiting) return;
             // Commands already queued at failure remain pending, but must not
             // turn persistent allocation failure into an immediate retry loop.
             const auto generation = previewGeneration_;
             const auto revision = settingsRevision_;
             const bool start = start_, stop = stop_, pauseRequested = pauseRequested_, pauseTarget = pauseTarget_, retry = retrySources_;
-            wake_.wait_until(lock, std::min({Clock::now() + std::chrono::seconds(1), recordingDeadline(), segmentDeadline()}), [&] {
+            wake_.wait_until(lock, std::min({Clock::now() + std::chrono::seconds(1), recordingDeadline(), segmentDeadline(), waitingDeadline()}), [&] {
                 return quit_ || previewGeneration_ != generation || settingsRevision_ != revision || start_ != start ||
                     stop_ != stop || pauseRequested_ != pauseRequested || pauseTarget_ != pauseTarget || retrySources_ != retry;
             });
@@ -862,6 +983,8 @@ void Engine::run() {
             try {
                 std::optional<Settings> snapshot;
                 bool quit, start = false, stop = false, pauseRequested = false, pauseTarget = false, retry = false;
+                bool cancelledWaiting = false, cancelledPreview = false;
+                uint64_t requestDeadline = 0, requestEpoch = 0;
                 { std::unique_lock<std::mutex> lock(mutex_);
                   // Sleep until useful work is due. Configuration revisions
                   // also catch notifications sent while capture was in flight.
@@ -887,6 +1010,11 @@ void Engine::run() {
                           deadline = std::min(deadline, lastTick + (std::chrono::milliseconds(skipDecision.nextBoundaryMs) - activeDuration));
                   }
                   deadline = std::min({deadline, recordingDeadline(), segmentDeadline()});
+                  if (status_.state == State::Waiting) {
+                      const auto tick = GetTickCount64();
+                      deadline = std::min(deadline, Clock::now() + std::chrono::milliseconds(
+                          status_.startDeadlineTick > tick ? status_.startDeadlineTick - tick : 0));
+                  }
                   if (FAILED(com)) deadline = Clock::now() + std::chrono::seconds(1);
                   auto commanded = [&] {
                       return quit_ || start_ || stop_ || pauseRequested_ || retrySources_ || settingsRevision_ != settingsRevision;
@@ -897,21 +1025,50 @@ void Engine::run() {
                   // ownership before copying, and consume commands only after
                   // their settings snapshot has succeeded.
                   quit = quit_;
+                  if (!quit && stop_ && delayedStartPending_ && status_.state == State::Waiting && !pending && !writing) {
+                      // Retire an armed request even when Settings copies keep
+                      // failing. Cancellation must not require an allocation.
+                      delayedSettings_.reset(); delayedRequest.reset(); delayedDeadline = 0;
+                      delayedOrigin = delayedLayersFrozen = delayedStartPending_ = delayedCancel_ = false;
+                      start_ = stop_ = pauseRequested_ = pauseTarget_ = false;
+                      status_.state = State::Idle; status_.startDeadlineTick = 0;
+                      status_.error = status_.recordingFailed = previewProblem_ = false;
+                      status_.nightEnabled = status_.nightWaiting = false;
+                      status_.message.swap(delayedCancellationMessage_);
+                      power.update(false, false);
+                      cancelledWaiting = true; cancelledPreview = settings_.preview;
+                      settingsRevision = settingsRevision_;
+                  }
                   previewGeneration = previewGeneration_;
                   visualPreviewGeneration = visualPreviewGeneration_;
                   cameraInputGeneration = cameraInputGeneration_;
                   const auto requiredWork = nightMode ? (nightQueued ? nightPollAt : nightStartAt) : nextFrame;
                   previewOnlyWork = !start_ && !stop_ && !quit_ && !pending &&
-                      (!writing || paused || Clock::now() < requiredWork) && Clock::now() < recordingDeadline() && Clock::now() < segmentDeadline();
-                  if (!quit) {
-                      snapshot.emplace(settings_);
+                      (!writing || paused || Clock::now() < requiredWork) && Clock::now() < recordingDeadline() && Clock::now() < segmentDeadline() &&
+                      (!delayedDeadline || GetTickCount64() < delayedDeadline);
+                  if (!quit && !cancelledWaiting) {
+                      if (start_ && delayedSettings_) snapshot.emplace(*delayedSettings_);
+                      else snapshot.emplace(settings_);
+                      snapshot->preview = settings_.preview;
                       settingsRevision = settingsRevision_;
                       start = start_; stop = stop_; pauseRequested = pauseRequested_; pauseTarget = pauseTarget_; retry = retrySources_;
                       // Record fixes cursor policy at acceptance even if an idle
                       // capture delays this worker and next-session edits arrive.
                       if (start) snapshot->captureCursor = requestedCursor_;
+                      if (start && delayedSettings_) {
+                          requestDeadline = status_.startDeadlineTick; requestEpoch = delayedWakeEpoch_;
+                          delayedSettings_.reset();
+                      }
                       start_ = stop_ = pauseRequested_ = retrySources_ = false;
                   } }
+                if (cancelledWaiting) {
+                    if (!cancelledPreview) {
+                        releaseDesktopCaptureCache(); resetWatermark();
+                        desktop = {}; webcam = {}; composed = {}; cameraComposed = {}; previewBuffer.reset();
+                        if (cameraRunning) { clearCameraInput(); camera->stop(); cameraRunning = false; activeCamera.clear(); }
+                    }
+                    continue;
+                }
                 const auto now = Clock::now();
                 advanceElapsed(now);
                 // Preview deadlines can coincide with every clock deadline.
@@ -920,8 +1077,38 @@ void Engine::run() {
                 if (quit) { if (writing || pending) { previewOnlyWork = false; closeRecording(L""); } break; }
                 Settings& cfg = *snapshot;
                 bool resetSkipRequested = false;
+                if (start && requestDeadline) {
+                    delayedRequest.emplace(std::move(cfg)); delayedDeadline = requestDeadline; delayedEpoch = requestEpoch;
+                    delayedOrigin = true; sessionStarted = false; start = false;
+                    cfg = *delayedRequest;
+                }
+                if (stop && delayedOrigin && !sessionStarted) { endDelayedRequest(L"", false); continue; }
+                if (delayedRequest && GetTickCount64() >= delayedDeadline) {
+                    previewOnlyWork = false;
+                    uint64_t epoch = 0; std::wstring error;
+                    const bool known = queryDelayedWakeEpoch(epoch, error);
+                    bool cancelled;
+                    { std::lock_guard<std::mutex> lock(mutex_); cancelled = quit_ || stop_ || delayedCancel_; }
+                    if (cancelled || !known || epoch != delayedEpoch) {
+                        endDelayedRequest(cancelled ? L"" : !known ? error : epoch != delayedEpoch
+                            ? L"Delayed start cancelled because Windows resumed." : L"", !known && !cancelled);
+                        continue;
+                    }
+                    const bool preview = cfg.preview;
+                    cfg = std::move(*delayedRequest); cfg.preview = preview;
+                    delayedRequest.reset(); delayedDeadline = 0; start = true;
+                    { std::lock_guard<std::mutex> lock(mutex_);
+                      delayedLayersFrozen = true;
+                      status_.state = State::Starting; status_.startDeadlineTick = 0;
+                      status_.nightEnabled = usesNightCamera(cfg); status_.nightWaiting = status_.nightEnabled;
+                      if (!previewProblem_) status_.message = L"Preparing recording..."; }
+                }
                 if (retry) { clearCameraInput(); if (camera) camera->stop(); cameraRunning = false; activeCamera.clear(); }
-                if (FAILED(com)) { publishError(L"Windows media initialization failed: " + errorText(com), true); continue; }
+                if (FAILED(com)) {
+                    const auto error = L"Windows media initialization failed: " + errorText(com);
+                    if (delayedOrigin) endDelayedRequest(error, true); else publishError(error, true);
+                    continue;
+                }
                 if (start) {
                     previewOnlyWork = false;
                     personFault = false; personFailure = {};
@@ -934,13 +1121,7 @@ void Engine::run() {
                     suggestedNightDurationMs = NightInitialDurationMs;
                     nightStartAt = now;
                     std::wstring validationError;
-                    if (cfg.segmentDurationSeconds < 0) validationError = L"Split files every must be Off or a positive whole number of seconds.";
-                    if (!validationError.empty() || !validateCaptureInterval(cfg.intervalMs, validationError) ||
-                        !validateVideoSize(cfg.width, cfg.height, validationError) ||
-                        !validateEncodingMode(cfg.encodingMode, cfg.recoveryMode, validationError) ||
-                        (nightMode && !validateNightCapture(cfg, validationError)) ||
-                        !normalizeTimeSkipSettings(cfg.timeSkip, validationError) ||
-                        !validateWatermarkSettings(cfg.watermark, validationError) ||
+                    if (!validateRecordingSettings(cfg, validationError) ||
                         !prepareWatermark(cfg, validationError)) {
                         closeRecording(validationError); continue;
                     }
@@ -983,7 +1164,7 @@ void Engine::run() {
                 // do not discard their reset intent as a disposable preview.
                 previewOnlyWork = !captureDue && !segmentExpired();
                 if (writing || pending) {
-                    if (!session->separateFiles) {
+                    if (!session->separateFiles && !delayedLayersFrozen) {
                         if (skipping && !sameLayers(session->layers, cfg.layers)) resetSkipRequested = true;
                         session->layers = cfg.layers;
                     }
@@ -1029,7 +1210,8 @@ void Engine::run() {
                     inspectSkipping();
                     captureDue = Clock::now() >= nextFrame;
                 }
-                power.update(writing && !paused, needDesktop);
+                const bool holdingDelay = delayedOrigin && !sessionStarted;
+                power.update(holdingDelay || (writing && !paused), !holdingDelay && needDesktop);
                 const bool active = pending || (writing && !paused) || cfg.preview;
                 // An idle hidden/disabled overlay owns no reusable GDI cache.
                 // Keep paused session resources and its last context intact:
@@ -1265,11 +1447,12 @@ void Engine::run() {
                             if (cfg.separateFiles) {
                                 if (sessionStarted) advanceElapsed(Clock::now());
                                 if (limitExpired()) { recordingLimitReached = true; closeRecording(L""); admit = false; break; }
-                                if (cfg.segmentDurationSeconds > 0 && commandPending()) {
+                                if ((cfg.segmentDurationSeconds > 0 || (delayedOrigin && !sessionStarted)) && commandPending()) {
                                     // Do not launch the second codec after a
                                     // queued command. Retire this owned empty
                                     // prospective part before Pause is serviced.
-                                    if (!finishSegment(L"", false)) closeRecording(L"");
+                                    if (delayedOrigin && !sessionStarted) endDelayedRequest(L"", false);
+                                    else if (!finishSegment(L"", false)) closeRecording(L"");
                                     admit = false; break;
                                 }
                                 if (!cameraEncoder) cameraEncoder.emplace();
@@ -1280,9 +1463,11 @@ void Engine::run() {
                             }
                             pending = false;
                             if (!sessionStarted) { lastTick = Clock::now(); nextFrame = lastTick; }
-                            power.update(true, needDesktop);
+                            power.update(true, !(delayedOrigin && !sessionStarted) && needDesktop);
                             { std::lock_guard<std::mutex> lock(mutex_);
-                              status_.state = State::Recording; status_.error = false; status_.message = recordingMessage(cfg.separateFiles); }
+                              status_.state = delayedOrigin ? State::Starting : State::Recording;
+                              status_.error = false;
+                              status_.message = delayedOrigin ? L"Preparing recording..." : recordingMessage(cfg.separateFiles); }
                         }
                         if (sessionStarted) advanceElapsed(Clock::now());
                         if (limitExpired()) { recordingLimitReached = true; closeRecording(L""); admit = false; break; }
@@ -1304,6 +1489,7 @@ void Engine::run() {
                         if (skipping) inspectSkipping();
                         if (commandPending()) { admit = false; break; }
                         admittedAt = Clock::now();
+                        if (delayedOrigin && !sessionStarted) lastTick = admittedAt;
                         advanceElapsed(admittedAt);
                         if (limitExpired()) { recordingLimitReached = true; closeRecording(L""); admit = false; break; }
                         if (segmentExpired()) continue;
@@ -1314,7 +1500,7 @@ void Engine::run() {
                         nextSegmentBoundary = nextSegmentCut(activeDuration, cfg.segmentDurationSeconds);
                         ++segmentOrdinal;
                     }
-                    sessionStarted = true;
+                    if (!delayedOrigin) sessionStarted = true;
                     const auto admittedActiveMs = std::chrono::duration_cast<std::chrono::milliseconds>(activeDuration).count();
                     if (cfg.watermark.enabled) {
                         // Both completed compositions share one admission context
@@ -1328,6 +1514,30 @@ void Engine::run() {
                             closeRecording(L"Watermark stopped recording: " + error); continue;
                         }
                         lastWatermarkContext = context; haveWatermarkContext = true;
+                    }
+                    if (delayedOrigin) {
+                        // Source, codec and both overlays remain preparation.
+                        // Recheck Windows after those potentially slow steps,
+                        // then let cancellation and paired admission race only
+                        // at this one allocation-free mutex commit.
+                        if (commandPending()) continue;
+                        std::wstring recordingText = recordingMessage(cfg.separateFiles), wakeError;
+                        uint64_t epoch = 0;
+                        const bool known = queryDelayedWakeEpoch(epoch, wakeError);
+                        bool cancelled;
+                        { std::lock_guard<std::mutex> lock(mutex_);
+                          cancelled = quit_ || stop_ || delayedCancel_;
+                          if (!cancelled && known && epoch == delayedEpoch) {
+                              delayedStartPending_ = delayedOrigin = delayedLayersFrozen = false;
+                              sessionStarted = true; admittedAt = lastTick = nextFrame = Clock::now();
+                              activeDuration = Clock::duration::zero(); elapsed = 0;
+                              status_.state = State::Recording; status_.error = false; status_.message.swap(recordingText);
+                          } }
+                        if (cancelled || !known || epoch != delayedEpoch) {
+                            endDelayedRequest(cancelled ? L"" : !known ? wakeError : L"Delayed start cancelled because Windows resumed.", !known && !cancelled);
+                            continue;
+                        }
+                        power.update(true, needDesktop);
                     }
                     if (!encoder->write(composed, error)) {
                         closeRecording((cfg.separateFiles ? L"Desktop recording stopped: " : L"Recording stopped: ") + error); continue;
@@ -1402,7 +1612,7 @@ void Engine::run() {
                       status_.error = false;
                       status_.message = writing
                           ? paused ? L"Paused. Resume when you are ready." : recordingMessage(cfg.separateFiles)
-                          : L"Ready to record.";
+                          : delayedRequest ? L"Waiting to start recording..." : L"Ready to record.";
                       previewProblem_ = false;
                   } }
             } catch (const std::exception&) {
@@ -1421,7 +1631,8 @@ void Engine::run() {
                 // new recording. Finalize first so captured frames can survive
                 // allocation/path failures as a playable video.
                 try {
-                    if (writing || pending) closeRecording(L"Recording stopped because a resource could not be allocated. You can try recording again.");
+                    if (delayedOrigin) endDelayedRequest(L"Delayed start stopped because a resource could not be allocated. You can try recording again.", true);
+                    else if (writing || pending) closeRecording(L"Recording stopped because a resource could not be allocated. You can try recording again.");
                     else publishError(L"Capture could not allocate a resource. You can try recording again.", true);
                 } catch (...) {
                     // Reporting or naming the completed recording may itself
@@ -1431,6 +1642,7 @@ void Engine::run() {
                     try { if (cameraEncoder) { std::wstring ignored; cameraEncoder->finish(ignored); } } catch (...) {}
                     std::lock_guard<std::mutex> lock(mutex_);
                     if (!start_) {
+                        delayedSettings_.reset(); delayedStartPending_ = delayedCancel_ = false; status_.startDeadlineTick = 0;
                         previewProblem_ = false;
                         status_.state = State::Idle; status_.error = true;
                         if (terminalClockFrozen && (writing || pending)) status_.elapsed = elapsed;
@@ -1447,6 +1659,7 @@ void Engine::run() {
                 nightMode = nightQueued = nightFrameReady = false;
                 cancelObservation(); skipping = observing = false; observationDesktop = {};
                 writing = segmentWriting = cameraWriting = pending = paused = false;
+                delayedRequest.reset(); delayedDeadline = 0; delayedOrigin = false;
                 desktop = {}; webcam = {}; composed = {}; cameraComposed = {}; previewBuffer.reset();
                 power.update(false, false);
                 std::unique_lock<std::mutex> lock(mutex_);

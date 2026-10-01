@@ -116,6 +116,7 @@ public:
         return result;
     }
     void releasePublication() noexcept { real_.releasePublication(); }
+    bool emptyOutputDiscarded() const noexcept { return real_.emptyOutputDiscarded(); }
     uint64_t frames() const { return real_.frames(); }
 private:
     Encoder real_;

@@ -44,10 +44,10 @@ class FixtureEngine {
 public:
     void configure(const Settings& value) {configuredSettings=value;++configurationCalls;}
     void refreshSources() {}
-    void record() {if(beforeRecording)beforeRecording();recordedSettings=configuredSettings;++recordCalls;fixtureStatus.state=State::Starting;}
+    void record() {if(beforeRecording)beforeRecording();recordedSettings=configuredSettings;++recordCalls;fixtureStatus.state=configuredSettings.startDelaySeconds?State::Waiting:State::Starting;}
     void pause() {}
     void setPaused(bool) {}
-    void finish() {}
+    void finish() {} void cancelDelayedStart() noexcept {}
     Status status(){return fixtureStatus;}
 };
 std::vector<Monitor> enumerateMonitors(){throw std::runtime_error("Unexpected device enumeration.");}
@@ -58,7 +58,7 @@ namespace {
 std::function<void()> beforePreferenceReplace;
 int replacementAttempts=0;
 DWORD replacementError=ERROR_SUCCESS;
-enum class WriteFault { None, DenySecond, DenyCompression, DenySegment, DenyWatermark, DenyCursor, DenyNightDuration, ThrowAfterFirst };
+enum class WriteFault { None, DenySecond, DenyCompression, DenySegment, DenyWatermark, DenyCursor, DenyNightDuration, DenyStartDelay, ThrowAfterFirst };
 WriteFault writeFault=WriteFault::None;
 int keyWrites=0, failedKeyWrites=0, syntheticExceptions=0, saveDiagnostics=0;
 DWORD keyWriteError=ERROR_SUCCESS;std::wstring failedPreferenceKey;
@@ -69,7 +69,7 @@ BOOL WINAPI fixtureWriteProfile(LPCWSTR section,LPCWSTR key,LPCWSTR value,LPCWST
     if(section&&key){
         ++keyWrites;
         if(!result){++failedKeyWrites;keyWriteError=error;failedPreferenceKey=key;}
-        const int denyAt=writeFault==WriteFault::DenySecond?2:writeFault==WriteFault::DenyCompression?24:writeFault==WriteFault::DenySegment?11:writeFault==WriteFault::DenyWatermark?31:writeFault==WriteFault::DenyCursor?14:writeFault==WriteFault::DenyNightDuration?16:0;
+        const int denyAt=writeFault==WriteFault::DenySecond?2:writeFault==WriteFault::DenyCompression?24:writeFault==WriteFault::DenySegment?11:writeFault==WriteFault::DenyWatermark?31:writeFault==WriteFault::DenyCursor?14:writeFault==WriteFault::DenyNightDuration?16:writeFault==WriteFault::DenyStartDelay?32:0;
         if(denyAt && keyWrites==denyAt-1 && result){
             deniedWrite=CreateFileW(path,GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
             if(deniedWrite==INVALID_HANDLE_VALUE)throw std::runtime_error("Cannot deny the next owned staging write.");
@@ -122,7 +122,7 @@ struct HiddenControls {
             for(int i=0;i<count;++i)add(window,std::to_wstring(i));choose(window,0);return window;
         };
         app.mode=combo(6);app.interval=combo(6);app.videoSize=combo(2);app.encodingQuality=combo(3);app.encodingMode=combo(5);app.stopAfter=combo(6);
-        app.splitEvery=combo(5);
+        app.splitEvery=combo(5);app.startDelay=combo(6);app.committedStartDelay=0;
         app.lowDisk=CreateWindowExW(0,L"BUTTON",L"Stop on low disk space",WS_CHILD|BS_AUTOCHECKBOX,0,0,200,30,app.window,nullptr,nullptr,nullptr);
         require(app.lowDisk!=nullptr,"Cannot create owned low disk option.");SendMessageW(app.lowDisk,BM_SETCHECK,BST_CHECKED,0);
         app.recoveryMode=CreateWindowExW(0,L"BUTTON",L"MP4 recovery mode (H.264)",WS_CHILD|BS_AUTOCHECKBOX,0,0,300,30,app.window,nullptr,nullptr,nullptr);
@@ -133,7 +133,7 @@ struct HiddenControls {
         require(app.nightEnabled!=nullptr,"Cannot create owned night option.");
         app.nightDuration=combo(6);app.nightTarget=combo(3);choose(app.nightTarget,1);
     }
-    ~HiddenControls(){DestroyWindow(app.window);app.window=app.captureCursor=nullptr;}
+    ~HiddenControls(){DestroyWindow(app.window);app.window=app.captureCursor=app.startDelay=nullptr;}
 };
 struct PreferencesFixture {
     std::filesystem::path base=std::filesystem::current_path(), directory, settingsDirectory;
@@ -244,7 +244,7 @@ void newUnicodeFile(){
 }
 void existingUnicodeRewrite(){
     PreferencesFixture fixture;
-    const std::wstring initial=L"[Settings]\r\nFolder="+unicodeFolder+L"\r\nInterval=5\r\nQuality=1\r\nEncodingQuality=2\r\nEncodingMode=0\r\nRecordingLimit=0\r\nStopOnLowDiskSpace=1\r\nRecoveryMode=0\r\nShowDesktopCursor=1\r\nNightEnabled=0\r\nNightDurationMs=0\r\nNightTargetBrightness=96\r\nCaptureIntervalMs=5000\r\nVideoWidth=1280\r\nVideoHeight=720\r\nRecordingLimitSeconds=900\r\nSegmentDurationSeconds=0\r\nTimeSkipMode=0\r\nTimeSkipMultiplier=4\r\nTimeSkipQuietAfterMs=120000\r\nTimeSkipRampFrames=30\r\nTimeSkipRepeatSeconds=0\r\nTimeSkipRanges=\r\nTimeSkipQuietSensitivity=1\r\nWatermarkEnabled=0\r\nWatermarkShowTime=1\r\nWatermarkShowSpeed=1\r\nWatermarkTimeKind=0\r\nWatermarkX=10000\r\nWatermarkY=10000\r\nWatermarkTextSize=1\r\n";
+    const std::wstring initial=L"[Settings]\r\nFolder="+unicodeFolder+L"\r\nInterval=5\r\nQuality=1\r\nEncodingQuality=2\r\nEncodingMode=0\r\nRecordingLimit=0\r\nStopOnLowDiskSpace=1\r\nRecoveryMode=0\r\nShowDesktopCursor=1\r\nNightEnabled=0\r\nNightDurationMs=0\r\nNightTargetBrightness=96\r\nCaptureIntervalMs=5000\r\nVideoWidth=1280\r\nVideoHeight=720\r\nRecordingLimitSeconds=900\r\nSegmentDurationSeconds=0\r\nTimeSkipMode=0\r\nTimeSkipMultiplier=4\r\nTimeSkipQuietAfterMs=120000\r\nTimeSkipRampFrames=30\r\nTimeSkipRepeatSeconds=0\r\nTimeSkipRanges=\r\nTimeSkipQuietSensitivity=1\r\nWatermarkEnabled=0\r\nWatermarkShowTime=1\r\nWatermarkShowSpeed=1\r\nWatermarkTimeKind=0\r\nWatermarkX=10000\r\nWatermarkY=10000\r\nWatermarkTextSize=1\r\nStartDelaySeconds=0\r\n";
     fixture.seed(utf16(initial));reload();expectOptions(unicodeFolder,5,1,2);
     const auto initialBytes=fixture.bytes();
     const std::wstring changed=L"C:\\Synthetic videos\\\u65e5\u672c\u8a9e-\U0001f3a5";
@@ -286,6 +286,29 @@ void recordingLimits(){
         reload();require(choice(app.stopAfter)==0,"Invalid recording limit enabled automatic stop.");
     }
     fixture.onlySettingsRemain();std::cout<<"PASS recording limits roundtrip; old or invalid settings remain unlimited\n";
+}
+void startDelayOptions(){
+    PreferencesFixture fixture;fixture.seed(legacy);reload();configure();
+    const auto records=lapse::recordCalls;
+    require(choice(app.startDelay)==0 && !app.settings.startDelaySeconds,"Legacy preferences enabled a self-timer.");
+    for(int index=0;index<6;++index){
+        choose(app.startDelay,index);configure();preferences(true);choose(app.startDelay,(index+1)%6);reload();configure();
+        wchar_t value[32]{};GetPrivateProfileStringW(L"Settings",L"StartDelaySeconds",L"",value,32,app.preferences.c_str());
+        require(choice(app.startDelay)==index && app.settings.startDelaySeconds==StartDelays[index] && std::wstring(value)==std::to_wstring(StartDelays[index]) && choice(app.mode)==0,
+            "Self-timer preset lost exact seconds or Desktop startup.");
+    }
+    for(const wchar_t* invalid:{L"",L"-1",L"1",L"4",L"301",L"5junk",L"05",L"+5",L"1.5",L"999999999999999999999999999999999999999"}){
+        require(WritePrivateProfileStringW(L"Settings",L"StartDelaySeconds",invalid,app.preferences.c_str())!=FALSE,"Cannot seed invalid delay.");
+        reload();configure();require(choice(app.startDelay)==0 && !app.settings.startDelaySeconds,"Malformed saved delay armed a timer.");
+    }
+    require(WritePrivateProfileStringW(L"Settings",L"StartDelaySeconds",nullptr,app.preferences.c_str())!=FALSE,"Cannot remove optional delay.");
+    reload();configure();require(!app.settings.startDelaySeconds,"Absent delay did not default to None.");
+    choose(app.startDelay,3);configure();preferences(true);const auto previous=fixture.bytes();
+    choose(app.startDelay,5);configure();keyWrites=failedKeyWrites=0;failedPreferenceKey.clear();writeFault=WriteFault::DenyStartDelay;preferences(true);writeFault=WriteFault::None;
+    require(keyWrites==32 && failedKeyWrites==1 && failedPreferenceKey==L"StartDelaySeconds" && fixture.bytes()==previous,"Failed final delay key published partial preferences.");
+    reload();configure();require(app.settings.startDelaySeconds==30 && lapse::recordCalls==records,"Preference loading armed a start or lost the prior delay after a failed save.");
+    expectUnknownContent(fixture);fixture.onlySettingsRemain();
+    std::cout<<"PASS self-timer exact presets/defaults/strict fallback, no armed-state persistence and final-key atomic failure\n";
 }
 void segmentOptions(){
     PreferencesFixture fixture;fixture.seed(legacy);reload();configure();
@@ -647,6 +670,7 @@ void checkpointBeforeRecording(){
     app.hasCustomLimit=true;app.customLimitSeconds=3700;app.committedLimit=6;customItems();
     windowProc(app.window,WM_COMMAND,MAKEWPARAM(IntervalBox,CBN_SELCHANGE),reinterpret_cast<LPARAM>(app.interval));
     windowProc(app.window,WM_COMMAND,NightBox,0);
+    choose(app.startDelay,3);windowProc(app.window,WM_COMMAND,MAKEWPARAM(StartDelayBox,CBN_SELCHANGE),reinterpret_cast<LPARAM>(app.startDelay));
     require(replacementAttempts==0 && keyWrites==0 && fixture.bytes()==original,"Idle option changes added unsolicited preference writes.");
     app.cameras.clear();windowProc(app.window,WM_COMMAND,Record,0);app.cameras={{L"Synthetic camera",L"owned-camera"}};
     choose(app.nightDuration,5);windowProc(app.window,WM_COMMAND,Record,0);choose(app.nightDuration,6);
@@ -654,12 +678,12 @@ void checkpointBeforeRecording(){
     require(!lapse::recordCalls && !replacementAttempts && !keyWrites && fixture.bytes()==original,"Invalid source/Night Record wrote settings or started capture.");
     lapse::beforeRecording=[&]{require(replacementAttempts==1 && fixture.bytes()!=original,"Capture began before its preference checkpoint.");};
     windowProc(app.window,WM_COMMAND,Record,0);
-    require(lapse::recordCalls==1 && lapse::recordedSettings.intervalMs==2500 && lapse::recordedSettings.recordingLimitSeconds==3700 && lapse::recordedSettings.segmentDurationSeconds==777 &&
+    require(lapse::recordCalls==1 && lapse::recordedSettings.startDelaySeconds==30 && lapse::fixtureStatus.state==State::Waiting && lapse::recordedSettings.intervalMs==2500 && lapse::recordedSettings.recordingLimitSeconds==3700 && lapse::recordedSettings.segmentDurationSeconds==777 &&
         !lapse::recordedSettings.captureCursor && lapse::recordedSettings.recoveryMode && lapse::recordedSettings.night.enabled && lapse::recordedSettings.night.durationMs==1501 && lapse::recordedSettings.night.targetBrightness==128 &&
         lapse::recordedSettings.timeSkip.mode==TimeSkipMode::NoPerson && lapse::recordedSettings.timeSkip.quietAfterMs==90000,
         "Accepted Record did not use the exact checkpointed custom/Night/person settings.");
     const auto saved=fixture.bytes();const auto configured=lapse::configurationCalls;const int writes=keyWrites;
-    for(auto state:{State::Starting,State::Recording,State::Paused,State::Finishing}){
+    for(auto state:{State::Waiting,State::Starting,State::Recording,State::Paused,State::Finishing}){
         app.status.state=lapse::fixtureStatus.state=state;windowProc(app.window,WM_COMMAND,Record,0);
     }
     require(lapse::recordCalls==1 && lapse::configurationCalls==configured && replacementAttempts==1 && keyWrites==writes && fixture.bytes()==saved,
@@ -671,17 +695,18 @@ void checkpointBeforeRecording(){
     require(replacementAttempts==1 && keyWrites==writes,"Status polling introduced periodic preference writes.");
     // Simulate reopening after interruption without WM_DESTROY or another save.
     reload();app.settings.layers=preset(Mode::Desktop);configure();
-    require(choice(app.mode)==0 && app.settings.intervalMs==2500 && app.settings.recordingLimitSeconds==3700 && app.settings.segmentDurationSeconds==777 &&
+    require(choice(app.mode)==0 && app.settings.startDelaySeconds==30 && lapse::recordCalls==1 && app.settings.intervalMs==2500 && app.settings.recordingLimitSeconds==3700 && app.settings.segmentDurationSeconds==777 &&
         SendMessageW(app.nightEnabled,BM_GETCHECK,0,0)==BST_CHECKED && choice(app.nightDuration)==6 && selectedNightDuration()==1501 && choice(app.nightTarget)==2 &&
         !app.settings.captureCursor && app.settings.recoveryMode && !app.settings.night.enabled && app.settings.timeSkip.mode==TimeSkipMode::NoPerson && app.settings.timeSkip.quietAfterMs==90000,
         "Interrupted-session restart lost checkpointed settings or silently enabled camera capture.");
     expectUnknownContent(fixture);fixture.onlySettingsRemain();
     app.settings.layers=preset(Mode::Camera);choose(app.mode,1);app.customIntervalMs=3500;customItems();
     SendMessageW(app.recoveryMode,BM_SETCHECK,BST_UNCHECKED,0);
+    choose(app.startDelay,5);
     OwnedFile locked(CreateFileW(fileIOPath(app.preferences).c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr));
     lapse::beforeRecording=[&]{require(replacementAttempts==2 && saveDiagnostics==1 && fixture.bytes()==saved,"Failed checkpoint did not preserve prior INI and emit the existing diagnostic before capture.");};
     windowProc(app.window,WM_COMMAND,Record,0);locked.close();lapse::beforeRecording={};
-    require(lapse::recordCalls==2 && lapse::recordedSettings.intervalMs==3500 && !lapse::recordedSettings.recoveryMode && fixture.bytes()==saved,
+    require(lapse::recordCalls==2 && lapse::recordedSettings.startDelaySeconds==300 && lapse::recordedSettings.intervalMs==3500 && !lapse::recordedSettings.recoveryMode && fixture.bytes()==saved,
         "A checkpoint replacement failure blocked recording or changed the previous settings.");
     fixture.onlySettingsRemain();app.startupComplete=false;app.engine.reset();app.status=lapse::fixtureStatus={};
     std::cout<<"PASS actual Record checkpoints accepted custom/Night/person options before capture; invalid/active/polled paths do not write; failed atomic replacement preserves prior INI and recording continues\n";
@@ -692,10 +717,10 @@ int main(){
     try{
         std::cout<<std::unitbuf;std::cout<<"ACP="<<GetACP()<<'\n';
         HiddenControls controls;
-        newUnicodeFile();existingUnicodeRewrite();migrateAnsi();encodingModes();recordingLimits();segmentOptions();diskSafety();recoveryOptions();cursorOptions();nightOptions();customOptions();readFailure();replacementFailure();
+        newUnicodeFile();existingUnicodeRewrite();migrateAnsi();encodingModes();recordingLimits();startDelayOptions();segmentOptions();diskSafety();recoveryOptions();cursorOptions();nightOptions();customOptions();readFailure();replacementFailure();
         preparationAllocationFailure();partialKeyWriteFailure();stagedExceptionCleanup();
         preferencePathBoundary(248);preferencePathBoundary(278);timeCompressionPreferences();watermarkPreferences();sizeCommandPreferences();checkpointBeforeRecording();
         require(!IsWindowVisible(app.window),"Fixture became visible.");
-        std::cout<<"All 21 preference cases passed; only owned hidden controls/settings were used.\n";return 0;
+        std::cout<<"All 23 preference cases passed; only owned hidden controls/settings were used.\n";return 0;
     }catch(const std::exception& error){std::cerr<<"PREFERENCES TEST FAILURE: "<<error.what()<<'\n';return 1;}
 }

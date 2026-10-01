@@ -20,7 +20,7 @@
 namespace {
 HRESULT comResult=S_OK,mediaResult=S_OK;
 int helperResult=-1, comStarts=0,mediaStarts=0,comStops=0,mediaStops=0;
-int windows=0,classes=0,engines=0,engineStops=0,profileCalls=0,folderBuffers=0,folderFrees=0,dialogs=0,messages=0;
+int windows=0,classes=0,engines=0,engineStops=0,recordRequests=0,profileCalls=0,folderBuffers=0,folderFrees=0,dialogs=0,messages=0;
 int quitCode=27,allocationFailures=0,lastErrorReads=0;
 int dialogComStops=0,dialogMediaStops=0,dialogEngineStops=0;
 bool forbidWindowFailureAllocation=false,residualWindowEngine=false,dialogEngineAlive=false;
@@ -109,7 +109,7 @@ class LifecycleEngine {
 public:
     LifecycleEngine(){++engines;engineAlive=true;}
     ~LifecycleEngine(){++engineStops;engineAlive=false;log('e');}
-    void configure(const Settings&){}void refreshSources(){}void record(){}void pause(){}void setPaused(bool){}void finish(){}
+    void configure(const Settings&){}void refreshSources(){}void record(){++recordRequests;}void pause(){}void setPaused(bool){}void finish(){} void cancelDelayedStart() noexcept {}
     Status status(){return {};}
 };
 std::vector<Monitor> enumerateMonitors(){throw std::runtime_error("Unexpected display enumeration");}
@@ -204,7 +204,7 @@ void destroyEngine(){app.engine.reset();}
 void reset(HRESULT com=S_OK,HRESULT media=S_OK){
     failNextAllocation=false;app.engine.reset();require(folderBuffers==0,"Previous known-folder buffer leaked");
     comResult=com;mediaResult=media;helperResult=-1;
-    comStarts=mediaStarts=comStops=mediaStops=windows=classes=engines=engineStops=profileCalls=folderFrees=dialogs=messages=allocationFailures=0;
+    comStarts=mediaStarts=comStops=mediaStops=windows=classes=engines=engineStops=recordRequests=profileCalls=folderFrees=dialogs=messages=allocationFailures=0;
     engineAlive=mediaStoppedAlive=invalidFolder=failWindow=loopError=normalDestroy=failPathCopy=failDiagnostic=false;
     cleanupSize=0;cleanup={};messageText={};debugText={};quitCode=27;
     lastErrorReads=dialogComStops=dialogMediaStops=dialogEngineStops=0;
@@ -228,6 +228,7 @@ bool order(const char* expected){const auto n=std::char_traits<char>::length(exp
 void clean(int com,int media,const char* events){
     require(comStops==com&&mediaStops==media&&!mediaStoppedAlive&&!app.engine&&order(events),"Initialization teardown ownership/order failed");
     require(profileCalls==0&&folderBuffers==0,"Probe touched profiles or leaked folder allocation");
+    require(recordRequests==0,"Normal/helper/tray startup armed a recording without an explicit Record command");
     require(!markerClosedWithLiveEngine,"Installer running marker was released before the recording engine joined");
 }
 void initialization(HRESULT com,HRESULT media,bool forbidAllocation=false){

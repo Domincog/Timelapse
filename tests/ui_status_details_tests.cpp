@@ -175,7 +175,7 @@ public:
     void record(){++detailsProbe::records;detailsProbe::current.state=State::Starting;}
     void pause(){}
     void setPaused(bool value){++detailsProbe::pauses;detailsProbe::current.state=value?State::Paused:State::Recording;}
-    void finish(){++detailsProbe::finishes;detailsProbe::current.state=State::Finishing;}
+    void finish(){++detailsProbe::finishes;detailsProbe::current.state=State::Finishing;} void cancelDelayedStart() noexcept {}
     Status status(){++detailsProbe::statusQueries;return detailsProbe::current;}
 };
 std::vector<Monitor> enumerateMonitors(){++detailsProbe::enumerations;return {{L"Synthetic display",{0,0,1280,720},L"owned-display"}};}
@@ -512,8 +512,8 @@ void stableSnapshot(){
     std::cout<<"PASS immutable snapshot and selection while main status changes; duplicate-open guard\n";
 }
 void modalLifecycle(){
-    for(int action:{0,1,2}){
-        Fixture fixture;Status recording;recording.state=State::Recording;recording.error=true;recording.message=L"Synthetic optional preview diagnostic during recording.";fixture.publish(recording);
+    for(State state:{State::Recording,State::Waiting,State::Starting})for(int action:{0,1,2}){
+        Fixture fixture;Status recording;recording.state=state;recording.startDeadlineTick=state==State::Waiting?GetTickCount64()+5000:0;recording.error=true;recording.message=L"Synthetic optional preview diagnostic during recording.";fixture.publish(recording);
         int afterFocus=0;
         detailsProbe::script=[&](HWND window){
             if(action==0)SendMessageW(fixture.window,WM_CLOSE,0,0);
@@ -526,7 +526,7 @@ void modalLifecycle(){
         require(!app.customDialog&&detailsProbe::focusCalls==afterFocus&&detailsProbe::invalidFocus==0,"Modal shutdown retained ownership or restored invalid/hidden focus.");
         require(detailsProbe::records==0&&detailsProbe::pauses==0&&detailsProbe::finishes==(action==1?1:0),"Inspecting/closing Details triggered extra recording commands.");
         if(action==0)require(app.hiddenToTray&&detailsProbe::notices==0,"Hide raised an unexpected details failure.");
-        if(action==1)require(app.closeWhenDone&&detailsProbe::notices==1,"Exit lost its single explicit finish confirmation.");
+        if(action==1)require(app.closeWhenDone&&detailsProbe::notices==(state==State::Waiting?0:1),"Exit confirmation did not match waiting cancellation or prepared/active recording.");
         if(action==2)require(!IsWindow(fixture.window),"Confirmed session end left owner alive.");
     }
     Fixture fixture;Status before;before.error=true;before.state=State::Recording;before.message=L"Preview issue before terminal result.";fixture.publish(before);
@@ -567,7 +567,7 @@ void cursorKeyboard(){
     for(int i=0;i<100;++i){auto copied=detailsProbe::current;(void)copied;}const auto copyAllocations=detailsProbe::allocations;detailsProbe::allocations=0;
     for(int i=0;i<100;++i)fixture.tick();detailsProbe::countAllocations=false;
     require(detailsProbe::configures==stable&&detailsProbe::textWrites==0&&detailsProbe::allocations==copyAllocations,"Unchanged cursor-off status ticks added UI work beyond existing Status copies.");
-    for(State state:{State::Starting,State::Recording,State::Paused,State::Finishing}){
+    for(State state:{State::Waiting,State::Starting,State::Recording,State::Paused,State::Finishing}){
         Status status;status.state=state;fixture.publish(status);const int calls=detailsProbe::configures;
         nativeMnemonic(app.preview,L'k');require(!app.settings.captureCursor&&detailsProbe::configures==calls&&!IsWindowEnabled(app.captureCursor),"Disabled cursor mnemonic changed an active session.");
     }
@@ -604,6 +604,34 @@ void distinctMainMnemonics(){
     }
     require(detailsProbe::records==0&&detailsProbe::finishes==0&&detailsProbe::pauses==0&&detailsProbe::notices==0&&!app.customDialog,"Main shortcuts dispatched recording, notices or left a modal owner.");
     std::cout<<"PASS distinct native Alt+H/Alt+C plus preserved Alt+O/Alt+I from multiple controls, collapsed/expanded and idle/recording/paused locks\n";
+}
+void delayKeyboard(){Fixture fixture;showOffscreen(fixture);
+    if(!app.advancedExpanded)fixture.command(AdvancedToggle);
+    nativeMnemonic(app.openFolder,L'x');
+    require(GetFocus()==app.startDelay && IsWindowEnabled(app.startDelay) && ownVisible(app.startDelay),
+        "Native Alt+X failed to focus the expanded editable start-delay selector");
+    const auto selected=choice(app.startDelay);const int configs=detailsProbe::configures;
+    for(bool expanded:{false,true})for(State state:{State::Waiting,State::Starting}){
+        if(app.advancedExpanded!=expanded)fixture.command(AdvancedToggle);
+        for(HWND start:{app.openFolder,app.advanced,app.preview}){Status value;value.state=state;
+            value.startDeadlineTick=state==State::Waiting?GetTickCount64()+5000:0;fixture.publish(value);
+            require(!IsWindowEnabled(app.stopAfter) && !IsWindowEnabled(app.startDelay) && IsWindowEnabled(app.finish) &&
+                textOf(app.finish)==L"Cancel s&tart","Waiting/Preparing keyboard preconditions were not locked");
+            const int finishes=detailsProbe::finishes,records=detailsProbe::records,pauses=detailsProbe::pauses;
+            nativeMnemonic(start,L't');
+            std::cout<<"Native delay key state="<<static_cast<int>(state)<<" expanded="<<expanded<<" start="<<GetDlgCtrlID(start)
+                <<" focus="<<GetDlgCtrlID(GetFocus())<<" finishes="<<detailsProbe::finishes-finishes
+                <<" records="<<detailsProbe::records-records<<" pauses="<<detailsProbe::pauses-pauses
+                <<" configs="<<detailsProbe::configures-configs<<" selection="<<choice(app.startDelay)<<'\n';
+            require(detailsProbe::finishes==finishes+1 && detailsProbe::records==records && detailsProbe::pauses==pauses &&
+                choice(app.startDelay)==selected && detailsProbe::configures==configs,
+                "Native Alt+T failed to cancel start or routed to the disabled Stop-after setting");
+        }
+    }
+    fixture.publish(Status{});nativeMnemonic(app.openFolder,L't');
+    require(GetFocus()==app.stopAfter && IsWindowEnabled(app.stopAfter) && detailsProbe::configures==configs,
+        "Returning idle failed to restore the native Stop-after mnemonic");
+    std::cout<<"PASS actual Alt+X delay focus and Alt+T Cancel across Waiting/Preparing, collapsed/expanded and multiple starting controls\n";
 }
 void clickFiles(HWND window){const HWND button=GetDlgItem(window,StatusDetailsFiles);require(button&&IsWindowEnabled(button),"Expected Show files action is unavailable.");SendMessageW(button,BM_CLICK,0,0);checkCallback();}
 void completeFiles(HWND window){waitFileWorker();SendMessageW(window,WM_TIMER,StatusDetailsFilesTimer,0);checkCallback();require(IsWindowEnabled(GetDlgItem(window,StatusDetailsFiles))&&!statusFilesBusy,"Completed task retained busy action/global slot.");}
@@ -729,7 +757,7 @@ void fileReopenedAndKeyboard(){
 int main(){try{
     detailsProbe::ownerThread=GetCurrentThreadId();
     INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_WIN95_CLASSES};require(InitCommonControlsEx(&controls)!=FALSE,"Common controls unavailable.");
-    exactSelectableReports();outcomeAndPrimaryPrecedence();keyboardAndCompactLayout();stableSnapshot();modalLifecycle();failuresAndUnchangedTicks();distinctMainMnemonics();cursorKeyboard();
+    exactSelectableReports();outcomeAndPrimaryPrecedence();keyboardAndCompactLayout();stableSnapshot();modalLifecycle();failuresAndUnchangedTicks();distinctMainMnemonics();cursorKeyboard();delayKeyboard();
     fileSnapshotSelection();fileEligibility();fileFailures();filePendingLifecycle();fileReopenedAndKeyboard();
-    std::cout<<"All thirteen status/keyboard/file groups passed with inert engine, owned native windows and intercepted Shell selection.\n";return 0;
+    std::cout<<"All fourteen status/keyboard/file groups passed with inert engine, owned native windows and intercepted Shell selection.\n";return 0;
 }catch(const std::exception& error){std::cerr<<"STATUS DETAILS FAILURE: "<<error.what()<<'\n';return 1;}}

@@ -285,12 +285,12 @@ CameraClient::~CameraClient()=default;
 bool CameraClient::start(const std::wstring&,std::wstring&, CameraResolution) { throw std::runtime_error("Unexpected camera activation."); }
 void CameraClient::stop(){}
 bool CameraClient::latest(Frame&,std::wstring&) { throw std::runtime_error("Unexpected camera read."); }
-struct Encoder::Impl { uint64_t frames=0; };
+struct Encoder::Impl { uint64_t frames=0; bool finished=false; };
 Encoder::Encoder():impl_(std::make_unique<Impl>()){}
 Encoder::~Encoder()=default;
 bool Encoder::open(const std::wstring& path,int,int,int,std::wstring& error,EncodingQuality,EncodingMode,bool) {
     require(std::filesystem::path(path).parent_path()==std::filesystem::path(fileIOPath(outputRoot.wstring())),"Synthetic encoder escaped fixture output.");
-    impl_->frames=0; error.clear(); return true;
+    impl_->frames=0; impl_->finished=false; error.clear(); return true;
 }
 bool Encoder::write(const Frame& frame,std::wstring& error) {
     require(frame.valid(),"Invalid synthetic encoded frame.");
@@ -301,8 +301,9 @@ bool Encoder::write(const Frame& frame,std::wstring& error) {
     if(blockFirstWrite && recordedFrames==1 && !frameChanged.wait_for(lock,4s,[]{return releaseFirstWrite;}))barrierTimeout=true;
     error.clear(); return true;
 }
-bool Encoder::finish(std::wstring& error) { error.clear(); return true; }
+bool Encoder::finish(std::wstring& error) { impl_->finished=true; error.clear(); return true; }
 bool Encoder::finishForPublication(std::wstring& error) { return finish(error); }
+bool Encoder::emptyOutputDiscarded() const noexcept { return impl_->finished && !impl_->frames; }
 DWORD Encoder::publish(const std::wstring& path) {
     require(std::filesystem::path(path).parent_path()==std::filesystem::path(fileIOPath(outputRoot.wstring())),
         "Synthetic publication escaped fixture folder.");

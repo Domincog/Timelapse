@@ -1,4 +1,4 @@
-﻿// Actual UI handlers, synthetic source lists and inert recording engine.
+// Actual UI handlers, synthetic source lists and inert recording engine.
 // Own hidden controls only; no device enumeration, capture, user input or INI I/O.
 #include "engine.h"
 #include "capture.h"
@@ -109,7 +109,7 @@ public:
     void record() { recorded=configured; ++recordCalls; fixtureStatus.state=State::Starting; }
     void pause() {}
     void setPaused(bool) {}
-    void finish() {}
+    void finish() {} void cancelDelayedStart() noexcept {}
     Status status() { return fixtureStatus; }
 };
 std::vector<Monitor> enumerateMonitors() { return listedMonitors; }

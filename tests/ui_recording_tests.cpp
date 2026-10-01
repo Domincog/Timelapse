@@ -18,6 +18,7 @@
 #include <stdexcept>
 #include <chrono>
 #include <atomic>
+#include <cstring>
 
 namespace probe {
 using Clock=std::chrono::steady_clock;
@@ -46,6 +47,20 @@ std::atomic<int> captureWidth{0};
 std::atomic<int> captureGateWidth{0};
 std::atomic<unsigned> encoderOpens{0};
 std::atomic<bool> encoderRecovery{false};
+std::atomic<unsigned> wakeLoads{0},wakeQueries{0},wakeFrees{0};
+HMODULE WINAPI loadWakeModule(LPCWSTR name,HANDLE file,DWORD flags){
+    require(name && std::wcscmp(name,L"powrprof.dll")==0 && !file && flags==LOAD_LIBRARY_SEARCH_SYSTEM32,"Unexpected module request in self-timer fixture");
+    ++wakeLoads;return reinterpret_cast<HMODULE>(1);
+}
+LONG WINAPI wakeInformation(POWER_INFORMATION_LEVEL level,PVOID input,ULONG inputBytes,PVOID output,ULONG outputBytes){
+    require(level==LastWakeTime && !input && !inputBytes && output && outputBytes==sizeof(uint64_t),"Unexpected self-timer wake query");
+    ++wakeQueries;const uint64_t epoch=17;std::memcpy(output,&epoch,sizeof(epoch));return 0;
+}
+FARPROC WINAPI wakeAddress(HMODULE module,LPCSTR name){
+    require(module==reinterpret_cast<HMODULE>(1) && name && std::strcmp(name,"CallNtPowerInformation")==0,"Unexpected self-timer export");
+    const auto function=&wakeInformation;FARPROC address{};static_assert(sizeof(address)==sizeof(function));std::memcpy(&address,&function,sizeof(address));return address;
+}
+BOOL WINAPI freeWakeModule(HMODULE module){require(module==reinterpret_cast<HMODULE>(1),"Wrong owned wake module");++wakeFrees;return TRUE;}
 int confirmations=0, errorDialogs=0, foregroundCalls=0, destroyCalls=0;
 std::wstring dialogMessage;
 int WINAPI messageBox(HWND,LPCWSTR message,LPCWSTR title,UINT flags) {
@@ -99,13 +114,13 @@ CameraClient::~CameraClient(){}
 bool CameraClient::start(const std::wstring&,std::wstring&,CameraResolution) { throw std::runtime_error("Physical camera path forbidden"); }
 void CameraClient::stop(){}
 bool CameraClient::latest(Frame&,std::wstring&) { throw std::runtime_error("Physical camera path forbidden"); }
-struct Encoder::Impl { HANDLE file=INVALID_HANDLE_VALUE;uint64_t count=0; };
+struct Encoder::Impl { HANDLE file=INVALID_HANDLE_VALUE;uint64_t count=0;bool emptyDiscarded=false; };
 Encoder::Encoder():impl_(std::make_unique<Impl>()){}
 Encoder::~Encoder(){if(impl_->file!=INVALID_HANDLE_VALUE)CloseHandle(impl_->file);}
 bool Encoder::open(const std::wstring& path,int,int,int,std::wstring& error,EncodingQuality,EncodingMode,bool recoveryMode) {
     ++probe::encoderOpens;probe::encoderRecovery=recoveryMode;
     if(impl_->file!=INVALID_HANDLE_VALUE)CloseHandle(impl_->file);
-    impl_->count=0;error.clear();
+    impl_->count=0;impl_->emptyDiscarded=false;error.clear();
     impl_->file=CreateFileW(path.c_str(),GENERIC_WRITE|DELETE,0,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
     if(impl_->file==INVALID_HANDLE_VALUE){error=L"Owned synthetic output could not open.";return false;}
     return true;
@@ -117,16 +132,27 @@ bool Encoder::write(const Frame& frame,std::wstring& error){
     ++impl_->count;return true;
 }
 bool Encoder::finishForPublication(std::wstring& error){probe::finishGate.enter();error.clear();
-    if(probe::failFinish) { error=L"Synthetic encoder finalization failed.";return false; }return true;
+    if(probe::failFinish) { error=L"Synthetic encoder finalization failed.";return false; }
+    if(!impl_->count){FILE_DISPOSITION_INFO remove{TRUE};
+        if(impl_->file==INVALID_HANDLE_VALUE || !SetFileInformationByHandle(impl_->file,FileDispositionInfo,&remove,sizeof(remove))){error=L"Synthetic empty output could not be removed.";return false;}
+        CloseHandle(impl_->file);impl_->file=INVALID_HANDLE_VALUE;impl_->emptyDiscarded=true;error=L"No video frames were recorded.";return false;
+    }return true;
 }
 bool Encoder::finish(std::wstring& error){const bool result=finishForPublication(error);releasePublication();return result;}
 DWORD Encoder::publish(const std::wstring& path){return probe::publishFile(impl_->file,path);}
 void Encoder::releasePublication() noexcept {if(impl_->file!=INVALID_HANDLE_VALUE)CloseHandle(impl_->file);impl_->file=INVALID_HANDLE_VALUE;}
 uint64_t Encoder::frames()const{return impl_->count;}
+bool Encoder::emptyOutputDiscarded()const noexcept{return impl_->emptyDiscarded;}
 }
 
 #define SetThreadExecutionState probe::power
+#define LoadLibraryExW probe::loadWakeModule
+#define GetProcAddress probe::wakeAddress
+#define FreeLibrary probe::freeWakeModule
 #include "../src/engine.cpp"
+#undef FreeLibrary
+#undef GetProcAddress
+#undef LoadLibraryExW
 #undef SetThreadExecutionState
 // The reject-entry sentinel intentionally makes the GUI entry unreachable.
 #pragma warning(push)
@@ -158,7 +184,7 @@ Status waitState(State state){
     throw std::runtime_error("Worker state deadline expired");
 }
 struct HiddenFixture {
-    explicit HiddenFixture(const wchar_t* name){
+    explicit HiddenFixture(const wchar_t* name,bool visiblePreview=true){
         probe::failCapture=false;probe::failFinish=false;probe::failRename=false;
         probe::captureGateWidth=0;
         probe::confirmations=probe::errorDialogs=probe::foregroundCalls=probe::destroyCalls=0;
@@ -167,13 +193,15 @@ struct HiddenFixture {
         app.failureNotice=FailureNotice::None;
         app.visibleDirty=true;app.controlsUpdated=app.trayStateValid=false;
         app.encodingValidation.clear();
-        app.hiddenToTray=app.trayRegistered=app.trayVersion4=app.trayNoticeShown=false;app.trayTooltip.clear();
+        app.hiddenToTray=!visiblePreview;app.trayRegistered=app.trayVersion4=app.trayNoticeShown=false;app.trayTooltip.clear();
+        probe::wakeLoads=probe::wakeQueries=probe::wakeFrees=0;
         app.settings.folder=(ownedRoot/name).wstring();
         app.window=CreateWindowExW(0,L"STATIC",L"Owned pause review",WS_OVERLAPPED,0,0,920,720,nullptr,nullptr,nullptr,nullptr);
         require(app.window&&!IsWindowVisible(app.window),"Hidden parent creation failed");
         auto child=[&](const wchar_t* cls,DWORD style){auto w=CreateWindowExW(0,cls,L"",WS_CHILD|style,0,0,100,100,app.window,nullptr,nullptr,nullptr);require(w!=nullptr,"Hidden child failed");return w;};
         auto combo=[&](int count){auto w=child(L"COMBOBOX",CBS_DROPDOWNLIST);for(int i=0;i<count;++i)add(w,std::to_wstring(i));choose(w,0);return w;};
         app.mode=combo(6);app.interval=combo(6);choose(app.interval,5);app.videoSize=combo(2);app.encodingQuality=combo(3);app.encodingMode=combo(5);
+        app.startDelay=combo(6);
         app.recoveryMode=child(L"BUTTON",BS_AUTOCHECKBOX);
         app.monitor=combo(1);app.camera=combo(0);app.monitors={{L"Synthetic",{0,0,640,360},L"owned-display"}};app.cameras.clear();
         app.preview=child(L"STATIC",0);app.statusText=child(L"STATIC",0);
@@ -363,6 +391,65 @@ bool terminalFailure(int kind) {
     return stayed;
 }
 
+void delayedUiCancellation(){
+    for(int action=0;action<4;++action){HiddenFixture f((L"delay-cancel-"+std::to_wstring(action)).c_str(),false);
+        choose(app.startDelay,1);configure();const auto opens=probe::encoderOpens.load();const auto captures=probe::captureCalls.load();
+        click(Record,app.record);const auto armed=waitState(State::Waiting);tick();
+        require(armed.startDeadlineTick && !armed.frames && armed.elapsed==0 && app.status.state==State::Waiting,
+            "Actual Record failed to expose a Waiting request");
+        windowProc(app.window,WM_COMMAND,Record,0);
+        windowProc(app.window,WM_CLOSE,0,0);
+        require(app.engine->status().startDeadlineTick==armed.startDeadlineTick && app.engine->status().state==State::Waiting &&
+            app.hiddenToTray && probe::encoderOpens==opens && probe::captureCalls==captures,
+            "Duplicate Record or Hide changed the armed deadline or performed hidden recording work");
+        if(action==0){windowProc(app.window,WM_COMMAND,TrayFinish,0);windowProc(app.window,WM_COMMAND,TrayFinish,0);}
+        else if(action==1)windowProc(app.window,WM_POWERBROADCAST,PBT_APMSUSPEND,0);
+        else if(action==2)windowProc(app.window,WM_COMMAND,TrayExit,0);
+        else {
+            require(windowProc(app.window,WM_QUERYENDSESSION,0,0)==TRUE,"Session-end query rejected shutdown");
+            windowProc(app.window,WM_ENDSESSION,FALSE,0);
+            require(app.engine->status().state==State::Waiting && !probe::destroyCalls,"Rejected session end canceled the timer");
+            windowProc(app.window,WM_ENDSESSION,TRUE,0);
+            require(probe::destroyCalls==1,"Confirmed session end failed to destroy the waiting owner");
+            // DestroyWindow is an inert seam here; deliver its documented
+            // destruction callback explicitly to run actual worker teardown.
+            windowProc(app.window,WM_DESTROY,0,0);
+            require(!app.engine,"Session teardown retained the armed worker");
+        }
+        if(action!=3){const auto cancelled=waitState(State::Idle);tick();
+            require(!cancelled.error && !cancelled.recordingFailed && !cancelled.frames && cancelled.elapsed==0 &&
+                !cancelled.startDeadlineTick && cancelled.savedPath.empty() && cancelled.savedPaths.empty(),
+                "Deliberate delayed cancellation became a recording failure or saved-output claim");
+            windowProc(app.window,WM_POWERBROADCAST,PBT_APMRESUMEAUTOMATIC,0);
+            windowProc(app.window,WM_POWERBROADCAST,PBT_APMRESUMESUSPEND,0);
+            require(app.engine->status().state==State::Idle,"Resume notification rearmed the cancelled timer");
+        }
+        require(probe::encoderOpens==opens && probe::captureCalls==captures && !std::filesystem::exists(app.settings.folder) &&
+            !probe::errorDialogs && probe::wakeLoads==probe::wakeFrees && probe::wakeQueries>0,
+            "Cancelled hidden timer performed output/capture work, leaked its query module or raised a failure notice");
+        if(action==2)require(probe::confirmations==0 && probe::destroyCalls==1,"Dormant Waiting Exit did not finish its direct cancellation path exactly once");
+        if(action<2){const auto queries=probe::wakeQueries.load();choose(app.startDelay,0);configure();tick();
+            windowProc(app.window,WM_COMMAND,Record,0);waitState(State::Recording);tick();windowProc(app.window,WM_COMMAND,TrayFinish,0);const auto saved=waitState(State::Idle);
+            require(saved.frames==1 && !saved.error && !saved.savedPath.empty() && probe::wakeQueries==queries,
+                "Explicit immediate Record after cancellation inherited the timer or its wake-query work");
+        }
+    }
+    std::cout<<"PASS actual UI/worker Waiting, fixed deadline, Hide, duplicate commands, Cancel/suspend/Exit/session end and explicit next Record\n";
+}
+void immediatePowerControls(){HiddenFixture f(L"immediate-power",false);
+    probe::captureGate.arm();click(Record,app.record);probe::captureGate.wait();
+    require(app.engine->status().state==State::Starting,"Immediate preparation gate was not reached");
+    for(UINT event:{PBT_APMSUSPEND,PBT_APMRESUMEAUTOMATIC,PBT_APMRESUMESUSPEND,PBT_APMRESUMECRITICAL})windowProc(app.window,WM_POWERBROADCAST,event,0);
+    require(app.engine->status().state==State::Starting && !probe::wakeLoads,"Power notification changed default-Off preparation or loaded its delay query");
+    probe::captureGate.release();waitState(State::Recording);tick();
+    for(bool paused:{false,true}){if(paused){windowProc(app.window,WM_COMMAND,TrayPause,0);waitState(State::Paused);tick();}
+        const auto before=app.engine->status();for(UINT event:{PBT_APMSUSPEND,PBT_APMRESUMEAUTOMATIC,PBT_APMRESUMESUSPEND,PBT_APMRESUMECRITICAL})windowProc(app.window,WM_POWERBROADCAST,event,0);
+        const auto after=app.engine->status();require(after.state==before.state && after.frames==before.frames && !probe::wakeLoads,
+            "New delayed-start power routing changed ordinary active/paused recording");
+    }
+    windowProc(app.window,WM_COMMAND,TrayFinish,0);const auto saved=waitState(State::Idle);require(!saved.error && saved.frames==1,"Ordinary power-control output did not finish normally");
+    std::cout<<"PASS suspend/resume messages preserve immediate Preparing and established Recording/Paused without delay-query work\n";
+}
 }
 int main(){
     std::cout<<std::unitbuf;
@@ -372,6 +459,7 @@ int main(){
         require(!std::filesystem::exists(ownedRoot),"Owned fixture directory already exists");
         repeatedPause();repeatedResume();finishThenRecord(false,false);finishThenRecord(false,true);finishThenRecord(true,false);
         recordingWhileHidden();recoveryRecording();unseenWorkerFailure(false);unseenWorkerFailure(true);
+        delayedUiCancellation();immediatePowerControls();
         int closePassed=0;
         closePassed+=successfulClose(false);closePassed+=successfulClose(true);
         closePassed+=terminalFailure(0);closePassed+=terminalFailure(1);closePassed+=terminalFailure(2);
@@ -387,7 +475,7 @@ int main(){
             require(std::filesystem::remove(directory.path()),"Synthetic folder cleanup failed");
         }
         require(std::filesystem::remove(ownedRoot),"Owned fixture root cleanup failed");
-        std::cout<<"PASS all fourteen actual-handler/worker command and exit/tray cases; no visible UI, input, hardware or real encoding.\n";
+        std::cout<<"PASS all sixteen actual-handler/worker command, delay and exit/tray groups; no visible UI, input, hardware or real encoding.\n";
         return 0;
     }catch(const std::exception& error){std::cerr<<"FIXTURE_FAILURE: "<<error.what()<<'\n';return 1;}
 }

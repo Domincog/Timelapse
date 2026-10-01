@@ -43,7 +43,7 @@ INT_PTR shellResult=33;
 std::wstring lastMessage,shellPath;
 PWSTR taskString=nullptr;
 LRESULT WINAPI message(HWND window,UINT message,WPARAM,LPARAM){
-    require(reinterpret_cast<UINT_PTR>(window)>=1 && reinterpret_cast<UINT_PTR>(window)<=7,"Unexpected control handle.");
+    require(reinterpret_cast<UINT_PTR>(window)>=1 && reinterpret_cast<UINT_PTR>(window)<=8,"Unexpected control handle.");
     if(message!=CB_GETCURSEL){forbidden();return 0;}return 0;
 }
 void WINAPI taskFree(void* memory){
@@ -71,7 +71,7 @@ namespace lapse {
 class FixtureEngine {
 public:
     void configure(const Settings&){++fixture::configured;}
-    void refreshSources(){} void record(){} void pause(){} void setPaused(bool){} void finish(){}
+    void refreshSources(){} void record(){} void pause(){} void setPaused(bool){} void finish(){} void cancelDelayedStart() noexcept {}
     Status status(){return {};}
 };
 std::vector<Monitor> enumerateMonitors(){fixture::forbidden();return {};}
@@ -222,6 +222,7 @@ struct HiddenWindow {
         app.interval=reinterpret_cast<HWND>(1);app.videoSize=reinterpret_cast<HWND>(2);app.encodingQuality=reinterpret_cast<HWND>(3);
         app.encodingMode=reinterpret_cast<HWND>(6);
         app.stopAfter=reinterpret_cast<HWND>(7);
+        app.startDelay=reinterpret_cast<HWND>(8);
         app.monitor=reinterpret_cast<HWND>(4);app.camera=reinterpret_cast<HWND>(5);
         app.engine=std::make_unique<lapse::FixtureEngine>();
     }

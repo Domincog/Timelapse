@@ -169,6 +169,10 @@ public:
     }
     bool finish(std::wstring& error) { return close(error, false); }
     bool finishForPublication(std::wstring& error) { return close(error, true); }
+    bool emptyOutputDiscarded() const noexcept {
+        return record_ && finished_ && !writing_ && file_ == INVALID_HANDLE_VALUE &&
+            !record_->frames && record_->emptyDeleted && !record_->cleanupFailed;
+    }
     DWORD publish(const std::wstring& destination) {
         if (publicationAttempted_) return publication_;
         require(record_ && finishOkay_ && file_ != INVALID_HANDLE_VALUE, "Invalid fake publication");

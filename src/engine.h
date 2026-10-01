@@ -6,9 +6,10 @@
 #include <mutex>
 #include <thread>
 #include <condition_variable>
+#include <optional>
 
 namespace lapse {
-enum class State { Idle, Starting, Recording, Paused, Finishing };
+enum class State { Idle, Starting, Recording, Paused, Finishing, Waiting };
 struct Settings {
     RECT monitor{};
     // Resolve the selected display by identity for every requested frame.
@@ -32,6 +33,9 @@ struct Settings {
     // Split at active recording-time boundaries; zero keeps one output set.
     // Pauses/initial preparation are excluded; automatic saving stays active.
     int segmentDurationSeconds = 0;
+    // Optional self-timer before preparation; does not consume recording time.
+    // Zero starts immediately; positive whole seconds are bounded to 1..300.
+    int startDelaySeconds = 0;
     // Best-effort room for finalization; query failure also stops admission.
     // Disable only for destinations that cannot report caller-available space.
     bool stopOnLowDiskSpace = true;
@@ -69,6 +73,8 @@ struct Status {
     // in the final message. Never resets at a file boundary.
     uint64_t frames = 0;
     double elapsed = 0;
+    // Authoritative GetTickCount64 deadline, nonzero only while Waiting.
+    uint64_t startDeadlineTick = 0;
     std::wstring message = L"Choose a source, then record.";
     std::wstring savedPath;
     // Latest finalized output set (at most two paths), including retained
@@ -100,6 +106,9 @@ public:
     void pause();
     void setPaused(bool paused);
     void finish();
+    // Cancel a delayed request through its first admission boundary. Called
+    // synchronously for suspend/resume; cleanup remains on the worker thread.
+    void cancelDelayedStart() noexcept;
     Status status();
 private:
     void run();
@@ -116,6 +125,10 @@ private:
     uint64_t cameraInputGeneration_ = 0;
     uint64_t settingsRevision_ = 0;
     bool requestedCursor_ = true;
+    std::optional<Settings> delayedSettings_;
+    std::wstring delayedCancellationMessage_;
+    uint64_t delayedWakeEpoch_ = 0;
+    bool delayedStartPending_ = false, delayedCancel_ = false;
     bool previewProblem_ = false;
     bool quit_ = false, start_ = false, stop_ = false, pauseRequested_ = false, pauseTarget_ = false, retrySources_ = false;
     std::thread worker_;

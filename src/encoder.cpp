@@ -343,6 +343,10 @@ bool Encoder::write(const Frame& frame, std::wstring& error) {
 bool Encoder::finish(std::wstring& error) { return impl_->finish(error, false); }
 
 bool Encoder::finishForPublication(std::wstring& error) { return impl_->finish(error, true); }
+bool Encoder::emptyOutputDiscarded() const noexcept {
+    return impl_->finishEmpty && !impl_->writer && !impl_->sink && !impl_->bytes &&
+        impl_->file == INVALID_HANDLE_VALUE && SUCCEEDED(impl_->finishCleanup);
+}
 
 DWORD Encoder::publish(const std::wstring& destination) {
     if (impl_->publicationAttempted) return impl_->publicationResult;

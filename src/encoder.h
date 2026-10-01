@@ -28,6 +28,9 @@ public:
     // Release only after reporting its path; a retained guard prevents open().
     // Plain finish() and destruction also release any retained guard.
     bool finishForPublication(std::wstring& error);
+    // After terminal cleanup, distinguish an intentionally discarded empty
+    // output from a real owned-file cleanup failure without parsing text.
+    bool emptyOutputDiscarded() const noexcept;
     DWORD publish(const std::wstring& destination);
     void releasePublication() noexcept;
     uint64_t frames() const;

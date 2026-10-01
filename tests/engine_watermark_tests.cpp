@@ -114,6 +114,7 @@ public:
     bool finishForPublication(std::wstring& error) { return real_.finishForPublication(error); }
     DWORD publish(const std::wstring& path) { return real_.publish(path); }
     void releasePublication() noexcept { real_.releasePublication(); }
+    bool emptyOutputDiscarded() const noexcept { return real_.emptyOutputDiscarded(); }
     uint64_t frames() const { return real_.frames(); }
 };
 }

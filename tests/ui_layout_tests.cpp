@@ -25,7 +25,7 @@ public:
     void record() {}
     void pause() {}
     void setPaused(bool) {}
-    void finish() {}
+    void finish() {} void cancelDelayedStart() noexcept {}
     Status status() { return {}; }
 };
 std::vector<Monitor> enumerateMonitors() { throw std::runtime_error("Unexpected monitor enumeration."); }
@@ -151,7 +151,7 @@ LRESULT WINAPI fixtureDispatchMessage(const MSG* message){
 std::vector<HWND> tabControls(){
     std::vector<HWND> result={app.mode,app.interval,app.videoSize,app.encodingQuality,app.monitor,app.camera,app.advanced,app.refresh};
     if(app.advancedExpanded){
-        result.push_back(app.encodingMode);result.push_back(app.stopAfter);result.push_back(app.lowDisk);result.push_back(app.recoveryMode);result.push_back(app.splitEvery);result.push_back(app.captureCursor);result.push_back(app.skipConfigure);result.push_back(app.watermarkConfigure);
+        result.push_back(app.encodingMode);result.push_back(app.stopAfter);result.push_back(app.lowDisk);result.push_back(app.recoveryMode);result.push_back(app.splitEvery);result.push_back(app.captureCursor);result.push_back(app.startDelay);result.push_back(app.skipConfigure);result.push_back(app.watermarkConfigure);
         if(nightRow())result.push_back(app.nightEnabled);
         if(nightRow()==2){result.push_back(app.nightDuration);result.push_back(app.nightTarget);}
     }
@@ -167,7 +167,7 @@ struct HiddenWindow {
         app.settings={};app.status={};app.watermarkCheckValid=false;app.watermarkValidation.clear();app.watermarkCaption.clear();app.watermarkRevision=0;app.advancedWatermarkRevision=-1;app.nightValidation.clear();app.encodingValidation.clear();app.advancedNightState=app.advancedRecoveryState=app.nightVisibility=-1;
         app.hasCustomInterval=app.hasCustomSize=app.hasCustomLimit=false;app.advancedCaption.clear();app.advancedTooltip.clear();
         app.hasCustomSegment=false;app.customSegmentSeconds=900;app.committedSegment=0;app.advancedSegmentSeconds=-1;
-        app.advancedCursorState=-1;
+        app.advancedCursorState=app.advancedDelaySeconds=-1;app.committedStartDelay=0;app.waitingRemaining=UINT64_MAX;app.waitingCaption.clear();
         app.committedInterval=2;app.committedSize=app.committedLimit=0;
         ownedFocus=ownedCapture=nullptr;
         app.window=CreateWindowExW(0,L"STATIC",L"Owned hidden scrolling fixture",WS_POPUP|WS_CLIPCHILDREN,0,0,width,height,nullptr,nullptr,nullptr,nullptr);
@@ -187,6 +187,10 @@ struct HiddenWindow {
         app.segmentLabel=child(L"STATIC",L"Split files e&very",0,211);app.splitEvery=child(L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL,SegmentBox);
         for(auto name:SegmentLabels)add(app.splitEvery,name);choose(app.splitEvery,0);
         app.captureCursor=child(L"BUTTON",L"Show des&ktop cursor",WS_TABSTOP|BS_AUTOCHECKBOX,CursorBox);SendMessageW(app.captureCursor,BM_SETCHECK,BST_CHECKED,0);
+        app.startDelayLabel=child(L"STATIC",L"Delay ne&xt recording",0,212);
+        app.startDelay=child(L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL,StartDelayBox);
+        for(auto label:StartDelayLabels)add(app.startDelay,label);choose(app.startDelay,0);
+        app.startDelayHint=child(L"STATIC",L"Preparation starts after the delay. Visible preview continues; Stop after counts active time.",SS_LEFT|SS_NOPREFIX,213);
         app.skipConfigure=button(L"Time &compression...",SkipConfigure);app.skipSummary=child(L"STATIC",L"Off",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS,SkipSummary);app.skipDetail=child(L"STATIC",L"",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS,SkipDetail);
         app.watermarkConfigure=button(L"&Watermark...",WatermarkConfigure);app.watermarkSummary=child(L"STATIC",L"Off",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS,WatermarkSummary);
         app.nightEnabled=child(L"BUTTON",L"&Night camera (software blend)",WS_TABSTOP|BS_AUTOCHECKBOX,NightBox);
@@ -202,7 +206,7 @@ struct HiddenWindow {
     }
     ~HiddenWindow(){
         ownedFocus=ownedCapture=nullptr;SetWindowLongPtrW(app.window,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(DefWindowProcW));
-        DestroyWindow(app.window);app.window=app.preview=app.captureCursor=nullptr;app.engine.reset();
+        DestroyWindow(app.window);app.window=app.preview=app.captureCursor=app.startDelay=app.startDelayLabel=app.startDelayHint=nullptr;app.engine.reset();
     }
 };
 void checkLayout(){
@@ -289,7 +293,7 @@ void advancedDisclosure(int dpi){
     }
     ownedFocus=app.advanced;windowProc(app.window,WM_COMMAND,AdvancedToggle,0);
     require(app.advancedExpanded&&styledVisible(app.encodingMode)&&styledVisible(app.stopAfter)&&styledVisible(app.lowDisk)&&SendMessageW(app.advanced,BM_GETCHECK,0,0)==BST_CHECKED,"Disclosure did not expose accessible checked state/options.");
-    require(app.contentHeight==collapsedHeight+app.scale(220),"Expanded options failed to claim their own layout rows.");
+    require(app.contentHeight==collapsedHeight+app.scale(280),"Expanded options failed to claim their own layout rows.");
     require(GetNextDlgTabItem(app.window,app.refresh,FALSE)==app.encodingMode&&GetNextDlgTabItem(app.window,app.encodingMode,FALSE)==app.stopAfter&&GetNextDlgTabItem(app.window,app.stopAfter,FALSE)==app.lowDisk,"Expanded native tab order skipped advanced options.");
     checkLayout();checkFocusReachability();scrollTo(INT_MAX,INT_MAX);ownedFocus=app.lowDisk;
     windowProc(app.window,WM_COMMAND,AdvancedToggle,0);
@@ -307,7 +311,7 @@ void compressionDisclosure(int dpi){
     const int collapsed=app.contentHeight;require(!visible(app.skipConfigure)&&!visible(app.skipSummary)&&!visible(app.skipDetail),"Collapsed compression controls visible.");
     windowProc(app.window,WM_COMMAND,AdvancedToggle,0);const int off=app.contentHeight;
     require(visible(app.skipConfigure)&&visible(app.skipSummary)&&!visible(app.skipDetail),"Off compression row visibility incorrect.");
-    require(GetNextDlgTabItem(app.window,app.lowDisk,FALSE)==app.recoveryMode&&GetNextDlgTabItem(app.window,app.recoveryMode,FALSE)==app.splitEvery&&GetNextDlgTabItem(app.window,app.splitEvery,FALSE)==app.captureCursor&&GetNextDlgTabItem(app.window,app.captureCursor,FALSE)==app.skipConfigure,"Recovery/split/cursor/compression controls not in native Advanced tab order.");
+    require(GetNextDlgTabItem(app.window,app.lowDisk,FALSE)==app.recoveryMode&&GetNextDlgTabItem(app.window,app.recoveryMode,FALSE)==app.splitEvery&&GetNextDlgTabItem(app.window,app.splitEvery,FALSE)==app.captureCursor&&GetNextDlgTabItem(app.window,app.captureCursor,FALSE)==app.startDelay&&GetNextDlgTabItem(app.window,app.startDelay,FALSE)==app.skipConfigure,"Recovery/split/cursor/delay/compression controls not in native Advanced tab order.");
     app.settings.timeSkip.mode=TimeSkipMode::Quiet;app.settings.timeSkip.multiplier=64;++app.skipRevision;updateControls();layout();
     require(app.contentHeight==off+app.scale(28) && visible(app.skipDetail) && bounds(app.skipDetail).bottom<bounds(app.preview).top,"Enabled compression detail overlaps preview or has wrong height.");
     const unsigned inspections=lapse::uiPersonPackInspections;
@@ -385,7 +389,7 @@ void nightDisclosure(int dpi){
     };
     windowProc(app.window,WM_COMMAND,AdvancedToggle,0);require(!visible(app.nightEnabled)&&!visible(app.nightDuration),"Desktop exposes irrelevant camera night controls.");
     choose(app.mode,static_cast<int>(Mode::Camera));changeLayout(false);
-    require(visible(app.nightEnabled)&&!visible(app.nightDuration)&&!visible(app.nightTarget)&&GetNextDlgTabItem(app.window,app.recoveryMode,FALSE)==app.splitEvery&&GetNextDlgTabItem(app.window,app.splitEvery,FALSE)==app.skipConfigure&&GetNextDlgTabItem(app.window,app.skipConfigure,FALSE)==app.watermarkConfigure&&GetNextDlgTabItem(app.window,app.watermarkConfigure,FALSE)==app.nightEnabled,"Camera night opt-in visibility/tab order failed.");
+    require(visible(app.nightEnabled)&&!visible(app.nightDuration)&&!visible(app.nightTarget)&&GetNextDlgTabItem(app.window,app.recoveryMode,FALSE)==app.splitEvery&&GetNextDlgTabItem(app.window,app.splitEvery,FALSE)==app.startDelay&&GetNextDlgTabItem(app.window,app.startDelay,FALSE)==app.skipConfigure&&GetNextDlgTabItem(app.window,app.skipConfigure,FALSE)==app.watermarkConfigure&&GetNextDlgTabItem(app.window,app.watermarkConfigure,FALSE)==app.nightEnabled,"Camera night opt-in visibility/tab order failed.");
     const auto offHeight=app.contentHeight;
     ownedFocus=app.nightEnabled;SendMessageW(app.nightEnabled,BM_SETCHECK,BST_CHECKED,0);windowProc(app.window,WM_COMMAND,NightBox,0);
     require(visible(app.nightDuration)&&visible(app.nightTarget)&&visible(app.nightHint)&&visible(app.nightDetail)&&app.contentHeight==offHeight+app.scale(72),"Night options did not claim exactly their detail row space.");
@@ -530,6 +534,45 @@ void segmentDisclosure(int dpi){
     windowProc(app.window,WM_COMMAND,AdvancedToggle,0);require(IsWindowEnabled(app.advanced)&&!IsWindowEnabled(app.splitEvery),"Active splitting was editable or disclosure was locked.");
     std::cout<<"PASS split disclosure/default, exact summaries, row bounds, focus/scroll, cumulative part counts and active lock dpi="<<dpi<<'\n';
 }
+void startDelayDisclosure(int dpi){
+    HiddenWindow owned(MulDiv(500,dpi,96),MulDiv(400,dpi,96),dpi);
+    const int collapsed=app.contentHeight;
+    const auto visible=[](HWND child){return (GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0;};
+    const auto fits=[](HWND child,int margin){
+        wchar_t label[256]{};GetWindowTextW(child,label,256);std::wstring text=label;
+        text.erase(std::remove(text.begin(),text.end(),L'&'),text.end());
+        HDC dc=GetDC(child);const auto previous=SelectObject(dc,reinterpret_cast<HFONT>(SendMessageW(child,WM_GETFONT,0,0)));SIZE extent{};
+        GetTextExtentPoint32W(dc,text.c_str(),static_cast<int>(text.size()),&extent);SelectObject(dc,previous);ReleaseDC(child,dc);
+        require(extent.cx+app.scale(margin)<=bounds(child).right-bounds(child).left,"Self-timer label or selected choice clips.");
+    };
+    require(!visible(app.startDelay)&&!visible(app.startDelayLabel)&&!visible(app.startDelayHint)&&app.advancedCaption==L"&Advanced"&&!selectedStartDelay(),"Default self-timer adds base clutter or an armed choice.");
+    choose(app.startDelay,5);configure();updateControls();fits(app.advanced,18);
+    require(app.advancedCaption.find(L"delay 5 min")!=std::wstring::npos&&app.advancedTooltip.find(L"5 minutes")!=std::wstring::npos,"Collapsed disclosure hides selected self-timer.");
+    windowProc(app.window,WM_COMMAND,AdvancedToggle,0);
+    require(visible(app.startDelay)&&visible(app.startDelayLabel)&&visible(app.startDelayHint),"Expanded self-timer row is incomplete.");
+    fits(app.startDelay,30);fits(app.startDelayLabel,0);
+    const auto delay=bounds(app.startDelay),hint=bounds(app.startDelayHint),label=bounds(app.startDelayLabel);
+    require(label.bottom<=delay.top&&!intersects(delay,hint)&&bounds(app.recoveryMode).bottom<label.top&&hint.bottom<=bounds(app.skipConfigure).top,"Self-timer timing row overlaps adjacent options.");
+    wchar_t help[256]{};GetWindowTextW(app.startDelayHint,help,256);HDC dc=GetDC(app.startDelayHint);const auto previous=SelectObject(dc,app.smallFont);
+    RECT measured{0,0,hint.right-hint.left,0};DrawTextW(dc,help,-1,&measured,DT_CALCRECT|DT_WORDBREAK|DT_NOPREFIX);SelectObject(dc,previous);ReleaseDC(app.startDelayHint,dc);
+    require(measured.bottom<=hint.bottom-hint.top,"Self-timer explanatory help clips when wrapped.");
+    checkLayout();checkFocusReachability();ownedFocus=app.startDelay;windowProc(app.window,WM_COMMAND,AdvancedToggle,0);
+    require(app.contentHeight==collapsed&&ownedFocus==app.advanced&&!visible(app.startDelay),"Collapse strands self-timer focus or expands the base window.");
+    app.settings.watermark.enabled=true;++app.watermarkRevision;choose(app.splitEvery,4);choose(app.stopAfter,5);SendMessageW(app.captureCursor,BM_SETCHECK,BST_UNCHECKED,0);updateAdvanced();fits(app.advanced,18);
+    require(app.advancedCaption.find(L"delay")!=std::wstring::npos,"Mixed collapsed summary loses the next-recording delay.");
+    app.encodingValidation=L"Check the MP4 mode";updateAdvanced();require(app.advancedCaption.find(L"check MP4")!=std::wstring::npos,"Self-timer summary displaced existing validation.");
+    app.encodingValidation.clear();app.settings.watermark.enabled=false;++app.watermarkRevision;choose(app.startDelay,3);configure();
+    windowProc(app.window,WM_COMMAND,AdvancedToggle,0);
+    for(auto state:{State::Waiting,State::Starting}){
+        app.status.state=state;updateControls();wchar_t caption[64]{};GetWindowTextW(app.finish,caption,64);
+        require(std::wstring(caption)==L"Cancel s&tart"&&IsWindowEnabled(app.finish)&&!IsWindowEnabled(app.record)&&!IsWindowEnabled(app.pause)&&!IsWindowEnabled(app.startDelay)&&!IsWindowEnabled(app.stopAfter)&&IsWindowEnabled(app.advanced),"Pending start loses cancellation or unlocks recording options.");
+        choose(app.startDelay,5);windowProc(app.window,WM_COMMAND,MAKEWPARAM(StartDelayBox,CBN_SELCHANGE),reinterpret_cast<LPARAM>(app.startDelay));
+        require(choice(app.startDelay)==3&&app.settings.startDelaySeconds==30,"Forged pending-start selection changes the frozen delay.");
+        fits(app.finish,18);
+    }
+    app.status.state=State::Recording;updateControls();wchar_t finish[64]{};GetWindowTextW(app.finish,finish,64);require(std::wstring(finish)==L"&Finish","Recording retained the pending-start action caption.");
+    std::cout<<"PASS self-timer minimal disclosure, wrapped help, warning priority, frozen options and Cancel start dpi="<<dpi<<'\n';
+}
 void cursorDisclosure(int dpi){
     HiddenWindow owned(MulDiv(500,dpi,96),MulDiv(400,dpi,96),dpi);
     const int collapsed=app.contentHeight;const auto styled=[](HWND child){return (GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0;};
@@ -551,7 +594,7 @@ void cursorDisclosure(int dpi){
 int main(){
     try{
         std::cout<<std::unitbuf;SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        for(int dpi:{96,144,192,288}){scenario(dpi,false);scenario(dpi,true);advancedDisclosure(dpi);compressionDisclosure(dpi);watermarkDisclosure(dpi);recoveryDisclosure(dpi);nightDisclosure(dpi);customGeometry(dpi);segmentDisclosure(dpi);cursorDisclosure(dpi);}
+        for(int dpi:{96,144,192,288}){scenario(dpi,false);scenario(dpi,true);advancedDisclosure(dpi);compressionDisclosure(dpi);watermarkDisclosure(dpi);recoveryDisclosure(dpi);nightDisclosure(dpi);customGeometry(dpi);segmentDisclosure(dpi);cursorDisclosure(dpi);startDelayDisclosure(dpi);}
         dragChecks();barDependency();dpiAndRouting();originalScenarios();std::cout<<"PASS hidden scrolling, custom geometry and disclosure cases at four DPIs\n";return 0;
     }catch(const std::exception& e){std::cerr<<"FIXTURE FAILURE: "<<e.what()<<'\n';return 1;}
 }
