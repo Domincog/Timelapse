@@ -174,11 +174,11 @@ void firstProcessedPreview(const std::filesystem::path& root) {
 }
 void pairedCadence(const std::filesystem::path& root,bool automatic) {
     reset();auto s=config(root/(automatic?L"auto-clamp":L"paired-cadence"),true);s.preview=true;
-    s.night.targetBrightness=64;if(automatic){s.night.durationMs=0;suggestedMs=30000;}
+    s.night.targetBrightness=64;suggestedMs=NightMaxDurationMs;if(automatic)s.night.durationMs=0;
     Engine engine;engine.configure(s);engine.record();
     auto first=await(engine,[](const auto& value){return value.frames==1&&value.preview;});
     const auto rawCalls=previews.load();
-    require(first.elapsed<.2&&first.night.samples==5&&first.nightDurationMs==1000,"Initial blend counted as active time or wrong facts");
+    require(first.elapsed<.2&&first.night.samples==5&&first.nightDurationMs==1000&&first.night.suggestedDurationMs==NightMaxDurationMs,"Initial blend counted as active time or lost its dark-scene suggestion");
     s.night.enabled=false;s.night.durationMs=30000;s.night.targetBrightness=128;s.intervalMs = 60000;
     s.width=1920;s.height=1080;
     engine.configure(s);writeDelayMs=80;

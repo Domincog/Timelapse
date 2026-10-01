@@ -16,6 +16,7 @@ struct NightSettings {
 bool validNightSettings(const NightSettings&) noexcept;
 struct NightResult {
     uint32_t samples = 0;
+    // Gain at the black end of the tone curve; brighter pixels receive less.
     double appliedGain = 1, inputBrightness = 0, outputBrightness = 0;
     int suggestedDurationMs = NightInitialDurationMs;
     bool targetLimited = false;
@@ -38,13 +39,13 @@ public:
     size_t storageBytes() const noexcept { return sums_.capacity() * sizeof(uint32_t) + output_.pixels.capacity(); }
 private:
     bool linear_ = true;
-    double maxGain_ = 8;
+    double maxGain_ = 16;
     bool fixed_ = false;
     double fixedGain_ = 1;
     NightSettings settings_;
     Frame output_;
     std::vector<uint32_t> sums_;
-    std::array<uint8_t, 65536> renderLut_{};
+    std::array<uint16_t, 65536> toneLut_{};
     std::array<uint64_t, 3> totals_{};
     uint64_t sequence_ = 0;
     unsigned count_ = 0;

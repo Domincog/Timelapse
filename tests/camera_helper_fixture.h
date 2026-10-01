@@ -116,7 +116,7 @@ bool Camera::latestNewer(Frame& output, std::wstring& error, CameraSampleInfo& i
     if (impl_->mode == L"night-warm" && age < 1200) return false;
     if (impl_->mode == L"night-hang" && watermark.sequence) Sleep(INFINITE);
     info.epoch = impl_->mode == L"night-epoch" && age >= 500 ? 2 : 1;
-    const uint64_t period = impl_->mode == L"night-slow" ? 2000 : 50;
+    const uint64_t period = impl_->mode == L"night-slow" || impl_->mode == L"night-slow-dark" ? 2000 : 50;
     info.sequence = impl_->mode == L"night-duplicate" ? 1 : age / period + 1;
     if (control.freeze) info.sequence = 1;
     info.receivedTick = impl_->started + (info.sequence - 1) * period;
@@ -143,7 +143,7 @@ bool Camera::latestNewer(Frame& output, std::wstring& error, CameraSampleInfo& i
     }
     if (control.throwCopy) throw std::bad_alloc();
     if (impl_->mode == L"night-slow-copy" && watermark.sequence) Sleep(3300);
-    InterlockedIncrement(&control.copies); pixels(output, impl_->mode == L"night-slow" ? 128 : 32,
+    InterlockedIncrement(&control.copies); pixels(output, impl_->mode == L"night-dark" ? 0 : impl_->mode == L"night-slow" ? 128 : 32,
         impl_->mode == L"night-1080p" ? 2 : impl_->mode == L"night-720p" ? 1 : 0);
     // Only a subsequent Night read gets the fault; ordinary preview can still
     // fetch a healthy frame. Model late conversion/invalid raw metadata after

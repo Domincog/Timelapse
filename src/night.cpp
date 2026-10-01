@@ -73,57 +73,101 @@ const Frame* NightAccumulator::finish(NightResult& result) noexcept {
     if(!active_ || !count_)return nullptr;
     if(finished_){result=result_;return &output_;}
     const auto& lut=tables().forward;
-    unsigned meterCount=0;std::array<unsigned,256> histogram{};
-    // Stratified deterministic samples avoid a fixed8-pixel grid aliasing
-    // stripes. This sparse histogram only limits highlights; mean metering
-    // uses every pixel accumulated above and cannot miss periodic detail.
-    for(int by=0;by<output_.height;by+=8)for(int bx=0;bx<output_.width;bx+=8){
-        uint32_t hash=uint32_t(by/8)*65537+uint32_t(bx/8)+1;
-        hash^=hash>>16;hash*=0x7feb352d;hash^=hash>>15;hash*=0x846ca68b;hash^=hash>>16;
-        const int x=bx+std::min(int(hash&7),output_.width-1-bx),y=by+std::min(int((hash>>3)&7),output_.height-1-by);
-        const auto* p=&sums_[(size_t(y)*output_.width+x)*3];
-        unsigned b=(p[0]+count_/2)/count_,g=(p[1]+count_/2)/count_,r=(p[2]+count_/2)/count_;
-        if(!linear_){b=lut[b];g=lut[g];r=lut[r];}
-        ++meterCount;++histogram[std::max({b,g,r})>>8];
-    }
     const size_t pixels=output_.pixels.size()/4;
+    std::array<uint32_t,256> histogram{};
+    std::array<uint64_t,256> maxima{},luma{};
+    auto* source=sums_.data();
+    for(size_t i=0;i<pixels;++i,source+=3){
+        unsigned b=(source[0]+count_/2)/count_,g=(source[1]+count_/2)/count_,r=(source[2]+count_/2)/count_;
+        if(!linear_){b=lut[b];g=lut[g];r=lut[r];}
+        // Normalize the completed sums in place. finish is idempotent, add is
+        // rejected afterwards, and begin clears them for the next window.
+        // The render pass then needs neither another division nor a buffer.
+        source[0]=b;source[1]=g;source[2]=r;
+        const unsigned maximum=std::max({b,g,r});
+        const unsigned bin=night_detail::encoded(maximum);
+        ++histogram[bin];maxima[bin]+=maximum;luma[bin]+=luminance(b,g,r);
+    }
     double mean=(double(totals_[0])*4732+double(totals_[1])*46871+double(totals_[2])*13933)/(65536.0*count_*pixels);
     if(!linear_){
-        uint64_t meter=0;const auto* p=sums_.data();
-        for(size_t i=0;i<pixels;++i,p+=3)meter+=luminance(lut[(p[0]+count_/2)/count_],lut[(p[1]+count_/2)/count_],lut[(p[2]+count_/2)/count_]);
+        uint64_t meter=0;for(const auto value:luma)meter+=value;
         mean=double(meter)/pixels;
     }
     const double target=lut[settings_.targetBrightness];
-    unsigned cumulative=0,percentile=0;const unsigned rank=(meterCount*99+99)/100;
-    for(;percentile<255;++percentile){cumulative+=histogram[percentile];if(cumulative>=rank)break;}
-    // Keep quantization headroom for 99% of the metered pixel maxima. This is
-    // approximate spatial metering, not a guarantee for unmetered highlights.
-    const double highlightCap=double(lut[250])/std::max(1u,std::min(65535u,(percentile+1)*256-1));
-    // Approach unity continuously near the black floor. A one-code meter
-    // fluctuation must not switch weak noisy signal directly from1x to8x.
-    const double signalRatio=mean/lut[8];
-    const double signalCap=std::clamp(signalRatio*signalRatio,1.0,maxGain_);
-    double wanted=std::clamp(target/std::max(1.0,mean),0.25,maxGain_);
-    wanted=std::min({wanted,highlightCap,signalCap});
-    if(mean<lut[8])wanted=1;
+    std::array<double,256> meterMax{},meterLuma{};
+    double meterPixels=0,meterTotal=0;
+    // Smoothly reduce the influence of lamps/screens without a hard spatial
+    // mask or percentile threshold. Every pixel contributes, including dark
+    // periodic patterns; constant-color scenes retain their exact meter.
+    for(unsigned bin=0;bin<256;++bin)if(histogram[bin]){
+        meterMax[bin]=double(maxima[bin])/histogram[bin];
+        const double relative=meterMax[bin]/lut[96];
+        const double weight=1/(1+relative*relative);
+        meterPixels+=histogram[bin]*weight;
+        meterLuma[bin]=double(luma[bin])*weight;meterTotal+=meterLuma[bin];
+    }
+    const double exposureMean=meterTotal/meterPixels;
+    const auto predicted=[&](double gain) noexcept {
+        double total=0;
+        for(unsigned bin=0;bin<256;++bin)if(histogram[bin]){
+            const double scale=gain<=1?gain:gain/(1+(gain-1)*meterMax[bin]/65535);
+            total+=meterLuma[bin]*scale;
+        }
+        return total/meterPixels;
+    };
+    // Extra contributions justify a bounded increase in shadow gain and a
+    // lower noise floor. This assumes partly independent noise, not measured
+    // SNR: an absolute floor remains and single-frame safeguards stay intact.
+    const double supportedGain=std::min(maxGain_,8*std::sqrt(double(count_)));
+    const double signalFloor=lut[8]/std::sqrt(double(std::min(count_,16u)));
+    const double signalRatio=exposureMean/signalFloor;
+    const double signalCap=std::clamp(signalRatio*signalRatio,1.0,supportedGain);
+    double lower=0.25,upper=supportedGain;
+    for(unsigned step=0;step<20;++step){
+        const double middle=(lower+upper)*0.5;
+        if(predicted(middle)<target)lower=middle;else upper=middle;
+    }
+    double wanted=std::min((lower+upper)*0.5,signalCap);
+    if(exposureMean<signalFloor)wanted=1;
     if(fixed_)gain_=std::clamp(fixedGain_,0.25,8.0);
     else {
-        const bool cut=previousMean_>0 && (mean<previousMean_*.4 || mean>previousMean_*2.5);
-        if(!metered_ || cut || previousMean_<lut[8])gain_=wanted;
-        else if(std::abs(mean*gain_-target)>target*0.05) {
+        const bool cut=previousMean_>0 && (exposureMean<previousMean_*.4 || exposureMean>previousMean_*2.5);
+        if(!metered_ || cut || previousMean_<signalFloor)gain_=wanted;
+        else if(std::abs(predicted(gain_)-target)>target*0.05) {
             // Smooth ordinary changes; cut exposure quickly when light rises.
             gain_=std::clamp(wanted,gain_*0.5,gain_*1.25);
         }
-        gain_=std::min({gain_,highlightCap,signalCap});
-        if(mean<lut[8])gain_=1;
-        gain_=std::clamp(gain_,0.25,maxGain_);
+        gain_=std::min(gain_,signalCap);
+        if(exposureMean<signalFloor)gain_=1;
+        gain_=std::clamp(gain_,0.25,supportedGain);
     }
-    metered_=true;previousMean_=mean;
+    metered_=true;previousMean_=exposureMean;
     const uint32_t gainQ=static_cast<uint32_t>(std::lround(gain_*4096));
-    for(unsigned i=0;i<65536;++i)renderLut_[i]=night_detail::encoded(static_cast<unsigned>(std::min<uint64_t>(65535,(uint64_t(i)*gainQ+2048)>>12)));
+    const double appliedGain=double(gainQ)/4096;
+    // White-anchored monotonic curve: g*x/(1+(g-1)*x). Store mapped maxima,
+    // not quantized scales: scale rounding can reverse adjacent intensities.
+    // Applying one exact ratio to all channels preserves linear RGB ratios.
+    for(unsigned i=0;i<65536;++i){
+        const double scale=appliedGain<=1||fixed_?appliedGain:appliedGain/(1+(appliedGain-1)*i/65535);
+        toneLut_[i]=static_cast<uint16_t>(std::lround(std::min(65535.0,i*scale)));
+    }
     auto* d=output_.pixels.data();const auto* s=sums_.data();uint64_t outputB=0,outputG=0,outputR=0;
+    const bool linearTone=appliedGain<=1||fixed_;
     for(size_t i=0;i<output_.pixels.size()/4;++i,s+=3,d+=4){
-        for(unsigned c=0;c<3;++c){unsigned v=(s[c]+count_/2)/count_;if(!linear_)v=lut[v];d[c]=renderLut_[v];}d[3]=255;
+        if(linearTone){
+            for(unsigned c=0;c<3;++c)d[c]=night_detail::encoded(toneLut_[s[c]]);
+        } else {
+            const unsigned maximum=std::max({s[0],s[1],s[2]});
+            const uint32_t mapped=toneLut_[maximum];
+            const uint8_t ceiling=maximum<65535?254:255;
+            // 65535*65535+65535/2 fits uint32_t; the maximum channel needs
+            // no division, and zero (including an all-black pixel) stays zero.
+            for(unsigned c=0;c<3;++c){
+                const unsigned value=s[c]==maximum?mapped:(s[c]*mapped+maximum/2)/maximum;
+                d[c]=std::min(ceiling,night_detail::encoded(value));
+            }
+        }
+        d[3]=255;
         outputB+=lut[d[0]];outputG+=lut[d[1]];outputR+=lut[d[2]];
     }
     result_.samples=count_;result_.appliedGain=double(gainQ)/4096;
@@ -131,9 +175,11 @@ const Frame* NightAccumulator::finish(NightResult& result) noexcept {
     const double finalMean=(double(outputB)*4732+double(outputG)*46871+double(outputR)*13933)/(65536.0*pixels);
     result_.outputBrightness=night_detail::encoded(static_cast<unsigned>(std::lround(finalMean)));
     result_.targetLimited=finalMean<target*.9 || finalMean>target*1.1;
-    // A longer average can offset independent noise when gain is raised. This
-    // is a bounded suggestion, not a promise of measured scene SNR.
-    result_.suggestedDurationMs=std::clamp(static_cast<int>(std::ceil(std::max(1.0,gain_*gain_)*NightCadenceMs/1000))*1000,NightMinDurationMs,NightMaxDurationMs);
+    // Base collection on illumination demand, even when weak signal limits
+    // displayed gain. The darkest scenes must not ask for the shortest window.
+    const double durationGain=std::clamp(target/std::max(1.0,exposureMean),1.0,
+        std::sqrt(double(NightMaxDurationMs)/NightCadenceMs));
+    result_.suggestedDurationMs=std::clamp(static_cast<int>(std::ceil(durationGain*durationGain*NightCadenceMs/1000))*1000,NightMinDurationMs,NightMaxDurationMs);
     finished_=true;result=result_;return &output_;
 }
 }

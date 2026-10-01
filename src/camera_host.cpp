@@ -333,12 +333,18 @@ int hostMain(const wchar_t* mappingName) {
                             if (nightSourceTick && nightCompletedTick - nightSourceTick > 3000)
                                 nightFailed(L"No fresh camera frame arrived for 3 seconds. Check the camera connection and try again.");
                             else if (completedNight && nightResult.exposure.samples) {
-                                // Aim for at least two actual source deliveries
-                                // on the next Auto window, even when bright slow
-                                // cameras would otherwise request only a second.
+                                // Convert the nominal five-per-second noise
+                                // budget to the camera's observed contribution
+                                // rate. Bright scenes still need only two fresh
+                                // samples; slow dark sources need more time.
                                 const uint64_t samples = nightResult.exposure.samples;
-                                const uint64_t twoSamples = (2ULL * nightDuration + samples - 1) / samples;
-                                const uint64_t rounded = ((twoSamples + 999) / 1000) * 1000;
+                                const uint64_t suggested = std::clamp(nightResult.exposure.suggestedDurationMs,
+                                    NightMinDurationMs, NightMaxDurationMs);
+                                const uint64_t contributions = suggested <= NightMinDurationMs ? 2 :
+                                    (suggested + NightCadenceMs - 1) / NightCadenceMs;
+                                const uint64_t observedDuration = (contributions * nightDuration + samples - 1) / samples;
+                                const uint64_t boundedDuration = std::min<uint64_t>(observedDuration, NightMaxDurationMs);
+                                const uint64_t rounded = ((boundedDuration + 999) / 1000) * 1000;
                                 nightResult.exposure.suggestedDurationMs = std::clamp(
                                     std::max(nightResult.exposure.suggestedDurationMs, int(std::min<uint64_t>(rounded, NightMaxDurationMs))),
                                     NightMinDurationMs, NightMaxDurationMs);

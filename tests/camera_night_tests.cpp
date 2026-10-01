@@ -169,11 +169,35 @@ void boundedFailures() {
     std::cout << "PASS independent source timeout, absolute completion deadline and bounded hung-helper cleanup\n";
 }
 void slowSourceSuggestion() {
-    Harness h(L"night-slow"); h.first(128); h.begin(1, 3000); lapse::Frame frame;
-    const auto result = h.completed(1, frame); checkWindow(result, frame, 3000);
-    require(result.exposure.samples == 1 && result.exposure.suggestedDurationMs == 6000,
-        "bright half-frame-per-second source shrank Auto below a useful two-sample window");
-    std::cout << "PASS bright slow source contributes once honestly and recommends a six-second Auto window\n";
+    for(bool dark : {false, true}) {
+        Harness h(dark ? L"night-slow-dark" : L"night-slow"); h.first(dark ? 32 : 128);
+        h.begin(1, 3000); lapse::Frame frame;
+        const auto result = h.completed(1, frame); checkWindow(result, frame, 3000);
+        require(result.exposure.samples == 1 && result.exposure.suggestedDurationMs == (dark ? lapse::NightMaxDurationMs : 6000),
+            "slow-source Auto did not account for its observed contribution rate and brightness demand");
+    }
+    std::cout << "PASS bright/dark slow sources contribute once honestly and adapt Auto to observed sample rate\n";
+}
+void darkSourceSuggestion() {
+    Harness h(L"night-dark"); h.first(0); h.begin(1); lapse::Frame automatic, manual;
+    const auto result = h.completed(1, automatic);
+    require(automatic.valid() && result.endTick - result.beginTick == 1000 && result.exposure.samples >= 3 &&
+        result.firstSampleTick >= result.beginTick && result.lastSampleTick < result.endTick &&
+        result.exposure.appliedGain == 1 && result.exposure.outputBrightness == 0 && result.exposure.targetLimited &&
+        result.exposure.suggestedDurationMs == lapse::NightMaxDurationMs,
+        "dark-source Auto brightened black, lost fresh window facts or shortened the noise-reduction suggestion");
+    for(size_t p = 0; p < automatic.pixels.size(); p += 4)
+        require(automatic.pixels[p] == 0 && automatic.pixels[p + 1] == 0 && automatic.pixels[p + 2] == 0 && automatic.pixels[p + 3] == 255,
+            "black-source blend invented color or changed alpha");
+    lapse::NightSettings settings; settings.enabled = true; settings.durationMs = 1000;
+    std::wstring error;
+    require(h.client.beginNight(2, 1000, settings, error) && error.empty(), "begin explicit dark-source blend");
+    const auto fixed = h.completed(2, manual);
+    require(fixed.endTick - fixed.beginTick == 1000 && manual.pixels == automatic.pixels &&
+        fixed.exposure.suggestedDurationMs == lapse::NightMaxDurationMs,
+        "darkness suggestion changed an explicit window or the source pixels");
+    h.client.cancelNight(); h.first(0);
+    std::cout << "PASS dark Auto requests bounded longer averaging, preserves black and respects an explicit window\n";
 }
 void completionBoundaries() {
     {
@@ -243,7 +267,7 @@ int main() {
     int result = 0;
     try {
         mappingContract();acceptedTierMutation();highTierNight();
-        previewAndStableResult(); replaceAndCancel(); sourceSemantics(); boundedFailures(); slowSourceSuggestion(); completionBoundaries(); typedPublicationRace();
+        previewAndStableResult(); replaceAndCancel(); sourceSemantics(); boundedFailures(); slowSourceSuggestion(); darkSourceSuggestion(); completionBoundaries(); typedPublicationRace();
         std::cout << "Synthetic night helper transport contracts passed.\n";
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; result = 1; }
     CoUninitialize(); return result;

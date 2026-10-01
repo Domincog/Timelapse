@@ -642,7 +642,7 @@ void updateNightText(bool force=false) {
     std::wstring detail=L"Night effect appears during recording; idle preview is unchanged.";
     if(app.status.nightEnabled && app.status.night.samples){
         wchar_t value[240]{};
-        swprintf_s(value,L"Last blend: %.1f s · %u camera frames · %.1f× digital gain%s",
+        swprintf_s(value,L"Last blend: %.1f s · %u camera frames · %.1f× shadow gain%s",
             app.status.nightDurationMs/1000.0,app.status.night.samples,app.status.night.appliedGain,
             app.status.night.targetLimited?L" · brightness target limited":L"");
         detail=value;
