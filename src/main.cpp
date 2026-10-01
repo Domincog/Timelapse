@@ -11,6 +11,7 @@
 #include <shlobj.h>
 #include <shellapi.h>
 #include <windowsx.h>
+#include <dwmapi.h>
 #include <wrl/client.h>
 #include <filesystem>
 #include <algorithm>
@@ -27,8 +28,22 @@
 
 using namespace lapse;
 namespace {
-constexpr COLORREF Ink = RGB(25, 38, 45), Muted = RGB(88, 106, 113), Accent = RGB(0, 116, 113);
-constexpr COLORREF Background = RGB(247, 249, 250), Canvas = RGB(21, 28, 34);
+// Light Fluent-style palette. Controls stay native; the window itself paints
+// only flat fills, a few antialiased rounded shapes and text.
+constexpr COLORREF Ink = RGB(27, 31, 36), Muted = RGB(92, 101, 110), Subtle = RGB(138, 146, 154);
+constexpr COLORREF Accent = RGB(0, 116, 113), AccentSoft = RGB(222, 241, 239);
+constexpr COLORREF Background = RGB(243, 244, 246), Panel = RGB(255, 255, 255), Border = RGB(222, 226, 230);
+constexpr COLORREF Canvas = RGB(23, 27, 32), Danger = RGB(196, 43, 28), DangerSoft = RGB(253, 233, 231);
+constexpr COLORREF Warning = RGB(138, 82, 0), WarningSoft = RGB(255, 243, 205), Info = RGB(0, 95, 184), InfoSoft = RGB(228, 240, 251);
+// Logical (96 DPI) geometry. Settings live in a fixed-width panel on the right
+// that scrolls on its own; the stage on the left keeps preview and transport.
+constexpr int PanelWidth = 328, PanelPad = 20, StagePad = 20, StageMinWidth = 560;
+constexpr int HeaderTop = 14, HeaderHeight = 32, PreviewGap = 10, PreviewMinHeight = 160;
+constexpr int TransportGap = 14, TransportHeight = 64, StatusGap = 8, StatusHeight = 26, StageBottom = 12;
+constexpr int StageMinHeight = HeaderTop + HeaderHeight + PreviewGap + PreviewMinHeight + TransportGap + TransportHeight + StatusGap + StatusHeight + StageBottom;
+// Horizontal space the Advanced disclosure reserves beside its caption text:
+// left inset, chevron, the gap before it and the right inset.
+constexpr int DisclosureChrome = 46;
 enum Id { ModeBox = 100, IntervalBox, SizeBox, EncodingQualityBox, MonitorBox, CameraBox, Refresh, Record, Pause, Finish, Folder, OpenFolder, Reset, Forward, Preview, EncodingModeBox, AdvancedToggle, StopAfterBox, LowDiskBox, NightBox, NightDurationBox, NightTargetBox, NightHint, NightDetail, SkipConfigure, SkipSummary, SkipDetail, RecoveryBox, SegmentBox, WatermarkConfigure, WatermarkSummary, StatusDetails, CursorBox, StartDelayBox, PlaybackConfigure };
 constexpr int StartDelays[] = {0,5,10,30,60,300};
 constexpr const wchar_t* StartDelayLabels[] = {L"None",L"5 seconds",L"10 seconds",L"30 seconds",L"1 minute",L"5 minutes"};
@@ -87,8 +102,9 @@ struct App {
     HWND advanced{}, stopAfter{}, lowDisk{}, recoveryMode{}, nightEnabled{}, nightDuration{}, nightTarget{}, nightHint{}, nightDetail{}, labels[10]{};
     HWND segmentLabel{}, splitEvery{}, captureCursor{};
     HWND startDelayLabel{}, startDelay{}, startDelayHint{};
-    HFONT font{}, titleFont{}, smallFont{};
-    HBRUSH background = CreateSolidBrush(Background);
+    HFONT font{}, titleFont{}, smallFont{}, strongFont{}, headerFont{};
+    HBRUSH background = CreateSolidBrush(Background), panelBrush = CreateSolidBrush(Panel);
+    HICON appIcons[2]{};
     int dpi = 96, selected = -1, modeIndex = 0;
     Mode collagePreset = Mode::Overlay;
     bool dragging = false, resizing = false, closeWhenDone = false, inspectUI = false;
@@ -103,7 +119,7 @@ struct App {
     bool advancedExpanded = false;
     int advancedLimitIndex = -1, advancedVisibility = -1, advancedNightState = -1, advancedRecoveryState = -1, nightVisibility = -1;
     int advancedSegmentSeconds = -1,advancedOutputFps=-1;
-    int advancedCursorState = -1, advancedDelaySeconds = -1, committedStartDelay = 0;
+    int advancedCursorState = -1, cursorVisibility = -1, advancedDelaySeconds = -1, committedStartDelay = 0;
     uint64_t waitingRemaining = UINT64_MAX;
     std::wstring waitingCaption;
     int customIntervalMs=5000, customWidth=1280, customHeight=720, customLimitSeconds=900;
@@ -136,7 +152,16 @@ struct App {
     bool trayStateValid = false, trayFailure = false, traySeparate = false;
     HICON trayIcons[5]{};
     int contentWidth = 0, contentHeight = 0, scrollX = 0, scrollY = 0;
-    int wheelVertical = 0, wheelHorizontal = 0;
+    int wheelVertical = 0, wheelHorizontal = 0, wheelPanel = 0;
+    // Docked: the stage fits the viewport and the window's vertical bar scrolls
+    // only the settings panel. Otherwise the whole canvas scrolls (panelScroll=0).
+    bool panelDocked = true;
+    int panelScroll = 0, panelHeight = 0, advancedTop = 0;
+    bool collageTools = false, advancedWarning = false;
+    // Painted geometry in logical canvas coordinates, refreshed by layout().
+    // Panel-relative rows are stored unscrolled; paint subtracts panelScroll.
+    RECT panelRect{}, headerRect{}, previewRect{}, transportRect{}, statsRect{}, statusRect{}, savePathRect{};
+    int sectionTops[3]{}, panelRules[6]{}, panelRuleCount = 0;
     POINT dragStart{};
     Rect dragRect{};
     RECT videoRect{};
@@ -148,7 +173,11 @@ struct App {
     std::wstring preferences, selectedMonitorId;
     int scale(int value) const { return MulDiv(value, dpi, 96); }
     bool active() const { return status.state != State::Idle; }
-    ~App() { if(openFolderTask)openFolderTask->cancel();for(auto icon:trayIcons)if(icon)DestroyIcon(icon);DeleteObject(font); DeleteObject(titleFont); DeleteObject(smallFont); DeleteObject(background); }
+    ~App() {
+        if(openFolderTask)openFolderTask->cancel();for(auto icon:trayIcons)if(icon)DestroyIcon(icon);for(auto icon:appIcons)if(icon)DestroyIcon(icon);
+        for(HGDIOBJ object:{static_cast<HGDIOBJ>(font),static_cast<HGDIOBJ>(titleFont),static_cast<HGDIOBJ>(smallFont),static_cast<HGDIOBJ>(strongFont),static_cast<HGDIOBJ>(headerFont),
+            static_cast<HGDIOBJ>(background),static_cast<HGDIOBJ>(panelBrush)})DeleteObject(object);
+    }
 } app;
 void removeTray();
 void unregisterRecordingHotkeys() noexcept {
@@ -254,6 +283,100 @@ bool defaultPaths(std::wstring& folder, std::wstring& preferencesPath) {
 void text(HDC dc, std::wstring value, RECT rect, COLORREF color, HFONT font, UINT flags = DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS) {
     auto old = SelectObject(dc, font); SetBkMode(dc, TRANSPARENT); SetTextColor(dc, color);
     DrawTextW(dc, value.c_str(), -1, &rect, flags | DT_NOPREFIX); SelectObject(dc, old);
+}
+int textWidth(HDC dc, const wchar_t* value, HFONT font) {
+    SIZE size{}; const auto old = SelectObject(dc, font);
+    GetTextExtentPoint32W(dc, value, static_cast<int>(std::wcslen(value)), &size); SelectObject(dc, old);
+    return size.cx;
+}
+COLORREF blend(COLORREF from, COLORREF to, double amount) {
+    amount = std::clamp(amount, 0.0, 1.0);
+    const auto channel = [&](int a, int b) { return static_cast<BYTE>(std::lround(a + (b - a) * amount)); };
+    return RGB(channel(GetRValue(from), GetRValue(to)), channel(GetGValue(from), GetGValue(to)), channel(GetBValue(from), GetBValue(to)));
+}
+void solid(HDC dc, const RECT& area, COLORREF color) {
+    if (area.right <= area.left || area.bottom <= area.top) return;
+    const COLORREF previous = SetDCBrushColor(dc, color);
+    FillRect(dc, &area, static_cast<HBRUSH>(GetStockObject(DC_BRUSH))); SetDCBrushColor(dc, previous);
+}
+// Antialiased rounded rectangle over a known opaque backdrop. Straight spans are
+// plain fills; only the four radius-sized corner squares are shaded per pixel,
+// so cost follows the radius, not the area, and no brush or bitmap is retained.
+void roundRect(HDC dc, const RECT& r, int radius, COLORREF fill, COLORREF backdrop, COLORREF border = CLR_INVALID, int stroke = 0) {
+    const int w = r.right - r.left, h = r.bottom - r.top;
+    if (w <= 0 || h <= 0) return;
+    if (border == CLR_INVALID) stroke = 0;
+    stroke = std::clamp(stroke, 0, std::min(w, h) / 2);
+    radius = std::clamp(std::max(radius, stroke), 0, std::min({w / 2, h / 2, 48}));
+    const int s = std::min(stroke, radius);
+    if (s) {
+        solid(dc, {r.left + radius, r.top, r.right - radius, r.top + s}, border);
+        solid(dc, {r.left + radius, r.bottom - s, r.right - radius, r.bottom}, border);
+        solid(dc, {r.left, r.top + radius, r.left + s, r.bottom - radius}, border);
+        solid(dc, {r.right - s, r.top + radius, r.right, r.bottom - radius}, border);
+    }
+    solid(dc, {r.left + radius, r.top + s, r.right - radius, r.bottom - s}, fill);
+    solid(dc, {r.left + s, r.top + radius, r.left + radius, r.bottom - radius}, fill);
+    solid(dc, {r.right - radius, r.top + radius, r.right - s, r.bottom - radius}, fill);
+    if (!radius) return;
+    std::array<uint32_t, 48 * 48> pixels{};
+    BITMAPINFO info{}; info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER); info.bmiHeader.biWidth = radius; info.bmiHeader.biHeight = -radius;
+    info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32; info.bmiHeader.biCompression = BI_RGB;
+    for (int corner = 0; corner < 4; ++corner) {
+        for (int y = 0; y < radius; ++y) for (int x = 0; x < radius; ++x) {
+            // Distance from this corner's arc centre, sampled at pixel centres.
+            const double dx = (corner & 1) ? x + .5 : radius - (x + .5), dy = (corner & 2) ? y + .5 : radius - (y + .5);
+            const double distance = std::sqrt(dx * dx + dy * dy), outer = std::clamp(radius - distance + .5, 0.0, 1.0);
+            const COLORREF color = s ? blend(blend(backdrop, border, outer), fill, std::clamp(radius - s - distance + .5, 0.0, 1.0)) : blend(backdrop, fill, outer);
+            pixels[size_t(y) * radius + x] = (uint32_t(GetRValue(color)) << 16) | (uint32_t(GetGValue(color)) << 8) | GetBValue(color);
+        }
+        StretchDIBits(dc, (corner & 1) ? r.right - radius : r.left, (corner & 2) ? r.bottom - radius : r.top, radius, radius,
+            0, 0, radius, radius, pixels.data(), &info, DIB_RGB_COLORS, SRCCOPY);
+    }
+}
+// Straight-alpha 32-bit icon rendered from signed distances, so edges stay
+// smooth at every system icon size without an icon resource or GDI+.
+template<class Shade> HICON shadedIcon(int size, Shade shade) {
+    size = std::clamp(size, 16, 256);
+    BITMAPINFO info{}; info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER); info.bmiHeader.biWidth = size; info.bmiHeader.biHeight = -size;
+    info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32; info.bmiHeader.biCompression = BI_RGB;
+    // Word-aligned 1-bpp rows for the largest size; static, so callbacks never allocate here.
+    static const std::array<BYTE, 32 * 256> emptyMask{};
+    void* bits = nullptr; HBITMAP color = CreateDIBSection(nullptr, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    HBITMAP mask = color ? CreateBitmap(size, size, 1, 1, emptyMask.data()) : nullptr;
+    HICON icon = nullptr;
+    if (color && mask && bits) {
+        auto pixels = static_cast<uint32_t*>(bits);
+        for (int y = 0; y < size; ++y) for (int x = 0; x < size; ++x) {
+            double alpha = 0; const COLORREF value = shade((x + .5) / size, (y + .5) / size, 1.0 / size, alpha);
+            pixels[size_t(y) * size + x] = (uint32_t(std::lround(std::clamp(alpha, 0.0, 1.0) * 255)) << 24) |
+                (uint32_t(GetRValue(value)) << 16) | (uint32_t(GetGValue(value)) << 8) | GetBValue(value);
+        }
+        ICONINFO parts{}; parts.fIcon = TRUE; parts.hbmColor = color; parts.hbmMask = mask; icon = CreateIconIndirect(&parts);
+    }
+    if (color) DeleteObject(color);
+    if (mask) DeleteObject(mask);
+    return icon;
+}
+double coverage(double signedDistance, double pixel) { return std::clamp(.5 - signedDistance / pixel, 0.0, 1.0); }
+double boxDistance(double x, double y, double cx, double cy, double hx, double hy, double radius) {
+    const double qx = std::abs(x - cx) - hx + radius, qy = std::abs(y - cy) - hy + radius;
+    return std::hypot(std::max(qx, 0.0), std::max(qy, 0.0)) + std::min(std::max(qx, qy), 0.0) - radius;
+}
+double roundedBoxDistance(double x, double y, double half, double radius) { return boxDistance(x, y, .5, .5, half, half, radius); }
+double segmentDistance(double x, double y, double ax, double ay, double bx, double by) {
+    const double px = x - ax, py = y - ay, vx = bx - ax, vy = by - ay;
+    const double t = std::clamp((px * vx + py * vy) / (vx * vx + vy * vy), 0.0, 1.0);
+    return std::hypot(px - vx * t, py - vy * t);
+}
+// Teal tile with a white clock face: recognizable in the taskbar and Alt+Tab.
+HICON createAppIcon(int size) {
+    return shadedIcon(size, [](double x, double y, double pixel, double& alpha) {
+        alpha = coverage(roundedBoxDistance(x, y, .46, .2), pixel);
+        const double ring = std::abs(std::hypot(x - .5, y - .5) - .27) - .045;
+        const double hands = std::min(segmentDistance(x, y, .5, .5, .5, .32), segmentDistance(x, y, .5, .5, .62, .58)) - .04;
+        return blend(blend(RGB(0, 138, 133), RGB(0, 100, 97), y), RGB(255, 255, 255), coverage(std::min(ring, hands), pixel));
+    });
 }
 std::wstring timeText(double seconds, bool hours) {
     auto n = static_cast<uint64_t>(std::max(0.0, seconds)); wchar_t value[80];
@@ -648,11 +771,13 @@ void startOpenFolder() {
 }
 void layoutStatusRow() {
     if(app.contentWidth<=0 || app.contentHeight<=0)return;
-    const int pad=app.scale(26),width=app.contentWidth-2*pad,details=app.statusDetailsVisible==1?app.scale(88):0;
-    const int top=app.contentHeight-app.scale(124)-app.scrollY;
-    MoveWindow(app.statusText,pad-app.scrollX,top,width-(details?details+app.scale(10):0),app.scale(25),TRUE);
+    // The status message sits under the transport card; Details takes the
+    // right end only while a report exists.
+    const RECT row=app.statusRect;const int height=row.bottom-row.top,detailsW=app.scale(92);
+    const int details=app.statusDetailsVisible==1?detailsW+app.scale(10):0,inset=app.scale(4);
+    MoveWindow(app.statusText,row.left+inset-app.scrollX,row.top-app.scrollY,std::max(1,int(row.right-row.left)-details-inset),height,TRUE);
     if(app.statusDetails && GetParent(app.statusDetails)==app.window)
-        MoveWindow(app.statusDetails,app.contentWidth-pad-app.scale(88)-app.scrollX,top,app.scale(88),app.scale(25),TRUE);
+        MoveWindow(app.statusDetails,row.right-detailsW-app.scrollX,row.top-app.scrollY,detailsW,height,TRUE);
 }
 void updateStatusDetails() {
     if(!app.statusDetails || !IsWindow(app.statusDetails) || GetParent(app.statusDetails)!=app.window)return;
@@ -730,11 +855,14 @@ void updateAdvanced() {
             HDC dc=GetDC(app.advanced);if(dc){const auto previous=SelectObject(dc,app.font);SIZE size{};
                 GetTextExtentPoint32W(dc,caption.c_str(),static_cast<int>(caption.size()),&size);
                 SelectObject(dc,previous);ReleaseDC(app.advanced,dc);
-                if(size.cx+app.scale(18)>bounds.right)caption=delay?L"&Advanced · delay "+formatDuration(int64_t(delay)*1000,true):cursor==1?L"&Advanced · cursor off + options":app.settings.watermark.enabled?L"&Advanced · watermark + options":segment?L"&Advanced · split + options":recovery?L"&Advanced · recovery + options":skipEnabled()?L"&Advanced · "+std::wstring(night?L"night/":L"")+
+                if(size.cx+app.scale(DisclosureChrome)>bounds.right)caption=delay?L"&Advanced · delay "+formatDuration(int64_t(delay)*1000,true):cursor==1?L"&Advanced · cursor off + options":app.settings.watermark.enabled?L"&Advanced · watermark + options":segment?L"&Advanced · split + options":recovery?L"&Advanced · recovery + options":skipEnabled()?L"&Advanced · "+std::wstring(night?L"night/":L"")+
                     (selection?L"stop/":L"")+std::to_wstring(app.settings.timeSkip.multiplier)+L"×":night?L"&Advanced · night + stop":selection?L"&Advanced · timed stop":L"&Advanced · "+std::to_wstring(app.settings.outputFps)+L" fps";
             }
         }
+        const bool warning=recovery==2 || night==2 || !app.watermarkValidation.empty() || !app.hotkeyWarning.empty();
         if(caption!=app.advancedCaption){SetWindowTextW(app.advanced,caption.c_str());app.advancedCaption=caption;}
+        else if(warning!=app.advancedWarning)InvalidateRect(app.advanced,nullptr,FALSE);
+        app.advancedWarning=warning;
         app.advancedTooltip=L"Show or hide advanced options. Recording options can be changed before recording. Night mode applies only to camera content. Show desktop cursor applies only to desktop content.";
         app.advancedTooltip+=L" Playback: "+std::to_wstring(app.settings.outputFps)+L" fps. Global shortcuts can be configured in Playback & shortcuts.";
         if(!app.hotkeyWarning.empty())app.advancedTooltip+=L" "+app.hotkeyWarning;
@@ -757,7 +885,9 @@ void updateAdvanced() {
     }
     const int visibleNight=app.advancedExpanded?nightRow():0;
     const int visibleSkip=app.advancedExpanded?(skipEnabled()?2:1):0;
-    if(app.advancedVisibility==static_cast<int>(app.advancedExpanded) && app.nightVisibility==visibleNight && app.skipVisibility==visibleSkip)return;
+    const bool visibleCursor=app.advancedExpanded && hasSource(Source::Desktop);
+    if(app.advancedVisibility==static_cast<int>(app.advancedExpanded) && app.nightVisibility==visibleNight && app.skipVisibility==visibleSkip && app.cursorVisibility==int(visibleCursor))return;
+    app.cursorVisibility=int(visibleCursor);
     app.advancedVisibility=static_cast<int>(app.advancedExpanded);
     app.nightVisibility=visibleNight;
     app.skipVisibility=visibleSkip;
@@ -765,7 +895,9 @@ void updateAdvanced() {
     const auto visible=[](HWND child,bool show){
         if(child && ((GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0)!=show)ShowWindow(child,show?SW_SHOWNA:SW_HIDE);
     };
-    for(HWND child:{app.labels[6],app.encodingMode,app.labels[7],app.stopAfter,app.lowDisk,app.recoveryMode,app.segmentLabel,app.splitEvery,app.captureCursor,app.startDelayLabel,app.startDelay,app.startDelayHint,app.watermarkConfigure,app.watermarkSummary,app.playbackConfigure})visible(child,app.advancedExpanded);
+    for(HWND child:{app.labels[6],app.encodingMode,app.labels[7],app.stopAfter,app.lowDisk,app.recoveryMode,app.segmentLabel,app.splitEvery,app.startDelayLabel,app.startDelay,app.startDelayHint,app.watermarkConfigure,app.watermarkSummary,app.playbackConfigure})visible(child,app.advancedExpanded);
+    if(!visibleCursor && GetFocus()==app.captureCursor)SetFocus(app.advanced);
+    visible(app.captureCursor,visibleCursor);
     for(HWND child:{app.skipConfigure,app.skipSummary})visible(child,visibleSkip!=0);
     visible(app.skipDetail,visibleSkip==2);
     if(!visibleNight && app.nightEnabled && GetFocus()==app.nightEnabled)SetFocus(app.advanced);
@@ -891,7 +1023,8 @@ void applyStatus(Status value,bool force=false) {
     const bool stats=state || app.status.frames!=value.frames || app.status.completedSegments!=value.completedSegments ||
         static_cast<uint64_t>(std::max(0.0,app.status.elapsed))!=static_cast<uint64_t>(std::max(0.0,value.elapsed));
     const bool message=app.status.message!=value.message,error=app.status.error!=value.error;
-    const bool outcome=app.status.recordingFailed!=value.recordingFailed || app.status.savedPath.empty()!=value.savedPath.empty() ||
+    const bool failure=app.status.recordingFailed!=value.recordingFailed;
+    const bool outcome=failure || app.status.savedPath.empty()!=value.savedPath.empty() ||
         app.status.savedPaths.empty()!=value.savedPaths.empty();
     const bool deadline=app.status.startDeadlineTick!=value.startDeadlineTick;
     const bool preview=app.status.preview!=value.preview;
@@ -921,8 +1054,9 @@ void applyStatus(Status value,bool force=false) {
         if(skip || (app.status.state==State::Recording && skipObserved(app.settings.timeSkip.mode) && age!=app.skipCheckAge))updateSkipText();
     }
     if(preview)InvalidateRect(app.preview,nullptr,FALSE);
-    if(state)invalidateCanvas({app.contentWidth-app.scale(280),app.scale(20),app.contentWidth-app.scale(26),app.scale(49)});
-    if(stats)invalidateCanvas({app.scale(26),app.contentHeight-app.scale(147),app.contentWidth-app.scale(26),app.contentHeight-app.scale(123)});
+    // Repaint only the state pill row and the transport statistics.
+    if(state || (failure && app.status.state==State::Idle))invalidateCanvas(app.headerRect);
+    if(stats)invalidateCanvas(app.statsRect);
 }
 void changeLayout(bool reset) {
     app.modeIndex = choice(app.mode);
@@ -936,19 +1070,18 @@ void changeLayout(bool reset) {
 }
 HICON trayIcon(int state) {
     if(app.trayIcons[state])return app.trayIcons[state];
-    // The colored circle remains recognizable at the notification area's size.
-    const COLORREF colors[]={RGB(70,100,110),RGB(210,60,50),RGB(220,156,30),RGB(40,126,187),RGB(160,40,40)};
-    BITMAPINFO info{};info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);info.bmiHeader.biWidth=16;
-    info.bmiHeader.biHeight=-16;info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;info.bmiHeader.biCompression=BI_RGB;
-    void* bits=nullptr;HBITMAP color=CreateDIBSection(nullptr,&info,DIB_RGB_COLORS,&bits,nullptr,0);
-    const BYTE maskBits[32]{};HBITMAP mask=CreateBitmap(16,16,1,1,maskBits);
-    if(color && mask && bits) {
-        auto pixels=static_cast<DWORD*>(bits);const auto c=colors[state];
-        for(int y=0;y<16;++y)for(int x=0;x<16;++x){const int dx=2*x-15,dy=2*y-15;
-            pixels[y*16+x]=dx*dx+dy*dy<=169 ? 0xff000000u|(DWORD(GetRValue(c))<<16)|(DWORD(GetGValue(c))<<8)|GetBValue(c) : 0;}
-        ICONINFO icon{};icon.fIcon=TRUE;icon.hbmColor=color;icon.hbmMask=mask;app.trayIcons[state]=CreateIconIndirect(&icon);
-    }
-    if(color)DeleteObject(color);if(mask)DeleteObject(mask);
+    // A colored disc with one white glyph stays recognizable at notification-area
+    // sizes: ring = ready/busy, dot = recording, bars = paused, mark = failed.
+    const COLORREF colors[]={Accent,Danger,RGB(202,131,0),Info,RGB(150,32,32)};
+    const COLORREF disc=colors[state];
+    app.trayIcons[state]=shadedIcon(GetSystemMetricsForDpi(SM_CXSMICON,static_cast<UINT>(app.dpi)),[state,disc](double x,double y,double pixel,double& alpha){
+        const double distance=std::hypot(x-.5,y-.5);alpha=coverage(distance-.48,pixel);
+        double glyph=std::abs(distance-.2)-.065;
+        if(state==1)glyph=distance-.17;
+        else if(state==2)glyph=std::min(boxDistance(x,y,.39,.5,.065,.19,.03),boxDistance(x,y,.61,.5,.065,.19,.03));
+        else if(state==4)glyph=std::min(segmentDistance(x,y,.5,.27,.5,.55)-.065,std::hypot(x-.5,y-.72)-.075);
+        return blend(disc,RGB(255,255,255),coverage(glyph,pixel));
+    });
     return app.trayIcons[state] ? app.trayIcons[state] : LoadIconW(nullptr,IDI_APPLICATION);
 }
 bool updateTray(bool addIcon=false) {
@@ -1100,10 +1233,114 @@ RECT previewVideoRect(const RECT& client) {
     return {(client.right-width)/2,(client.bottom-height)/2,
             (client.right+width)/2,(client.bottom+height)/2};
 }
+bool shown(HWND child) { return child && (GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0; }
+void showControl(HWND child,bool show) {
+    if(child && shown(child)!=show)ShowWindow(child,show?SW_SHOWNA:SW_HIDE);
+}
+// Settings-panel membership decides scrolling, focus reveal and background.
+bool panelControl(HWND child) {
+    if(!child)return false;
+    for(HWND member:{app.labels[0],app.mode,app.labels[4],app.monitor,app.labels[5],app.camera,app.refresh,app.labels[1],app.interval,app.labels[2],app.videoSize,
+        app.labels[3],app.encodingQuality,app.folder,app.openFolder,app.advanced,app.labels[6],app.encodingMode,app.recoveryMode,app.labels[7],app.stopAfter,
+        app.segmentLabel,app.splitEvery,app.startDelayLabel,app.startDelay,app.startDelayHint,app.lowDisk,app.captureCursor,app.skipConfigure,app.skipSummary,
+        app.skipDetail,app.watermarkConfigure,app.watermarkSummary,app.playbackConfigure,app.nightEnabled,app.labels[8],app.nightDuration,app.labels[9],
+        app.nightTarget,app.nightHint,app.nightDetail})if(member==child)return true;
+    return false;
+}
+// Device rows appear only for sources the layout uses, and collage tools only
+// for editable collages. Hidden controls drop out of Tab order and mnemonics.
+void updateSourceRows() {
+    const bool desktop=hasSource(Source::Desktop),camera=hasSource(Source::Camera);
+    app.collageTools=!app.settings.separateFiles && app.settings.layers.size()>1;
+    const HWND focused=GetFocus();
+    if(focused && ((!desktop && focused==app.monitor) || (!camera && focused==app.camera)))SetFocus(app.mode);
+    if(focused && !app.collageTools && (focused==app.reset || focused==app.forward))SetFocus(app.preview);
+    for(HWND child:{app.labels[4],app.monitor})showControl(child,desktop);
+    for(HWND child:{app.labels[5],app.camera})showControl(child,camera);
+    for(HWND child:{app.reset,app.forward})showControl(child,app.collageTools);
+}
+int wrappedHeight(HWND child,int width,HFONT font,int minimum) {
+    if(!child)return minimum;
+    wchar_t value[512]{};GetWindowTextW(child,value,static_cast<int>(std::size(value)));
+    HDC dc=GetDC(child);if(!dc)return minimum;
+    const auto previous=SelectObject(dc,font?static_cast<HGDIOBJ>(font):GetStockObject(DEFAULT_GUI_FONT));
+    RECT measured{0,0,std::max(1,width),0};DrawTextW(dc,value,-1,&measured,DT_CALCRECT|DT_WORDBREAK|DT_NOPREFIX);
+    SelectObject(dc,previous);ReleaseDC(child,dc);
+    return std::max(minimum,static_cast<int>(measured.bottom));
+}
+// Lays out the settings panel top to bottom and returns its content height.
+// Rows use panel coordinates; offset maps them into the scrolled viewport.
+// Hidden rows keep a parked position but add no height.
+int placePanel(bool place,int left,int offset) {
+    const int pad=app.scale(PanelPad),width=app.scale(PanelWidth)-2*pad;
+    const int labelH=app.scale(20),comboTop=app.scale(22),field=app.scale(62),check=app.scale(26),button=app.scale(32);
+    const int line=app.scale(16),rowGap=app.scale(12);
+    int y=app.scale(14),rules=0;
+    const auto put=[&](HWND child,int top,int height,int x=0,int w=0){
+        if(place && child)MoveWindow(child,left+pad+x,top-offset,w?w:width,height,TRUE);};
+    const auto combo=[&](HWND label,HWND box,int dropped,bool visible=true){
+        put(label,y,labelH);put(box,y+comboTop,app.scale(dropped));if(visible)y+=field;};
+    const auto rule=[&]{y+=app.scale(4);if(place && rules<static_cast<int>(std::size(app.panelRules)))app.panelRules[rules++]=y;y+=app.scale(16);};
+    const auto section=[&](int index){if(place)app.sectionTops[index]=y;y+=app.scale(34);};
+    const int refreshW=app.scale(88);
+    put(app.refresh,y+app.scale(1),app.scale(28),width-refreshW,refreshW);
+    section(0);
+    combo(app.labels[0],app.mode,230);
+    combo(app.labels[4],app.monitor,220,hasSource(Source::Desktop));
+    combo(app.labels[5],app.camera,220,hasSource(Source::Camera));
+    rule();section(1);
+    combo(app.labels[1],app.interval,220);
+    combo(app.labels[2],app.videoSize,140);
+    combo(app.labels[3],app.encodingQuality,160);
+    rule();section(2);
+    if(place)app.savePathRect={app.panelRect.left+pad,y,app.panelRect.left+pad+width,y+app.scale(20)};
+    y+=app.scale(26);
+    const int changeW=app.scale(104),buttonGap=app.scale(8);
+    put(app.folder,y,button,0,changeW);put(app.openFolder,y,button,changeW+buttonGap,width-changeW-buttonGap);
+    y+=button;rule();
+    if(place)app.advancedTop=y;
+    put(app.advanced,y,app.scale(38));y+=app.scale(38);
+    // Advanced rows are always positioned so focus and hit-testing never see
+    // stale geometry, but they add height only while expanded.
+    const int collapsedBottom=y;
+    y+=app.scale(14);
+    combo(app.labels[6],app.encodingMode,190);
+    put(app.recoveryMode,y-app.scale(4),check);y+=check+app.scale(14);
+    combo(app.labels[7],app.stopAfter,210);
+    combo(app.segmentLabel,app.splitEvery,210);
+    put(app.startDelayLabel,y,labelH);put(app.startDelay,y+comboTop,app.scale(210));
+    const int hintTop=y+comboTop+app.scale(34),hintH=wrappedHeight(app.startDelayHint,width,app.smallFont,2*line);
+    put(app.startDelayHint,hintTop,hintH);y=hintTop+hintH+rowGap;
+    put(app.lowDisk,y,check);y+=check+app.scale(4);
+    put(app.captureCursor,y,check);if(hasSource(Source::Desktop))y+=check+app.scale(16);
+    put(app.skipConfigure,y,button);y+=button+app.scale(6);
+    put(app.skipSummary,y,2*line);y+=2*line;
+    put(app.skipDetail,y,2*line);if(skipEnabled())y+=2*line;
+    y+=rowGap;
+    put(app.watermarkConfigure,y,button);y+=button+app.scale(6);
+    put(app.watermarkSummary,y,line);y+=line+rowGap;
+    put(app.playbackConfigure,y,button);y+=button+app.scale(16);
+    const int night=nightRow();
+    put(app.nightEnabled,y,check);if(night)y+=check+app.scale(8);
+    combo(app.labels[8],app.nightDuration,210,night==2);
+    combo(app.labels[9],app.nightTarget,150,night==2);
+    put(app.nightHint,y,2*line);if(night==2)y+=2*line+app.scale(2);
+    put(app.nightDetail,y,2*line);if(night==2)y+=2*line;
+    if(place)app.panelRuleCount=rules;
+    return (app.advancedExpanded?y:collapsedBottom)+app.scale(20);
+}
+constexpr UINT_PTR SavePathTip=1;
+void updateSavePathTip() {
+    if(!app.tooltip)return;
+    TOOLINFOW tip{sizeof(tip)};tip.hwnd=app.window;tip.uId=SavePathTip;tip.rect=app.savePathRect;
+    OffsetRect(&tip.rect,-app.scrollX,-(app.scrollY+app.panelScroll));
+    SendMessageW(app.tooltip,TTM_NEWTOOLRECTW,0,reinterpret_cast<LPARAM>(&tip));
+}
 void layout() {
     if (app.layingOut || !app.preview || IsIconic(app.window)) return;
     app.layingOut = true;
     endLayoutDrag();
+    updateSourceRows();
     RECT r; GetClientRect(app.window,&r);
     // Solve both scroll bars together: either bar can make the other necessary.
     const auto style=GetWindowLongPtrW(app.window,GWL_STYLE);
@@ -1111,93 +1348,84 @@ void layout() {
     const int barH=GetSystemMetricsForDpi(SM_CYHSCROLL,app.dpi);
     const int availableW=r.right+((style&WS_VSCROLL)?barW:0);
     const int availableH=r.bottom+((style&WS_HSCROLL)?barH:0);
-    const int minimumW=app.scale(830);
-    const int night=nightRow();
-    const int skipHeight=(skipEnabled()?80:52)+42;
-    const int previewTop=app.scale(app.advancedExpanded?(night==2?372:night==1?300:258)+skipHeight+118:190);
-    const int minimumH=previewTop+app.scale(160)+app.scale(191);
+    const int panelW=app.scale(PanelWidth),minimumW=panelW+app.scale(StageMinWidth),stageMinH=app.scale(StageMinHeight);
+    app.panelHeight=placePanel(false,0,0);
     bool horizontal=false, vertical=false;
     for(int i=0;i<3;++i) {
         horizontal=availableW-(vertical?barW:0)<minimumW;
-        vertical=availableH-(horizontal?barH:0)<minimumH;
+        const int viewH=availableH-(horizontal?barH:0);
+        // A docked stage always fits; only a taller panel then needs the bar.
+        vertical=viewH<stageMinH || app.panelHeight>viewH;
     }
     ShowScrollBar(app.window,SB_HORZ,horizontal);
     ShowScrollBar(app.window,SB_VERT,vertical);
     GetClientRect(app.window,&r);
     const int viewportW=std::max(1L,r.right), viewportH=std::max(1L,r.bottom);
+    // Below the stage minimum, fall back to one scrolling canvas with the
+    // panel unrolled beside the stage, so every control stays reachable.
+    app.panelDocked=viewportH>=stageMinH;
+    const int stageH=std::max(viewportH,stageMinH);
     app.contentWidth=std::max(viewportW,minimumW);
-    app.contentHeight=std::max(viewportH,minimumH);
+    app.contentHeight=app.panelDocked?viewportH:std::max(stageH,app.panelHeight);
     app.scrollX=std::clamp(app.scrollX,0,app.contentWidth-viewportW);
-    app.scrollY=std::clamp(app.scrollY,0,app.contentHeight-viewportH);
+    app.scrollY=app.panelDocked?0:std::clamp(app.scrollY,0,app.contentHeight-viewportH);
+    app.panelScroll=app.panelDocked?std::clamp(app.panelScroll,0,std::max(0,app.panelHeight-viewportH)):0;
     SCROLLINFO scroll{sizeof(scroll),SIF_RANGE|SIF_PAGE|SIF_POS};
     scroll.nMax=app.contentWidth-1;scroll.nPage=viewportW;scroll.nPos=app.scrollX;
     SetScrollInfo(app.window,SB_HORZ,&scroll,TRUE);
-    scroll.nMax=app.contentHeight-1;scroll.nPage=viewportH;scroll.nPos=app.scrollY;
+    // Docked, the window's vertical bar sits beside the panel and scrolls only it.
+    scroll.nMax=(app.panelDocked?app.panelHeight:app.contentHeight)-1;scroll.nPage=viewportH;
+    scroll.nPos=app.panelDocked?app.panelScroll:app.scrollY;
     SetScrollInfo(app.window,SB_VERT,&scroll,TRUE);
-    r.right=app.contentWidth;r.bottom=app.contentHeight;
-    const int pad=app.scale(26), gap=app.scale(14), width=std::max(1,static_cast<int>(r.right)-2*pad);
-    const int row1=app.scale(86), row2=app.scale(143), ch=app.scale(30), label=app.scale(65);
-    // Keep resolution and compression separate without consuming preview height.
-    const int available=width-3*gap, sourceW=available*32/100, intervalW=available*22/100, sizeW=available*18/100;
-    const int qualityW=available-sourceW-intervalW-sizeW;
-    const int intervalX=pad+sourceW+gap, sizeX=intervalX+intervalW+gap, qualityX=sizeX+sizeW+gap;
+    const int panelLeft=app.contentWidth-panelW;
+    app.panelRect={panelLeft,0,app.contentWidth,app.contentHeight};
+    const int pad=app.scale(StagePad),stageRight=panelLeft-pad,width=std::max(1,stageRight-pad);
     auto move=[&](HWND w,int x,int y,int cx,int cy){MoveWindow(w,x-app.scrollX,y-app.scrollY,cx,cy,TRUE);};
-    move(app.labels[0],pad,label,sourceW,app.scale(20)); move(app.mode,pad,row1,sourceW,app.scale(230));
-    move(app.labels[1],intervalX,label,intervalW,app.scale(20)); move(app.interval,intervalX,row1,intervalW,app.scale(220));
-    move(app.labels[2],sizeX,label,sizeW,app.scale(20)); move(app.videoSize,sizeX,row1,sizeW,app.scale(140));
-    move(app.labels[3],qualityX,label,qualityW,app.scale(20)); move(app.encodingQuality,qualityX,row1,qualityW,app.scale(160));
-    const int refreshW=app.scale(92), optionsW=width-refreshW-3*gap;
-    const int deviceW=optionsW*31/100, advancedW=optionsW-2*deviceW;
-    const int cameraX=pad+deviceW+gap, advancedX=cameraX+deviceW+gap;
-    move(app.labels[4],pad,app.scale(121),deviceW,app.scale(20)); move(app.monitor,pad,row2,deviceW,app.scale(220));
-    move(app.labels[5],cameraX,app.scale(121),deviceW,app.scale(20)); move(app.camera,cameraX,row2,deviceW,app.scale(220));
-    move(app.advanced,advancedX,row2,advancedW,ch);
-    const int options=width-2*gap, encodingW=options*40/100, stopW=options*25/100;
-    const int stopX=pad+encodingW+gap, diskX=stopX+stopW+gap;
-    move(app.labels[6],pad,app.scale(190),encodingW,app.scale(20));move(app.encodingMode,pad,app.scale(211),encodingW,app.scale(190));
-    move(app.labels[7],stopX,app.scale(190),stopW,app.scale(20));move(app.stopAfter,stopX,app.scale(211),stopW,app.scale(210));
-    move(app.lowDisk,diskX,app.scale(211),options-encodingW-stopW,ch);
-    move(app.recoveryMode,pad,app.scale(271),encodingW,ch);
-    move(app.segmentLabel,stopX,app.scale(250),stopW,app.scale(20));move(app.splitEvery,stopX,app.scale(271),stopW,app.scale(210));
-    move(app.captureCursor,diskX,app.scale(271),options-encodingW-stopW,ch);
-    move(app.startDelayLabel,pad,app.scale(310),encodingW,app.scale(20));
-    move(app.startDelay,pad,app.scale(331),encodingW,app.scale(210));
-    move(app.startDelayHint,stopX,app.scale(331),width-encodingW-gap,app.scale(42));
-    move(app.skipConfigure,pad,app.scale(376),app.scale(202),ch);
-    move(app.skipSummary,pad+app.scale(216),app.scale(376),width-app.scale(216),ch);
-    move(app.skipDetail,pad,app.scale(412),width,app.scale(21));
-    move(app.watermarkConfigure,pad,app.scale(334+skipHeight),app.scale(202),ch);
-    move(app.watermarkSummary,pad+app.scale(216),app.scale(334+skipHeight),width-app.scale(432),ch);
-    move(app.playbackConfigure,pad+width-app.scale(202),app.scale(334+skipHeight),app.scale(202),ch);
-    move(app.nightEnabled,pad,app.scale((night==2?396:376)+skipHeight),encodingW,ch);
-    move(app.labels[8],stopX,app.scale(375+skipHeight),stopW,app.scale(20));move(app.nightDuration,stopX,app.scale(396+skipHeight),stopW,app.scale(210));
-    move(app.labels[9],diskX,app.scale(375+skipHeight),options-encodingW-stopW,app.scale(20));move(app.nightTarget,diskX,app.scale(396+skipHeight),options-encodingW-stopW,app.scale(150));
-    move(app.nightHint,pad,app.scale(431+skipHeight),width,app.scale(21));move(app.nightDetail,pad,app.scale(455+skipHeight),width,app.scale(21));
-    move(app.refresh,r.right-pad-refreshW,row2,refreshW,ch);
-    // The logical canvas retains a usable preview when the viewport is small.
-    const int previewH=static_cast<int>(r.bottom)-previewTop-app.scale(191);
-    move(app.preview,pad,previewTop,width,previewH);
+    // Header: state pill and hint, with collage tools at the right end.
+    const int headerTop=app.scale(HeaderTop),headerBottom=headerTop+app.scale(HeaderHeight);
+    const int toolH=app.scale(30),toolY=headerTop+(app.scale(HeaderHeight)-toolH)/2,forwardW=app.scale(124),resetW=app.scale(112);
+    move(app.forward,stageRight-forwardW,toolY,forwardW,toolH);
+    move(app.reset,stageRight-forwardW-app.scale(8)-resetW,toolY,resetW,toolH);
+    app.headerRect={pad,headerTop,app.collageTools?stageRight-forwardW-resetW-app.scale(20):stageRight,headerBottom};
+    // Transport and status hug the bottom; the preview takes the remaining height.
+    const int statusTop=stageH-app.scale(StageBottom+StatusHeight);
+    app.statusRect={pad,statusTop,stageRight,statusTop+app.scale(StatusHeight)};
+    const int transportTop=statusTop-app.scale(StatusGap+TransportHeight);
+    app.transportRect={pad,transportTop,stageRight,transportTop+app.scale(TransportHeight)};
+    const int previewTop=headerBottom+app.scale(PreviewGap);
+    app.previewRect={pad,previewTop,stageRight,transportTop-app.scale(TransportGap)};
+    move(app.preview,pad,previewTop,width,app.previewRect.bottom-previewTop);
     RECT previewClient{};GetClientRect(app.preview,&previewClient);
     app.videoRect=previewVideoRect(previewClient);
-    move(app.reset,r.right-pad-app.scale(240),previewTop+previewH+app.scale(10),app.scale(113),app.scale(27));
-    move(app.forward,r.right-pad-app.scale(120),previewTop+previewH+app.scale(10),app.scale(120),app.scale(27));
-    move(app.folder,r.right-pad-app.scale(92),r.bottom-app.scale(92),app.scale(92),app.scale(26));
+    const int buttonH=app.scale(40),buttonY=transportTop+(app.scale(TransportHeight)-buttonH)/2,inset=app.scale(12),gap=app.scale(8);
+    const int recordW=app.scale(120),pauseW=app.scale(100),finishW=app.scale(112);
+    move(app.record,pad+inset,buttonY,recordW,buttonH);
+    move(app.pause,pad+inset+recordW+gap,buttonY,pauseW,buttonH);
+    move(app.finish,pad+inset+recordW+pauseW+2*gap,buttonY,finishW,buttonH);
+    const int statsLeft=pad+inset+recordW+pauseW+finishW+2*gap+app.scale(20);
+    app.statsRect={statsLeft,transportTop+app.scale(8),std::max(statsLeft,stageRight-app.scale(16)),app.transportRect.bottom-app.scale(8)};
     layoutStatusRow();
-    move(app.record,pad,r.bottom-app.scale(54),app.scale(150),app.scale(34));
-    move(app.pause,pad+app.scale(160),r.bottom-app.scale(54),app.scale(106),app.scale(34));
-    move(app.finish,pad+app.scale(276),r.bottom-app.scale(54),app.scale(106),app.scale(34));
-    move(app.openFolder,r.right-pad-app.scale(133),r.bottom-app.scale(54),app.scale(133),app.scale(34));
+    placePanel(true,panelLeft-app.scrollX,app.scrollY+app.panelScroll);
+    updateSavePathTip();
     app.advancedLimitIndex=-1;updateAdvanced();
     app.layingOut = false;
     updateAdvanced();
     InvalidateRect(app.window,nullptr,TRUE);
 }
+int viewportHeight() { RECT r{};GetClientRect(app.window,&r);return static_cast<int>(r.bottom); }
 void scrollTo(int x,int y) {
     RECT r;GetClientRect(app.window,&r);
     x=std::clamp(x,0,std::max(0,app.contentWidth-static_cast<int>(r.right)));
-    y=std::clamp(y,0,std::max(0,app.contentHeight-static_cast<int>(r.bottom)));
+    y=app.panelDocked?0:std::clamp(y,0,std::max(0,app.contentHeight-static_cast<int>(r.bottom)));
     if(x==app.scrollX && y==app.scrollY)return;
     app.scrollX=x;app.scrollY=y;layout();
+}
+void scrollPanelTo(int y,int x=-1) {
+    RECT r;GetClientRect(app.window,&r);
+    y=app.panelDocked?std::clamp(y,0,std::max(0,app.panelHeight-static_cast<int>(r.bottom))):0;
+    x=x<0?app.scrollX:std::clamp(x,0,std::max(0,app.contentWidth-static_cast<int>(r.right)));
+    if(y==app.panelScroll && x==app.scrollX)return;
+    app.panelScroll=y;app.scrollX=x;layout();
 }
 void scrollBar(int bar,int command) {
     SCROLLINFO info{sizeof(info),SIF_ALL};
@@ -1214,7 +1442,8 @@ void scrollBar(int bar,int command) {
     case SB_THUMBTRACK:case SB_THUMBPOSITION:position=info.nTrackPos;break;
     default:return;
     }
-    scrollTo(bar==SB_HORZ?position:app.scrollX,bar==SB_VERT?position:app.scrollY);
+    if(bar==SB_VERT && app.panelDocked)scrollPanelTo(position);
+    else scrollTo(bar==SB_HORZ?position:app.scrollX,bar==SB_VERT?position:app.scrollY);
 }
 void revealFocusedControl() {
     HWND child=GetFocus();
@@ -1223,7 +1452,9 @@ void revealFocusedControl() {
     if(!(GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE))return;
     RECT target{}, viewport{};GetWindowRect(child,&target);GetClientRect(app.window,&viewport);
     MapWindowPoints(nullptr,app.window,reinterpret_cast<POINT*>(&target),2);
-    OffsetRect(&target,app.scrollX,app.scrollY);
+    // A docked panel row scrolls the panel; everything else scrolls the canvas.
+    const bool panel=app.panelDocked && panelControl(child);
+    OffsetRect(&target,app.scrollX,panel?app.panelScroll:app.scrollY);
     // Keep a margin only when it fits; a nearly viewport-sized button must
     // remain fully visible instead of being clipped to make room for padding.
     const int marginX=std::clamp(static_cast<int>((viewport.right-(target.right-target.left))/2),0,app.scale(8));
@@ -1233,37 +1464,72 @@ void revealFocusedControl() {
         if(first<position || last-first>size)return first;
         return last>position+size?last-size:position;
     };
-    scrollTo(reveal(app.scrollX,viewport.right,target.left,target.right),
-             reveal(app.scrollY,viewport.bottom,target.top,target.bottom));
+    const int x=reveal(app.scrollX,viewport.right,target.left,target.right);
+    if(panel)scrollPanelTo(reveal(app.panelScroll,viewport.bottom,target.top,target.bottom),x);
+    else scrollTo(x,reveal(app.scrollY,viewport.bottom,target.top,target.bottom));
 }
 void toggleAdvanced() {
     const HWND focused=GetFocus();
     if(app.advancedExpanded)for(HWND child:{app.encodingMode,app.stopAfter,app.splitEvery,app.lowDisk,app.recoveryMode,app.captureCursor,app.startDelay,app.skipConfigure,app.watermarkConfigure,app.playbackConfigure,app.nightEnabled,app.nightDuration,app.nightTarget})
         if(child && (focused==child || (focused && IsChild(child,focused)))){SetFocus(app.advanced);break;}
     app.advancedExpanded=!app.advancedExpanded;
-    updateAdvanced();layout();revealFocusedControl();
+    updateAdvanced();layout();
+    // Bring newly expanded options into view, keeping the toggle on screen.
+    if(app.advancedExpanded && app.panelDocked)scrollPanelTo(std::max(app.panelScroll,app.advancedTop-app.scale(12)));
+    revealFocusedControl();
+}
+// Applies one wheel gesture to the panel or canvas. Returns whether that axis
+// can scroll; a closed combo then never consumes the gesture as a selection.
+bool wheelScroll(UINT message,WPARAM wp,bool overPanel) {
+    if(GET_KEYSTATE_WPARAM(wp)&MK_CONTROL)return false;
+    const bool horizontal=message==WM_MOUSEHWHEEL || (GET_KEYSTATE_WPARAM(wp)&MK_SHIFT);
+    RECT viewport;GetClientRect(app.window,&viewport);
+    const bool panel=!horizontal && app.panelDocked;
+    if(panel?(!overPanel || app.panelHeight<=viewport.bottom):(horizontal?app.contentWidth<=viewport.right:app.contentHeight<=viewport.bottom))return false;
+    UINT lines=3;
+    SystemParametersInfoW(horizontal?SPI_GETWHEELSCROLLCHARS:SPI_GETWHEELSCROLLLINES,0,&lines,0);
+    int& remainder=horizontal?app.wheelHorizontal:panel?app.wheelPanel:app.wheelVertical;
+    // Horizontal wheel positive means right; vertical wheel positive means up.
+    remainder+=GET_WHEEL_DELTA_WPARAM(wp)*(message==WM_MOUSEHWHEEL?1:-1);
+    const int steps=remainder/WHEEL_DELTA;remainder%=WHEEL_DELTA;
+    const int size=horizontal?viewport.right:viewport.bottom,page=std::max(1,size-app.scale(24));
+    const int amount=lines==WHEEL_PAGESCROLL?page:static_cast<int>(std::min<uint64_t>(uint64_t(lines)*app.scale(20),page));
+    if(panel)scrollPanelTo(app.panelScroll+steps*amount);
+    else scrollTo(app.scrollX+(horizontal?steps*amount:0),app.scrollY+(horizontal?0:steps*amount));
+    return true;
+}
+bool pointInPanel(POINT screen) {
+    if(!ScreenToClient(app.window,&screen))return false;
+    RECT viewport{};GetClientRect(app.window,&viewport);
+    return screen.x>=app.panelRect.left-app.scrollX && screen.x<viewport.right && screen.y>=0 && screen.y<viewport.bottom;
 }
 bool scrollWheelMessage(const MSG& message) {
     if(message.message!=WM_MOUSEWHEEL && message.message!=WM_MOUSEHWHEEL)return false;
     if(GET_KEYSTATE_WPARAM(message.wParam)&MK_CONTROL)return false;
     if(message.hwnd!=app.window && !IsChild(app.window,message.hwnd))return false;
-    const bool horizontal=message.message==WM_MOUSEHWHEEL || (GET_KEYSTATE_WPARAM(message.wParam)&MK_SHIFT);
-    RECT viewport;GetClientRect(app.window,&viewport);
-    if((horizontal?app.contentWidth:app.contentHeight)<=(horizontal?viewport.right:viewport.bottom))return false;
     // Open lists own their wheel input. Closed lists must not change recording
     // settings when the user's wheel gesture is scrolling the surrounding page.
-    for(HWND box:{app.mode,app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.splitEvery,app.nightDuration,app.nightTarget,app.monitor,app.camera})
-        if(SendMessageW(box,CB_GETDROPPEDSTATE,0,0))return false;
-    SendMessageW(app.window,message.message,message.wParam,message.lParam);
-    return true;
+    bool closedChoice=false;
+    for(HWND box:{app.mode,app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.splitEvery,app.startDelay,app.nightDuration,app.nightTarget,app.monitor,app.camera}){
+        if(box && SendMessageW(box,CB_GETDROPPEDSTATE,0,0))return false;
+        closedChoice=closedChoice || (box && (message.hwnd==box || IsChild(box,message.hwnd)));
+    }
+    // WM_MOUSEWHEEL can be delivered to the focused combo even when the pointer
+    // is over the preview. Route by the gesture's screen point, not that focus.
+    const bool overPanel=pointInPanel({GET_X_LPARAM(message.lParam),GET_Y_LPARAM(message.lParam)});
+    if(wheelScroll(message.message,message.wParam,overPanel))return true;
+    // A wheel over the fixed stage must also be kept away from a focused
+    // closed choice, whose default handler would silently change its value.
+    return app.panelDocked && !overPanel && closedChoice;
 }
 void fonts() {
-    DeleteObject(app.font); DeleteObject(app.titleFont); DeleteObject(app.smallFont);
-    app.font = CreateFontW(-app.scale(14),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
-    app.titleFont = CreateFontW(-app.scale(25),0,0,0,FW_SEMIBOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
-    app.smallFont = CreateFontW(-app.scale(12),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
+    for(HFONT* font:{&app.font,&app.titleFont,&app.smallFont,&app.strongFont,&app.headerFont}){DeleteObject(*font);*font=nullptr;}
+    const auto make=[](int pixels,int weight){return CreateFontW(-app.scale(pixels),0,0,0,weight,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");};
+    app.font=make(14,FW_NORMAL);app.titleFont=make(24,FW_SEMIBOLD);app.smallFont=make(12,FW_NORMAL);
+    app.strongFont=make(14,FW_SEMIBOLD);app.headerFont=make(12,FW_SEMIBOLD);
     EnumChildWindows(app.window,[](HWND w,LPARAM p)->BOOL { SendMessageW(w,WM_SETFONT,p,TRUE); return TRUE; },reinterpret_cast<LPARAM>(app.font));
-    for(HWND child:{app.statusText,app.statusDetails,app.startDelayHint,app.nightHint,app.nightDetail,app.skipDetail})if(child)SendMessageW(child,WM_SETFONT,reinterpret_cast<WPARAM>(app.smallFont),TRUE);
+    for(HWND child:{app.statusText,app.statusDetails,app.startDelayHint,app.nightHint,app.nightDetail,app.skipSummary,app.skipDetail,app.watermarkSummary})
+        if(child)SendMessageW(child,WM_SETFONT,reinterpret_cast<WPARAM>(app.smallFont),TRUE);
 }
 
 enum class CustomKind { Interval, Size, Limit, Range, Segment, Night };
@@ -2673,6 +2939,178 @@ RECT layerGripRect(const RECT& layer,int preferredPixels) {
     const LONG gripWidth=std::min<LONG>(preferredPixels,std::max(1L,width/3)),gripHeight=std::min<LONG>(preferredPixels,std::max(1L,height/3));
     return {layer.right-gripWidth,layer.bottom-gripHeight,layer.right,layer.bottom};
 }
+struct StateLook { const wchar_t* label; COLORREF fill, ink; };
+StateLook stateLook() {
+    switch(app.status.state) {
+    case State::Recording:return {L"Recording",DangerSoft,Danger};
+    case State::Paused:return {L"Paused",WarningSoft,Warning};
+    case State::Waiting:return {L"Waiting to start",InfoSoft,Info};
+    case State::Starting:return {L"Preparing",InfoSoft,Info};
+    case State::Finishing:return {L"Saving",InfoSoft,Info};
+    default:return app.status.recordingFailed?StateLook{L"Stopped",DangerSoft,Danger}:StateLook{L"Ready",RGB(230,232,235),Muted};
+    }
+}
+std::wstring stageHint() {
+    if(app.settings.separateFiles)return L"Desktop and camera each save to their own MP4.";
+    if(app.settings.layers.size()>1)return L"Drag a layer to move it. Pull its corner to resize.";
+    return L"Preview · "+sizeText(app.settings.width,app.settings.height)+L" at "+std::to_wstring(app.settings.outputFps)+L" fps";
+}
+// Antialiased glyph from a signed-distance function in box pixels; the box is
+// small, so this costs a few hundred pixel evaluations per button paint.
+template<class Distance> void shade(HDC dc,const RECT& box,COLORREF ink,COLORREF backdrop,Distance distance) {
+    const int w=box.right-box.left,h=box.bottom-box.top;
+    if(w<=0 || h<=0 || w>48 || h>48)return;
+    std::array<uint32_t,48*48> pixels{};
+    BITMAPINFO info{};info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);info.bmiHeader.biWidth=w;info.bmiHeader.biHeight=-h;
+    info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;info.bmiHeader.biCompression=BI_RGB;
+    for(int y=0;y<h;++y)for(int x=0;x<w;++x){const COLORREF color=blend(backdrop,ink,coverage(distance(x+.5,y+.5),1.0));
+        pixels[size_t(y)*w+x]=(uint32_t(GetRValue(color))<<16)|(uint32_t(GetGValue(color))<<8)|GetBValue(color);}
+    StretchDIBits(dc,box.left,box.top,w,h,0,0,w,h,pixels.data(),&info,DIB_RGB_COLORS,SRCCOPY);
+}
+enum class Glyph { None, Dot, Bars, Play, Square, ChevronDown, ChevronUp };
+void glyph(HDC dc,Glyph kind,const RECT& box,COLORREF ink,COLORREF backdrop) {
+    const double s=box.right-box.left;
+    // Convex shapes use the largest outward edge distance of their sides.
+    const auto triangle=[s](double x,double y){
+        const double points[][2]={{.22*s,.1*s},{.94*s,.5*s},{.22*s,.9*s}};double distance=-1e9;
+        for(int i=0;i<3;++i){const auto& a=points[i];const auto& b=points[(i+1)%3];const double dx=b[0]-a[0],dy=b[1]-a[1],length=std::hypot(dx,dy);
+            distance=std::max(distance,((x-a[0])*dy-(y-a[1])*dx)/length);}
+        return distance;};
+    const double stroke=std::max(1.4,s/7);
+    switch(kind) {
+    case Glyph::Dot:shade(dc,box,ink,backdrop,[s](double x,double y){return std::hypot(x-s/2,y-s/2)-s*.42;});break;
+    case Glyph::Bars:shade(dc,box,ink,backdrop,[s](double x,double y){return std::min(boxDistance(x,y,s*.27,s/2,s*.14,s*.44,1),boxDistance(x,y,s*.73,s/2,s*.14,s*.44,1));});break;
+    case Glyph::Play:shade(dc,box,ink,backdrop,triangle);break;
+    case Glyph::Square:shade(dc,box,ink,backdrop,[s](double x,double y){return boxDistance(x,y,s/2,s/2,s*.4,s*.4,s*.12);});break;
+    case Glyph::ChevronDown:case Glyph::ChevronUp:{
+        const double top=kind==Glyph::ChevronDown?s*.32:s*.68,tip=kind==Glyph::ChevronDown?s*.68:s*.32;
+        shade(dc,box,ink,backdrop,[=](double x,double y){return std::min(segmentDistance(x,y,s*.12,top,s*.5,tip),segmentDistance(x,y,s*.5,tip,s*.88,top))-stroke/2;});break;}
+    default:break;
+    }
+}
+enum class ButtonLook { None, Primary, Secondary, Quiet, Disclosure };
+ButtonLook buttonLook(HWND button) {
+    if(!button)return ButtonLook::None;
+    if(button==app.record)return ButtonLook::Primary;
+    if(button==app.advanced)return ButtonLook::Disclosure;
+    if(button==app.statusDetails)return ButtonLook::Quiet;
+    for(HWND member:{app.pause,app.finish,app.refresh,app.folder,app.openFolder,app.reset,app.forward,app.skipConfigure,app.watermarkConfigure,app.playbackConfigure})
+        if(member==button)return ButtonLook::Secondary;
+    return ButtonLook::None;
+}
+COLORREF controlBackdrop(HWND child) {
+    return child==app.record || child==app.pause || child==app.finish || panelControl(child)?Panel:Background;
+}
+// Native buttons keep their behavior, state, keyboard and accessibility; only
+// their face is painted here, through comctl32 custom draw.
+LRESULT drawButton(const NMCUSTOMDRAW& draw) {
+    const HWND button=draw.hdr.hwndFrom;const auto look=buttonLook(button);
+    if(look==ButtonLook::None || draw.dwDrawStage!=CDDS_PREPAINT)return CDRF_DODEFAULT;
+    const HDC dc=draw.hdc;const RECT r=draw.rc;
+    const auto state=SendMessageW(button,BM_GETSTATE,0,0),cues=SendMessageW(button,WM_QUERYUISTATE,0,0);
+    const bool enabled=IsWindowEnabled(button)!=FALSE && !(draw.uItemState&CDIS_DISABLED);
+    const bool pressed=enabled && ((state&BST_PUSHED) || (draw.uItemState&CDIS_SELECTED));
+    const bool hot=enabled && ((state&BST_HOT) || (draw.uItemState&CDIS_HOT));
+    const bool focused=(draw.uItemState&CDIS_FOCUS) && !(cues&UISF_HIDEFOCUS);
+    const COLORREF backdrop=controlBackdrop(button);
+    COLORREF fill=Panel,edge=Border,ink=enabled?Ink:Subtle;
+    switch(look) {
+    case ButtonLook::Primary:
+        fill=!enabled?RGB(233,235,238):pressed?RGB(158,33,21):hot?RGB(177,38,25):Danger;edge=fill;ink=enabled?RGB(255,255,255):Subtle;break;
+    case ButtonLook::Quiet:
+        fill=pressed?RGB(222,227,232):hot?RGB(232,236,240):backdrop;edge=fill;ink=enabled?Accent:Subtle;break;
+    default:
+        fill=!enabled?blend(backdrop,Panel,.5):pressed?RGB(229,232,236):hot?RGB(242,244,246):Panel;
+        edge=enabled?Border:RGB(232,235,238);
+        if(look==ButtonLook::Disclosure && enabled && app.advancedWarning)ink=Danger;
+        break;
+    }
+    if(focused)edge=Ink;
+    roundRect(dc,r,app.scale(look==ButtonLook::Primary?6:5),fill,backdrop,edge,focused?std::max(2,app.scale(2)):1);
+    wchar_t caption[128]{};GetWindowTextW(button,caption,static_cast<int>(std::size(caption)));
+    Glyph kind=Glyph::None;
+    if(button==app.record)kind=Glyph::Dot;
+    else if(button==app.pause)kind=std::wcsstr(caption,L"Resume")?Glyph::Play:Glyph::Bars;
+    else if(button==app.finish && !std::wcsstr(caption,L"Cancel"))kind=Glyph::Square;
+    else if(look==ButtonLook::Disclosure)kind=(state&BST_CHECKED)?Glyph::ChevronUp:Glyph::ChevronDown;
+    const HFONT owned=reinterpret_cast<HFONT>(SendMessageW(button,WM_GETFONT,0,0));
+    const auto previousFont=SelectObject(dc,look==ButtonLook::Primary && app.strongFont?app.strongFont:owned?owned:app.font);
+    const UINT prefix=(cues&UISF_HIDEACCEL)?DT_HIDEPREFIX:0;
+    SetBkMode(dc,TRANSPARENT);SetTextColor(dc,ink);
+    const int icon=kind==Glyph::None?0:app.scale(10),middle=(r.top+r.bottom)/2;
+    if(look==ButtonLook::Disclosure) {
+        const int inset=app.scale(14);
+        RECT label{r.left+inset,r.top,r.right-inset-icon-app.scale(8),r.bottom};
+        DrawTextW(dc,caption,-1,&label,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|prefix);
+        glyph(dc,kind,{r.right-inset-icon,middle-icon/2,r.right-inset,middle-icon/2+icon},enabled?Muted:Subtle,fill);
+    } else {
+        RECT measured{};DrawTextW(dc,caption,-1,&measured,DT_CALCRECT|DT_SINGLELINE|prefix);
+        const int gap=app.scale(8),textW=measured.right-measured.left;
+        // Drop the glyph rather than clip a translated or longer caption.
+        const bool withIcon=icon && textW+icon+gap+app.scale(20)<=r.right-r.left;
+        const int content=textW+(withIcon?icon+gap:0);
+        int x=r.left+std::max(app.scale(8),static_cast<int>((r.right-r.left-content)/2));
+        if(withIcon){glyph(dc,kind,{x,middle-icon/2,x+icon,middle-icon/2+icon},ink,fill);x+=icon+gap;}
+        RECT label{x,r.top,r.right-app.scale(6),r.bottom};
+        DrawTextW(dc,caption,-1,&label,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|prefix);
+    }
+    SelectObject(dc,previousFont);
+    return CDRF_SKIPDEFAULT;
+}
+void paintHeader(HDC dc) {
+    const RECT band=app.headerRect;if(band.right<=band.left)return;
+    const auto look=stateLook();
+    const int height=app.scale(26),top=band.top+(band.bottom-band.top-height)/2,inset=app.scale(11),mark=app.scale(8),space=app.scale(7);
+    RECT pill{band.left,top,std::min<LONG>(band.right,band.left+2*inset+mark+space+textWidth(dc,look.label,app.headerFont)),top+height};
+    roundRect(dc,pill,height/2,look.fill,Background);
+    const int markX=pill.left+inset,markY=top+(height-mark)/2;
+    glyph(dc,app.status.state==State::Paused?Glyph::Bars:Glyph::Dot,{markX,markY,markX+mark,markY+mark},look.ink,look.fill);
+    text(dc,look.label,{markX+mark+space,pill.top,pill.right,pill.bottom},look.ink,app.headerFont);
+    text(dc,stageHint(),{pill.right+app.scale(12),band.top,band.right,band.bottom},Muted,app.smallFont);
+}
+void paintStats(HDC dc) {
+    const RECT r=app.statsRect;if(r.right<=r.left)return;
+    std::wstring primary,secondary;HFONT primaryFont=app.strongFont;
+    if((app.active() && app.status.state!=State::Waiting) || app.status.frames) {
+        primary=timeText(app.status.elapsed,true);primaryFont=app.titleFont;
+        secondary=std::to_wstring(app.status.frames)+L" frames  ·  "+timeText(double(app.status.frames)/std::clamp(app.recordedOutputFps,MinOutputFps,MaxOutputFps),false)+L" video";
+    } else if(skipEnabled()) {
+        primary=L"Base interval "+formatDuration(app.settings.intervalMs);
+        secondary=L"Time compression up to "+std::to_wstring(app.settings.timeSkip.multiplier)+L"×";
+    } else {
+        primary=L"Every "+formatDuration(app.settings.intervalMs);
+        wchar_t buffer[96]{};const double videoSeconds=3600000.0/(double(std::max(MinCaptureIntervalMs,app.settings.intervalMs))*app.settings.outputFps);
+        swprintf_s(buffer,L"1 hour → %.*f s video",videoSeconds<1?3:videoSeconds<10?1:0,videoSeconds);secondary=buffer;
+    }
+    if(app.status.completedSegments)secondary+=L"  ·  "+std::to_wstring(app.status.completedSegments)+(app.status.completedSegments==1?L" part saved":L" parts saved");
+    const int split=r.top+(r.bottom-r.top)*3/5;
+    text(dc,primary,{r.left,r.top,r.right,split},Ink,primaryFont,DT_LEFT|DT_BOTTOM|DT_SINGLELINE|DT_END_ELLIPSIS);
+    text(dc,secondary,{r.left,split+app.scale(2),r.right,r.bottom},Muted,app.smallFont,DT_LEFT|DT_TOP|DT_SINGLELINE|DT_END_ELLIPSIS);
+}
+void paintPanel(HDC dc) {
+    const int pad=app.scale(PanelPad),left=app.panelRect.left+pad,right=app.panelRect.right-pad,offset=app.panelScroll;
+    static constexpr const wchar_t* Headings[]={L"INPUT",L"OUTPUT",L"SAVE TO"};
+    const int spacing=SetTextCharacterExtra(dc,std::max(1,app.scale(1)));
+    for(int i=0;i<3;++i){const int top=app.sectionTops[i]-offset;text(dc,Headings[i],{left,top,right-app.scale(100),top+app.scale(30)},Muted,app.headerFont);}
+    SetTextCharacterExtra(dc,spacing);
+    for(int i=0;i<app.panelRuleCount;++i){const int y=app.panelRules[i]-offset;solid(dc,{left,y,right,y+1},Border);}
+    RECT path=app.savePathRect;OffsetRect(&path,0,-offset);
+    text(dc,app.settings.folder,path,Ink,app.smallFont,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_PATH_ELLIPSIS);
+}
+// Paints the parent surface in client coordinates; children are clipped out.
+void paintWindow(HDC dc,const RECT& dirty) {
+    const int divider=app.panelRect.left-app.scrollX;
+    solid(dc,{dirty.left,dirty.top,std::min<LONG>(dirty.right,divider),dirty.bottom},Background);
+    solid(dc,{std::max<LONG>(dirty.left,divider),dirty.top,dirty.right,dirty.bottom},Panel);
+    solid(dc,{divider,dirty.top,divider+1,dirty.bottom},Border);
+    POINT origin{};OffsetViewportOrgEx(dc,-app.scrollX,-app.scrollY,&origin);
+    RECT logical=dirty;OffsetRect(&logical,app.scrollX,app.scrollY);
+    const auto touches=[&](const RECT& area){RECT overlap{};return IntersectRect(&overlap,&logical,&area)!=FALSE;};
+    if(touches(app.headerRect))paintHeader(dc);
+    if(touches(app.transportRect)){roundRect(dc,app.transportRect,app.scale(8),Panel,Background,Border,1);paintStats(dc);}
+    if(touches(app.panelRect))paintPanel(dc);
+    SetViewportOrgEx(dc,origin.x,origin.y,nullptr);
+}
 void customized() {
     app.settings.separateFiles=false;
     app.modeIndex=static_cast<int>(Mode::Custom); choose(app.mode,app.modeIndex);
@@ -2684,7 +3122,12 @@ LRESULT CALLBACK previewProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
         PAINTSTRUCT ps; HDC dc=BeginPaint(w,&ps); RECT r; GetClientRect(w,&r);
-        HDC mem=CreateCompatibleDC(dc); HBITMAP bmp=CreateCompatibleBitmap(dc,std::max(1L,r.right),std::max(1L,r.bottom)); auto old=SelectObject(mem,bmp);
+        HDC mem=CreateCompatibleDC(dc);
+        BITMAPINFO surface{};surface.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);surface.bmiHeader.biWidth=std::max(1L,r.right);
+        surface.bmiHeader.biHeight=-std::max(1L,r.bottom);surface.bmiHeader.biPlanes=1;surface.bmiHeader.biBitCount=32;surface.bmiHeader.biCompression=BI_RGB;
+        void* pixels=nullptr;HBITMAP bmp=mem?CreateDIBSection(dc,&surface,DIB_RGB_COLORS,&pixels,nullptr,0):nullptr;
+        if(!mem || !bmp){if(bmp)DeleteObject(bmp);if(mem)DeleteDC(mem);FillRect(dc,&r,app.background);EndPaint(w,&ps);return 0;}
+        auto old=SelectObject(mem,bmp);
         HBRUSH bg=CreateSolidBrush(Canvas); FillRect(mem,&r,bg); DeleteObject(bg);
         app.videoRect=previewVideoRect(r);
         const int width=app.videoRect.right-app.videoRect.left, height=app.videoRect.bottom-app.videoRect.top;
@@ -2706,6 +3149,18 @@ LRESULT CALLBACK previewProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
             HBRUSH label=CreateSolidBrush(RGB(23,41,47));FillRect(mem,&tag,label);DeleteObject(label);
             text(mem,app.settings.layers[i].source==Source::Desktop?L"Desktop":L"Camera",tag,RGB(239,248,250),app.smallFont,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
             if(selected) {RECT handle=layerGripRect(layer,app.scale(12));HBRUSH h=CreateSolidBrush(RGB(83,229,205));FillRect(mem,&handle,h);DeleteObject(h);}
+        }
+        // Only the small corner squares need alpha coverage. Blend the finished
+        // preview into the stage background, including video and layer handles.
+        GdiFlush();
+        const int radius=std::min({app.scale(8),int(r.right)/2,int(r.bottom)/2,48});
+        auto surfacePixels=static_cast<uint32_t*>(pixels);
+        for(int corner=0;corner<4;++corner)for(int y=0;y<radius;++y)for(int x=0;x<radius;++x){
+            const double dx=radius-(x+.5),dy=radius-(y+.5),alpha=std::clamp(radius-std::hypot(dx,dy)+.5,0.0,1.0);
+            const int px=(corner&1)?r.right-1-x:x,py=(corner&2)?r.bottom-1-y:y;
+            auto& pixel=surfacePixels[size_t(py)*surface.bmiHeader.biWidth+px];
+            const COLORREF color=blend(Background,RGB((pixel>>16)&255,(pixel>>8)&255,pixel&255),alpha);
+            pixel=(uint32_t(GetRValue(color))<<16)|(uint32_t(GetGValue(color))<<8)|GetBValue(color);
         }
         BitBlt(dc,0,0,r.right,r.bottom,mem,0,0,SRCCOPY);SelectObject(mem,old);DeleteObject(bmp);DeleteDC(mem);EndPaint(w,&ps);return 0;
     }
@@ -2762,7 +3217,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         cancelOpenFolder();app.shellBusyObserved=shellOperationBusy.load(std::memory_order_acquire);app.openFolderBusyShown=false;
         app.startupComplete=false;app.advancedExpanded=false;app.advancedLimitIndex=app.advancedVisibility=-1;
         app.advancedSegmentSeconds=-1;
-        app.advancedCursorState=app.advancedDelaySeconds=-1;app.committedStartDelay=0;
+        app.advancedCursorState=app.cursorVisibility=app.advancedDelaySeconds=-1;app.committedStartDelay=0;
         app.waitingRemaining=UINT64_MAX;app.waitingCaption.clear();
         app.failureNotice=FailureNotice::None;
         app.trayMenuOpen=app.trayMenuCanceled=false;
@@ -2781,8 +3236,15 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         app.committedSegment=0;app.customSegmentSeconds=900;app.hasCustomSegment=false;
         app.committedNightDuration=0;app.customNightDurationMs=NightInitialDurationMs;app.hasCustomNightDuration=false;
         app.visibleDirty=true;app.controlsUpdated=false;app.trayStateValid=false;
+        app.scrollX=app.scrollY=app.panelScroll=app.wheelVertical=app.wheelHorizontal=app.wheelPanel=0;
+        app.contentWidth=app.contentHeight=app.panelHeight=app.advancedTop=0;
+        app.panelDocked=true;app.collageTools=app.advancedWarning=false;
         try {
         app.window=w;app.dpi=static_cast<int>(GetDpiForWindow(w));fonts();
+        // Attribute 35 is DWMWA_CAPTION_COLOR. Older Windows/SDKs simply
+        // retain their normal title bar when the attribute is unsupported.
+        const COLORREF captionColor=Background;
+        DwmSetWindowAttribute(w,35,&captionColor,sizeof(captionColor));
         bool controlsReady=true;
         auto requiredControl=[&](LPCWSTR cls,LPCWSTR name,DWORD style,int id) {
             HWND child=control(cls,name,style,id);
@@ -2794,52 +3256,50 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
             app.labels[index]=requiredControl(L"STATIC",label,0,200+index);
             return requiredControl(L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL,id);
         };
+        auto button=[&](const wchar_t* s,int id){return requiredControl(L"BUTTON",s,WS_TABSTOP|BS_PUSHBUTTON,id);};
+        app.reset=button(L"Reset layout",Reset);app.forward=button(L"Bring forward",Forward);
+        app.preview=requiredControl(L"LapsePreview",L"Collage preview. Space selects a layer. Arrow keys move it. Shift and arrow keys resize it.",WS_TABSTOP,Preview);
+        app.record=button(L"&Record",Record);app.pause=button(L"&Pause",Pause);app.finish=button(L"&Finish",Finish);
+        app.statusText=requiredControl(L"STATIC",app.status.message.c_str(),SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX|SS_NOTIFY,210);
+        app.statusDetails=button(L"Deta&ils...",StatusDetails);
+        app.refresh=button(L"Re&fresh",Refresh);
         app.mode=combo(0,L"&Source",ModeBox);for(auto s:{L"Desktop",L"Camera",L"Desktop + camera",L"Side by side",L"Custom collage",SeparateFilesLabel})add(app.mode,s);
+        app.monitor=combo(4,L"&Display",MonitorBox);app.camera=combo(5,L"Ca&mera",CameraBox);
         app.interval=combo(1,L"Capture &every",IntervalBox);for(auto s:{L"1 second",L"2 seconds",L"5 seconds",L"10 seconds",L"30 seconds",L"60 seconds"})add(app.interval,s);
         app.videoSize=combo(2,L"Video si&ze",SizeBox);add(app.videoSize,L"720p");add(app.videoSize,L"1080p");
         app.encodingQuality=combo(3,L"Video &quality",EncodingQualityBox);for(auto s:{L"Smaller file",L"Balanced",L"More detail"})add(app.encodingQuality,s);
-        app.monitor=combo(4,L"&Display",MonitorBox);app.camera=combo(5,L"Ca&mera",CameraBox);
-        auto button=[&](const wchar_t* s,int id){return requiredControl(L"BUTTON",s,WS_TABSTOP|BS_PUSHBUTTON,id);};
+        app.folder=button(L"C&hange...",Folder);app.openFolder=button(L"&Open folder",OpenFolder);
         app.advanced=requiredControl(L"BUTTON",L"&Advanced",WS_TABSTOP|BS_AUTOCHECKBOX|BS_PUSHLIKE,AdvancedToggle);
-        app.refresh=button(L"Re&fresh",Refresh);
         app.encodingMode=combo(6,L"Encodin&g",EncodingModeBox);
         for(auto label:EncodingModeLabels)add(app.encodingMode,label);
-        app.stopAfter=combo(7,L"S&top after",StopAfterBox);for(auto label:RecordingLimitLabels)add(app.stopAfter,label);
-        app.lowDisk=requiredControl(L"BUTTON",L"Stop on &low disk space",WS_TABSTOP|BS_AUTOCHECKBOX,LowDiskBox);
         app.recoveryMode=requiredControl(L"BUTTON",L"MP4 recover&y mode (H.264)",WS_TABSTOP|BS_AUTOCHECKBOX,RecoveryBox);
+        app.stopAfter=combo(7,L"S&top after",StopAfterBox);for(auto label:RecordingLimitLabels)add(app.stopAfter,label);
         app.segmentLabel=requiredControl(L"STATIC",L"Split files e&very",0,211);
         app.splitEvery=requiredControl(L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL,SegmentBox);for(auto label:SegmentLabels)add(app.splitEvery,label);
-        app.captureCursor=requiredControl(L"BUTTON",L"Show des&ktop cursor",WS_TABSTOP|BS_AUTOCHECKBOX,CursorBox);
-        SendMessageW(app.captureCursor,BM_SETCHECK,BST_CHECKED,0);
         app.startDelayLabel=requiredControl(L"STATIC",L"Delay ne&xt recording",0,212);
         app.startDelay=requiredControl(L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL,StartDelayBox);
         for(auto label:StartDelayLabels)add(app.startDelay,label);choose(app.startDelay,0);
         app.startDelayHint=requiredControl(L"STATIC",L"Preparation starts after the delay. Visible preview continues; Stop after counts active time.",SS_LEFT|SS_NOPREFIX,213);
+        app.lowDisk=requiredControl(L"BUTTON",L"Stop on &low disk space",WS_TABSTOP|BS_AUTOCHECKBOX,LowDiskBox);
+        app.captureCursor=requiredControl(L"BUTTON",L"Show des&ktop cursor",WS_TABSTOP|BS_AUTOCHECKBOX,CursorBox);
+        SendMessageW(app.captureCursor,BM_SETCHECK,BST_CHECKED,0);
         app.skipConfigure=button(L"Time &compression...",SkipConfigure);
-        app.skipSummary=requiredControl(L"STATIC",L"Off",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX,SkipSummary);
-        app.skipDetail=requiredControl(L"STATIC",L"",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX,SkipDetail);
+        app.skipSummary=requiredControl(L"STATIC",L"Off",SS_LEFT|SS_ENDELLIPSIS|SS_NOPREFIX|SS_NOTIFY,SkipSummary);
+        app.skipDetail=requiredControl(L"STATIC",L"",SS_LEFT|SS_ENDELLIPSIS|SS_NOPREFIX|SS_NOTIFY,SkipDetail);
         app.watermarkConfigure=button(L"&Watermark...",WatermarkConfigure);
         app.watermarkSummary=requiredControl(L"STATIC",L"Off",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX,WatermarkSummary);
         app.playbackConfigure=button(L"Playback && shortcuts...",PlaybackConfigure);
         app.nightEnabled=requiredControl(L"BUTTON",L"&Night camera (software blend)",WS_TABSTOP|BS_AUTOCHECKBOX,NightBox);
         app.nightDuration=combo(8,L"Blend d&uration",NightDurationBox);for(auto label:NightDurationLabels)add(app.nightDuration,label);
         app.nightTarget=combo(9,L"Auto &brightness",NightTargetBox);for(auto label:{L"Dark",L"Balanced",L"Bright"})add(app.nightTarget,label);
-        app.nightHint=requiredControl(L"STATIC",L"",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX,NightHint);
-        app.nightDetail=requiredControl(L"STATIC",L"",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX,NightDetail);
-        app.record=button(L"●  &Record",Record);app.pause=button(L"&Pause",Pause);app.finish=button(L"&Finish",Finish);app.folder=button(L"C&hange...",Folder);app.openFolder=button(L"&Open folder",OpenFolder);app.reset=button(L"Reset layout",Reset);app.forward=button(L"Bring forward",Forward);
-        app.preview=requiredControl(L"LapsePreview",L"Collage preview. Space selects a layer. Arrow keys move it. Shift and arrow keys resize it.",WS_TABSTOP,Preview);
-        app.statusText=requiredControl(L"STATIC",app.status.message.c_str(),SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX,210);
-        app.statusDetails=button(L"Deta&ils...",StatusDetails);
+        app.nightHint=requiredControl(L"STATIC",L"",SS_LEFT|SS_ENDELLIPSIS|SS_NOPREFIX|SS_NOTIFY,NightHint);
+        app.nightDetail=requiredControl(L"STATIC",L"",SS_LEFT|SS_ENDELLIPSIS|SS_NOPREFIX|SS_NOTIFY,NightDetail);
         if(!controlsReady) {
             app.mode=nullptr;
             OutputDebugStringW(L"Timelapse could not create its required controls.\n");
             return -1;
         }
-        SendMessageW(app.statusText,WM_SETFONT,reinterpret_cast<WPARAM>(app.smallFont),TRUE);
-        SendMessageW(app.statusDetails,WM_SETFONT,reinterpret_cast<WPARAM>(app.smallFont),TRUE);
-        SendMessageW(app.nightHint,WM_SETFONT,reinterpret_cast<WPARAM>(app.smallFont),TRUE);SendMessageW(app.nightDetail,WM_SETFONT,reinterpret_cast<WPARAM>(app.smallFont),TRUE);
-        SendMessageW(app.skipDetail,WM_SETFONT,reinterpret_cast<WPARAM>(app.smallFont),TRUE);
-        SendMessageW(app.startDelayHint,WM_SETFONT,reinterpret_cast<WPARAM>(app.smallFont),TRUE);
+        fonts();
         app.tooltip=CreateWindowExW(WS_EX_TOPMOST,TOOLTIPS_CLASSW,nullptr,WS_POPUP|TTS_ALWAYSTIP|TTS_NOPREFIX,0,0,0,0,w,nullptr,nullptr,nullptr);
         TOOLINFOW tip{sizeof(tip)};tip.uFlags=TTF_IDISHWND|TTF_SUBCLASS;tip.hwnd=w;tip.uId=reinterpret_cast<UINT_PTR>(app.statusText);tip.lpszText=LPSTR_TEXTCALLBACKW;
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));SendMessageW(app.tooltip,TTM_SETMAXTIPWIDTH,0,app.scale(520));
@@ -2885,6 +3345,8 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
         tip.lpszText=LPSTR_TEXTCALLBACKW;
         for(HWND child:{app.nightHint,app.nightDetail,app.skipSummary,app.skipDetail}){tip.uId=reinterpret_cast<UINT_PTR>(child);SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));}
+        tip.uFlags=TTF_SUBCLASS;tip.uId=SavePathTip;tip.rect={};tip.lpszText=LPSTR_TEXTCALLBACKW;
+        SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
         preferences(false);refreshSources();changeLayout(true);
         try {
             app.engine=std::make_unique<Engine>();
@@ -2921,27 +3383,14 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         if(lp)break;
         scrollBar(msg==WM_VSCROLL?SB_VERT:SB_HORZ,LOWORD(wp));return 0;
     case WM_MOUSEWHEEL:case WM_MOUSEHWHEEL: {
-        if(GET_KEYSTATE_WPARAM(wp)&MK_CONTROL)break;
-        const bool horizontal=msg==WM_MOUSEHWHEEL || (GET_KEYSTATE_WPARAM(wp)&MK_SHIFT);
-        RECT viewport;GetClientRect(w,&viewport);
-        const int size=horizontal?viewport.right:viewport.bottom;
-        if((horizontal?app.contentWidth:app.contentHeight)<=size)break;
-        UINT lines=3;
-        SystemParametersInfoW(horizontal?SPI_GETWHEELSCROLLCHARS:SPI_GETWHEELSCROLLLINES,0,&lines,0);
-        int& remainder=horizontal?app.wheelHorizontal:app.wheelVertical;
-        // Horizontal wheel positive means right; vertical wheel positive means up.
-        remainder+=GET_WHEEL_DELTA_WPARAM(wp)*(msg==WM_MOUSEHWHEEL?1:-1);
-        const int steps=remainder/WHEEL_DELTA;remainder%=WHEEL_DELTA;
-        const int page=std::max(1,size-app.scale(24));
-        const int amount=lines==WHEEL_PAGESCROLL?page:
-            static_cast<int>(std::min<uint64_t>(uint64_t(lines)*app.scale(20),page));
-        scrollTo(app.scrollX+(horizontal?steps*amount:0),app.scrollY+(horizontal?0:steps*amount));
-        return 0;
+        if(wheelScroll(msg,wp,pointInPanel({GET_X_LPARAM(lp),GET_Y_LPARAM(lp)})))return 0;
+        break;
     }
     case WM_DPICHANGED: {
         endLayoutDrag();
         const int dpi=HIWORD(wp);
         app.scrollX=MulDiv(app.scrollX,dpi,app.dpi);app.scrollY=MulDiv(app.scrollY,dpi,app.dpi);
+        app.panelScroll=MulDiv(app.panelScroll,dpi,app.dpi);
         app.dpi=dpi;fonts();auto suggested=reinterpret_cast<RECT*>(lp);
         const RECT r=fitWindow(*suggested,workArea(MonitorFromRect(suggested,MONITOR_DEFAULTTONEAREST)));
         SetWindowPos(w,nullptr,r.left,r.top,r.right-r.left,r.bottom-r.top,SWP_NOZORDER|SWP_NOACTIVATE);layout();revealFocusedControl();return 0;
@@ -2949,7 +3398,9 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
     case WM_GETMINMAXINFO: {
         auto info=reinterpret_cast<MINMAXINFO*>(lp);
         const RECT work=workArea(MonitorFromWindow(w,MONITOR_DEFAULTTONEAREST));
-        info->ptMinTrackSize={std::min<LONG>(app.scale(830),work.right-work.left),std::min<LONG>(app.scale(600),work.bottom-work.top)};
+        RECT minimum{0,0,app.scale(StageMinWidth+PanelWidth)+GetSystemMetricsForDpi(SM_CXVSCROLL,app.dpi),app.scale(StageMinHeight)};
+        AdjustWindowRectExForDpi(&minimum,WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,FALSE,0,app.dpi);
+        info->ptMinTrackSize={std::min<LONG>(minimum.right-minimum.left,work.right-work.left),std::min<LONG>(minimum.bottom-minimum.top,work.bottom-work.top)};
         return 0;
     }
     case WM_TIMER: {
@@ -2979,6 +3430,10 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
     case WM_COMMAND: {
         if(app.failureNotice==FailureNotice::Presenting)return 0;
         const int id=LOWORD(wp),code=HIWORD(wp);
+        // SS_NOTIFY gives static labels mouse input for hover tooltips. Their
+        // STN_CLICKED value equals BN_CLICKED; never treat them as buttons.
+        if(lp && (reinterpret_cast<HWND>(lp)==app.statusText || reinterpret_cast<HWND>(lp)==app.nightHint ||
+           reinterpret_cast<HWND>(lp)==app.nightDetail || reinterpret_cast<HWND>(lp)==app.skipSummary || reinterpret_cast<HWND>(lp)==app.skipDetail))return 0;
         if(id==SizeBox && code==CBN_DROPDOWN){refreshSizeSuggestions();return 0;}
         if(code==CBN_SELCHANGE){
             if(app.active() && (id==EncodingModeBox || id==NightDurationBox || id==NightTargetBox || id==IntervalBox || id==SizeBox || id==StopAfterBox || id==SegmentBox || id==StartDelayBox)){
@@ -3055,6 +3510,11 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         }return 0;
     }
     case WM_NOTIFY:
+        if(reinterpret_cast<NMHDR*>(lp)->code==NM_CUSTOMDRAW && buttonLook(reinterpret_cast<NMHDR*>(lp)->hwndFrom)!=ButtonLook::None)
+            return drawButton(*reinterpret_cast<NMCUSTOMDRAW*>(lp));
+        if(reinterpret_cast<NMHDR*>(lp)->code==TTN_GETDISPINFOW && reinterpret_cast<NMHDR*>(lp)->idFrom==SavePathTip){
+            reinterpret_cast<NMTTDISPINFOW*>(lp)->lpszText=const_cast<LPWSTR>(app.settings.folder.c_str());return 0;
+        }
         if(reinterpret_cast<NMHDR*>(lp)->code==TTN_GETDISPINFOW){
             auto info=reinterpret_cast<NMTTDISPINFOW*>(lp);const auto child=reinterpret_cast<HWND>(info->hdr.idFrom);
             info->lpszText=const_cast<LPWSTR>(child==app.statusText?statusTooltip():child==app.videoSize?videoSizeTooltip():
@@ -3063,29 +3523,25 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         }break;
     case WM_CTLCOLORSTATIC: {
         const auto child=reinterpret_cast<HWND>(lp);const bool warning=(child==app.statusText && statusCaptionError()) || (child==app.nightHint && !app.nightValidation.empty());
-        SetBkColor(reinterpret_cast<HDC>(wp),Background);SetTextColor(reinterpret_cast<HDC>(wp),warning?RGB(174,53,44):Muted);return reinterpret_cast<LRESULT>(app.background);
+        bool label=child==app.segmentLabel || child==app.startDelayLabel;
+        for(HWND value:app.labels)label=label || child==value;
+        const bool panel=panelControl(child);
+        SetBkColor(reinterpret_cast<HDC>(wp),panel?Panel:Background);SetTextColor(reinterpret_cast<HDC>(wp),warning?Danger:label?Ink:Muted);
+        return reinterpret_cast<LRESULT>(panel?app.panelBrush:app.background);
     }
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: {
-        PAINTSTRUCT ps;HDC dc=BeginPaint(w,&ps);RECT r;GetClientRect(w,&r);FillRect(dc,&ps.rcPaint,app.background);
-        SetViewportOrgEx(dc,-app.scrollX,-app.scrollY,nullptr);
-        r.right=app.contentWidth;r.bottom=app.contentHeight;
-        int p=app.scale(26);RECT title={p,app.scale(14),r.right-p,app.scale(53)};text(dc,L"Timelapse",title,Ink,app.titleFont);
-        RECT badge={r.right-app.scale(280),app.scale(20),r.right-p,app.scale(49)};
-        std::wstring state=app.status.state==State::Recording?L"●  RECORDING":app.status.state==State::Paused?L"Ⅱ  PAUSED":app.status.state==State::Waiting?L"WAITING":app.status.state==State::Starting?L"PREPARING":app.status.state==State::Finishing?L"SAVING":L"DESKTOP + CAMERA";
-        text(dc,state,badge,app.status.state==State::Recording?Accent:Muted,app.smallFont,DT_RIGHT|DT_VCENTER|DT_SINGLELINE);
-        RECT hint={p,r.bottom-app.scale(180),r.right-p-app.scale(251),r.bottom-app.scale(150)};
-        text(dc,app.settings.separateFiles?L"Desktop and camera each save to their own MP4.":app.settings.layers.size()>1?L"Drag a layer to move it. Pull its corner to resize.":L"Preview · your recording is saved at "+std::to_wstring(app.settings.outputFps)+L" fps",hint,Muted,app.smallFont);
-        RECT stats={p,r.bottom-app.scale(147),r.right-p,r.bottom-app.scale(123)};
-        std::wstring detail;
-        if((app.active() && app.status.state!=State::Waiting) || app.status.frames)detail=std::to_wstring(app.status.frames)+L" frames  ·  "+timeText(double(app.status.frames)/std::clamp(app.recordedOutputFps,MinOutputFps,MaxOutputFps),false)+L" video  ·  "+timeText(app.status.elapsed,true)+L" recording";
-        else if(skipEnabled())detail=L"Base interval "+formatDuration(app.settings.intervalMs)+L" · time compression up to "+std::to_wstring(app.settings.timeSkip.multiplier)+L"×";
-        else {wchar_t buf[140];const double videoSeconds=3600000.0/(double(std::max(MinCaptureIntervalMs,app.settings.intervalMs))*app.settings.outputFps);
-            swprintf_s(buf,L"  ·  1 hour becomes %.*f seconds of video",videoSeconds<1?3:videoSeconds<10?1:0,videoSeconds);
-            detail=L"Every "+formatDuration(app.settings.intervalMs)+buf;}
-        if(app.status.completedSegments)detail+=L"  ·  "+std::to_wstring(app.status.completedSegments)+(app.status.completedSegments==1?L" part saved":L" parts saved");
-        text(dc,detail,stats,Ink,app.font);
-        RECT path={p,r.bottom-app.scale(92),r.right-p-app.scale(106),r.bottom-app.scale(66)};text(dc,L"Save to: "+app.settings.folder,path,Muted,app.smallFont,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_PATH_ELLIPSIS);
+        // Double-buffer only the dirty rectangle so timer and stats updates never flicker.
+        PAINTSTRUCT ps;HDC dc=BeginPaint(w,&ps);const RECT dirty=ps.rcPaint;
+        const int width=dirty.right-dirty.left,height=dirty.bottom-dirty.top;
+        HDC memory=width>0 && height>0?CreateCompatibleDC(dc):nullptr;HBITMAP bitmap=memory?CreateCompatibleBitmap(dc,width,height):nullptr;
+        if(memory && bitmap){
+            const auto previous=SelectObject(memory,bitmap);SetViewportOrgEx(memory,-dirty.left,-dirty.top,nullptr);
+            paintWindow(memory,dirty);SetViewportOrgEx(memory,0,0,nullptr);
+            BitBlt(dc,dirty.left,dirty.top,width,height,memory,0,0,SRCCOPY);SelectObject(memory,previous);
+        } else paintWindow(dc,dirty);
+        if(bitmap)DeleteObject(bitmap);
+        if(memory)DeleteDC(memory);
         EndPaint(w,&ps);return 0;
     }
     case WM_CLOSE:
@@ -3161,13 +3617,16 @@ int runGui(HINSTANCE instance,int show,bool& windowCreationFailed) {
     }
     app.taskbarCreated=RegisterWindowMessageW(L"TaskbarCreated");
     WNDCLASSEXW preview{sizeof(preview)};preview.lpfnWndProc=previewProc;preview.hInstance=instance;preview.hCursor=LoadCursorW(nullptr,IDC_ARROW);preview.lpszClassName=L"LapsePreview";RegisterClassExW(&preview);
-    WNDCLASSEXW cls{sizeof(cls)};cls.lpfnWndProc=windowProc;cls.hInstance=instance;cls.hCursor=LoadCursorW(nullptr,IDC_ARROW);cls.hIcon=LoadIconW(nullptr,IDI_APPLICATION);cls.hbrBackground=app.background;cls.lpszClassName=L"TimelapseWindow";RegisterClassExW(&cls);
     app.dpi=static_cast<int>(GetDpiForSystem());
+    app.appIcons[0]=createAppIcon(GetSystemMetricsForDpi(SM_CXICON,app.dpi));
+    app.appIcons[1]=createAppIcon(GetSystemMetricsForDpi(SM_CXSMICON,app.dpi));
+    WNDCLASSEXW cls{sizeof(cls)};cls.lpfnWndProc=windowProc;cls.hInstance=instance;cls.hCursor=LoadCursorW(nullptr,IDC_ARROW);
+    cls.hIcon=app.appIcons[0]?app.appIcons[0]:LoadIconW(nullptr,IDI_APPLICATION);cls.hIconSm=app.appIcons[1];cls.hbrBackground=app.background;cls.lpszClassName=L"TimelapseWindow";RegisterClassExW(&cls);
     POINT cursor{};GetCursorPos(&cursor);
     const RECT work=workArea(MonitorFromPoint(cursor,MONITOR_DEFAULTTOPRIMARY));
     const int margin=app.scale(16);
-    const int width=std::min(app.scale(920),std::max(1,static_cast<int>(work.right-work.left)-2*margin));
-    const int height=std::min(app.scale(680),std::max(1,static_cast<int>(work.bottom-work.top)-2*margin));
+    const int width=std::min(app.scale(1040),std::max(1,static_cast<int>(work.right-work.left)-2*margin));
+    const int height=std::min(app.scale(720),std::max(1,static_cast<int>(work.bottom-work.top)-2*margin));
     HWND window=CreateWindowExW(0,cls.lpszClassName,L"Timelapse",WS_OVERLAPPEDWINDOW|WS_CLIPCHILDREN,work.left+(work.right-work.left-width)/2,work.top+(work.bottom-work.top-height)/2,width,height,nullptr,nullptr,instance,nullptr);
     if(!window){windowCreationFailed=true;return 1;}
     if(const HMENU menu=GetSystemMenu(window,FALSE)){AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING,ExitSystemCommand,L"E&xit Timelapse");}

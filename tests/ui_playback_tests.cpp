@@ -131,7 +131,7 @@ void dialogStateAndGeometry(){
             require(bounds.left>=0 && bounds.top>=0 && bounds.right<=client.right && bounds.bottom<=client.bottom,"Small viewport cannot reveal its Cancel button.");}
         playbackProc(window,WM_COMMAND,IDCANCEL,0);};editPlayback();
     app.dpi=96;app.advancedExpanded=true;layout();RECT watermark{},summary{},playback{};GetWindowRect(app.watermarkConfigure,&watermark);GetWindowRect(app.watermarkSummary,&summary);GetWindowRect(app.playbackConfigure,&playback);
-    require(watermark.right<summary.left && summary.right<playback.left && watermark.top==playback.top,"Compact main-row playback entry overlaps the watermark summary or adds a row.");
+    require(watermark.bottom<=summary.top && summary.bottom<playback.top && watermark.left==playback.left,"Panel playback entry overlaps the watermark controls or leaves the panel column.");
     app.advancedExpanded=false;updateAdvanced();require(!(GetWindowLongPtrW(app.playbackConfigure,GWL_STYLE)&WS_VISIBLE),"Playback entry leaked into the collapsed main interface.");
     playbackProbe::failDialog=true;editPlayback();require(probe::lastDialog.find(L"could not be opened")!=std::wstring::npos && !app.customDialog,"Failed dialog lost recovery feedback or modal ownership.");
     std::cout<<"PASS active-settings lock, dialog DPI/scroll geometry, compact main row and creation failure recovery\n";

@@ -68,7 +68,7 @@ HDC WINAPI fixtureBeginPaint(HWND window,LPPAINTSTRUCT paint){
 }
 BOOL WINAPI fixtureEndPaint(HWND window,const PAINTSTRUCT* paint){return paintDC?TRUE:EndPaint(window,paint);}
 int WINAPI fixtureDrawText(HDC dc,LPCWSTR value,int count,LPRECT rect,UINT flags){
-    if(dc==paintDC){
+    if(paintDC && !(flags&DT_CALCRECT)){
         TextDraw draw{count<0?std::wstring(value):std::wstring(value,count),*rect,*rect};
         LPtoDP(dc,reinterpret_cast<POINT*>(&draw.device),2);drawnText.push_back(draw);
     }
@@ -156,11 +156,12 @@ std::vector<HWND> tabControls(){
         if(nightRow()==2){result.push_back(app.nightDuration);result.push_back(app.nightTarget);}
     }
     for(HWND child:{app.record,app.pause,app.finish,app.folder,app.openFolder,app.reset,app.forward,app.preview})result.push_back(child);
+    result.erase(std::remove_if(result.begin(),result.end(),[](HWND child){return !(GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE);}),result.end());
     return result;
 }
 struct HiddenWindow {
     HiddenWindow(int width,int height,int dpi){
-        app.dpi=dpi;app.scrollX=app.scrollY=app.wheelVertical=app.wheelHorizontal=0;
+        app.dpi=dpi;app.scrollX=app.scrollY=app.panelScroll=app.wheelVertical=app.wheelHorizontal=app.wheelPanel=0;app.cursorVisibility=-1;
         app.contentWidth=app.contentHeight=0;app.layingOut=app.dragging=app.advancedExpanded=false;app.advancedLimitIndex=app.advancedVisibility=-1;
         app.visibleDirty=true;app.controlsUpdated=false;app.hiddenToTray=false;
         app.skipRevision=0;app.advancedSkipRevision=app.skipSummaryRevision=app.skipVisibility=-1;app.skipSummaryCaption.clear();app.skipDetailCaption.clear();app.skipCheckAge=UINT64_MAX;
@@ -201,6 +202,15 @@ struct HiddenWindow {
         app.record=button(L"&Record",Record);app.pause=button(L"&Pause",Pause);app.finish=button(L"&Finish",Finish);
         app.folder=button(L"C&hange...",Folder);app.openFolder=button(L"&Open folder",OpenFolder);app.reset=button(L"Reset layout",Reset);app.forward=button(L"Bring forward",Forward);
         app.preview=child(L"STATIC",L"Preview",WS_TABSTOP,Preview);app.statusText=child(L"STATIC",L"Ready",SS_LEFT|SS_CENTERIMAGE,210);
+        // Match the application's new native sibling/tab order.
+        for(HWND member:{app.reset,app.forward,app.preview,app.record,app.pause,app.finish,app.statusText,app.refresh,
+            app.labels[0],app.mode,app.labels[4],app.monitor,app.labels[5],app.camera,app.labels[1],app.interval,
+            app.labels[2],app.videoSize,app.labels[3],app.encodingQuality,app.folder,app.openFolder,app.advanced,
+            app.labels[6],app.encodingMode,app.recoveryMode,app.labels[7],app.stopAfter,app.segmentLabel,app.splitEvery,
+            app.startDelayLabel,app.startDelay,app.startDelayHint,app.lowDisk,app.captureCursor,app.skipConfigure,
+            app.skipSummary,app.skipDetail,app.watermarkConfigure,app.watermarkSummary,app.playbackConfigure,
+            app.nightEnabled,app.labels[8],app.nightDuration,app.labels[9],app.nightTarget,app.nightHint,app.nightDetail})
+            SetWindowPos(member,HWND_BOTTOM,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOACTIVATE);
         SetWindowLongPtrW(app.window,GWLP_WNDPROC,reinterpret_cast<LONG_PTR>(fixtureWindowProc));
         app.engine=std::make_unique<FixtureEngine>();
         fonts();layout();
@@ -212,16 +222,16 @@ struct HiddenWindow {
 };
 void checkLayout(){
     const auto view=client();
-    require(app.contentWidth>=app.scale(830) && app.contentHeight>=app.scale(541),"Logical minimum lost.");
+    require(app.contentWidth>=app.scale(StageMinWidth+PanelWidth) && app.contentHeight>=app.scale(StageMinHeight),"Logical minimum lost.");
     require(app.scrollX>=0 && app.scrollX<=app.contentWidth-view.right && app.scrollY>=0 && app.scrollY<=app.contentHeight-view.bottom,"Offsets exceed viewport range.");
     require(!intersects(bounds(app.forward),bounds(app.folder)),"Bring forward overlaps Change folder.");
     require(!intersects(bounds(app.finish),bounds(app.openFolder)),"Finish overlaps Open folder.");
-    require(!intersects(bounds(app.monitor),bounds(app.camera)) && !intersects(bounds(app.camera),bounds(app.advanced)) &&
+    require((!hasSource(Source::Desktop) || !hasSource(Source::Camera) || !intersects(bounds(app.monitor),bounds(app.camera))) && !intersects(bounds(app.camera),bounds(app.advanced)) &&
             !intersects(bounds(app.advanced),bounds(app.refresh)),"Source or Advanced controls overlap.");
-    if(app.advancedExpanded)require(bounds(app.watermarkConfigure).bottom<=bounds(app.preview).top && !intersects(bounds(app.watermarkConfigure),bounds(app.skipConfigure)) && !intersects(bounds(app.watermarkConfigure),bounds(app.watermarkSummary)),"Watermark controls overlap the other options or preview.");
+    if(app.advancedExpanded)require(!intersects(bounds(app.watermarkConfigure),bounds(app.preview)) && !intersects(bounds(app.watermarkConfigure),bounds(app.skipConfigure)) && !intersects(bounds(app.watermarkConfigure),bounds(app.watermarkSummary)),"Watermark controls overlap the other options or preview.");
     if(app.advancedExpanded){
-        require(bounds(app.playbackConfigure).top==bounds(app.watermarkConfigure).top &&
-            bounds(app.playbackConfigure).bottom<=bounds(app.preview).top &&
+        require(bounds(app.playbackConfigure).top>bounds(app.watermarkSummary).bottom &&
+            !intersects(bounds(app.playbackConfigure),bounds(app.preview)) &&
             !intersects(bounds(app.playbackConfigure),bounds(app.watermarkConfigure)) &&
             !intersects(bounds(app.playbackConfigure),bounds(app.watermarkSummary)),"Playback disclosure adds height or overlaps the watermark row.");
         wchar_t raw[100]{};GetWindowTextW(app.playbackConfigure,raw,100);std::wstring caption=raw;
@@ -230,7 +240,7 @@ void checkLayout(){
         GetTextExtentPoint32W(dc,caption.c_str(),static_cast<int>(caption.size()),&extent);SelectObject(dc,previous);ReleaseDC(app.playbackConfigure,dc);
         require(extent.cx+app.scale(18)<=bounds(app.playbackConfigure).right-bounds(app.playbackConfigure).left,"Playback disclosure caption truncates at this DPI.");
     }
-    if(app.advancedExpanded)require(!intersects(bounds(app.encodingMode),bounds(app.stopAfter))&&!intersects(bounds(app.stopAfter),bounds(app.lowDisk))&&bounds(app.lowDisk).bottom<bounds(app.preview).top,"Advanced options overlap each other or preview.");
+    if(app.advancedExpanded)require(!intersects(bounds(app.encodingMode),bounds(app.stopAfter))&&!intersects(bounds(app.stopAfter),bounds(app.lowDisk))&&!intersects(bounds(app.lowDisk),bounds(app.preview)),"Advanced options overlap each other or preview.");
     HDC textDc=GetDC(app.mode);auto oldFont=SelectObject(textDc,app.font);SIZE labelSize{};
     GetTextExtentPoint32W(textDc,SeparateFilesLabel,static_cast<int>(std::wcslen(SeparateFilesLabel)),&labelSize);
     SelectObject(textDc,oldFont);ReleaseDC(app.mode,textDc);
@@ -244,7 +254,10 @@ void checkLayout(){
     require(preview.bottom-preview.top>=app.scale(160),"Preview is unusably short.");
     RECT local{};GetClientRect(app.preview,&local);require(equal(app.videoRect,previewVideoRect(local)),"Hit-test geometry was left waiting for paint.");
     auto all=tabControls();all.push_back(app.statusText);for(auto label:app.labels)all.push_back(label);
-    for(auto w:all){const auto r=bounds(w);require(r.left+app.scrollX>=0 && r.right+app.scrollX<=app.contentWidth && r.top+app.scrollY>=0 && r.bottom+app.scrollY<=app.contentHeight,"Child escaped the logical canvas.");}
+    for(auto w:all){if(!(GetWindowLongPtrW(w,GWL_STYLE)&WS_VISIBLE))continue;
+        const auto r=bounds(w);const bool panel=app.panelDocked && panelControl(w);
+        const int offset=panel?app.panelScroll:app.scrollY,height=panel?app.panelHeight:app.contentHeight;
+        require(r.left+app.scrollX>=0 && r.right+app.scrollX<=app.contentWidth && r.top+offset>=0 && r.bottom+offset<=height,"Child escaped its stage or settings panel.");}
     require(!IsWindowVisible(app.window),"Fixture became visible.");
 }
 void checkFocusReachability(){
@@ -259,11 +272,13 @@ void checkFocusReachability(){
 void paintCheck(){
     paintDC=CreateCompatibleDC(nullptr);require(paintDC!=nullptr,"Memory paint DC failed.");
     HBITMAP bitmap=CreateBitmap(1,1,1,32,nullptr);auto old=SelectObject(paintDC,bitmap);drawnText.clear();
-    windowProc(app.window,WM_PAINT,0,0);
-    require(drawnText.size()==5,"Unexpected parent painted-text count.");
+    // Inspect the complete canvas even when the real dirty viewport culls
+    // off-screen stage text. Scoped WM_PAINT invalidation is covered in tray tests.
+    paintWindow(paintDC,RECT{-app.scrollX,-app.scrollY,app.contentWidth-app.scrollX,app.contentHeight-app.scrollY});
+    require(drawnText.size()==8,"Unexpected parent painted-text count.");
     for(const auto& draw:drawnText){RECT expected=draw.logical;OffsetRect(&expected,-app.scrollX,-app.scrollY);require(equal(expected,draw.device),"Parent paint origin does not follow scrolling.");}
-    require(drawnText.back().logical.top==app.contentHeight-app.scale(92),"Painted save path uses viewport height.");
-    require(drawnText.back().device.top==bounds(app.folder).top,"Painted save path detached from Change button.");
+    require(drawnText.back().logical.top==app.savePathRect.top-app.panelScroll,"Painted save path uses viewport height.");
+    require(drawnText.back().device.bottom+app.scale(6)==bounds(app.folder).top,"Painted save path detached from Change button.");
     SelectObject(paintDC,old);DeleteObject(bitmap);DeleteDC(paintDC);paintDC=nullptr;
 }
 void scenario(int dpi,bool constrained){
@@ -275,12 +290,13 @@ void scenario(int dpi,bool constrained){
     checkFocusReachability();
     scrollTo(INT_MAX,INT_MAX);checkLayout();paintCheck();
     scrollBar(SB_VERT,SB_TOP);scrollBar(SB_HORZ,SB_TOP);
-    require(app.scrollX==0 && app.scrollY==0,"Top command did not reset offsets.");
+    require(app.scrollX==0 && app.scrollY==0 && app.panelScroll==0,"Top command did not reset offsets.");
     if(constrained){
-        scrollBar(SB_VERT,SB_PAGEDOWN);require(app.scrollY>0,"Vertical page command did not scroll.");
+        scrollBar(SB_VERT,SB_PAGEDOWN);require((app.panelDocked?app.panelScroll:app.scrollY)>0,"Vertical page command did not scroll.");
         scrollBar(SB_HORZ,SB_LINEDOWN);require(app.scrollX>0,"Horizontal line command did not scroll.");
-        scrollTo(0,0);MSG wheel{};wheel.hwnd=app.encodingQuality;wheel.message=WM_MOUSEWHEEL;wheel.wParam=MAKEWPARAM(0,static_cast<WORD>(-WHEEL_DELTA));
-        require(scrollWheelMessage(wheel) && app.scrollY>0 && choice(app.encodingQuality)==0,"Closed quality combo wheel changed settings or failed to scroll.");
+        scrollTo(INT_MAX,0);scrollPanelTo(0);MSG wheel{};wheel.hwnd=app.encodingQuality;wheel.message=WM_MOUSEWHEEL;wheel.wParam=MAKEWPARAM(0,static_cast<WORD>(-WHEEL_DELTA));
+        POINT pointer{int(client().right)-app.scale(24),app.scale(60)};ClientToScreen(app.window,&pointer);wheel.lParam=MAKELPARAM(pointer.x,pointer.y);
+        require(scrollWheelMessage(wheel) && (app.panelDocked?app.panelScroll:app.scrollY)>0 && choice(app.encodingQuality)==0,"Closed quality combo wheel changed settings or failed to scroll.");
         wheel.wParam=MAKEWPARAM(MK_SHIFT,static_cast<WORD>(-WHEEL_DELTA));require(scrollWheelMessage(wheel) && app.scrollX>0,"Shift wheel did not scroll horizontally.");
         droppedCombo=app.encodingQuality;require(!scrollWheelMessage(wheel),"An open combo lost wheel ownership.");droppedCombo=nullptr;
         scrollTo(0,0);wheel.message=WM_MOUSEHWHEEL;wheel.wParam=MAKEWPARAM(0,WHEEL_DELTA);require(scrollWheelMessage(wheel) && app.scrollX>0,"Horizontal wheel did not scroll right.");
@@ -294,7 +310,7 @@ void advancedDisclosure(int dpi){
     HiddenWindow owned(MulDiv(500,dpi,96),MulDiv(400,dpi,96),dpi);
     auto styledVisible=[](HWND child){return (GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0;};
     require(!app.advancedExpanded&&!styledVisible(app.encodingMode)&&!styledVisible(app.stopAfter)&&!styledVisible(app.lowDisk)&&SendMessageW(app.advanced,BM_GETCHECK,0,0)==BST_UNCHECKED,"Advanced options were not collapsed by default.");
-    const auto collapsedHeight=app.contentHeight;
+    const auto collapsedHeight=app.panelHeight;
     for(int i=0;i<6;++i){
         choose(app.stopAfter,i);updateAdvanced();wchar_t label[128]{};GetWindowTextW(app.advanced,label,128);
         require(i==0 || std::wstring(label).find(RecordingLimitLabels[i])!=std::wstring::npos,"Collapsed disclosure hides a configured time limit.");
@@ -305,12 +321,12 @@ void advancedDisclosure(int dpi){
     }
     ownedFocus=app.advanced;windowProc(app.window,WM_COMMAND,AdvancedToggle,0);
     require(app.advancedExpanded&&styledVisible(app.encodingMode)&&styledVisible(app.stopAfter)&&styledVisible(app.lowDisk)&&SendMessageW(app.advanced,BM_GETCHECK,0,0)==BST_CHECKED,"Disclosure did not expose accessible checked state/options.");
-    require(app.contentHeight==collapsedHeight+app.scale(280),"Expanded options failed to claim their own layout rows.");
-    require(GetNextDlgTabItem(app.window,app.refresh,FALSE)==app.encodingMode&&GetNextDlgTabItem(app.window,app.encodingMode,FALSE)==app.stopAfter&&GetNextDlgTabItem(app.window,app.stopAfter,FALSE)==app.lowDisk,"Expanded native tab order skipped advanced options.");
+    require(app.panelHeight>collapsedHeight,"Expanded options failed to claim their own layout rows.");
+    require(GetNextDlgTabItem(app.window,app.advanced,FALSE)==app.encodingMode&&GetNextDlgTabItem(app.window,app.encodingMode,FALSE)==app.recoveryMode&&GetNextDlgTabItem(app.window,app.recoveryMode,FALSE)==app.stopAfter,"Expanded native tab order skipped advanced options.");
     checkLayout();checkFocusReachability();scrollTo(INT_MAX,INT_MAX);ownedFocus=app.lowDisk;
     windowProc(app.window,WM_COMMAND,AdvancedToggle,0);
     require(!app.advancedExpanded&&ownedFocus==app.advanced&&!styledVisible(app.labels[6])&&!styledVisible(app.labels[7]),"Collapsing stranded keyboard focus or labels.");
-    require(app.contentHeight==collapsedHeight&&GetNextDlgTabItem(app.window,app.refresh,FALSE)==app.record,"Collapsed row retained blank height or hidden tab stops.");
+    require(app.panelHeight==collapsedHeight&&GetNextDlgTabItem(app.window,app.advanced,FALSE)==app.preview,"Collapsed row retained blank height or hidden tab stops.");
     checkLayout();checkFocusReachability();
     app.status.state=State::Recording;updateControls();windowProc(app.window,WM_COMMAND,AdvancedToggle,0);
     require(app.advancedExpanded&&IsWindowEnabled(app.advanced)&&!IsWindowEnabled(app.stopAfter)&&!IsWindowEnabled(app.encodingMode)&&!IsWindowEnabled(app.lowDisk),"Recording froze disclosure or allowed advanced edits.");
@@ -320,31 +336,31 @@ void advancedDisclosure(int dpi){
 void compressionDisclosure(int dpi){
     HiddenWindow owned(MulDiv(500,dpi,96),MulDiv(400,dpi,96),dpi);
     const auto visible=[](HWND child){return (GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0;};
-    const int collapsed=app.contentHeight;require(!visible(app.skipConfigure)&&!visible(app.skipSummary)&&!visible(app.skipDetail),"Collapsed compression controls visible.");
-    windowProc(app.window,WM_COMMAND,AdvancedToggle,0);const int off=app.contentHeight;
+    const int collapsed=app.panelHeight;require(!visible(app.skipConfigure)&&!visible(app.skipSummary)&&!visible(app.skipDetail),"Collapsed compression controls visible.");
+    windowProc(app.window,WM_COMMAND,AdvancedToggle,0);const int off=app.panelHeight;
     require(visible(app.skipConfigure)&&visible(app.skipSummary)&&!visible(app.skipDetail),"Off compression row visibility incorrect.");
-    require(GetNextDlgTabItem(app.window,app.lowDisk,FALSE)==app.recoveryMode&&GetNextDlgTabItem(app.window,app.recoveryMode,FALSE)==app.splitEvery&&GetNextDlgTabItem(app.window,app.splitEvery,FALSE)==app.captureCursor&&GetNextDlgTabItem(app.window,app.captureCursor,FALSE)==app.startDelay&&GetNextDlgTabItem(app.window,app.startDelay,FALSE)==app.skipConfigure,"Recovery/split/cursor/delay/compression controls not in native Advanced tab order.");
+    require(GetNextDlgTabItem(app.window,app.recoveryMode,FALSE)==app.stopAfter&&GetNextDlgTabItem(app.window,app.stopAfter,FALSE)==app.splitEvery&&GetNextDlgTabItem(app.window,app.splitEvery,FALSE)==app.startDelay&&GetNextDlgTabItem(app.window,app.startDelay,FALSE)==app.lowDisk&&GetNextDlgTabItem(app.window,app.lowDisk,FALSE)==app.captureCursor&&GetNextDlgTabItem(app.window,app.captureCursor,FALSE)==app.skipConfigure,"Recovery/split/cursor/delay/compression controls not in native Advanced tab order.");
     app.settings.timeSkip.mode=TimeSkipMode::Quiet;app.settings.timeSkip.multiplier=64;++app.skipRevision;updateControls();layout();
-    require(app.contentHeight==off+app.scale(28) && visible(app.skipDetail) && bounds(app.skipDetail).bottom<bounds(app.preview).top,"Enabled compression detail overlaps preview or has wrong height.");
+    require(app.panelHeight==off+app.scale(32) && visible(app.skipDetail) && !intersects(bounds(app.skipDetail),bounds(app.preview)),"Enabled compression detail overlaps preview or has wrong height.");
     const unsigned inspections=lapse::uiPersonPackInspections;
     app.settings.timeSkip.mode=TimeSkipMode::NoPersonWithinSchedule;++app.skipRevision;updateControls();layout();
-    require(app.contentHeight==off+app.scale(28) && app.skipDetailCaption.find(L"Select camera")!=std::wstring::npos && lapse::uiPersonPackInspections==inspections,
+    require(app.panelHeight==off+app.scale(32) && app.skipDetailCaption.find(L"Select camera")!=std::wstring::npos && lapse::uiPersonPackInspections==inspections,
         "Person policy changed base geometry, hid camera scope or inspected its pack from a main refresh.");
-    paintCheck();require(drawnText[3].value.find(L"Base interval")!=std::wstring::npos && drawnText[3].value.find(L"1 hour becomes")==std::wstring::npos,"Enabled compression promised a fixed resulting video duration.");
+    paintCheck();require(drawnText[2].value.find(L"Base interval")!=std::wstring::npos && drawnText[3].value.find(L"Time compression")!=std::wstring::npos,"Enabled compression promised a fixed resulting video duration.");
     for(int limit=0;limit<6;++limit){choose(app.stopAfter,limit);updateAdvanced();wchar_t value[200]{};GetWindowTextW(app.advanced,value,200);
         std::wstring measured=value;measured.erase(std::remove(measured.begin(),measured.end(),L'&'),measured.end());HDC dc=GetDC(app.advanced);auto prior=SelectObject(dc,app.font);SIZE size{};
         GetTextExtentPoint32W(dc,measured.c_str(),static_cast<int>(measured.size()),&size);SelectObject(dc,prior);ReleaseDC(app.advanced,dc);
         require(size.cx+app.scale(18)<=bounds(app.advanced).right-bounds(app.advanced).left,"Compression/finite-stop disclosure truncates.");
         require(measured.find(L"64")!=std::wstring::npos && (!limit || measured.find(L"stop")!=std::wstring::npos || measured.find(RecordingLimitShortLabels[limit])!=std::wstring::npos),"Collapsed compression hides its configured multiplier or finite stop.");}
     ownedFocus=app.skipConfigure;windowProc(app.window,WM_COMMAND,AdvancedToggle,0);
-    require(app.contentHeight==collapsed && ownedFocus==app.advanced && !visible(app.skipConfigure),"Collapse stranded compression focus or retained height.");
+    require(app.panelHeight==collapsed && ownedFocus==app.advanced && !visible(app.skipConfigure),"Collapse stranded compression focus or retained height.");
     windowProc(app.window,WM_COMMAND,AdvancedToggle,0);app.status.state=State::Recording;updateControls();require(IsWindowEnabled(app.skipConfigure),"Active policy inspection was disabled.");
     checkLayout();checkFocusReachability();std::cout<<"PASS compression disclosure dpi="<<dpi<<" visibility, exact height, tab/focus, finite summaries and active inspection\n";
 }
 void watermarkDisclosure(int dpi){
     HiddenWindow owned(MulDiv(500,dpi,96),MulDiv(400,dpi,96),dpi);
     const auto visible=[](HWND child){return (GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0;};
-    const int collapsed=app.contentHeight;require(!visible(app.watermarkConfigure)&&!visible(app.watermarkSummary),"Collapsed watermark row was visible.");
+    const int collapsed=app.panelHeight;require(!visible(app.watermarkConfigure)&&!visible(app.watermarkSummary),"Collapsed watermark row was visible.");
     windowProc(app.window,WM_COMMAND,AdvancedToggle,0);require(visible(app.watermarkConfigure)&&visible(app.watermarkSummary)&&GetNextDlgTabItem(app.window,app.skipConfigure,FALSE)==app.watermarkConfigure,"Watermark Advanced row lost visibility/native tab order.");
     for(bool skip:{false,true})for(bool night:{false,true}){
         app.settings.timeSkip.mode=skip?TimeSkipMode::Quiet:TimeSkipMode::Off;++app.skipRevision;
@@ -357,7 +373,7 @@ void watermarkDisclosure(int dpi){
         require(value.find(L"watermark")!=std::wstring::npos&&extent.cx+app.scale(18)<=bounds(app.advanced).right-bounds(app.advanced).left,"Enabled watermark vanished/truncated in collapsed summary.");
     }
     checkFocusReachability();
-    ownedFocus=app.watermarkConfigure;windowProc(app.window,WM_COMMAND,AdvancedToggle,0);require(!visible(app.watermarkConfigure)&&ownedFocus==app.advanced&&app.contentHeight==collapsed,"Collapse retained watermark height or stranded focus.");
+    ownedFocus=app.watermarkConfigure;windowProc(app.window,WM_COMMAND,AdvancedToggle,0);require(!visible(app.watermarkConfigure)&&ownedFocus==app.advanced&&app.panelHeight==collapsed,"Collapse retained watermark height or stranded focus.");
     app.status.state=State::Recording;updateControls();windowProc(app.window,WM_COMMAND,AdvancedToggle,0);require(IsWindowEnabled(app.watermarkConfigure),"Active watermark inspection was disabled.");
     std::cout<<"PASS watermark disclosure dpi="<<dpi<<" compact base, conditional row spacing, caption, focus and active inspection\n";
 }
@@ -369,14 +385,14 @@ void recoveryDisclosure(int dpi){
         HDC dc=GetDC(child);auto previous=SelectObject(dc,app.font);SIZE size{};GetTextExtentPoint32W(dc,measured.c_str(),static_cast<int>(measured.size()),&size);
         SelectObject(dc,previous);ReleaseDC(child,dc);require(size.cx+app.scale(padding)<=bounds(child).right-bounds(child).left,"Recovery summary or checkbox text truncates.");
     };
-    const auto collapsed=app.contentHeight;
+    const auto collapsed=app.panelHeight;
     require(!visible(app.recoveryMode)&&SendMessageW(app.recoveryMode,BM_GETCHECK,0,0)==BST_UNCHECKED,"Recovery was not hidden and off by default.");
     windowProc(app.window,WM_COMMAND,AdvancedToggle,0);fits(app.recoveryMode,26);
-    require(visible(app.recoveryMode)&&bounds(app.lowDisk).bottom<bounds(app.recoveryMode).top&&bounds(app.recoveryMode).bottom<bounds(app.skipConfigure).top,
+    require(visible(app.recoveryMode)&&bounds(app.encodingMode).bottom<bounds(app.recoveryMode).top&&bounds(app.recoveryMode).bottom<bounds(app.skipConfigure).top,
         "Recovery row overlaps its adjacent controls.");
     SendMessageW(app.recoveryMode,BM_SETCHECK,BST_CHECKED,0);windowProc(app.window,WM_COMMAND,RecoveryBox,0);
     ownedFocus=app.recoveryMode;windowProc(app.window,WM_COMMAND,AdvancedToggle,0);
-    require(app.contentHeight==collapsed&&!visible(app.recoveryMode)&&ownedFocus==app.advanced&&app.advancedCaption.find(L"recovery")!=std::wstring::npos,
+    require(app.panelHeight==collapsed&&!visible(app.recoveryMode)&&ownedFocus==app.advanced&&app.advancedCaption.find(L"recovery")!=std::wstring::npos,
         "Recovery changed the collapsed height, hid its opt-in summary or stranded focus.");fits(app.advanced,18);
     app.settings.night.enabled=true;app.settings.timeSkip.mode=TimeSkipMode::Quiet;app.settings.timeSkip.multiplier=64;++app.skipRevision;
     for(int limit=0;limit<6;++limit){choose(app.stopAfter,limit);updateAdvanced();fits(app.advanced,18);
@@ -401,16 +417,16 @@ void nightDisclosure(int dpi){
     };
     windowProc(app.window,WM_COMMAND,AdvancedToggle,0);require(!visible(app.nightEnabled)&&!visible(app.nightDuration),"Desktop exposes irrelevant camera night controls.");
     choose(app.mode,static_cast<int>(Mode::Camera));changeLayout(false);
-    require(visible(app.nightEnabled)&&!visible(app.nightDuration)&&!visible(app.nightTarget)&&GetNextDlgTabItem(app.window,app.recoveryMode,FALSE)==app.splitEvery&&GetNextDlgTabItem(app.window,app.splitEvery,FALSE)==app.startDelay&&GetNextDlgTabItem(app.window,app.startDelay,FALSE)==app.skipConfigure&&GetNextDlgTabItem(app.window,app.skipConfigure,FALSE)==app.watermarkConfigure&&GetNextDlgTabItem(app.window,app.watermarkConfigure,FALSE)==app.playbackConfigure&&GetNextDlgTabItem(app.window,app.playbackConfigure,FALSE)==app.nightEnabled,"Camera night opt-in visibility/tab order failed.");
-    const auto offHeight=app.contentHeight;
+    require(visible(app.nightEnabled)&&!visible(app.nightDuration)&&!visible(app.nightTarget)&&GetNextDlgTabItem(app.window,app.recoveryMode,FALSE)==app.stopAfter&&GetNextDlgTabItem(app.window,app.stopAfter,FALSE)==app.splitEvery&&GetNextDlgTabItem(app.window,app.splitEvery,FALSE)==app.startDelay&&GetNextDlgTabItem(app.window,app.startDelay,FALSE)==app.lowDisk&&GetNextDlgTabItem(app.window,app.lowDisk,FALSE)==app.skipConfigure&&GetNextDlgTabItem(app.window,app.skipConfigure,FALSE)==app.watermarkConfigure&&GetNextDlgTabItem(app.window,app.watermarkConfigure,FALSE)==app.playbackConfigure&&GetNextDlgTabItem(app.window,app.playbackConfigure,FALSE)==app.nightEnabled,"Camera night opt-in visibility/tab order failed.");
+    const auto offHeight=app.panelHeight;
     ownedFocus=app.nightEnabled;SendMessageW(app.nightEnabled,BM_SETCHECK,BST_CHECKED,0);windowProc(app.window,WM_COMMAND,NightBox,0);
-    require(visible(app.nightDuration)&&visible(app.nightTarget)&&visible(app.nightHint)&&visible(app.nightDetail)&&app.contentHeight==offHeight+app.scale(72),"Night options did not claim exactly their detail row space.");
+    require(visible(app.nightDuration)&&visible(app.nightTarget)&&visible(app.nightHint)&&visible(app.nightDetail)&&app.panelHeight==offHeight+app.scale(190),"Night options did not claim exactly their detail row space.");
     require(GetNextDlgTabItem(app.window,app.nightEnabled,FALSE)==app.nightDuration&&GetNextDlgTabItem(app.window,app.nightDuration,FALSE)==app.nightTarget,"Night duration/brightness native tab order failed.");
     measure(app.nightEnabled,26);measure(app.labels[8],0);measure(app.labels[9],0);measure(app.nightTarget,30);
-    require(!intersects(bounds(app.nightEnabled),bounds(app.nightDuration))&&!intersects(bounds(app.nightDuration),bounds(app.nightTarget))&&bounds(app.nightDetail).bottom<bounds(app.preview).top,"Night controls overlap or touch preview.");
+    require(!intersects(bounds(app.nightEnabled),bounds(app.nightDuration))&&!intersects(bounds(app.nightDuration),bounds(app.nightTarget))&&!intersects(bounds(app.nightDetail),bounds(app.preview)),"Night controls overlap or touch preview.");
     for(int i=0;i<6;++i){choose(app.stopAfter,i);updateAdvanced();measure(app.advanced,18);}
     checkLayout();checkFocusReachability();ownedFocus=app.nightTarget;windowProc(app.window,WM_COMMAND,AdvancedToggle,0);
-    require(ownedFocus==app.advanced&&!visible(app.nightEnabled)&&!visible(app.nightDuration)&&GetNextDlgTabItem(app.window,app.refresh,FALSE)==app.record,"Collapsing stranded night focus or tab stops.");
+    require(ownedFocus==app.advanced&&!visible(app.nightEnabled)&&!visible(app.nightDuration)&&GetNextDlgTabItem(app.window,app.advanced,FALSE)==app.preview,"Collapsing stranded night focus or tab stops.");
     windowProc(app.window,WM_COMMAND,AdvancedToggle,0);choose(app.nightDuration,5);windowProc(app.window,WM_COMMAND,MAKEWPARAM(NightDurationBox,CBN_SELCHANGE),0);measure(app.advanced,18);
     require(!app.nightValidation.empty()&&!IsWindowEnabled(app.record),"Invalid night duration lacks compact validation.");
     ownedFocus=app.nightTarget;SendMessageW(app.nightEnabled,BM_SETCHECK,BST_UNCHECKED,0);windowProc(app.window,WM_COMMAND,NightBox,0);
@@ -442,13 +458,13 @@ void dragChecks(){
     std::cout<<"PASS drag scroll/resize/DPI cancellation preserves last edit and foreign capture\n";
 }
 void barDependency(){
-    HiddenWindow owned(835,530,96);require((GetWindowLongPtrW(app.window,GWL_STYLE)&(WS_HSCROLL|WS_VSCROLL))==(WS_HSCROLL|WS_VSCROLL),"Vertical bar did not induce horizontal bar.");
-    SetWindowPos(app.window,nullptr,0,0,820,546,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);require((GetWindowLongPtrW(app.window,GWL_STYLE)&(WS_HSCROLL|WS_VSCROLL))==(WS_HSCROLL|WS_VSCROLL),"Horizontal bar did not induce vertical bar.");
+    HiddenWindow owned(895,530,96);require((GetWindowLongPtrW(app.window,GWL_STYLE)&(WS_HSCROLL|WS_VSCROLL))==(WS_HSCROLL|WS_VSCROLL),"Vertical bar did not induce horizontal bar.");
+    SetWindowPos(app.window,nullptr,0,0,880,610,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);require((GetWindowLongPtrW(app.window,GWL_STYLE)&(WS_HSCROLL|WS_VSCROLL))==(WS_HSCROLL|WS_VSCROLL),"Horizontal bar did not induce vertical bar.");
     checkLayout();std::cout<<"PASS mutually dependent native scrollbars\n";
 }
 void dpiAndRouting(){
-    HiddenWindow owned(500,400,96);
-    scrollTo(60,70);RECT suggestion{0,0,1000,800};
+    HiddenWindow owned(500,300,96);
+    scrollTo(60,70);RECT suggestion{0,0,1000,600};
     windowProc(app.window,WM_DPICHANGED,MAKELONG(192,192),reinterpret_cast<LPARAM>(&suggestion));
     require(app.scrollX==120 && app.scrollY==140,"DPI transition did not scale existing offsets.");checkLayout();
     scrollTo(INT_MAX,INT_MAX);suggestion={0,0,1000,740};
@@ -474,12 +490,30 @@ void dpiAndRouting(){
 }
 void originalScenarios(){
     {
-        HiddenWindow owned(904,701,96);
-        require(equal(bounds(app.forward),RECT{758,520,878,547}) && equal(bounds(app.folder),RECT{786,609,878,635}) &&
-            equal(bounds(app.finish),RECT{302,647,408,681}) && equal(bounds(app.openFolder),RECT{745,647,878,681}),
-            "Original normal-size control geometry changed.");
-        require(bounds(app.preview).bottom-bounds(app.preview).top==320,"Original roomy preview height changed.");
-        std::cout<<"PASS original normal-size geometry unchanged\n";
+        HiddenWindow owned(1040,701,96);
+        require(app.panelDocked && bounds(app.preview).right<bounds(app.folder).left && bounds(app.finish).bottom<bounds(app.statusText).top,
+            "Normal-size panel overlaps preview or transport/status.");
+        const RECT preview=bounds(app.preview),record=bounds(app.record),finish=bounds(app.finish);
+        windowProc(app.window,WM_COMMAND,AdvancedToggle,0);
+        const RECT expanded=bounds(app.preview);
+        require(preview.left==expanded.left && preview.top==expanded.top && preview.bottom==expanded.bottom &&
+            preview.right-expanded.right<=GetSystemMetricsForDpi(SM_CXVSCROLL,app.dpi) &&
+            equal(record,bounds(app.record)) && equal(finish,bounds(app.finish)) && app.panelScroll>0,
+            "Expanding Advanced displaced preview/transport instead of scrolling settings.");
+        scrollPanelTo(INT_MAX);require(equal(expanded,bounds(app.preview)) && equal(record,bounds(app.record)),"Panel scrolling moved the stage.");
+        scrollPanelTo(100);RECT suggested{0,0,2080,1402};
+        windowProc(app.window,WM_DPICHANGED,MAKELONG(192,192),reinterpret_cast<LPARAM>(&suggested));
+        require(app.panelDocked && app.panelScroll==200 && app.scrollY==0,"Docked panel offset was lost during DPI scaling.");
+        const RECT stage=bounds(app.preview);const int offset=app.panelScroll;
+        MSG wheel{};wheel.hwnd=app.encodingMode;wheel.message=WM_MOUSEWHEEL;wheel.wParam=MAKEWPARAM(0,static_cast<WORD>(-WHEEL_DELTA));
+        POINT pointer{app.scale(60),app.scale(100)};ClientToScreen(app.window,&pointer);wheel.lParam=MAKELPARAM(pointer.x,pointer.y);
+        const int selection=choice(app.encodingMode);
+        require(scrollWheelMessage(wheel),"Wheel over the stage leaked into a focused closed choice.");
+        dispatchAppMessage(app.window,wheel);
+        require(app.panelScroll==offset && choice(app.encodingMode)==selection && equal(stage,bounds(app.preview)),"Wheel over the fixed stage scrolled settings or changed a focused choice.");
+        pointer={int(client().right)-app.scale(24),app.scale(100)};ClientToScreen(app.window,&pointer);wheel.lParam=MAKELPARAM(pointer.x,pointer.y);
+        require(scrollWheelMessage(wheel) && app.panelScroll>offset && equal(stage,bounds(app.preview)),"Wheel over settings failed to scroll only the panel.");
+        std::cout<<"PASS normal-size fixed preview and transport with independent panel scrolling\n";
     }
     for(int outerWidth:{1366,1024}){
         app.dpi=192;syntheticWork={0,0,outerWidth,688};RECT border{};
@@ -520,7 +554,7 @@ void customGeometry(int dpi){
 void segmentDisclosure(int dpi){
     HiddenWindow owned(MulDiv(500,dpi,96),MulDiv(400,dpi,96),dpi);
     const auto visible=[](HWND child){return (GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0;};
-    const auto collapsed=app.contentHeight;
+    const auto collapsed=app.panelHeight;
     require(!visible(app.splitEvery)&&!visible(app.segmentLabel)&&!selectedSegment(),"Default split control was visible or enabled.");
     const auto fits=[&](HWND child,int padding){wchar_t text[256]{};GetWindowTextW(child,text,256);std::wstring label=text;
         label.erase(std::remove(label.begin(),label.end(),L'&'),label.end());HDC dc=GetDC(child);const auto prior=SelectObject(dc,app.font);SIZE size{};
@@ -532,9 +566,9 @@ void segmentDisclosure(int dpi){
     app.customSegmentSeconds=INT_MAX;app.hasCustomSegment=true;app.committedSegment=5;customItems();configure();updateControls();fits(app.advanced,18);
     windowProc(app.window,WM_COMMAND,AdvancedToggle,0);fits(app.splitEvery,30);fits(app.segmentLabel,0);fits(app.recoveryMode,26);fits(app.captureCursor,26);
     require(visible(app.splitEvery)&&visible(app.segmentLabel)&&!intersects(bounds(app.splitEvery),bounds(app.recoveryMode)) &&
-        !intersects(bounds(app.splitEvery),bounds(app.captureCursor))&&bounds(app.splitEvery).bottom<bounds(app.skipConfigure).top,"Split/recovery/cursor row overlaps adjacent controls.");
+        !intersects(bounds(app.splitEvery),bounds(app.captureCursor))&&bounds(app.splitEvery).bottom<bounds(app.startDelayLabel).top,"Split/recovery/cursor row overlaps adjacent controls.");
     checkLayout();checkFocusReachability();ownedFocus=app.splitEvery;windowProc(app.window,WM_COMMAND,AdvancedToggle,0);
-    require(app.contentHeight==collapsed && ownedFocus==app.advanced && !visible(app.splitEvery)&&!visible(app.segmentLabel),"Collapse stranded split focus or increased base height.");
+    require(app.panelHeight==collapsed && ownedFocus==app.advanced && !visible(app.splitEvery)&&!visible(app.segmentLabel),"Collapse stranded split focus or increased base height.");
     app.settings.night.enabled=true;app.settings.timeSkip.mode=TimeSkipMode::NoPerson;app.settings.recoveryMode=true;++app.skipRevision;
     choose(app.stopAfter,2);updateAdvanced();fits(app.advanced,18);
     require(app.advancedCaption.find(L"split")!=std::wstring::npos && app.advancedTooltip.find(L"Person checks")!=std::wstring::npos &&
@@ -548,7 +582,7 @@ void segmentDisclosure(int dpi){
 }
 void startDelayDisclosure(int dpi){
     HiddenWindow owned(MulDiv(500,dpi,96),MulDiv(400,dpi,96),dpi);
-    const int collapsed=app.contentHeight;
+    const int collapsed=app.panelHeight;
     const auto visible=[](HWND child){return (GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0;};
     const auto fits=[](HWND child,int margin){
         wchar_t label[256]{};GetWindowTextW(child,label,256);std::wstring text=label;
@@ -569,7 +603,7 @@ void startDelayDisclosure(int dpi){
     RECT measured{0,0,hint.right-hint.left,0};DrawTextW(dc,help,-1,&measured,DT_CALCRECT|DT_WORDBREAK|DT_NOPREFIX);SelectObject(dc,previous);ReleaseDC(app.startDelayHint,dc);
     require(measured.bottom<=hint.bottom-hint.top,"Self-timer explanatory help clips when wrapped.");
     checkLayout();checkFocusReachability();ownedFocus=app.startDelay;windowProc(app.window,WM_COMMAND,AdvancedToggle,0);
-    require(app.contentHeight==collapsed&&ownedFocus==app.advanced&&!visible(app.startDelay),"Collapse strands self-timer focus or expands the base window.");
+    require(app.panelHeight==collapsed&&ownedFocus==app.advanced&&!visible(app.startDelay),"Collapse strands self-timer focus or expands the base window.");
     app.settings.watermark.enabled=true;++app.watermarkRevision;choose(app.splitEvery,4);choose(app.stopAfter,5);SendMessageW(app.captureCursor,BM_SETCHECK,BST_UNCHECKED,0);updateAdvanced();fits(app.advanced,18);
     require(app.advancedCaption.find(L"delay")!=std::wstring::npos,"Mixed collapsed summary loses the next-recording delay.");
     app.encodingValidation=L"Check the MP4 mode";updateAdvanced();require(app.advancedCaption.find(L"check MP4")!=std::wstring::npos,"Self-timer summary displaced existing validation.");
@@ -587,13 +621,13 @@ void startDelayDisclosure(int dpi){
 }
 void cursorDisclosure(int dpi){
     HiddenWindow owned(MulDiv(500,dpi,96),MulDiv(400,dpi,96),dpi);
-    const int collapsed=app.contentHeight;const auto styled=[](HWND child){return (GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0;};
+    const int collapsed=app.panelHeight;const auto styled=[](HWND child){return (GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0;};
     require(!styled(app.captureCursor)&&app.advancedCaption==L"&Advanced","Default cursor option expanded or changed the base disclosure.");
-    windowProc(app.window,WM_COMMAND,AdvancedToggle,0);const int expanded=app.contentHeight;
+    windowProc(app.window,WM_COMMAND,AdvancedToggle,0);const int expanded=app.panelHeight;
     SendMessageW(app.captureCursor,BM_SETCHECK,BST_UNCHECKED,0);windowProc(app.window,WM_COMMAND,MAKEWPARAM(CursorBox,BN_CLICKED),reinterpret_cast<LPARAM>(app.captureCursor));
-    require(app.contentHeight==expanded&&app.advancedCaption.find(L"cursor off")!=std::wstring::npos,"Cursor selection changed layout height or hid its nondefault summary.");
+    require(app.panelHeight==expanded&&app.advancedCaption.find(L"cursor off")!=std::wstring::npos,"Cursor selection changed layout height or hid its nondefault summary.");
     ownedFocus=app.captureCursor;windowProc(app.window,WM_COMMAND,AdvancedToggle,0);
-    require(app.contentHeight==collapsed&&!styled(app.captureCursor)&&ownedFocus==app.advanced,"Collapse stranded cursor focus or added base height.");
+    require(app.panelHeight==collapsed&&!styled(app.captureCursor)&&ownedFocus==app.advanced,"Collapse stranded cursor focus or added base height.");
     app.settings.layers=preset(Mode::Camera);updateControls();require(!IsWindowEnabled(app.captureCursor)&&app.advancedCaption.find(L"cursor off")==std::wstring::npos,"Camera-only caption implies a desktop effect or checkbox stays enabled.");
     app.settings.layers=preset(Mode::Desktop);app.settings.watermark.enabled=true;++app.watermarkRevision;app.settings.recoveryMode=true;choose(app.splitEvery,4);choose(app.stopAfter,5);updateAdvanced();
     std::wstring caption=app.advancedCaption;caption.erase(std::remove(caption.begin(),caption.end(),L'&'),caption.end());

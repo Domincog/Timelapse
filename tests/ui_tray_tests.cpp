@@ -566,7 +566,7 @@ void unchangedWork(){Fixture f;
 }
 void scopedPaint(){Fixture f;probe::current.state=State::Recording;f.tick();app.scrollX=43;app.scrollY=61;
     probe::resetWork();probe::current.frames=1;probe::current.elapsed=.2;f.tick();
-    RECT expected{app.scale(26)-43,app.contentHeight-app.scale(147)-61,app.contentWidth-app.scale(26)-43,app.contentHeight-app.scale(123)-61};
+    RECT expected=app.statsRect;OffsetRect(&expected,-43,-61);
     require(probe::invalidated.size()==1&&!probe::invalidated[0].whole&&probe::invalidated[0].window==app.window&&EqualRect(&expected,&probe::invalidated[0].rect)&&probe::enables==0,"Frame update did not invalidate only the scrolled statistics region");
     probe::resetWork();probe::current.elapsed=.9;f.tick();require(probe::invalidated.empty(),"Fractional elapsed time repainted unchanged displayed seconds");
     probe::current.elapsed=1;f.tick();require(probe::invalidated.size()==1,"Displayed second did not repaint statistics");
@@ -580,6 +580,17 @@ void scopedPaint(){Fixture f;probe::current.state=State::Recording;f.tick();app.
     probe::resetWork();probe::current.preview=std::make_shared<Frame>();f.tick();require(probe::invalidated.size()==1&&probe::invalidated[0].window==app.preview,"New preview did not repaint only preview");
     probe::resetWork();probe::current.state=State::Paused;f.tick();
     require(probe::enables>0&&probe::textWrites==1&&probe::invalidated.size()==2&&!probe::invalidated[0].whole&&!probe::invalidated[1].whole,"State transition missed control, badge, or statistics update");
+}
+void idleStateBadge(){Fixture f;layout();f.tick();probe::resetWork();
+    require(std::wcscmp(stateLook().label,L"Ready")==0,"Idle badge did not start Ready.");
+    probe::current.recordingFailed=true;f.tick();
+    RECT header=app.headerRect;OffsetRect(&header,-app.scrollX,-app.scrollY);
+    require(std::wcscmp(stateLook().label,L"Stopped")==0 &&
+        std::any_of(probe::invalidated.begin(),probe::invalidated.end(),[&](const auto& area){return area.window==app.window && !area.whole && EqualRect(&area.rect,&header);}),
+        "Idle failure changed the badge without repainting its header.");
+    probe::resetWork();f.tick();require(probe::invalidated.empty(),"Unchanged Stopped badge repainted.");
+    probe::current.recordingFailed=false;f.tick();require(std::wcscmp(stateLook().label,L"Ready")==0,"Cleared failure retained the Stopped badge.");
+    std::cout<<"PASS idle Ready/Stopped badge changes and unchanged scoped painting\n";
 }
 void deferredVisuals(bool minimized){Fixture f;probe::current.state=State::Recording;f.tick();
     SendMessageW(app.lowDisk,BM_SETCHECK,BST_UNCHECKED,0);choose(app.stopAfter,2);configure();
@@ -631,7 +642,7 @@ void compressionResultWork(){Fixture f;app.advancedExpanded=true;app.settings.ti
 int main(){std::cout<<std::unitbuf;try{
     folderLifecycle();folderDeferrals();folderHiddenCompletion();folderFreshPendingPriority();folderOutcomePriority();
     hideAndShow();failedRegistration();restart(false);restart(true);legacyFallback();menuAndCommands();trayProgressSnapshots();trayProgressFailureControls();waitingSnapshots();waitingCommandsAndPower();exitOutcome(false);exitOutcome(true);backgroundFailure();modifierFailure();cleanupAndStartup();
-    unchangedWork();scopedPaint();deferredVisuals(false);deferredVisuals(true);unchangedTrayTip();nightResultDetails();compressionResultWork();
+    unchangedWork();scopedPaint();idleStateBadge();deferredVisuals(false);deferredVisuals(true);unchangedTrayTip();nightResultDetails();compressionResultWork();
     for(int order=0;order<5;++order)failureOrdering(order);visibleFailure();obscuredFailure();for(int kind=0;kind<3;++kind)shownFailure(kind);nextFailedSession();previewOnlyError();
     for(bool duringShow:{false,true})for(bool finishing:{false,true})failureNoticeReentrancy(duringShow,finishing);trayLossWithFailure();failureInsideMenu();visibleFailureInsideMenu();failureMessageAllocation();
     std::cout<<"PASS 42 tray/status groups: owned hidden windows, synthetic engine, no tray icons, captures, input, or settings writes.\n";return 0;

@@ -12,6 +12,10 @@ A small native Windows timelapse recorder. Record a display, a camera, or both i
 
 Open folder uses the save destination selected when clicked and creates it if needed. Slow folder operations leave the recording controls responsive. The button shows Opening... while an Open folder or Show files request is outstanding; another request can start after it finishes. Hiding or exiting cancels a request that has not yet been sent to Explorer. A request already sent may still finish, and directory creation already in progress may complete. Folder-opening errors do not replace recording or recovery details.
 
+The preview, coloured recording state, Record/Pause/Finish controls and status message occupy the left side. Input, output and save settings live in the right panel. Expanding Advanced scrolls that panel while the preview and recording controls stay visible. Hover over the save path or a status/detail label to read its full text. Display and Camera choices appear only for sources in use; collage tools appear only for editable collages.
+
+Use the mouse wheel over settings to scroll the panel, or Tab to bring a control into view. Shift + wheel scrolls horizontally when needed. On very small work areas or at high display scaling, the window provides scrolling in both directions so every control remains reachable.
+
 When a camera source is selected and the camera list cannot be loaded, choose Details beside the status message, or hover over it, for the Windows error and a retry hint. The reason also appears in the status line when no current error, saved result or settings warning takes priority.
 
 **Status details:** Save results, errors and settings warnings offer a compact Details button (Alt + I). It opens the full message in a selectable, read-only view: use Ctrl + A and Ctrl + C to copy the text, including long recovery paths. The view is a snapshot from when you opened it; recording continues, and reopening shows the current details. Recording outcomes appear before any additional settings or source diagnostic. Close or Escape returns to the main window. A failed recording's recovery details remain available after Refresh or source changes; starting a new recording replaces the previous outcome.
@@ -106,7 +110,7 @@ Tab moves between controls. Alt + H changes the save folder while idle, and Alt 
 
 In the collage preview, Space cycles between sources, arrow keys move the selected source, and Shift + arrow keys resize it. Using these keys while dragging ends the current drag and preserves the keyboard edit. Reset layout restores the preset.
 
-On smaller work areas, scroll to reach the preview and controls. The wheel scrolls vertically, Shift + wheel scrolls horizontally, and keyboard navigation brings focused controls into view.
+On smaller work areas, the settings panel scrolls independently while the preview and recording controls stay visible. When the work area cannot fit the preview's minimum height, the whole window scrolls to keep every control reachable. Shift + wheel scrolls horizontally, and keyboard navigation brings focused controls into view.
 
 Custom-value, Playback & shortcuts, Time compression, Watermark and Status Details dialogs also support these wheel gestures. Closed dropdowns retain their values while you scroll an overflowing dialog; open dropdowns, the scheduled-ranges list and the Details report keep their own scrolling. Wheel amount follows your Windows settings. In a constrained Details window, Tab brings the focused action into view.
 
