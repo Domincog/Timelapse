@@ -46,7 +46,7 @@ constexpr int SeparateFilesMode = 5;
 constexpr wchar_t SeparateFilesLabel[] = L"Desktop + camera (2 files)";
 constexpr UINT TrayMessage = WM_APP + 1, ShowExistingMessage = WM_APP + 2;
 constexpr UINT CancelOwnedWorkMessage = WM_APP + 3;
-constexpr UINT TrayShow = 4001, TrayPause = 4002, TrayFinish = 4003, TrayExit = 4004;
+constexpr UINT TrayShow = 4001, TrayPause = 4002, TrayFinish = 4003, TrayExit = 4004, TrayProgress = 4005;
 constexpr UINT ExitSystemCommand = 0x1000;
 constexpr wchar_t InstanceMutexName[] = L"Local\\Timelapse.Application.{DC32D155-1B8D-4880-9902-CE6245D34923}";
 constexpr wchar_t SetupMutexName[] = L"Local\\Timelapse.Setup.{DC32D155-1B8D-4880-9902-CE6245D34923}";
@@ -820,11 +820,39 @@ void exitApplication() {
         app.closeWhenDone=true;app.engine->finish();EnableWindow(app.window,FALSE);
     } else DestroyWindow(app.window);
 }
+bool trayProgressText(const Status& status,wchar_t (&value)[160]) noexcept {
+    value[0]=L'\0';
+    const wchar_t* state=nullptr;
+    switch(status.state) {
+    case State::Recording:state=L"Recording";break;
+    case State::Paused:state=L"Paused";break;
+    case State::Finishing:state=L"Saving";break;
+    default:return false;
+    }
+    // A menu-opening snapshot: truncate whole seconds, never extrapolate or
+    // imply that accepted frames have already been finalized to a file.
+    // UINT64_MAX rounds to 2^64 as double, so equality is also out of range.
+    if(!std::isfinite(status.elapsed) || status.elapsed<0 ||
+       status.elapsed>=static_cast<double>(UINT64_MAX))return false;
+    const auto active=static_cast<uint64_t>(status.elapsed);
+    if(status.frames<30)
+        return swprintf_s(value,L"%ls: %02llu:%02llu:%02llu active | %llu %ls total",
+            state,active/3600,active/60%60,active%60,status.frames,
+            status.frames==1?L"frame":L"frames")>=0;
+    const auto video=status.frames/30;
+    return swprintf_s(value,L"%ls: %02llu:%02llu:%02llu active | %02llu:%02llu:%02llu video total",
+        state,active/3600,active/60%60,active%60,video/3600,video/60%60,video%60)>=0;
+}
 void trayMenu(POINT at={},bool usePoint=false) {
     if(app.failureNotice==FailureNotice::Presenting || app.trayMenuOpen)return;
     applyStatus(app.engine->status());
     if(app.hiddenToTray && reportRecordingFailure())return;
     HMENU menu=CreatePopupMenu();if(!menu){showWindow();return;}
+    wchar_t progress[160]{};
+    if(trayProgressText(app.status,progress) &&
+       AppendMenuW(menu,MF_STRING|MF_GRAYED,TrayProgress,progress) &&
+       !AppendMenuW(menu,MF_SEPARATOR,0,nullptr))
+        DeleteMenu(menu,TrayProgress,MF_BYCOMMAND);
     AppendMenuW(menu,MF_STRING,TrayShow,L"&Show Timelapse");
     const bool pauseAllowed=!app.closeWhenDone&&(app.status.state==State::Recording||app.status.state==State::Paused);
     AppendMenuW(menu,MF_STRING|(pauseAllowed?MF_ENABLED:MF_GRAYED),TrayPause,app.status.state==State::Paused?L"&Resume recording":L"&Pause recording");

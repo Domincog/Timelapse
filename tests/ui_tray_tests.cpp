@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <iostream>
 #include <functional>
+#include <limits>
 #include <stdexcept>
 #include <cstdlib>
 #include <new>
@@ -35,6 +36,9 @@ int records=0,finishes=0,pauses=0,shows=0,hides=0,foregrounds=0,destroys=0,dialo
 int confirmations=0,confirmation=IDOK,menus=0,menuX=0,menuY=0;
 int endedMenus=0;UINT menuResult=0;
 UINT pauseFlags=0,finishFlags=0,exitFlags=0;
+struct MenuItem {UINT id=0,type=0,state=0;wchar_t text[200]{};};
+MenuItem menuItems[8]{};int menuItemCount=0;UINT menuDefault=0;
+bool failProgressAppend=false,failProgressSeparator=false;int progressAppendFailures=0,progressSeparatorFailures=0;
 bool failAdd=false,failModify=false,failVersion=false;
 bool iconic=false;
 bool failAfterStatus=false;
@@ -65,8 +69,23 @@ BOOL WINAPI foreground(HWND){++foregrounds;return TRUE;}
 BOOL WINAPI destroy(HWND){++destroys;return TRUE;}
 int WINAPI dialog(HWND,LPCWSTR message,LPCWSTR,UINT flags){lastDialog=message;++dialogs;if((flags&MB_ICONMASK)==MB_ICONQUESTION){++confirmations;return confirmation;}auto callback=std::move(onWarning);if(callback)callback();return IDOK;}
 BOOL WINAPI point(LPPOINT value){*value={17,29};return TRUE;}
+BOOL WINAPI appendMenu(HMENU menu,UINT flags,UINT_PTR id,LPCWSTR label){
+    if(failProgressAppend && id==4005){++progressAppendFailures;SetLastError(ERROR_NOT_ENOUGH_MEMORY);return FALSE;}
+    if(failProgressSeparator && (flags&MF_SEPARATOR) && GetMenuState(menu,4005,MF_BYCOMMAND)!=UINT(-1)){
+        failProgressSeparator=false;++progressSeparatorFailures;SetLastError(ERROR_NOT_ENOUGH_MEMORY);return FALSE;
+    }
+    return AppendMenuW(menu,flags,id,label);
+}
 BOOL WINAPI menu(HMENU value,UINT flags,int x,int y,int,HWND,const RECT*){
     require((flags&TPM_RETURNCMD)!=0,"Menu must not dispatch commands asynchronously");++menus;menuX=x;menuY=y;
+    menuItemCount=GetMenuItemCount(value);require(menuItemCount>=0 && menuItemCount<=8,"Unexpected tray menu inventory.");
+    menuDefault=GetMenuDefaultItem(value,FALSE,0);
+    for(int i=0;i<menuItemCount;++i){
+        auto& item=menuItems[i];item={};MENUITEMINFOW info{sizeof(info)};
+        info.fMask=MIIM_ID|MIIM_FTYPE|MIIM_STATE|MIIM_STRING;info.dwTypeData=item.text;info.cch=200;
+        require(GetMenuItemInfoW(value,static_cast<UINT>(i),TRUE,&info)!=FALSE,"Cannot inspect owned native menu item.");
+        item.id=info.wID;item.type=info.fType;item.state=info.fState;
+    }
     pauseFlags=GetMenuState(value,4002,MF_BYCOMMAND);finishFlags=GetMenuState(value,4003,MF_BYCOMMAND);exitFlags=GetMenuState(value,4004,MF_BYCOMMAND);auto callback=std::move(onMenu);if(callback)callback();return static_cast<BOOL>(menuResult);
 }
 BOOL WINAPI endMenu(){++endedMenus;return TRUE;}
@@ -96,6 +115,7 @@ int runCameraHost(const wchar_t*){throw std::runtime_error("Unexpected applicati
 #define MessageBoxW probe::dialog
 #define GetCursorPos probe::point
 #define TrackPopupMenu probe::menu
+#define AppendMenuW probe::appendMenu
 #define EndMenu probe::endMenu
 #define RegisterWindowMessageW probe::registerMessage
 #define PostQuitMessage probe::quit
@@ -118,6 +138,7 @@ int runCameraHost(const wchar_t*){throw std::runtime_error("Unexpected applicati
 #undef MessageBoxW
 #undef GetCursorPos
 #undef TrackPopupMenu
+#undef AppendMenuW
 #undef EndMenu
 #undef RegisterWindowMessageW
 #undef PostQuitMessage
@@ -141,6 +162,7 @@ struct Fixture {
     Fixture(){
         app.settings={};app.status=probe::current={};app.selected=-1;app.closeWhenDone=false;
         app.failureNotice=FailureNotice::None;app.trayMenuOpen=app.trayMenuCanceled=false;probe::onShow=probe::onWarning=probe::onMenu={};probe::endedMenus=0;probe::menuResult=0;
+        probe::menuItemCount=0;probe::menuDefault=0;probe::failProgressAppend=probe::failProgressSeparator=false;probe::progressAppendFailures=probe::progressSeparatorFailures=0;
         probe::failAfterStatus=noticeAllocation::failNext=false;noticeAllocation::failures=0;
         app.visibleDirty=true;app.controlsUpdated=app.trayStateValid=probe::iconic=false;
         app.advancedExpanded=false;app.advancedLimitIndex=app.advancedVisibility=-1;
@@ -205,6 +227,69 @@ void menuAndCommands(){Fixture f;f.state(State::Recording);f.close();
     f.state(State::Idle);f.tick();windowProc(app.window,TrayMessage,0,MAKELPARAM(WM_CONTEXTMENU,1));
     require((probe::pauseFlags&MF_GRAYED)&&(probe::finishFlags&MF_GRAYED)&&!(probe::exitFlags&MF_GRAYED),"Idle menu exposes invalid recording commands");
     f.command(TrayExit);require(probe::destroys==1,"Idle Exit failed");
+}
+void inspectTrayActions(bool progress,State state){
+    const int start=progress?2:0;
+    require(probe::menuItemCount==start+5 && probe::menuDefault==TrayShow,"Progress changed tray action count or the default Show command.");
+    require(probe::menuItems[start].id==TrayShow && std::wstring(probe::menuItems[start].text)==L"&Show Timelapse" &&
+        probe::menuItems[start+1].id==TrayPause && std::wstring(probe::menuItems[start+1].text)==(state==State::Paused?L"&Resume recording":L"&Pause recording") &&
+        probe::menuItems[start+2].id==TrayFinish && std::wstring(probe::menuItems[start+2].text)==L"&Finish recording" &&
+        (probe::menuItems[start+3].type&MFT_SEPARATOR) && probe::menuItems[start+4].id==TrayExit && std::wstring(probe::menuItems[start+4].text)==L"E&xit Timelapse",
+        "Progress changed native tray action identities, order, labels or separator.");
+    const bool pause=state==State::Recording || state==State::Paused;
+    require(bool(probe::pauseFlags&MF_GRAYED)==!pause && bool(probe::finishFlags&MF_GRAYED)==!(pause || state==State::Starting) && !(probe::exitFlags&MF_GRAYED),
+        "Progress changed native Pause/Finish/Exit availability.");
+    if(progress)require(probe::menuItems[0].id==4005 && (probe::menuItems[0].state&MFS_DISABLED) &&
+        !(probe::menuItems[0].type&MFT_SEPARATOR) && (probe::menuItems[1].type&MFT_SEPARATOR),"Progress heading is actionable or missing its separate native row.");
+}
+void trayProgressSnapshots(){Fixture f;f.state(State::Recording);f.close();
+    const auto open=[&]{const int queries=probe::statusQueries;windowProc(app.window,TrayMessage,MAKELPARAM(30,40),MAKELPARAM(WM_CONTEXTMENU,1));
+        require(probe::statusQueries==queries+1,"Progress introduced another engine status query.");};
+    struct FrameCase {uint64_t frames;const wchar_t* output;};
+    const FrameCase cases[]={{0,L"0 frames total"},{1,L"1 frame total"},{29,L"29 frames total"},{30,L"00:00:01 video total"},
+        {107999,L"00:59:59 video total"},{108000,L"01:00:00 video total"},{UINT64_MAX,L"170803185867681:02:00 video total"}};
+    for(auto state:{State::Recording,State::Paused,State::Finishing})for(const auto& entry:cases){
+        app.status.state=State::Idle;app.status.frames=9000;app.status.elapsed=999;
+        probe::current.state=state;probe::current.frames=entry.frames;probe::current.elapsed=5025.875;open();inspectTrayActions(true,state);
+        const std::wstring expected=std::wstring(state==State::Recording?L"Recording":state==State::Paused?L"Paused":L"Saving")+L": 01:23:45 active | "+entry.output;
+        require(std::wstring(probe::menuItems[0].text)==expected,"Tray progress rounded, overflowed or used a stale status instead of the sampled recording facts.");
+    }
+    // The common frame count includes all parts and is per recording timeline,
+    // even when desktop and camera each receive an output file.
+    app.settings.separateFiles=true;app.settings.segmentDurationSeconds=60;
+    probe::current.state=State::Paused;probe::current.frames=126030;probe::current.elapsed=360001.25;probe::current.completedSegments=7;
+    probe::current.savedPaths={L"C:/OwnedSynthetic/desktop-part007.mp4",L"C:/OwnedSynthetic/camera-part007.mp4"};open();
+    require(std::wstring(probe::menuItems[0].text)==L"Paused: 100:00:01 active | 01:10:01 video total","Paired or split progress doubled/reset common frames or wrapped long active time.");
+    const auto paused=std::wstring(probe::menuItems[0].text);probe::now+=600000;open();
+    require(std::wstring(probe::menuItems[0].text)==paused,"Paused tray progress extrapolated elapsed time from the wall clock.");
+    probe::current.state=State::Finishing;open();const auto saving=std::wstring(probe::menuItems[0].text);probe::now+=600000;open();
+    require(std::wstring(probe::menuItems[0].text)==saving,"Saving tray progress extrapolated a frozen admission timeline.");
+    for(auto state:{State::Idle,State::Starting}){probe::current.state=state;open();inspectTrayActions(false,state);}
+    probe::current.state=State::Recording;open();const auto last=std::wstring(probe::menuItems[0].text);const int menus=probe::menus;
+    // Menu snapshots do not refresh the tooltip. Settle the earlier switch to
+    // paired output through its existing timer before measuring stable ticks.
+    f.tick();require(probe::tip.find(L"desktop + camera files")!=std::wstring::npos,"Paired tooltip transition did not reach the existing timer path.");
+    probe::resetWork();for(int i=0;i<1000;++i)f.tick();
+    require(probe::statusQueries==1000 && probe::menus==menus && !probe::enables && !probe::textWrites && probe::invalidated.empty() && probe::notifications.empty() &&
+        std::wstring(probe::menuItems[0].text)==last,"Hidden unchanged recording added menu, visual or shell work for progress.");
+    require(!probe::records && !probe::pauses && !probe::finishes && !probe::destroys,"Inspecting progress dispatched a recording command.");
+    std::cout<<"PASS actual native tray progress snapshots: states, zero/subsecond/hour/uint64 counts, cumulative paired/parts, no extrapolation and unchanged single-query/hidden work\n";
+}
+void trayProgressFailureControls(){Fixture f;f.state(State::Recording);f.close();probe::current.frames=60;
+    for(double invalid:{-1.0,(std::numeric_limits<double>::infinity)(),(std::numeric_limits<double>::quiet_NaN)(),18446744073709551616.0}){
+        probe::current.elapsed=invalid;trayMenu();inspectTrayActions(false,State::Recording);
+    }
+    probe::current.elapsed=2;
+    probe::failProgressAppend=true;trayMenu();probe::failProgressAppend=false;inspectTrayActions(false,State::Recording);
+    require(probe::progressAppendFailures==1,"Optional progress append fault was not reached.");
+    probe::failProgressSeparator=true;trayMenu();inspectTrayActions(false,State::Recording);
+    require(probe::progressSeparatorFailures==1,"Optional heading separator fault was not reached.");
+    trayMenu();inspectTrayActions(true,State::Recording);
+    require(std::wstring(probe::menuItems[0].text)==L"Recording: 00:00:02 active | 00:00:02 video total","Healthy menu did not recover after optional progress failure.");
+    probe::menuResult=TrayPause;trayMenu();require(probe::pauses==1 && probe::current.state==State::Paused,"Returned native Pause command changed after adding progress.");
+    probe::menuResult=TrayPause;trayMenu();require(probe::pauses==2 && probe::current.state==State::Recording,"Returned native Resume command changed after adding progress.");
+    probe::menuResult=TrayFinish;trayMenu();require(probe::finishes==1 && probe::current.state==State::Finishing && !probe::destroys,"Returned native Finish command exited or stopped dispatching.");
+    std::cout<<"PASS invalid progress and optional menu append failures preserve native actions without orphan rows; native Pause/Resume/Finish dispatch recovers\n";
 }
 void exitOutcome(bool fail){Fixture f;f.state(State::Recording);f.close();f.command(TrayExit);
     require(probe::finishes==1&&app.closeWhenDone&&!IsWindowEnabled(app.window)&&probe::destroys==0,"Exit did not wait for finalization");
@@ -392,9 +477,9 @@ void compressionResultWork(){Fixture f;app.advancedExpanded=true;app.settings.ti
 }
 }
 int main(){std::cout<<std::unitbuf;try{
-    hideAndShow();failedRegistration();restart(false);restart(true);legacyFallback();menuAndCommands();exitOutcome(false);exitOutcome(true);backgroundFailure();modifierFailure();cleanupAndStartup();
+    hideAndShow();failedRegistration();restart(false);restart(true);legacyFallback();menuAndCommands();trayProgressSnapshots();trayProgressFailureControls();exitOutcome(false);exitOutcome(true);backgroundFailure();modifierFailure();cleanupAndStartup();
     unchangedWork();scopedPaint();deferredVisuals(false);deferredVisuals(true);unchangedTrayTip();nightResultDetails();compressionResultWork();
     for(int order=0;order<5;++order)failureOrdering(order);visibleFailure();obscuredFailure();for(int kind=0;kind<3;++kind)shownFailure(kind);nextFailedSession();previewOnlyError();
     for(bool duringShow:{false,true})for(bool finishing:{false,true})failureNoticeReentrancy(duringShow,finishing);trayLossWithFailure();failureInsideMenu();visibleFailureInsideMenu();failureMessageAllocation();
-    std::cout<<"PASS 38 tray/status cases: owned hidden windows, synthetic engine, no tray icons, captures, input, or settings writes.\n";return 0;
+    std::cout<<"PASS 40 tray/status cases: owned hidden windows, synthetic engine, no tray icons, captures, input, or settings writes.\n";return 0;
 }catch(const std::exception& error){std::cerr<<"FAIL: "<<error.what()<<'\n';return 1;}}

@@ -28,6 +28,8 @@ Camera input stays within 1280 x 720 when the output fits inside that box. Large
 
 **System tray:** Closing the window hides Timelapse while recording continues. Reopen it from its tray icon or the Start menu. Right-click the tray icon for Show, Pause/Resume, Finish, or Exit. Exit finishes an active recording before closing; a saving failure brings the window back with the recovery information. Hidden windows stop preview processing. If Windows cannot add the tray icon, the app stays accessible in its window.
 
+While recording, paused or saving, the menu also shows active recording time and total accumulated video time at 30 fps. Before the first second of video, it shows the frame count instead. Totals include all split parts; paired files share one timeline and are counted once. These are accepted-frame totals, not a guarantee that the current file has finished saving. The heading is a snapshot from when you opened the menu; reopen it to refresh. Viewing it does not restore the preview or add background polling.
+
 A recording failure received while hidden opens the window with its details. Opening the tray menu does not dismiss that notice. A fresh failure is shown before Hide or Exit can dismiss it; after it has been shown, those controls work normally.
 
 Hiding to the tray cancels open settings drafts. Custom-value dialogs leave keyboard focus out of the hidden window; ordinary Cancel returns focus to the setting you were editing.
