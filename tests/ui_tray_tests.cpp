@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <cstdlib>
 #include <new>
+#include <process.h>
 
 namespace noticeAllocation {thread_local bool failNext=false;thread_local unsigned failures=0;}
 void* operator new(size_t size){
@@ -46,6 +47,9 @@ ULONGLONG now=1000000;
 ULONGLONG WINAPI ticks(){return now;}
 int statusQueries=0,enables=0,textWrites=0;
 int delayedCancels=0;
+int unexpectedThreads=0,unexpectedShell=0;
+uintptr_t __cdecl noThread(void*,unsigned,unsigned (__stdcall*)(void*),void*,unsigned,unsigned*){++unexpectedThreads;return 0;}
+BOOL WINAPI noShell(SHELLEXECUTEINFOW*){++unexpectedShell;return FALSE;}
 bool delayedOrigin=false;
 struct Invalidated {HWND window;bool whole;RECT rect;};
 std::vector<Invalidated> invalidated;
@@ -112,6 +116,8 @@ std::vector<Monitor> enumerateMonitors(){throw std::runtime_error("Unexpected di
 std::vector<CameraDevice> enumerateCameras(std::wstring&){throw std::runtime_error("Unexpected camera enumeration");}
 int runCameraHost(const wchar_t*){throw std::runtime_error("Unexpected application entry");}
 }
+#define ShellExecuteExW probe::noShell
+#define _beginthreadex probe::noThread
 #define Engine TrayEngine
 #define Shell_NotifyIconW probe::notify
 #define ShowWindow probe::show
@@ -135,6 +141,8 @@ int runCameraHost(const wchar_t*){throw std::runtime_error("Unexpected applicati
 #include "ui_person_pack_stub.h"
 #include "../src/main.cpp"
 #pragma warning(pop)
+#undef ShellExecuteExW
+#undef _beginthreadex
 #undef Engine
 #undef Shell_NotifyIconW
 #undef ShowWindow
@@ -165,6 +173,8 @@ namespace {
 using probe::require;
 struct Fixture {
     Fixture(){
+        cancelOpenFolder();shellOperationBusy=false;app.shellBusyObserved=app.openFolderBusyShown=false;
+        app.customDialog=nullptr;probe::unexpectedThreads=probe::unexpectedShell=0;
         app.settings={};app.status=probe::current={};app.selected=-1;app.closeWhenDone=false;
         app.failureNotice=FailureNotice::None;app.trayMenuOpen=app.trayMenuCanceled=false;probe::onShow=probe::onWarning=probe::onMenu={};probe::endedMenus=0;probe::menuResult=0;
         probe::menuItemCount=0;probe::menuDefault=0;probe::failProgressAppend=probe::failProgressSeparator=false;probe::progressAppendFailures=probe::progressSeparatorFailures=0;
@@ -195,13 +205,93 @@ struct Fixture {
         for(auto p:{&app.refresh,&app.record,&app.pause,&app.finish,&app.folder,&app.openFolder,&app.reset,&app.forward})*p=child(L"BUTTON",BS_PUSHBUTTON);
         app.engine=std::make_unique<lapse::TrayEngine>();configure();updateControls();
     }
-    ~Fixture(){removeTray();app.engine.reset();DestroyWindow(app.window);app.window=app.preview=app.statusText=nullptr;}
+    ~Fixture(){cancelOpenFolder();shellOperationBusy=false;app.shellBusyObserved=app.openFolderBusyShown=false;removeTray();app.engine.reset();DestroyWindow(app.window);app.window=app.preview=app.statusText=nullptr;}
     void state(State value){app.status=probe::current={};app.status.state=probe::current.state=value;}
     void close(){windowProc(app.window,WM_CLOSE,0,0);}
     void command(UINT value){windowProc(app.window,WM_COMMAND,value,0);}
     void tick(){windowProc(app.window,WM_TIMER,1,0);}
     int notifications(DWORD operation){return static_cast<int>(std::count(probe::notifications.begin(),probe::notifications.end(),operation));}
 };
+// Seed only the UI-facing result boundary; ui_folder_tests owns the real
+// blocked native worker and resource-lifetime proof. These cases never launch it.
+std::shared_ptr<OpenFolderTask> pendingFolder(){
+    auto task=std::make_shared<OpenFolderTask>();task->folder=app.settings.folder;
+    app.openFolderTask=task;shellOperationBusy=true;app.shellBusyObserved=true;refreshOpenFolderControl();return task;
+}
+void completeFolder(const std::shared_ptr<OpenFolderTask>& task,OpenFolderResult result){
+    task->result=result;shellOperationBusy=false;task->done.store(true,std::memory_order_release);
+}
+std::wstring folderCaption(){wchar_t text[100]{};GetWindowTextW(app.openFolder,text,100);return text;}
+void folderLifecycle(){
+    for(int action=0;action<6;++action){Fixture f;f.state(State::Recording);const auto task=pendingFolder();
+        require(!IsWindowEnabled(app.openFolder)&&folderCaption()==L"Opening...","Pending folder action did not disable/cache its caption.");
+        if(action==0){probe::failAdd=true;f.close();require(!app.hiddenToTray&&app.openFolderTask==task&&task->phase==OpenFolderPhase::Preparing,"Rejected Hide canceled a still-valid request.");}
+        if(action==1){probe::confirmation=IDCANCEL;f.command(TrayExit);require(!app.closeWhenDone&&app.openFolderTask==task&&task->phase==OpenFolderPhase::Preparing,"Rejected Exit canceled a still-valid request.");}
+        if(action==2)f.close();
+        if(action==3)f.command(TrayExit);
+        if(action==4)windowProc(app.window,WM_DESTROY,0,0);
+        if(action==5){windowProc(app.window,WM_ENDSESSION,FALSE,0);require(app.openFolderTask==task,"Rejected session-end canceled work.");windowProc(app.window,WM_ENDSESSION,TRUE,0);}
+        if(action>=2)require(!app.openFolderTask&&task->phase==OpenFolderPhase::Cancelled&&shellOperationBusy&&!task->done,
+            "Accepted lifecycle transition failed to detach/cancel, or released a still-owned Shell slot.");
+        require(!probe::unexpectedThreads&&!probe::unexpectedShell,"UI boundary test launched native folder work.");
+    }
+    std::cout<<"PASS pending-folder accepted/rejected Hide, Exit, session-end and direct destruction ownership\n";
+}
+void folderDeferrals(){
+    for(int blocker=0;blocker<4;++blocker){Fixture f;f.state(State::Recording);app.settings.folder=L"C:\\Immutable requested folder";
+        const auto task=pendingFolder();completeFolder(task,OpenFolderResult::ShellFailure);
+        if(blocker==0)app.customDialog=app.pause;
+        if(blocker==1)EnableWindow(app.window,FALSE);
+        if(blocker==2)probe::iconic=true;
+        if(blocker==3)app.trayMenuOpen=true;
+        f.tick();require(app.openFolderTask==task&&!probe::dialogs,"Folder error interrupted an owned/disabled/iconic/menu context.");
+        app.customDialog=nullptr;EnableWindow(app.window,TRUE);probe::iconic=false;app.trayMenuOpen=false;
+        int reentries=0;probe::onWarning=[&]{++reentries;require(!app.openFolderTask,"Folder result was not claimed before its modal.");f.tick();f.close();};
+        f.tick();require(reentries==1&&probe::dialogs==1&&app.hiddenToTray&&!app.openFolderTask&&probe::lastDialog.find(task->folder)!=std::wstring::npos,
+            "Deferred folder error lost its immutable path, duplicated on modal reentry, or touched abandoned state.");
+        require(!probe::records&&!probe::finishes&&!probe::unexpectedThreads&&!probe::unexpectedShell,"Optional folder reporting changed recording or launched native work.");
+    }
+    std::cout<<"PASS folder-error modal deferral, immutable path and claim-before-reentrant-Hide\n";
+}
+void folderHiddenCompletion(){Fixture f;f.state(State::Recording);const auto task=pendingFolder();f.close();
+    require(app.hiddenToTray&&!app.openFolderTask&&shellOperationBusy,"Hide failed to retain only detached worker ownership.");
+    completeFolder(task,OpenFolderResult::Cancelled);f.tick();
+    require(!app.shellBusyObserved&&app.openFolderBusyShown&&app.visibleDirty&&!probe::dialogs,"Hidden completion churned controls or retained observed busy state.");
+    f.command(TrayShow);
+    require(!app.hiddenToTray&&!app.openFolderBusyShown&&IsWindowEnabled(app.openFolder)&&folderCaption()==L"&Open folder"&&!probe::dialogs,
+        "Show failed to restore the button after hidden completion cleared its observed task flags.");
+    std::cout<<"PASS hidden completion and later Show restore cached folder caption/availability\n";
+}
+void folderFreshPendingPriority(){Fixture f;f.state(State::Recording);app.settings.folder=L"C:\\Recovery folder";
+    const auto task=pendingFolder();probe::current.state=State::Idle;probe::current.recordingFailed=probe::current.error=true;
+    probe::current.message=L"Original recording recovery report";probe::current.savedPath=L"C:\\Retained.recording.mp4";
+    probe::current.savedPaths={probe::current.savedPath};f.tick();
+    require(app.failureNotice==FailureNotice::Presented && app.openFolderTask==task && !probe::dialogs,
+        "Fresh recording failure failed to retain first reporting priority while the folder worker was incomplete.");
+    completeFolder(task,OpenFolderResult::ShellFailure);f.tick();
+    require(!app.openFolderTask&&!probe::dialogs,"A late folder completion resurfaced after competing with a fresh recording failure.");
+    // Explicitly start a NEW action after acknowledgement. The thread seam
+    // refuses it without launching work, so its local startup error is visible.
+    f.command(OpenFolder);
+    require(probe::unexpectedThreads==1 && !probe::unexpectedShell && probe::dialogs==1 &&
+        probe::lastDialog.find(L"could not start the folder request")!=std::wstring::npos && !app.openFolderTask,
+        "Acknowledged recording failure permanently swallowed a later explicit folder-action diagnostic.");
+    f.tick();require(probe::dialogs==1 && app.failureNotice==FailureNotice::Presented && app.status.error &&
+        app.status.message==probe::current.message && app.status.savedPaths==probe::current.savedPaths,
+        "Later optional feedback duplicated or changed the retained recording recovery result.");
+    std::cout<<"PASS fresh-outcome priority persists through slow work; later explicit recovery action gets its own error\n";
+}
+void folderOutcomePriority(){
+    for(int kind=0;kind<3;++kind){Fixture f;f.state(State::Recording);app.settings.folder=L"C:\\Original folder";const auto task=pendingFolder();completeFolder(task,OpenFolderResult::ShellFailure);
+        if(kind==0){probe::current.state=State::Idle;probe::current.recordingFailed=true;probe::current.error=true;probe::current.message=L"Recording recovery report";probe::current.savedPath=L"C:\\Retained.recording.mp4";probe::current.savedPaths={probe::current.savedPath};}
+        if(kind==1)app.settings.folder=L"C:\\New folder";
+        if(kind==2)app.closeWhenDone=true;
+        f.tick();require(!app.openFolderTask&&!probe::dialogs,"Obsolete/closing folder error interrupted primary lifecycle reporting.");
+        if(kind==0)require(app.status.message==probe::current.message&&app.status.savedPaths==probe::current.savedPaths&&app.failureNotice==FailureNotice::Presented,
+            "Optional error changed recording recovery facts or failure acknowledgement.");
+    }
+    std::cout<<"PASS recording outcome, changed folder and closing state suppress obsolete optional errors\n";
+}
 void hideAndShow(){Fixture f;f.state(State::Recording);f.close();
     require(app.hiddenToTray&&app.trayRegistered&&app.trayVersion4&&!probe::configured.preview&&probe::hides==1&&probe::finishes==0&&probe::records==0&&probe::destroys==0&&probe::dialogs==0,"Close interrupted recording or hid without tray ownership");
     require(f.notifications(NIM_ADD)==1&&f.notifications(NIM_SETVERSION)==1&&probe::tip.find(L"Recording")!=std::wstring::npos,"Recording indicator missing");
@@ -539,6 +629,7 @@ void compressionResultWork(){Fixture f;app.advancedExpanded=true;app.settings.ti
 }
 }
 int main(){std::cout<<std::unitbuf;try{
+    folderLifecycle();folderDeferrals();folderHiddenCompletion();folderFreshPendingPriority();folderOutcomePriority();
     hideAndShow();failedRegistration();restart(false);restart(true);legacyFallback();menuAndCommands();trayProgressSnapshots();trayProgressFailureControls();waitingSnapshots();waitingCommandsAndPower();exitOutcome(false);exitOutcome(true);backgroundFailure();modifierFailure();cleanupAndStartup();
     unchangedWork();scopedPaint();deferredVisuals(false);deferredVisuals(true);unchangedTrayTip();nightResultDetails();compressionResultWork();
     for(int order=0;order<5;++order)failureOrdering(order);visibleFailure();obscuredFailure();for(int kind=0;kind<3;++kind)shownFailure(kind);nextFailedSession();previewOnlyError();

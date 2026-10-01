@@ -42,6 +42,8 @@ bool contains(const wchar_t* text){return std::wcsstr(messageText.data(),text)!=
 void log(char c){if(cleanupSize>=cleanup.size())std::abort();cleanup[cleanupSize++]=c;}
 void require(bool value,const char* message){if(!value)throw std::runtime_error(message);}
 void createEngine();void destroyEngine();
+void armFolderTask();void observeFolderCleanup();
+bool attachFolderAtLoop=false,folderCancelledBeforeEngine=false;
 HRESULT WINAPI fakeCom(LPVOID,DWORD){++comStarts;return comResult;}
 void WINAPI fakeComStop(){++comStops;log('c');}
 HRESULT WINAPI fakeMedia(ULONG,DWORD){++mediaStarts;return mediaResult;}
@@ -70,7 +72,7 @@ HWND WINAPI fakeWindow(DWORD,LPCWSTR,LPCWSTR,DWORD,int,int,int,int,HWND,HMENU,HI
 }
 BOOL WINAPI fakeShow(HWND,int show){++shows;lastShow=show;return TRUE;}BOOL WINAPI fakeUpdate(HWND){return TRUE;}
 BOOL WINAPI fakeMessage(LPMSG msg,HWND,UINT,UINT){
-    ++messages;if(loopError){if(failDiagnostic)failNextAllocation=true;return -1;}
+    ++messages;if(attachFolderAtLoop)armFolderTask();if(loopError){if(failDiagnostic)failNextAllocation=true;return -1;}
     if(normalDestroy)destroyEngine();msg->message=WM_QUIT;msg->wParam=quitCode;return 0;
 }
 DWORD WINAPI fakeLastError(){if(std::exchange(mutexErrorPending,false))return fixtureMutexError;++lastErrorReads;return ERROR_NOT_ENOUGH_MEMORY;}
@@ -108,7 +110,7 @@ namespace lapse {
 class LifecycleEngine {
 public:
     LifecycleEngine(){++engines;engineAlive=true;}
-    ~LifecycleEngine(){++engineStops;engineAlive=false;log('e');}
+    ~LifecycleEngine(){observeFolderCleanup();++engineStops;engineAlive=false;log('e');}
     void configure(const Settings&){}void refreshSources(){}void record(){++recordRequests;}void pause(){}void setPaused(bool){}void finish(){} void cancelDelayedStart() noexcept {}
     Status status(){return {};}
 };
@@ -201,7 +203,16 @@ int runCameraHost(const wchar_t*){return helperResult;}
 namespace {
 void createEngine(){app.engine=std::make_unique<lapse::LifecycleEngine>();}
 void destroyEngine(){app.engine.reset();}
+std::shared_ptr<OpenFolderTask> retainedFolder;
+void armFolderTask(){
+    retainedFolder=std::make_shared<OpenFolderTask>();retainedFolder->folder=L"C:\\Synthetic immutable folder";
+    app.openFolderTask=retainedFolder;shellOperationBusy=true;app.shellBusyObserved=true;
+}
+void observeFolderCleanup(){if(attachFolderAtLoop)folderCancelledBeforeEngine=retainedFolder &&
+    retainedFolder->phase==OpenFolderPhase::Cancelled && !app.openFolderTask;}
 void reset(HRESULT com=S_OK,HRESULT media=S_OK){
+    cancelOpenFolder();retainedFolder.reset();shellOperationBusy=false;
+    app.shellBusyObserved=app.openFolderBusyShown=false;attachFolderAtLoop=folderCancelledBeforeEngine=false;
     failNextAllocation=false;app.engine.reset();require(folderBuffers==0,"Previous known-folder buffer leaked");
     comResult=com;mediaResult=media;helperResult=-1;
     comStarts=mediaStarts=comStops=mediaStops=windows=classes=engines=engineStops=recordRequests=profileCalls=folderFrees=dialogs=messages=allocationFailures=0;
@@ -277,6 +288,14 @@ void diagnosticAllocation(bool direct=false){reset();loopError=failDiagnostic=tr
     std::cout<<"  diagnostic failure code="<<out.code<<" threw="<<out.threw<<" direct="<<direct<<" alloc="<<allocationFailures<<" stops="<<comStops<<','<<mediaStops<<" engine="<<engineAlive<<" order=";
     for(size_t i=0;i<cleanupSize;++i)std::cout<<cleanup[i];std::cout<<'\n';
     require(!out.threw&&out.code==1&&allocationFailures==1,"Actual message-error allocation failure was not contained");clean(1,1,"emc");fallback();}
+void abandonedFolder(bool error){
+    reset();loopError=error;attachFolderAtLoop=true;const auto out=entry();
+    require(!out.threw && out.code==(error?1:27),"Pending folder work changed message-loop exit result.");
+    require(folderCancelledBeforeEngine && retainedFolder && retainedFolder->phase==OpenFolderPhase::Cancelled &&
+        !app.openFolderTask && !retainedFolder->done && shellOperationBusy,
+        "Abnormal exit did not cancel/detach before engine teardown, or falsely released the worker-owned slot.");
+    clean(1,1,"emc");retainedFolder.reset();shellOperationBusy=false;
+}
 void installedLifecycle(int scenario) {
     reset();setupPresent=scenario==0;setupRacing=scenario==1;instancePresent=scenario>=2&&scenario<=4;
     instanceUnavailable=scenario==3;startInTray=scenario>=4;
@@ -304,6 +323,8 @@ int main(){
     test("GetMessage error reports failure and closes engine first",[]{loopCase(true,false);});
     test("WM_QUIT with surviving engine retains code and order",[]{loopCase(false,false);});
     test("WM_QUIT after destruction does not double cleanup",[]{loopCase(false,true);});
+    test("GetMessage error cancels pending folder before engine teardown",[]{abandonedFolder(true);});
+    test("WM_QUIT without destroy cancels pending folder before engine teardown",[]{abandonedFolder(false);});
     test("S_OK normal startup and quit",[]{loopCase(false,false,S_OK);});
     test("helper success returns before GUI initialization",[]{helper(0);});
     test("helper failure code returns before GUI initialization",[]{helper(37);});

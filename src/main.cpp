@@ -53,6 +53,19 @@ constexpr UINT ExitSystemCommand = 0x1000;
 constexpr wchar_t InstanceMutexName[] = L"Local\\Timelapse.Application.{DC32D155-1B8D-4880-9902-CE6245D34923}";
 constexpr wchar_t SetupMutexName[] = L"Local\\Timelapse.Setup.{DC32D155-1B8D-4880-9902-CE6245D34923}";
 enum class FailureNotice { None, Pending, Presenting, Presented };
+enum class OpenFolderPhase { Preparing, Cancelled, Dispatching };
+enum class OpenFolderResult { Opened, DirectoryUnavailable, ShellFailure, ComFailure, OutOfMemory, StartFailure, Failed, Cancelled };
+struct OpenFolderTask {
+    std::wstring folder;
+    std::atomic<OpenFolderPhase> phase{OpenFolderPhase::Preparing};
+    std::atomic<bool> done{false};
+    OpenFolderResult result=OpenFolderResult::Failed;
+    bool suppressError=false; // UI-only: a newer recording notice takes priority.
+    void cancel() noexcept {auto expected=OpenFolderPhase::Preparing;phase.compare_exchange_strong(expected,OpenFolderPhase::Cancelled);}
+};
+// Both Explorer actions share one bounded slot, including native cleanup after
+// their UI has closed. A blocked provider cannot accumulate replacement jobs.
+std::atomic<bool> shellOperationBusy{false};
 struct App {
     struct SizeSuggestion {
         int item=-1,width=0,height=0;
@@ -78,6 +91,8 @@ struct App {
     bool startupComplete = false;
     FailureNotice failureNotice = FailureNotice::None;
     bool trayMenuOpen = false, trayMenuCanceled = false;
+    std::shared_ptr<OpenFolderTask> openFolderTask;
+    bool shellBusyObserved = false, openFolderBusyShown = false;
     bool visibleDirty = true, controlsUpdated = false;
     State controlsState = State::Idle;
     bool advancedExpanded = false;
@@ -128,9 +143,12 @@ struct App {
     std::wstring preferences, selectedMonitorId;
     int scale(int value) const { return MulDiv(value, dpi, 96); }
     bool active() const { return status.state != State::Idle; }
-    ~App() { for(auto icon:trayIcons)if(icon)DestroyIcon(icon);DeleteObject(font); DeleteObject(titleFont); DeleteObject(smallFont); DeleteObject(background); }
+    ~App() { if(openFolderTask)openFolderTask->cancel();for(auto icon:trayIcons)if(icon)DestroyIcon(icon);DeleteObject(font); DeleteObject(titleFont); DeleteObject(smallFont); DeleteObject(background); }
 } app;
 void removeTray();
+void cancelOpenFolder() noexcept;
+void refreshOpenFolderControl();
+void pollOpenFolder();
 void cancelOwnedDialogs() {
     // EndDialog returns before destruction: walk ownership, not the global
     // pointer, so an open range editor and its settings dialog both terminate.
@@ -146,6 +164,7 @@ struct MediaRuntime {
     const HRESULT com = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     const HRESULT media = SUCCEEDED(com) ? MFStartup(MF_VERSION, MFSTARTUP_LITE) : E_UNEXPECTED;
     ~MediaRuntime() {
+        cancelOpenFolder();
         // Join the worker before releasing its media runtime, including when
         // startup or message retrieval exits without receiving WM_DESTROY.
         app.engine.reset();
@@ -483,6 +502,111 @@ void restoreStatusFocus(HWND owner,HWND preferred) {
         (GetWindowLongPtrW(child,GWL_STYLE)&WS_TABSTOP)){target=child;break;}
     SetFocus(target?target:owner);revealFocusedControl();
 }
+void cancelOpenFolder() noexcept {
+    if(app.openFolderTask)app.openFolderTask->cancel();
+    app.openFolderTask.reset();
+}
+void refreshOpenFolderControl() {
+    if(app.shellBusyObserved && !shellOperationBusy.load(std::memory_order_acquire))app.shellBusyObserved=false;
+    const bool busy=app.openFolderTask || app.shellBusyObserved;
+    if(busy==app.openFolderBusyShown)return;
+    if(app.hiddenToTray || IsIconic(app.window)){app.visibleDirty=true;return;}
+    if(!app.openFolder || !IsWindow(app.openFolder) || GetParent(app.openFolder)!=app.window)return;
+    if(busy && GetFocus()==app.openFolder)restoreStatusFocus(app.window,app.advanced);
+    SetWindowTextW(app.openFolder,busy?L"Opening...":L"&Open folder");
+    EnableWindow(app.openFolder,!busy);app.openFolderBusyShown=busy;
+}
+OpenFolderResult openFolderPath(OpenFolderTask& task) {
+    const auto cancelled=[&]{return task.phase.load()==OpenFolderPhase::Cancelled;};
+    if(cancelled())return OpenFolderResult::Cancelled;
+    struct Com {
+        HRESULT result=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED|COINIT_DISABLE_OLE1DDE);
+        ~Com(){if(SUCCEEDED(result))CoUninitialize();}
+    } com;
+    if(FAILED(com.result))return OpenFolderResult::ComFailure;
+    if(cancelled())return OpenFolderResult::Cancelled;
+    std::error_code error;
+    std::filesystem::create_directories(fileIOPath(task.folder),error);
+    if(cancelled())return OpenFolderResult::Cancelled;
+    if(error)return OpenFolderResult::DirectoryUnavailable;
+    // A dispatched Shell request cannot be revoked. Before this transition,
+    // hiding/exiting prevents dispatch even if directory preparation was slow.
+    auto expected=OpenFolderPhase::Preparing;
+    if(!task.phase.compare_exchange_strong(expected,OpenFolderPhase::Dispatching))return OpenFolderResult::Cancelled;
+    SHELLEXECUTEINFOW request{sizeof(request)};
+    request.fMask=SEE_MASK_NOASYNC|SEE_MASK_FLAG_NO_UI;
+    request.lpVerb=L"open";request.lpFile=task.folder.c_str();request.nShow=SW_SHOWNORMAL;
+    // NOASYNC lets this short-lived STA finish provider dispatch without a
+    // message loop. NO_UI suppresses ordinary errors, not security prompts.
+    return ShellExecuteExW(&request)?OpenFolderResult::Opened:OpenFolderResult::ShellFailure;
+}
+unsigned __stdcall openFolderWorker(void* argument) noexcept {
+    std::unique_ptr<std::shared_ptr<OpenFolderTask>> owned(static_cast<std::shared_ptr<OpenFolderTask>*>(argument));
+    const auto task=*owned;owned.reset();
+    try {task->result=openFolderPath(*task);}
+    catch(const std::bad_alloc&){task->result=OpenFolderResult::OutOfMemory;}
+    catch(...){task->result=OpenFolderResult::Failed;}
+    // COM/native resources are gone before another Explorer action can start.
+    shellOperationBusy.store(false,std::memory_order_release);
+    task->done.store(true,std::memory_order_release);return 0;
+}
+bool openFolderReportReady() {
+    return IsWindow(app.window) && !app.hiddenToTray && !IsIconic(app.window) && IsWindowEnabled(app.window) &&
+        !app.customDialog && !app.trayMenuOpen && !app.closeWhenDone &&
+        app.failureNotice!=FailureNotice::Pending && app.failureNotice!=FailureNotice::Presenting;
+}
+void pollOpenFolder() {
+    if(!app.openFolderTask && !app.shellBusyObserved)return;
+    if(!app.openFolderTask || !app.openFolderTask->done.load(std::memory_order_acquire)){refreshOpenFolderControl();return;}
+    const auto result=app.openFolderTask->result;
+    const bool discard=result==OpenFolderResult::Opened || result==OpenFolderResult::Cancelled ||
+        !IsWindow(app.window) || app.hiddenToTray || app.closeWhenDone || app.openFolderTask->suppressError ||
+        app.failureNotice==FailureNotice::Pending || app.failureNotice==FailureNotice::Presenting ||
+        app.openFolderTask->folder!=app.settings.folder;
+    if(!discard && !openFolderReportReady()){refreshOpenFolderControl();return;}
+    // Claim the result before a modal error can reenter, hide, or destroy App's
+    // window. The recording report and its acknowledgement remain untouched.
+    const auto task=std::move(app.openFolderTask);refreshOpenFolderControl();
+    if(discard || !openFolderReportReady())return;
+    const wchar_t* message=L"Windows could not open the save folder. Try again.";
+    std::wstring detailed;
+    if(result==OpenFolderResult::DirectoryUnavailable)message=L"The save folder is unavailable. Choose another folder.";
+    else if(result==OpenFolderResult::OutOfMemory)message=L"Not enough memory to open the save folder. Try again.";
+    else if(result==OpenFolderResult::StartFailure)message=L"Windows could not start the folder request. Try again.";
+    else if(result==OpenFolderResult::ShellFailure){
+        try {detailed=L"Windows could not open the save folder. Try opening it in File Explorer:\n\n"+task->folder;message=detailed.c_str();}
+        catch(...){/* The fixed message remains safe under allocation failure. */}
+    }
+    MessageBoxW(app.window,message,L"Timelapse",MB_OK|MB_ICONERROR);
+}
+void startOpenFolder() {
+    if(!IsWindow(app.window) || app.hiddenToTray || IsIconic(app.window) || !IsWindowEnabled(app.window) ||
+        app.customDialog || app.closeWhenDone || app.failureNotice==FailureNotice::Presenting)return;
+    if(app.openFolderTask){refreshOpenFolderControl();return;}
+    bool expected=false;
+    if(!shellOperationBusy.compare_exchange_strong(expected,true)){
+        app.shellBusyObserved=true;refreshOpenFolderControl();return;
+    }
+    app.shellBusyObserved=true;
+    std::shared_ptr<OpenFolderTask> task;
+    std::unique_ptr<std::shared_ptr<OpenFolderTask>> argument;
+    try {
+        task=std::make_shared<OpenFolderTask>();task->folder=app.settings.folder;
+        task->suppressError=app.failureNotice==FailureNotice::Pending || app.failureNotice==FailureNotice::Presenting;
+        argument=std::make_unique<std::shared_ptr<OpenFolderTask>>(task);
+    } catch(...) {
+        shellOperationBusy.store(false,std::memory_order_release);refreshOpenFolderControl();
+        if(openFolderReportReady())MessageBoxW(app.window,L"Not enough memory to open the save folder. Try again.",L"Timelapse",MB_OK|MB_ICONERROR);
+        return;
+    }
+    app.openFolderTask=task;
+    const uintptr_t thread=_beginthreadex(nullptr,0,openFolderWorker,argument.get(),0,nullptr);
+    if(!thread){
+        task->result=OpenFolderResult::StartFailure;task->done.store(true,std::memory_order_release);
+        shellOperationBusy.store(false,std::memory_order_release);pollOpenFolder();return;
+    }
+    argument.release();CloseHandle(reinterpret_cast<HANDLE>(thread));refreshOpenFolderControl();
+}
 void layoutStatusRow() {
     if(app.contentWidth<=0 || app.contentHeight<=0)return;
     const int pad=app.scale(26),width=app.contentWidth-2*pad,details=app.statusDetailsVisible==1?app.scale(88):0;
@@ -704,6 +828,7 @@ void updateControls() {
     EnableWindow(app.reset,collage); EnableWindow(app.forward,collage && app.selected>=0);
     updateAdvanced();
     updateNightText(!app.controlsUpdated);updateSkipText(!app.controlsUpdated);updateStatusText(!app.controlsUpdated);
+    refreshOpenFolderControl();
     app.controlsState=app.status.state;app.controlsUpdated=true;
 }
 void invalidateCanvas(RECT rect) {
@@ -716,6 +841,8 @@ void applyStatus(Status value,bool force=false) {
         if(!value.recordingFailed)app.failureNotice=FailureNotice::None;
         else if(app.failureNotice==FailureNotice::None)app.failureNotice=FailureNotice::Pending;
     }
+    if(app.openFolderTask && (app.failureNotice==FailureNotice::Pending || app.failureNotice==FailureNotice::Presenting))
+        app.openFolderTask->suppressError=true;
     const bool state=app.status.state!=value.state;
     const bool stats=state || app.status.frames!=value.frames || app.status.completedSegments!=value.completedSegments ||
         static_cast<uint64_t>(std::max(0.0,app.status.elapsed))!=static_cast<uint64_t>(std::max(0.0,value.elapsed));
@@ -844,7 +971,7 @@ bool hideToTray() {
         MessageBoxW(app.window,L"Windows could not add Timelapse to the system tray. The window will stay open so you can control your recording.",L"Timelapse",MB_OK|MB_ICONWARNING);
         return false;
     }
-    app.hiddenToTray=true;configure();ShowWindow(app.window,SW_HIDE);
+    cancelOpenFolder();app.hiddenToTray=true;configure();ShowWindow(app.window,SW_HIDE);
     if(!app.trayNoticeShown) {
         NOTIFYICONDATAW data{sizeof(data)};data.hWnd=app.window;data.uID=1;data.uFlags=NIF_INFO;data.dwInfoFlags=NIIF_INFO;
         wcscpy_s(data.szInfoTitle,L"Timelapse is in the system tray");
@@ -863,8 +990,8 @@ void exitApplication() {
         if(app.status.state!=State::Waiting && MessageBoxW(app.window,
             preparing?L"Cancel the pending start and exit Timelapse?":L"Finish the current recording and exit Timelapse?",
             preparing?L"Cancel start":L"Finish recording",MB_OKCANCEL|MB_ICONQUESTION)!=IDOK)return;
-        app.closeWhenDone=true;app.engine->finish();EnableWindow(app.window,FALSE);
-    } else DestroyWindow(app.window);
+        cancelOpenFolder();app.closeWhenDone=true;app.engine->finish();EnableWindow(app.window,FALSE);
+    } else {cancelOpenFolder();DestroyWindow(app.window);}
 }
 bool trayProgressText(const Status& status,wchar_t (&value)[160]) noexcept {
     value[0]=L'\0';
@@ -1226,7 +1353,6 @@ struct StatusFilesTask {
     HRESULT result=E_PENDING;
     void cancel() noexcept {auto expected=StatusFilesPhase::Resolving;phase.compare_exchange_strong(expected,StatusFilesPhase::Cancelled);}
 };
-std::atomic<bool> statusFilesBusy{false};
 std::vector<std::wstring> statusDetailsFiles(const Status& status,std::wstring& folder) {
     folder.clear();
     if(status.savedPaths.size()>2)return {};
@@ -1280,7 +1406,7 @@ unsigned __stdcall statusFilesWorker(void* argument) noexcept {
     catch(const std::bad_alloc&){task->result=E_OUTOFMEMORY;}
     catch(...){task->result=E_FAIL;}
     // All COM/PIDL resources are released before the next request may start.
-    statusFilesBusy.store(false,std::memory_order_release);
+    shellOperationBusy.store(false,std::memory_order_release);
     task->done.store(true,std::memory_order_release);return 0;
 }
 struct StatusDetailsDraft : CustomDraft {
@@ -1362,27 +1488,28 @@ void cancelStatusFiles(HWND window,StatusDetailsDraft& draft) noexcept {
 void startStatusFiles(HWND window,StatusDetailsDraft& draft) {
     if(draft.files.empty()||draft.filesTask||!draft.showFiles||!IsWindowEnabled(draft.showFiles))return;
     bool expected=false;
-    if(!statusFilesBusy.compare_exchange_strong(expected,true)){
+    if(!shellOperationBusy.compare_exchange_strong(expected,true)){
         statusFilesFeedback(window,draft,L"Another file request is finishing. Try again in a moment.");return;
     }
+    app.shellBusyObserved=true;refreshOpenFolderControl();
     std::shared_ptr<StatusFilesTask> task;
     std::unique_ptr<std::shared_ptr<StatusFilesTask>> argument;
     try {
         task=std::make_shared<StatusFilesTask>();task->files=draft.files;task->folder=draft.filesFolder;
         argument=std::make_unique<std::shared_ptr<StatusFilesTask>>(task);
     } catch(...) {
-        statusFilesBusy.store(false,std::memory_order_release);
+        shellOperationBusy.store(false,std::memory_order_release);refreshOpenFolderControl();
         statusFilesFeedback(window,draft,L"Not enough memory to show the files. Try again.");return;
     }
     // Establish completion delivery before launch. Failure starts no worker.
     if(!SetTimer(window,StatusDetailsFilesTimer,150,nullptr)){
-        statusFilesBusy.store(false,std::memory_order_release);
+        shellOperationBusy.store(false,std::memory_order_release);refreshOpenFolderControl();
         statusFilesFeedback(window,draft,L"Windows could not prepare the file request. Try again.");return;
     }
     draft.filesTimer=true;draft.filesTask=task;
     const uintptr_t thread=_beginthreadex(nullptr,0,statusFilesWorker,argument.get(),0,nullptr);
     if(!thread){
-        cancelStatusFiles(window,draft);draft.filesTask.reset();statusFilesBusy.store(false,std::memory_order_release);
+        cancelStatusFiles(window,draft);draft.filesTask.reset();shellOperationBusy.store(false,std::memory_order_release);refreshOpenFolderControl();
         statusFilesFeedback(window,draft,L"Windows could not start the file request. Try again.");return;
     }
     argument.release();CloseHandle(reinterpret_cast<HANDLE>(thread));
@@ -2439,6 +2566,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         return 0;
     }
     case WM_CREATE: {
+        cancelOpenFolder();app.shellBusyObserved=shellOperationBusy.load(std::memory_order_acquire);app.openFolderBusyShown=false;
         app.startupComplete=false;app.advancedExpanded=false;app.advancedLimitIndex=app.advancedVisibility=-1;
         app.advancedSegmentSeconds=-1;
         app.advancedCursorState=app.advancedDelaySeconds=-1;app.committedStartDelay=0;
@@ -2640,6 +2768,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
             } else DestroyWindow(w);
         } else if(wasHidden && pendingRecordingFailure())reportRecordingFailure();
         else acknowledgeVisibleFailure();
+        pollOpenFolder();
         return 0;
     }
     case WM_COMMAND: {
@@ -2715,16 +2844,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         case Pause:app.engine->setPaused(app.status.state!=State::Paused);break;
         case Finish:app.engine->finish();break;
         case Folder:selectFolder();break;
-        case OpenFolder: {
-            std::error_code ec;
-            std::filesystem::create_directories(fileIOPath(app.settings.folder),ec);
-            if(ec) MessageBoxW(w,L"The save folder is unavailable. Choose another folder.",L"Timelapse",MB_OK|MB_ICONERROR);
-            else if(reinterpret_cast<INT_PTR>(ShellExecuteW(w,L"open",app.settings.folder.c_str(),nullptr,nullptr,SW_SHOWNORMAL))<=32) {
-                const auto message=L"Windows could not open the save folder. Try opening it in File Explorer:\n\n"+app.settings.folder;
-                MessageBoxW(w,message.c_str(),L"Timelapse",MB_OK|MB_ICONERROR);
-            }
-            break;
-        }
+        case OpenFolder:startOpenFolder();break;
         case Reset:if(!app.settings.separateFiles){choose(app.mode,static_cast<int>(app.collagePreset));changeLayout(false);}break;
         case Forward:if(!app.settings.separateFiles && app.selected>=0){auto layer=app.settings.layers[app.selected];app.settings.layers.erase(app.settings.layers.begin()+app.selected);app.settings.layers.push_back(layer);app.selected=static_cast<int>(app.settings.layers.size())-1;customized();}break;
         }return 0;
@@ -2775,9 +2895,9 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
     case WM_ENDSESSION:
         // Confirmed session shutdown reaches WM_DESTROY and joins the engine,
         // giving the encoder a chance to finalize before Windows terminates us.
-        if(wp){cancelOwnedDialogs();DestroyWindow(w);}
+        if(wp){cancelOpenFolder();cancelOwnedDialogs();DestroyWindow(w);}
         return 0;
-    case WM_DESTROY:removeTray();KillTimer(w,1);if(app.startupComplete)preferences(true);app.startupComplete=false;app.engine.reset();PostQuitMessage(0);return 0;
+    case WM_DESTROY:cancelOpenFolder();removeTray();KillTimer(w,1);if(app.startupComplete)preferences(true);app.startupComplete=false;app.engine.reset();PostQuitMessage(0);return 0;
     }
     return DefWindowProcW(w,msg,wp,lp);
 }

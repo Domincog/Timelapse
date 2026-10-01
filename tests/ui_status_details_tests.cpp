@@ -38,7 +38,9 @@ size_t allocations=0;
 int allocationFailures=0,dialogs=0,notices=0,records=0,finishes=0,pauses=0;
 int statusQueries=0,configures=0,enumerations=0,textWrites=0,focusCalls=0,invalidFocus=0;
 int trayCalls=0,shows=0,hides=0,foregrounds=0,quits=0,profileReads=0;
-int folderCalls=0,shellCalls=0;
+int folderCalls=0;std::atomic<int> shellCalls{0};
+std::atomic<bool> blockFolderShell{false},folderShellEntered{false},releaseFolderShell{false};
+std::wstring expectedOpenFolder;
 std::atomic<int> fileThreadStarts{0},fileThreadExits{0},fileThreadCloses{0},fileComStarts{0},fileComEnds{0},fileParses{0},fileSelections{0},filePidls{0},fileFrees{0};
 std::atomic<bool> blockFileParse{false},fileParseEntered{false},releaseFileParse{false},fileProbeError{false};
 bool failFileThread=false,failFileTimer=false;
@@ -68,7 +70,7 @@ uintptr_t __cdecl beginThread(void* security,unsigned stack,unsigned (__stdcall*
 }
 BOOL WINAPI closeHandle(HANDLE value){++fileThreadCloses;return CloseHandle(value);}
 HRESULT WINAPI comInitialize(LPVOID,DWORD flags){
-    if(GetCurrentThreadId()==ownerThread || flags!=COINIT_APARTMENTTHREADED)fileProbeError=true;
+    if(GetCurrentThreadId()==ownerThread || (flags!=COINIT_APARTMENTTHREADED && flags!=(COINIT_APARTMENTTHREADED|COINIT_DISABLE_OLE1DDE)))fileProbeError=true;
     ++fileComStarts;return fileComResult;
 }
 void WINAPI comUninitialize(){++fileComEnds;}
@@ -152,9 +154,16 @@ HRESULT WINAPI folderFactory(REFCLSID id,LPUNKNOWN,DWORD,REFIID,LPVOID* output){
     *output=nullptr;require(id==CLSID_FileOpenDialog,"Unexpected COM activation.");++folderCalls;
     return HRESULT_FROM_WIN32(ERROR_CANCELLED); // Count dispatch; never display a picker.
 }
-HINSTANCE WINAPI shell(HWND,LPCWSTR verb,LPCWSTR file,LPCWSTR parameters,LPCWSTR directory,INT showMode){
-    require(verb&&std::wcscmp(verb,L"open")==0&&file&&std::filesystem::path(file)==std::filesystem::current_path()&&!parameters&&!directory&&showMode==SW_SHOWNORMAL,"Unexpected shell invocation.");
-    ++shellCalls;return reinterpret_cast<HINSTANCE>(33); // No Explorer process/window.
+BOOL WINAPI shellEx(SHELLEXECUTEINFOW* value){
+    if(!value || value->cbSize!=sizeof(*value) || value->hwnd ||
+       value->fMask!=(SEE_MASK_NOASYNC|SEE_MASK_FLAG_NO_UI) || !value->lpVerb || std::wcscmp(value->lpVerb,L"open") ||
+       !value->lpFile || value->lpFile!=expectedOpenFolder || value->lpParameters || value->lpDirectory ||
+       value->nShow!=SW_SHOWNORMAL || GetCurrentThreadId()==ownerThread){fileProbeError=true;return FALSE;}
+    ++shellCalls;
+    if(blockFolderShell){folderShellEntered=true;const auto until=std::chrono::steady_clock::now()+std::chrono::seconds(5);
+        while(!releaseFolderShell && std::chrono::steady_clock::now()<until)std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if(!releaseFolderShell){fileProbeError=true;return FALSE;}}
+    return TRUE; // Intercept actual async dispatch; never launch Explorer.
 }
 }
 void* operator new(size_t size){
@@ -204,7 +213,7 @@ int runCameraHost(const wchar_t*){throw std::runtime_error("Unexpected normal ap
 #define GetPrivateProfileStringW detailsProbe::profileString
 #define WritePrivateProfileStringW detailsProbe::profileWrite
 #define CoCreateInstance detailsProbe::folderFactory
-#define ShellExecuteW detailsProbe::shell
+#define ShellExecuteExW detailsProbe::shellEx
 #define _beginthreadex detailsProbe::beginThread
 #define CloseHandle detailsProbe::closeHandle
 #define CoInitializeEx detailsProbe::comInitialize
@@ -243,7 +252,7 @@ int runCameraHost(const wchar_t*){throw std::runtime_error("Unexpected normal ap
 #undef GetPrivateProfileStringW
 #undef WritePrivateProfileStringW
 #undef CoCreateInstance
-#undef ShellExecuteW
+#undef ShellExecuteExW
 #undef _beginthreadex
 #undef CloseHandle
 #undef CoInitializeEx
@@ -281,6 +290,7 @@ LRESULT CALLBACK ownedMain(HWND window,UINT message,WPARAM wp,LPARAM lp){
 struct Fixture {
     HWND window{};
     Fixture(){
+        cancelOpenFolder();app.shellBusyObserved=app.openFolderBusyShown=false;
         app.engine.reset();app.settings={};app.status=detailsProbe::current={};
         app.window=app.mode=app.preview=nullptr;app.customDialog=nullptr;
         app.hiddenToTray=app.closeWhenDone=app.startupComplete=app.layingOut=false;
@@ -289,6 +299,8 @@ struct Fixture {
         detailsProbe::failAllocation=detailsProbe::countAllocations=detailsProbe::failDialog=detailsProbe::routeFailed=false;
         detailsProbe::dialogs=detailsProbe::notices=detailsProbe::records=detailsProbe::finishes=detailsProbe::pauses=0;
         detailsProbe::folderCalls=detailsProbe::shellCalls=0;
+        detailsProbe::blockFolderShell=detailsProbe::folderShellEntered=detailsProbe::releaseFolderShell=false;
+        detailsProbe::expectedOpenFolder=std::filesystem::current_path().wstring();
         detailsProbe::focusCalls=detailsProbe::invalidFocus=detailsProbe::quits=detailsProbe::allocationFailures=0;
         detailsProbe::script={};detailsProbe::scriptFailure={};detailsProbe::notice.clear();detailsProbe::workArea={0,0,1920,1080};detailsProbe::mainWindow=nullptr;detailsProbe::mainVisible=true;detailsProbe::iconic=false;
         WNDCLASSEXW cls{sizeof(cls)};cls.lpfnWndProc=ownedMain;cls.hInstance=GetModuleHandleW(nullptr);cls.lpszClassName=L"OwnedStatusDetailsMain";
@@ -384,7 +396,7 @@ struct OwnedFiles {
         }
     }
     ~OwnedFiles(){
-        detailsProbe::releaseFileParse=true;
+        detailsProbe::releaseFileParse=true;detailsProbe::releaseFolderShell=true;
         if(detailsProbe::fileThread){WaitForSingleObject(detailsProbe::fileThread,6000);CloseHandle(detailsProbe::fileThread);detailsProbe::fileThread=nullptr;}
         std::error_code ignored;std::filesystem::remove_all(folder,ignored);
     }
@@ -597,7 +609,8 @@ void distinctMainMnemonics(){
             nativeMnemonic(start,L'h');require(detailsProbe::folderCalls==folders+(state==State::Idle?1:0)&&compressionDialogs==compressed&&detailDialogs==details,"Alt+H failed to route only to the enabled Change action.");
             // IsDialogMessage also activates unique mnemonics of collapsed advanced buttons.
             nativeMnemonic(start,L'c');require(compressionDialogs==compressed+1&&detailsProbe::folderCalls==folders+(state==State::Idle?1:0)&&detailDialogs==details,"Alt+C changed folder or failed to invoke compression.");
-            nativeMnemonic(start,L'o');require(detailsProbe::shellCalls==shells+1,"Alt+O no longer opens the configured folder through its existing command.");
+            nativeMnemonic(start,L'o');waitFileWorker();fixture.tick();
+            require(detailsProbe::shellCalls==shells+1 && !detailsProbe::fileProbeError && !app.openFolderTask,"Alt+O no longer completes the configured folder action asynchronously.");
             nativeMnemonic(start,L'i');require(detailDialogs==details+1,"Alt+I no longer invokes Details.");
         }
         require(detailsProbe::configures==configurations&&app.settings.folder==settings.folder&&app.settings.intervalMs==settings.intervalMs&&skipValues(app.settings.timeSkip)==skipValues(settings.timeSkip),"Canceled keyboard inspection changed accepted settings/configuration.");
@@ -634,7 +647,35 @@ void delayKeyboard(){Fixture fixture;showOffscreen(fixture);
     std::cout<<"PASS actual Alt+X delay focus and Alt+T Cancel across Waiting/Preparing, collapsed/expanded and multiple starting controls\n";
 }
 void clickFiles(HWND window){const HWND button=GetDlgItem(window,StatusDetailsFiles);require(button&&IsWindowEnabled(button),"Expected Show files action is unavailable.");SendMessageW(button,BM_CLICK,0,0);checkCallback();}
-void completeFiles(HWND window){waitFileWorker();SendMessageW(window,WM_TIMER,StatusDetailsFilesTimer,0);checkCallback();require(IsWindowEnabled(GetDlgItem(window,StatusDetailsFiles))&&!statusFilesBusy,"Completed task retained busy action/global slot.");}
+void completeFiles(HWND window){waitFileWorker();SendMessageW(window,WM_TIMER,StatusDetailsFilesTimer,0);checkCallback();require(IsWindowEnabled(GetDlgItem(window,StatusDetailsFiles))&&!shellOperationBusy,"Completed task retained busy action/global slot.");}
+void sharedFolderSlot(){
+    OwnedFiles files;Fixture fixture;auto report=files.report();fixture.publish(report);
+    app.settings.folder=files.folder.wstring();detailsProbe::expectedOpenFolder=app.settings.folder;
+    detailsProbe::blockFolderShell=true;fixture.command(OpenFolder);
+    waitFiles([]{return detailsProbe::folderShellEntered.load();});
+    const auto mainTask=app.openFolderTask;
+    require(mainTask && shellOperationBusy && detailsProbe::fileThreadStarts==1,"Open folder failed to own the shared Shell slot.");
+    detailsProbe::script=[&](HWND window){const auto snapshot=textOf(classChild(window,L"EDIT"));clickFiles(window);
+        require(detailsProbe::fileThreadStarts==1 && detailsProbe::fileSelections==0 &&
+            textOf(GetDlgItem(window,StatusDetailsFilesStatus)).find(L"Another file request")!=std::wstring::npos,
+            "Show files bypassed a pending main folder request.");
+        detailsProbe::releaseFolderShell=true;waitFileWorker();fixture.tick();
+        require(!app.openFolderTask && !shellOperationBusy && detailsProbe::notices==0 && textOf(classChild(window,L"EDIT"))==snapshot,
+            "Successful main completion behind Details changed the immutable report or raised a modal.");
+        detailsProbe::blockFileParse=true;clickFiles(window);waitFiles([]{return detailsProbe::fileParseEntered.load();});closeDetails(window);
+    };fixture.command(StatusDetails);
+    require(shellOperationBusy && detailsProbe::fileThreadStarts==2,"Closing Details released its still-blocked worker slot early.");
+    fixture.command(OpenFolder);
+    require(!app.openFolderTask && detailsProbe::fileThreadStarts==2 && detailsProbe::shellCalls==1,
+        "Main action bypassed a cancelled but still-running Show files request.");
+    detailsProbe::releaseFileParse=true;waitFileWorker();fixture.tick();
+    require(!shellOperationBusy && IsWindowEnabled(app.openFolder) && detailsProbe::fileSelections==0 &&
+        app.status.message==report.message && app.status.savedPaths==report.savedPaths,"Shared-slot retirement changed recovery facts or disabled retry.");
+    detailsProbe::blockFolderShell=false;fixture.command(OpenFolder);waitFileWorker();fixture.tick();
+    require(detailsProbe::shellCalls==2 && detailsProbe::fileThreadStarts==3 && !app.openFolderTask,"Main action could not retry after the shared slot retired.");
+    files.assertClean(3);
+    std::cout<<"PASS actual cross-action Shell exclusion, detached Details cancellation and main retry without stale report mutation\n";
+}
 void fileSnapshotSelection(){
     for(bool paired:{false,true}){
         OwnedFiles files;Fixture fixture;const auto report=files.report(paired);fixture.publish(report);if(paired)detailsProbe::fileComResult=S_FALSE;
@@ -692,7 +733,7 @@ void fileFailures(){
             if(fault==9)detailsProbe::failAllocation=true;
             if(fault==10)require(MoveFileW(files.files[0].c_str(),(files.folder/L"moved-output.mp4").c_str())!=FALSE,"Cannot move owned file fixture.");
             clickFiles(window);if((fault>1&&fault<9)||fault==10)completeFiles(window);
-            require(!statusFilesBusy&&IsWindowEnabled(GetDlgItem(window,StatusDetailsFiles)),"Failed file request consumed the retry slot/action.");
+            require(!shellOperationBusy&&IsWindowEnabled(GetDlgItem(window,StatusDetailsFiles)),"Failed file request consumed the retry slot/action.");
             require(textOf(classChild(window,L"EDIT"))==original&&app.status.message==report.message&&app.status.savedPaths==report.savedPaths,"File failure changed saved/recovery facts.");
             require(!textOf(GetDlgItem(window,StatusDetailsFilesStatus)).empty()&&!detailsProbe::notices,"File failure lacked inline feedback or produced a modal warning.");
             require(detailsProbe::fileSelections==(fault==7?1:0),"A failed prerequisite still issued Shell selection.");
@@ -717,10 +758,10 @@ void filePendingLifecycle(){
             if(action==3)SendMessageW(fixture.window,WM_ENDSESSION,TRUE,0);
             require(std::chrono::steady_clock::now()-began<std::chrono::seconds(1),"Closing/hiding/exiting waited for blocked Shell parsing.");
             require(detailsProbe::modals.back().ended||!IsWindow(window),"Owned dialog survived Close/Hide/Exit/session end.");
-            require(statusFilesBusy&&detailsProbe::fileThreadExits==0&&detailsProbe::fileTimerKills==1,"Pending cancellation released global work early or retained dialog polling.");
+            require(shellOperationBusy&&detailsProbe::fileThreadExits==0&&detailsProbe::fileTimerKills==1,"Pending cancellation released global work early or retained dialog polling.");
         };fixture.command(StatusDetails);
         const int focus=detailsProbe::focusCalls;detailsProbe::releaseFileParse=true;waitFileWorker();
-        require(!statusFilesBusy&&detailsProbe::fileSelections==0&&!app.customDialog&&detailsProbe::focusCalls==focus,"Cancelled detached work selected files or touched a stale dialog/focus.");
+        require(!shellOperationBusy&&detailsProbe::fileSelections==0&&!app.customDialog&&detailsProbe::focusCalls==focus,"Cancelled detached work selected files or touched a stale dialog/focus.");
         require(detailsProbe::records==0&&detailsProbe::finishes==(action==2?1:0),"Pending file request changed recording lifecycle.");files.assertClean(1);
     }
     std::cout<<"PASS blocked parsing keeps status ticks and Close/Hide/Exit/session shutdown responsive; cancellation suppresses late selection\n";
@@ -734,7 +775,7 @@ void fileReopenedAndKeyboard(){
         const auto original=textOf(classChild(window,L"EDIT"));clickFiles(window);
         require(detailsProbe::fileThreadStarts==1&&IsWindowEnabled(GetDlgItem(window,StatusDetailsFiles)),"Reopened Details bypassed single global job slot or permanently disabled retry.");
         require(textOf(GetDlgItem(window,StatusDetailsFilesStatus)).find(L"Another file request")!=std::wstring::npos,"Detached-busy state lacked retry explanation.");
-        const auto feedback=textOf(GetDlgItem(window,StatusDetailsFilesStatus));detailsProbe::releaseFileParse=true;waitFileWorker();require(detailsProbe::fileSelections==0&&!statusFilesBusy&&textOf(GetDlgItem(window,StatusDetailsFilesStatus))==feedback,"Old dialog's worker selected or changed newer feedback after cancellation.");
+        const auto feedback=textOf(GetDlgItem(window,StatusDetailsFilesStatus));detailsProbe::releaseFileParse=true;waitFileWorker();require(detailsProbe::fileSelections==0&&!shellOperationBusy&&textOf(GetDlgItem(window,StatusDetailsFilesStatus))==feedback,"Old dialog's worker selected or changed newer feedback after cancellation.");
         SetWindowPos(window,nullptr,-30000,-30000,640,380,SWP_NOZORDER|SWP_NOACTIVATE);ShowWindow(window,SW_SHOWNOACTIVATE);
         HWND edit=classChild(window,L"EDIT"),button=GetDlgItem(window,StatusDetailsFiles),close=GetDlgItem(window,IDCANCEL);
         SetFocus(edit);MSG mnemonic{};mnemonic.hwnd=edit;mnemonic.message=WM_SYSCHAR;mnemonic.wParam=L'f';mnemonic.lParam=1L<<29;
@@ -758,6 +799,6 @@ int main(){try{
     detailsProbe::ownerThread=GetCurrentThreadId();
     INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_WIN95_CLASSES};require(InitCommonControlsEx(&controls)!=FALSE,"Common controls unavailable.");
     exactSelectableReports();outcomeAndPrimaryPrecedence();keyboardAndCompactLayout();stableSnapshot();modalLifecycle();failuresAndUnchangedTicks();distinctMainMnemonics();cursorKeyboard();delayKeyboard();
-    fileSnapshotSelection();fileEligibility();fileFailures();filePendingLifecycle();fileReopenedAndKeyboard();
-    std::cout<<"All fourteen status/keyboard/file groups passed with inert engine, owned native windows and intercepted Shell selection.\n";return 0;
+    fileSnapshotSelection();fileEligibility();fileFailures();filePendingLifecycle();fileReopenedAndKeyboard();sharedFolderSlot();
+    std::cout<<"All fifteen status/keyboard/file groups passed with inert engine, owned native windows and intercepted Shell selection.\n";return 0;
 }catch(const std::exception& error){std::cerr<<"STATUS DETAILS FAILURE: "<<error.what()<<'\n';return 1;}}
