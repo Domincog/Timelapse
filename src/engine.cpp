@@ -520,20 +520,39 @@ void Engine::run() {
                         else if (cadenceVerdict == person::Verdict::QualifiedAbsent) presence = PersonPresence::QualifiedAbsent;
                         const auto age = tick - result.source.receivedTick;
                         const int64_t observedAt = std::max<int64_t>(0, activeMilliseconds() - static_cast<int64_t>(age));
-                        if (timeSkip.observePerson({presence, result.source.cameraEpoch, result.source.sequence, observedAt})) {
+                        const bool healthyUncertainty = result.output.verdict == person::Verdict::Unknown &&
+                            std::isfinite(result.output.rawMaxPerson) && std::isfinite(result.output.validMaxPerson) &&
+                            result.output.rawMaxPerson >= 0 && result.output.rawMaxPerson <= 1 &&
+                            result.output.validMaxPerson >= 0 && result.output.validMaxPerson <= result.output.rawMaxPerson &&
+                            (result.output.reason == person::Reason::Ambiguous || result.output.reason == person::Reason::InsufficientDetail);
+                        if (presence == PersonPresence::Unknown && !healthyUncertainty) {
+                            // Fresh failed replies are checks, but never absence
+                            // evidence. Keep their source identity for admission.
+                            observationTicks[1] = result.source.receivedTick; personLastSource = result.source;
+                            personProblem(L"The optional detector could not complete a valid person check; using normal cadence.", false);
+                        } else if (timeSkip.observePerson({presence, result.source.cameraEpoch, result.source.sequence, observedAt})) {
                             observationTicks[1] = result.source.receivedTick;
                             observationProblems[1] = {}; personLastSource = result.source;
                             if (presence == PersonPresence::Unknown) {
-                                if (result.output.reason != person::Reason::Ambiguous &&
-                                    result.output.reason != person::Reason::InsufficientDetail) {
-                                    personProblem(L"The optional detector could not complete a valid person check; using normal cadence.", false);
+                                // The recording's frozen policy owns cadence;
+                                // keep the model's uncertainty visible here.
+                                const bool uncertainAsAbsent = session->timeSkip.uncertainAsAbsent;
+                                const wchar_t* detail;
+                                if (result.output.reason == person::Reason::InsufficientDetail) {
+                                    detail = uncertainAsAbsent
+                                        ? L"Too little image detail for the person check; treating uncertainty as no person detected."
+                                        : L"Too little image detail for the person check; using normal cadence.";
+                                } else if (!result.sufficientDetail) {
+                                    detail = uncertainAsAbsent
+                                        ? L"The person check is ambiguous with too little image detail; treating uncertainty as no person detected."
+                                        : L"The person check is ambiguous with too little image detail; using normal cadence.";
                                 } else {
-                                    const wchar_t* detail = result.output.reason == person::Reason::InsufficientDetail || !result.sufficientDetail
-                                        ? L"Too little image detail for absence checks; using normal cadence."
-                                        : L"The person check is uncertain; using normal cadence.";
-                                    auto& message = observationProblems[1];
-                                    std::copy_n(detail, std::min(wcslen(detail), message.size() - 1), message.begin());
+                                    detail = uncertainAsAbsent
+                                        ? L"The person check is ambiguous; treating uncertainty as no person detected."
+                                        : L"The person check is ambiguous; using normal cadence.";
                                 }
+                                auto& message = observationProblems[1];
+                                std::copy_n(detail, std::min(wcslen(detail), message.size() - 1), message.begin());
                             }
                         } else personProblem(L"The person check repeated or regressed its source; using normal cadence.", false);
                     }

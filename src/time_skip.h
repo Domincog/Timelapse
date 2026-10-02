@@ -16,6 +16,9 @@ struct TimeSkipSettings {
     int64_t quietAfterMs = 120000;
     // Image-change sensitivity applies only to Quiet modes, not person checks.
     QuietSensitivity quietSensitivity = QuietSensitivity::Standard;
+    // Completed uncertain person checks can count toward absence. Missing,
+    // stale or failed checks must be marked unavailable by the engine.
+    bool uncertainAsAbsent = true;
     // Canonical 30fps units: 15/30/60 select 0.5/1/2 seconds of saved video.
     // The controller scales to whole output frames at the session playback FPS.
     int rampFrames = 30;
@@ -32,7 +35,7 @@ struct TimeSkipDescriptor {
 // Fixed sixteen stratified BGRA samples per thumbnail cell; no allocation.
 // This is an image-change descriptor, not semantic activity recognition.
 bool describeTimeSkipFrame(const Frame& frame, TimeSkipDescriptor& output) noexcept;
-enum class TimeSkipReason { Off, Normal, Checking, Quiet, Manual, Unavailable, NoPerson, PersonPresent, PersonUncertain };
+enum class TimeSkipReason { Off, Normal, Checking, Quiet, Manual, Unavailable, NoPerson, PersonPresent, PersonUncertain, NoPersonUncertain };
 enum class PersonPresence { Unknown, Present, QualifiedAbsent };
 struct PersonObservation {
     PersonPresence presence = PersonPresence::Unknown;
@@ -60,7 +63,8 @@ public:
     void unavailable(unsigned sourceIndex) noexcept;
     // Engine validates model/session identity and wall-clock source freshness.
     // A person observation describes the selected camera only. Qualification
-    // requires distinct negative reports spanning the full active-time dwell.
+    // requires distinct eligible reports spanning the full active-time dwell;
+    // the uncertainty setting controls whether healthy Unknown is eligible.
     bool observePerson(const PersonObservation&) noexcept;
     void personUnavailable() noexcept;
     // Does not advance ramp phase. May request a prompt base-rate return after

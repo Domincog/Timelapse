@@ -12,6 +12,26 @@ std::unique_ptr<lapse::CameraPersonInput> person(Harness& h, uint64_t token) {
     }
     throw std::runtime_error("person input timed out");
 }
+void admitPerson(Harness& h, uint64_t token, lapse::CameraPersonInput& output, std::wstring& error) {
+    bool admitted = false;
+    const auto until = GetTickCount64() + 1000;
+    while (!admitted && GetTickCount64() < until) {
+        h.inspect([&](auto& shared) {
+            admitted = shared.observationToken == token && shared.observationKind == lapse::ObservationKind::Person &&
+                shared.observationRequested > shared.observationCompleted;
+            if (admitted) return;
+            // A pending nonblocking call may not have queued its request. Hold
+            // the owned recursive mutex while retrying admission, so the child
+            // cannot publish a response that this call might copy prematurely.
+            require(!h.client.personInput(token, output, error), "new request completed before admission");
+            require(error.empty(), "person request admission failed");
+            admitted = shared.observationToken == token && shared.observationKind == lapse::ObservationKind::Person &&
+                shared.observationRequested > shared.observationCompleted;
+        });
+        if (!admitted) Sleep(1);
+    }
+    require(admitted, "person request was not admitted");
+}
 void pixelsAndDemand() {
     Harness h(L"night-live"); h.first();
     const std::wstring name = std::wstring(h.control().name) + L".person";
@@ -62,7 +82,7 @@ void corruptGeometryAndKind() {
     auto output = std::make_unique<lapse::CameraPersonInput>(); output->source.sequence = 777;
     std::wstring error;
     InterlockedExchange(&h.control().readGate, 1);
-    require(!h.client.personInput(21, *output, error), "gated source already returned");
+    admitPerson(h, 21, *output, error);
     const auto until = GetTickCount64() + 1000;
     while (!h.control().readReached && GetTickCount64() < until) Sleep(1);
     require(h.control().readReached, "source gate not reached");
@@ -76,7 +96,7 @@ void corruptGeometryAndKind() {
         "wrong response type exposed retained person data");
     InterlockedExchange(&h.control().readRelease, 1); InterlockedExchange(&h.control().readGate, 0);
     person(h, 22); Sleep(60);
-    require(!h.client.personInput(23, *output, error), "new request completed before child runs");
+    admitPerson(h, 23, *output, error);
     bool published = false;
     const auto deadline = GetTickCount64() + 1000;
     while (!published && GetTickCount64() < deadline) {

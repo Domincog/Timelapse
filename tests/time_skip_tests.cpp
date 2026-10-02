@@ -239,7 +239,7 @@ void quietSensitivity() {
             if (i >= 3) require(controller.inspect(i * 1000).reason == TimeSkipReason::Quiet,
                                 "Sensitivity changed ordinary exposure compensation");
         }
-        settings.mode = TimeSkipMode::NoPerson; settings.quietAfterMs = 1000;
+        settings.mode = TimeSkipMode::NoPerson; settings.quietAfterMs = 1000; settings.uncertainAsAbsent = false;
         require(controller.reset(settings, 100, 2), "Prepare person independence");
         controller.observePerson({PersonPresence::QualifiedAbsent, 1, 1, 0});
         require(controller.inspect(1000).reason == TimeSkipReason::Checking, "Sensitivity weakened person baseline guard");

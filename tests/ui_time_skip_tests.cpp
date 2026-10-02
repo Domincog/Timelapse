@@ -103,7 +103,7 @@ void boundsAndFreeze(){
     for(auto state:{State::Starting,State::Recording,State::Paused,State::Finishing}){
         app.status.state=state;const int initial=lapse::configurationCalls;
         skipScript=[](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);require(draft.readOnly,"Active editor not read only.");
-            for(HWND child:{draft.mode,draft.speed,draft.ramp,draft.quiet,draft.repeat,draft.add,draft.edit,draft.remove,draft.okay})require(!IsWindowEnabled(child),"Active edit control enabled.");
+            for(HWND child:{draft.mode,draft.speed,draft.ramp,draft.quiet,draft.repeat,draft.uncertain,draft.add,draft.edit,draft.remove,draft.okay})require(!IsWindowEnabled(child),"Active edit control enabled.");
             require(IsWindowEnabled(draft.ranges) && IsWindowEnabled(draft.cancel),"Active schedule cannot be inspected or closed.");
             const auto count=draft.policy.rangeCount;skipProc(window,WM_COMMAND,SkipRemove,0);skipProc(window,WM_COMMAND,SkipAdd,0);require(count==draft.policy.rangeCount,"Forged active mutation changed draft.");
             choose(draft.mode,0);skipProc(window,WM_COMMAND,IDOK,0);require(outcome()==IDCANCEL,"Forged active OK committed.");};
@@ -146,9 +146,9 @@ void modalLayoutAndInactiveDraft(){
 }
 void strictPolicy(){
     TimeSkipSettings original;original.mode=TimeSkipMode::QuietWithinSchedule;original.multiplier=64;original.rampFrames=60;original.quietAfterMs=int64_t(INT_MAX)*1000;
-    original.repeatSeconds=INT_MAX;original.rangeCount=2;original.ranges[0]={INT_MAX-1,INT_MAX};original.ranges[1]={0,1};
+    original.repeatSeconds=INT_MAX;original.rangeCount=2;original.ranges[0]={INT_MAX-1,INT_MAX};original.ranges[1]={0,1};original.uncertainAsAbsent=false;
     const auto values=skipValues(original);TimeSkipSettings parsed;
-    require(parseSkipValues(values,parsed) && parsed.quietAfterMs==int64_t(INT_MAX)*1000 && parsed.ranges[0].startSeconds==0 && parsed.ranges[1].endSeconds==INT_MAX,"Maximum policy failed exact canonical roundtrip.");
+    require(parseSkipValues(values,parsed) && !parsed.uncertainAsAbsent && parsed.quietAfterMs==int64_t(INT_MAX)*1000 && parsed.ranges[0].startSeconds==0 && parsed.ranges[1].endSeconds==INT_MAX,"Maximum policy failed exact canonical roundtrip.");
     for(size_t key=0;key<values.size();++key)for(auto invalid:{L"?",L"-1",L"1junk",L"999999999999999999999999999999999"}){
         auto bad=values;bad[key]=invalid;TimeSkipSettings untouched=original;require(!parseSkipValues(bad,untouched) && untouched.ranges[0].startSeconds==INT_MAX-1,"Malformed policy partially changed destination.");}
     auto bad=values;bad[5]=L"0:2;2:3";require(parseSkipValues(bad,parsed) && parsed.rangeCount==1 && parsed.ranges[0].endSeconds==3,"Loaded touching ranges not canonicalized.");
@@ -201,10 +201,10 @@ void personModesAndManagement(){
     skipScript=[](HWND window,DLGPROC,LPARAM parameter){
         auto& draft=*reinterpret_cast<SkipDraft*>(parameter);
         const auto visible=[](HWND child){return (GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0;};
-        require(SendMessageW(draft.mode,CB_GETCOUNT,0,0)==6 && lapse::uiPersonPackInspections==0 && !visible(draft.packManage),
+        require(SendMessageW(draft.mode,CB_GETCOUNT,0,0)==6 && lapse::uiPersonPackInspections==0 && !visible(draft.packManage) && !visible(draft.uncertain),
             "Default editor inspected pack or lacks six explicit modes.");
         mode(window,draft,TimeSkipMode::NoPerson);
-        require(lapse::uiPersonPackInspections==1 && lapse::uiPersonPackDialogs==0 && visible(draft.packInfo) && visible(draft.packManage),
+        require(lapse::uiPersonPackInspections==1 && lapse::uiPersonPackDialogs==0 && visible(draft.packInfo) && visible(draft.packManage) && visible(draft.uncertain),
             "Person mode did not expose one inspected explicit management action.");
         require(caption(draft.labels[3]).find(L"person")!=std::wstring::npos && visible(draft.quiet) && !visible(draft.ranges),
             "Person mode did not reuse dwell without an unsolicited schedule.");
@@ -216,7 +216,7 @@ void personModesAndManagement(){
         require(lapse::uiPersonPackDialogs==1 && lapse::uiPersonPackOwner==window && lapse::uiPersonPackInspections==2 &&
             caption(draft.packInfo).find(L"installed")!=std::wstring::npos,"Explicit manager did not refresh cached availability.");
         mode(window,draft,TimeSkipMode::Quiet);skipProc(window,WM_COMMAND,SkipPackManage,0);
-        require(!visible(draft.packManage) && lapse::uiPersonPackDialogs==1,"Hidden manager remained actionable outside person mode.");
+        require(!visible(draft.packManage) && !visible(draft.uncertain) && lapse::uiPersonPackDialogs==1,"Person-only controls remained visible outside person mode.");
         mode(window,draft,TimeSkipMode::NoPersonWithinSchedule);
         require(visible(draft.ranges) && visible(draft.quiet) && lapse::uiPersonPackInspections==2,"Person schedule lost controls or repeated hash inspection.");
         skipProc(window,WM_COMMAND,IDCANCEL,0);
@@ -246,13 +246,20 @@ void personLayoutAndStatus(){
     skipScript=[](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);
         for(int dpi:{96,144,192,288}){
             RECT suggested{0,0,320,260};skipProc(window,WM_DPICHANGED,MAKELONG(dpi,dpi),reinterpret_cast<LPARAM>(&suggested));
-            for(HWND child:{draft.packInfo,draft.help,draft.error}){RECT bounds{};GetClientRect(child,&bounds);wchar_t value[2048]{};GetWindowTextW(child,value,2048);
-                RECT measured{0,0,bounds.right,0};HDC dc=GetDC(window);auto prior=SelectObject(dc,draft.font);
+            for(HWND child:{draft.uncertain,draft.packInfo,draft.help,draft.error}){RECT bounds{};GetClientRect(child,&bounds);wchar_t value[2048]{};GetWindowTextW(child,value,2048);
+                RECT measured{0,0,bounds.right-(child==draft.uncertain?draft.scale(24):0),0};HDC dc=GetDC(window);auto prior=SelectObject(dc,draft.font);
                 DrawTextW(dc,value,-1,&measured,DT_CALCRECT|DT_WORDBREAK|DT_NOPREFIX);SelectObject(dc,prior);ReleaseDC(window,dc);
                 require(bounds.bottom>=measured.bottom,"Person management/help text clipped at constrained DPI.");}
-            for(HWND child:{draft.quiet,draft.packManage,draft.ranges,draft.repeat,draft.okay,draft.cancel}){
+            for(HWND child:{draft.quiet,draft.uncertain,draft.packManage,draft.ranges,draft.repeat,draft.okay,draft.cancel}){
                 skipReveal(window,draft,child);RECT bounds{},client{};GetWindowRect(child,&bounds);MapWindowPoints(nullptr,window,reinterpret_cast<POINT*>(&bounds),2);GetClientRect(window,&client);
                 require(bounds.right>0 && bounds.left<client.right && bounds.bottom>0 && bounds.top<client.bottom,"Person dialog keyboard control unreachable.");}
+            const auto checked=SendMessageW(draft.uncertain,BM_GETCHECK,0,0);
+            SendMessageW(window,WM_NEXTDLGCTL,reinterpret_cast<WPARAM>(draft.cancel),TRUE);SendMessageW(window,WM_VSCROLL,SB_BOTTOM,0);
+            SendMessageW(window,WM_NEXTDLGCTL,reinterpret_cast<WPARAM>(draft.uncertain),TRUE);
+            RECT checkBounds{},checkClient{};GetWindowRect(draft.uncertain,&checkBounds);MapWindowPoints(nullptr,window,reinterpret_cast<POINT*>(&checkBounds),2);GetClientRect(window,&checkClient);
+            if(GetFocus()!=draft.uncertain || checkBounds.top<0 || checkBounds.bottom>checkClient.bottom || checkBounds.right<=0 || checkBounds.left>=checkClient.right || SendMessageW(draft.uncertain,BM_GETCHECK,0,0)!=checked)
+                std::cerr<<"Uncertainty focus dpi="<<dpi<<" focused="<<(GetFocus()==draft.uncertain)<<" bounds="<<checkBounds.left<<","<<checkBounds.top<<","<<checkBounds.right<<","<<checkBounds.bottom<<" client="<<checkClient.right<<","<<checkClient.bottom<<" checked="<<SendMessageW(draft.uncertain,BM_GETCHECK,0,0)<<" expected="<<checked<<"\n";
+            require(GetFocus()==draft.uncertain && checkBounds.top>=0 && checkBounds.bottom<=checkClient.bottom && checkBounds.right>0 && checkBounds.left<checkClient.right && SendMessageW(draft.uncertain,BM_GETCHECK,0,0)==checked,"Native uncertainty checkbox focus did not reveal its wrapped row or changed its value.");
             HDC dc=GetDC(window);auto prior=SelectObject(dc,draft.font);RECT combo{};GetClientRect(draft.mode,&combo);
             for(const auto* label:SkipModeLabels){SIZE size{};GetTextExtentPoint32W(dc,label,static_cast<int>(std::wcslen(label)),&size);
                 require(size.cx+draft.scale(28)<=combo.right,"Selected person mode label truncates at minimum canvas width.");}
@@ -266,7 +273,7 @@ void personLayoutAndStatus(){
     editSkip();app.advancedExpanded=true;++app.skipRevision;
     Status status;status.state=State::Recording;status.timeSkip.enabled=true;status.timeSkip.intervalMs=20000;
     status.timeSkip.lastCheckTick=GetTickCount64()-2000;status.message=L"Keep original save failure";status.error=true;
-    for(auto item:{std::pair{TimeSkipReason::NoPerson,L"No person detected"},std::pair{TimeSkipReason::PersonPresent,L"Person detected"},
+    for(auto item:{std::pair{TimeSkipReason::NoPerson,L"No person detected"},std::pair{TimeSkipReason::NoPersonUncertain,L"No person detected (uncertain)"},std::pair{TimeSkipReason::PersonPresent,L"Person detected"},
         std::pair{TimeSkipReason::Checking,L"Checking for absence"},std::pair{TimeSkipReason::Unavailable,L"Checks unavailable"},
         std::pair{TimeSkipReason::PersonUncertain,L"Person check uncertain"}}){
         status.timeSkip.reason=item.first;applyStatus(status,true);require(app.skipDetailCaption.find(item.second)!=std::wstring::npos &&
@@ -274,6 +281,42 @@ void personLayoutAndStatus(){
     const unsigned inspections=lapse::uiPersonPackInspections;for(int i=0;i<10;++i)applyStatus(status);
     require(lapse::uiPersonPackInspections==inspections,"Person status polling hashed the pack.");
     app.status={};std::cout<<"PASS person modal DPI/wrap/focus/labels and truthful status without polling pack work\n";
+}
+void personUncertaintyChoice(){
+    HiddenFixture owned;setupSkip();const int initial=lapse::configurationCalls;
+    require(app.settings.timeSkip.uncertainAsAbsent,"Default uncertainty policy is not no person.");
+    skipScript=[](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);
+        const auto visible=[](HWND child){return (GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0;};
+        require(!visible(draft.uncertain) && SendMessageW(draft.uncertain,BM_GETCHECK,0,0)==BST_CHECKED,"Default draft checkbox lost the enabled default.");
+        mode(window,draft,TimeSkipMode::NoPerson);
+        require(visible(draft.uncertain) && IsWindowEnabled(draft.uncertain) && caption(draft.help).find(L"count toward the no-person waiting time")!=std::wstring::npos,"Person mode did not explain the enabled uncertainty choice.");
+        require(GetNextDlgTabItem(window,draft.quietUnits,FALSE)==draft.uncertain && GetNextDlgTabItem(window,draft.uncertain,FALSE)==draft.packManage,"Uncertainty checkbox is absent from the person-mode tab order.");
+        SendMessageW(draft.uncertain,BM_CLICK,0,0);
+        require(SendMessageW(draft.uncertain,BM_GETCHECK,0,0)==BST_UNCHECKED && caption(draft.help).find(L"Uncertain checks keep normal speed")!=std::wstring::npos && app.settings.timeSkip.uncertainAsAbsent,"Native uncertainty click did not update help or mutated accepted settings.");
+        mode(window,draft,TimeSkipMode::Quiet);require(!visible(draft.uncertain),"Quiet mode exposed the person uncertainty setting.");
+        mode(window,draft,TimeSkipMode::NoPerson);require(SendMessageW(draft.uncertain,BM_GETCHECK,0,0)==BST_UNCHECKED,"Mode switching lost the uncertainty draft.");
+        skipProc(window,WM_COMMAND,IDCANCEL,0);
+    };
+    editSkip();require(app.settings.timeSkip.mode==TimeSkipMode::Off && app.settings.timeSkip.uncertainAsAbsent && lapse::configurationCalls==initial,"Cancelled uncertainty opt-out changed accepted settings.");
+    skipScript=[](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);mode(window,draft,TimeSkipMode::NoPerson);
+        SendMessageW(draft.uncertain,BM_CLICK,0,0);SendMessageW(draft.okay,BM_CLICK,0,0);require(outcome()==IDOK,"Valid uncertainty opt-out failed native acceptance.");};
+    editSkip();require(app.settings.timeSkip.mode==TimeSkipMode::NoPerson && !app.settings.timeSkip.uncertainAsAbsent && !lapse::configured.timeSkip.uncertainAsAbsent && lapse::configurationCalls==initial+1,"Accepted uncertainty opt-out was not configured exactly once.");
+    app.settings.layers=preset(Mode::Camera);app.personPackKnown=true;app.personPack.state=PersonPackState::Ready;
+    require(personAvailability().find(L"Uncertain, missing, failed or stale checks keep")!=std::wstring::npos,"Opt-out availability claims uncertainty can speed up.");
+    app.settings.timeSkip.uncertainAsAbsent=true;
+    require(personAvailability().find(L"Uncertain checks count as no person")!=std::wstring::npos,"Enabled availability hides its uncertainty policy.");
+    app.settings.timeSkip.uncertainAsAbsent=false;
+    skipScript=[](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);
+        require(SendMessageW(draft.uncertain,BM_GETCHECK,0,0)==BST_UNCHECKED,"Reopened dialog lost uncertainty opt-out.");SendMessageW(draft.uncertain,BM_CLICK,0,0);skipProc(window,WM_COMMAND,IDCANCEL,0);};
+    editSkip();require(!app.settings.timeSkip.uncertainAsAbsent,"Cancelled uncertainty opt-in changed accepted settings.");
+    for(auto state:{State::Waiting,State::Starting,State::Recording,State::Paused,State::Finishing}){
+        app.status.state=state;
+        skipScript=[](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);
+            require(draft.readOnly && !IsWindowEnabled(draft.uncertain) && SendMessageW(draft.uncertain,BM_GETCHECK,0,0)==BST_UNCHECKED,"Active uncertainty option is editable or displays a different choice.");
+            SendMessageW(draft.uncertain,BM_SETCHECK,BST_CHECKED,0);skipProc(window,WM_COMMAND,SkipUncertain,0);skipProc(window,WM_COMMAND,IDOK,0);require(outcome()==IDCANCEL,"Forged active uncertainty acceptance committed.");};
+        editSkip();require(!app.settings.timeSkip.uncertainAsAbsent && lapse::configurationCalls==initial+1,"Active uncertainty mutation reached accepted or engine settings.");
+    }
+    app.status={};std::cout<<"PASS enabled uncertainty default, native opt-out, mode/tab behavior, cancel isolation, exact configuration, truthful availability and frozen active choices\n";
 }
 void nativeModalButtons(){
     HiddenFixture owned;setupSkip();
@@ -424,8 +467,8 @@ void nativePageWheelOwnership(){
     const auto constrain=[](HWND window){RECT suggested{0,0,320,230};SendMessageW(window,WM_DPICHANGED,MAKELONG(192,192),reinterpret_cast<LPARAM>(&suggested));
         SCROLLINFO info{sizeof(info),SIF_ALL};require(GetScrollInfo(window,SB_VERT,&info)!=FALSE && int64_t(info.nMax)-info.nPage+1>info.nMin,"Wheel fixture must have real vertical overflow.");};
     const auto wheel=[](HWND target,WORD keys=0){SendMessageW(target,WM_MOUSEWHEEL,MAKEWPARAM(keys,static_cast<WORD>(-WHEEL_DELTA)),0);};
-    for(bool readOnly:{false,true}){
-        HiddenFixture owned;setupSkip();app.settings.timeSkip.mode=TimeSkipMode::QuietWithinSchedule;
+    for(auto policyMode:{TimeSkipMode::QuietWithinSchedule,TimeSkipMode::NoPersonWithinSchedule})for(bool readOnly:{false,true}){
+        HiddenFixture owned;setupSkip();app.settings.timeSkip.mode=policyMode;
         app.settings.timeSkip.rangeCount=16;for(unsigned i=0;i<16;++i)app.settings.timeSkip.ranges[i]={int(i*60),int(i*60+30)};
         app.status.state=readOnly?State::Recording:State::Idle;
         const auto accepted=skipValues(app.settings.timeSkip);const int configurationCount=lapse::configurationCalls;int nested=0;HWND outer{};
@@ -439,11 +482,12 @@ void nativePageWheelOwnership(){
                 SendMessageW(window,WM_COMMAND,IDCANCEL,0);return;
             }
             auto& draft=*reinterpret_cast<SkipDraft*>(parameter);outer=window;require(draft.readOnly==readOnly,"Wheel inspection lock mismatch.");constrain(window);
-            const auto policy=skipValues(draft.policy);const int speed=choice(draft.speed);const auto quiet=caption(draft.quiet),repeat=caption(draft.repeat);
+            const auto policy=skipValues(draft.policy);const int speed=choice(draft.speed);const auto quiet=caption(draft.quiet),repeat=caption(draft.repeat);const auto uncertain=SendMessageW(draft.uncertain,BM_GETCHECK,0,0);
             std::vector<HWND> targets{window,draft.help,draft.cancel};if(!readOnly){targets.push_back(draft.quiet);targets.push_back(draft.speed);}
+            if(skipPerson(policyMode))targets.push_back(draft.uncertain);
             for(HWND target:targets){SetFocus(readOnly?draft.cancel:draft.quiet);SendMessageW(window,WM_VSCROLL,SB_TOP,0);const HWND focused=GetFocus();wheel(target);
                 require(position(window)>0 && GetFocus()==focused && !outcome(),"Compression wheel did not scroll the page without focus/action side effects.");
-                require(choice(draft.speed)==speed && caption(draft.quiet)==quiet && caption(draft.repeat)==repeat && skipValues(draft.policy)==policy,"Page or closed-combo wheel changed the compression draft.");}
+                require(choice(draft.speed)==speed && caption(draft.quiet)==quiet && caption(draft.repeat)==repeat && SendMessageW(draft.uncertain,BM_GETCHECK,0,0)==uncertain && skipValues(draft.policy)==policy,"Page, checkbox or closed-combo wheel changed the compression draft.");}
             if(!readOnly){
                 struct YieldReset {~YieldReset(){reportedOpenWheelCombo=yieldWheelCombo=nullptr;}} reset;
                 yieldWheelCombo=draft.speed;SendMessageW(window,WM_VSCROLL,SB_TOP,0);const int before=nativeWheelYields;
@@ -464,5 +508,5 @@ void nativePageWheelOwnership(){
     std::cout<<"PASS compression page/closed-combo wheel, native list ownership, nested range isolation, read-only scrolling and safe Ctrl/open-dropdown yield\n";
 }
 }
-int main(){try{transactionalRanges();boundsAndFreeze();modalLayoutAndInactiveDraft();strictPolicy();nativeCompressionInsertion();statusAndNestedClose();personModesAndManagement();personLayoutAndStatus();nativeModalButtons();fineTuning();nativeScheduleMnemonicsAndReadOnlyEnter();nativePageWheelOwnership();std::cout<<"All twelve time-compression UI groups passed using owned synthetic windows only.\n";return 0;}
+int main(){try{transactionalRanges();boundsAndFreeze();modalLayoutAndInactiveDraft();strictPolicy();nativeCompressionInsertion();statusAndNestedClose();personModesAndManagement();personLayoutAndStatus();personUncertaintyChoice();nativeModalButtons();fineTuning();nativeScheduleMnemonicsAndReadOnlyEnter();nativePageWheelOwnership();std::cout<<"All thirteen time-compression UI groups passed using owned synthetic windows only.\n";return 0;}
 catch(const std::exception& error){std::cerr<<"TIME COMPRESSION UI FAILURE: "<<error.what()<<'\n';return 1;}}

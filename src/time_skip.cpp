@@ -243,7 +243,8 @@ bool TimeSkipController::observePerson(const PersonObservation& input) noexcept 
     person_.epoch = input.epoch; person_.sequence = input.sequence;
     person_.observationMs = input.activeMs; person_.initialized = true;
     person_.presence = input.presence; person_.available = true;
-    if (input.presence != PersonPresence::QualifiedAbsent) {
+    if (input.presence == PersonPresence::Present ||
+        (input.presence == PersonPresence::Unknown && !settings_.uncertainAsAbsent)) {
         person_.absentSinceMs = -1; person_.absentCount = 0; baseReturn();
     } else {
         if (!person_.absentCount) person_.absentSinceMs = input.activeMs;
@@ -284,13 +285,13 @@ TimeSkipDecision TimeSkipController::evaluate(int64_t activeMs) noexcept {
         if (person_.presence == PersonPresence::Present) {
             baseReturn(); result.reason = TimeSkipReason::PersonPresent; return result;
         }
-        if (person_.presence == PersonPresence::Unknown) {
+        if (person_.presence == PersonPresence::Unknown && !settings_.uncertainAsAbsent) {
             baseReturn(); result.reason = TimeSkipReason::PersonUncertain; return result;
         }
         if (person_.absentCount < 2 || person_.observationMs - person_.absentSinceMs < settings_.quietAfterMs) {
             baseReturn(); result.reason = TimeSkipReason::Checking; return result;
         }
-        result.reason = TimeSkipReason::NoPerson;
+        result.reason = person_.presence == PersonPresence::Unknown ? TimeSkipReason::NoPersonUncertain : TimeSkipReason::NoPerson;
     } else if (automatic(settings_.mode)) {
         bool quiet = true;
         for (unsigned i = 0; i < sources_.size(); ++i) if (sourceMask_ & (1u << i)) {
@@ -313,7 +314,8 @@ int64_t TimeSkipController::onFrame(int64_t activeMs) noexcept {
     const auto status = evaluate(activeMs);
     if (activeMs < 0 || activeMs <= lastFrameMs_) return status.intervalMs;
     lastFrameMs_ = activeMs; returnPending_ = false;
-    if (status.reason != TimeSkipReason::Quiet && status.reason != TimeSkipReason::Manual && status.reason != TimeSkipReason::NoPerson) return baseMs_;
+    if (status.reason != TimeSkipReason::Quiet && status.reason != TimeSkipReason::Manual &&
+        status.reason != TimeSkipReason::NoPerson && status.reason != TimeSkipReason::NoPersonUncertain) return baseMs_;
     if (finished_) return baseMs_;
     const bool bounded = windowEndMs_ != 0;
     const int64_t remaining = bounded ? std::max(int64_t(0), windowEndMs_ - activeMs) : INT64_MAX;

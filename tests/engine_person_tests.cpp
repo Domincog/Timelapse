@@ -29,7 +29,7 @@ std::atomic<unsigned> detectorConstructions{0}, detectorStarts{0}, detectorPolls
 std::atomic<unsigned> cameraReports{0}, activityCalls{0}, desktopObservations{0}, detectorCancels{0};
 std::atomic<int> verdict{1}, sourceMode{0}, detectorMode{0}, startupDelay{0}, inferenceDelay{25}, cameraDelay{25};
 std::atomic<lapse::person::Reason> unknownReason{lapse::person::Reason::InsufficientDetail};
-std::atomic<bool> throwConstruction{false}, startedBeforeVideo{false}, ambiguousOutput{false};
+std::atomic<bool> throwConstruction{false}, startedBeforeVideo{false}, ambiguousOutput{false}, highScoreAmbiguity{false};
 std::atomic<uint64_t> oldReceipt{0};
 std::atomic<bool> gateNextWrite{false}, writeGateEntered{false};
 std::mutex writeGateMutex;
@@ -47,7 +47,7 @@ void resetEvidence() {
     cameraReports=activityCalls=desktopObservations=detectorCancels=0;
     verdict=1;sourceMode=detectorMode=startupDelay=0;inferenceDelay=cameraDelay=25;
     unknownReason=lapse::person::Reason::InsufficientDetail;
-    throwConstruction=startedBeforeVideo=ambiguousOutput=false;oldReceipt=0;
+    throwConstruction=startedBeforeVideo=ambiguousOutput=highScoreAmbiguity=false;oldReceipt=0;
     gateNextWrite = writeGateEntered = false;
     { std::lock_guard<std::mutex> gateLock(writeGateMutex); writeGateOpen = false; }
 }
@@ -139,19 +139,35 @@ void offAndNoCamera(const std::filesystem::path& root) {
     std::cout<<"off/manual/no-camera isolation passed\n";
 }
 void accelerateAndActivity(const std::filesystem::path& root) {
-    resetEvidence();Engine e;auto s=configuration(root/L"paired");s.separateFiles=true;s.captureCursor=false;e.configure(s);e.record();
+    resetEvidence();Engine e;auto s=configuration(root/L"paired");s.separateFiles=true;s.captureCursor=false;s.timeSkip.uncertainAsAbsent=false;e.configure(s);e.record();
     await(e,[](const auto& x){return x.timeSkip.intervalMs>120&&x.timeSkip.reason==TimeSkipReason::NoPerson;});
     require(!startedBeforeVideo&&detectorStarts==1&&desktopObservations==0&&activityCalls==0,"Person checks did not isolate camera/first admission");
     const auto beforeGeometry=cameraReports.load();sourceMode=7;inferenceDelay=250;
     await(e,[&](const auto& x){return cameraReports>beforeGeometry&&x.timeSkip.intervalMs==100;},2200);
     await(e,[](const auto& x){return x.timeSkip.intervalMs>110&&x.timeSkip.reason==TimeSkipReason::NoPerson;},4200);
     inferenceDelay=25;
-    // Person mode is session-frozen even if an external caller changes controls.
-    s.timeSkip.mode=TimeSkipMode::Off;e.configure(s);verdict=2;
+    // Person mode and uncertainty policy are session-frozen even if an external caller changes controls.
+    s.timeSkip.mode=TimeSkipMode::Off;s.timeSkip.uncertainAsAbsent=true;e.configure(s);verdict=2;
     await(e,[](const auto& x){return x.timeSkip.reason==TimeSkipReason::PersonPresent&&x.timeSkip.intervalMs==100;},2200);
-    verdict=0;await(e,[](const auto& x){return x.timeSkip.reason==TimeSkipReason::PersonUncertain&&x.timeSkip.intervalMs==100&&std::wstring(x.timeSkip.diagnostic.data()).find(L"Too little image detail")!=std::wstring::npos;},2200);
+    verdict=0;
+    const auto uncertain=await(e,[](const auto& x){return x.timeSkip.reason==TimeSkipReason::PersonUncertain&&x.timeSkip.intervalMs==100&&std::wstring(x.timeSkip.diagnostic.data()).find(L"Too little image detail")!=std::wstring::npos;},2200);
+    require(std::wstring(uncertain.timeSkip.diagnostic.data()).find(L"using normal cadence")!=std::wstring::npos,
+        "Uncertainty diagnostic used a live setting instead of the frozen opt-out");
+    const auto holdUntil=uncertain.timeSkip.lastCheckTick+uint64_t(s.timeSkip.quietAfterMs)+1200;
+    while(e.status().timeSkip.lastCheckTick<holdUntil){
+        const auto current=e.status();
+        require(current.timeSkip.reason==TimeSkipReason::PersonUncertain&&current.timeSkip.intervalMs==100,
+            "Opted-out healthy uncertainty accelerated after repeated checks");
+        require(GetTickCount64()<holdUntil+2200,"Opted-out uncertainty stopped receiving fresh checks");
+        std::this_thread::sleep_for(3ms);
+    }
+    highScoreAmbiguity=true;
+    const auto ambiguous=await(e,[&](const auto& x){return x.timeSkip.reason==TimeSkipReason::PersonUncertain&&x.timeSkip.intervalMs==100&&
+        x.timeSkip.lastCheckTick>=holdUntil&&std::wstring(x.timeSkip.diagnostic.data()).find(L"ambiguous")!=std::wstring::npos;},2200);
+    require(std::wstring(ambiguous.timeSkip.diagnostic.data()).find(L"using normal cadence")!=std::wstring::npos,
+        "Opt-out failed to keep model ambiguity at normal cadence");
     decode(finish(e),2);require(detectorLive==0,"Finished detector retained its resources");boundedCadence();
-    std::cout<<"camera-only paired acceleration, Present/Unknown return and frozen policy passed\n";
+    std::cout<<"camera-only paired acceleration, Present/Unknown return and frozen opt-out passed\n";
 }
 void ambiguousAbsenceAndUncertainty(const std::filesystem::path& root) {
     resetEvidence(); verdict=2;
@@ -179,34 +195,64 @@ void ambiguousAbsenceAndUncertainty(const std::filesystem::path& root) {
     ambiguousOutput=false;
     const auto returned=await(e,[](const auto& x){return x.timeSkip.reason==TimeSkipReason::PersonPresent&&x.timeSkip.intervalMs==100;},2200);
     verdict=0;
-    const auto uncertain=await(e,[&](const auto& x){return x.timeSkip.reason==TimeSkipReason::PersonUncertain&&x.timeSkip.lastCheckTick>returned.timeSkip.lastCheckTick;},2200);
+    const auto uncertain=await(e,[&](const auto& x){return x.timeSkip.reason==TimeSkipReason::Checking&&x.timeSkip.lastCheckTick>returned.timeSkip.lastCheckTick;},2200);
     require(uncertain.timeSkip.intervalMs==100&&detectorLive==1&&
-        std::wstring(uncertain.timeSkip.diagnostic.data()).find(L"Too little image detail")!=std::wstring::npos,
-        "Healthy low-detail result was presented as a detector outage or accelerated");
-    const auto moreChecksBy=GetTickCount64()+4000;
-    while(e.status().timeSkip.lastCheckTick<uncertain.timeSkip.lastCheckTick+2200&&GetTickCount64()<moreChecksBy){
-        const auto current=e.status();
-        require(current.timeSkip.reason==TimeSkipReason::PersonUncertain&&current.timeSkip.intervalMs==100,
-            "Repeated low-detail results qualified absence or became unavailable");
+        std::wstring(uncertain.timeSkip.diagnostic.data()).find(L"Too little image detail")!=std::wstring::npos&&
+        std::wstring(uncertain.timeSkip.diagnostic.data()).find(L"treating uncertainty as no person detected")!=std::wstring::npos,
+        "Default low-detail uncertainty was unavailable, hid its policy or skipped its dwell");
+    // Changes made during recording must not alter either cadence or diagnostics.
+    s.timeSkip.uncertainAsAbsent=false;e.configure(s);
+    const auto uncertainDwellAt=uncertain.timeSkip.lastCheckTick+uint64_t(s.timeSkip.quietAfterMs);
+    while(GetTickCount64()+100<uncertainDwellAt){
+        require(e.status().timeSkip.intervalMs==100,"Unknown result borrowed earlier absence or presence dwell");
         std::this_thread::sleep_for(3ms);
     }
-    require(e.status().timeSkip.lastCheckTick>=uncertain.timeSkip.lastCheckTick+2200,"Healthy uncertainty stopped receiving fresh checks");
-    unknownReason=person::Reason::ModelFailure;
-    const auto failed=await(e,[&](const auto& x){return x.timeSkip.reason==TimeSkipReason::Unavailable&&x.timeSkip.lastCheckTick>uncertain.timeSkip.lastCheckTick+2200;},2200);
-    require(failed.timeSkip.intervalMs==100&&detectorLive==1&&failed.timeSkip.diagnostic[0],
-        "Model inference failure was described as healthy uncertainty or accelerated");
-    const auto failedAgain=await(e,[&](const auto& x){return x.timeSkip.lastCheckTick>failed.timeSkip.lastCheckTick;},2200);
+    const auto uncertainAccelerated=await(e,[](const auto& x){return x.timeSkip.reason==TimeSkipReason::NoPersonUncertain&&x.timeSkip.intervalMs>=350;},7000);
+    require(uncertainAccelerated.timeSkip.lastCheckTick-uncertain.timeSkip.lastCheckTick+10>=uint64_t(s.timeSkip.quietAfterMs)&&
+        std::wstring(uncertainAccelerated.timeSkip.diagnostic.data()).find(L"treating uncertainty as no person detected")!=std::wstring::npos,
+        "Default uncertainty skipped full dwell or its frozen diagnostic policy");
+    await(e,[&](const auto& x){return x.frames>=uncertainAccelerated.frames+3&&x.timeSkip.reason==TimeSkipReason::NoPersonUncertain;},2200);
+    {
+        std::lock_guard<std::mutex> lock(evidenceMutex);
+        require(writes.size()>=4,"No saved frames followed uncertain-absence acceleration");
+        for(size_t i=writes.size()-2;i<writes.size();++i)
+            require(writes[i].us-writes[i-1].us>=300000,"Uncertainty changed status without slowing saved-frame cadence");
+    }
+    highScoreAmbiguity=true;
+    const auto ambiguousUncertain=await(e,[&](const auto& x){return x.timeSkip.reason==TimeSkipReason::NoPersonUncertain&&x.timeSkip.intervalMs>=350&&
+        x.timeSkip.lastCheckTick>uncertainAccelerated.timeSkip.lastCheckTick&&std::wstring(x.timeSkip.diagnostic.data()).find(L"ambiguous")!=std::wstring::npos;},2200);
+    require(std::wstring(ambiguousUncertain.timeSkip.diagnostic.data()).find(L"treating uncertainty as no person detected")!=std::wstring::npos,
+        "Default ambiguous uncertainty lost its policy or model detail");
+    highScoreAmbiguity=false;
+    auto lastFailureTick=ambiguousUncertain.timeSkip.lastCheckTick;
+    for(const auto reason:{person::Reason::InvalidInput,person::Reason::ModelFailure,person::Reason::InvalidOutput,person::Reason::StaleSource,person::Reason::None}){
+        unknownReason=reason;
+        const auto failed=await(e,[&](const auto& x){return x.timeSkip.reason==TimeSkipReason::Unavailable&&x.timeSkip.lastCheckTick>lastFailureTick;},2200);
+        require(failed.timeSkip.intervalMs==100&&detectorLive==1&&failed.timeSkip.diagnostic[0],
+            "A failed or invalid person result was treated as uncertain absence");
+        lastFailureTick=failed.timeSkip.lastCheckTick;
+    }
+    const auto failedAgain=await(e,[&](const auto& x){return x.timeSkip.lastCheckTick>lastFailureTick;},2200);
     require(failedAgain.timeSkip.reason==TimeSkipReason::Unavailable&&failedAgain.timeSkip.intervalMs==100,
         "Repeated model inference failure qualified absence");
     unknownReason=person::Reason::InsufficientDetail;
-    const auto recovered=await(e,[&](const auto& x){return x.timeSkip.reason==TimeSkipReason::PersonUncertain&&x.timeSkip.lastCheckTick>failedAgain.timeSkip.lastCheckTick;},2200);
+    const auto recovered=await(e,[&](const auto& x){return x.timeSkip.reason==TimeSkipReason::Checking&&x.timeSkip.lastCheckTick>failedAgain.timeSkip.lastCheckTick;},2200);
     require(recovered.timeSkip.intervalMs==100&&detectorLive==1,"Fresh healthy uncertainty did not recover after a failed check");
+    const auto recoveryDwellAt=recovered.timeSkip.lastCheckTick+uint64_t(s.timeSkip.quietAfterMs);
+    while(GetTickCount64()+100<recoveryDwellAt){
+        require(e.status().timeSkip.intervalMs==100,"Healthy uncertainty borrowed dwell through failed checks");
+        std::this_thread::sleep_for(3ms);
+    }
+    await(e,[&](const auto& x){return x.timeSkip.reason==TimeSkipReason::NoPersonUncertain&&x.timeSkip.intervalMs>100&&
+        x.timeSkip.lastCheckTick-recovered.timeSkip.lastCheckTick+10>=uint64_t(s.timeSkip.quietAfterMs);},4200);
+    verdict=2;
+    await(e,[](const auto& x){return x.timeSkip.reason==TimeSkipReason::PersonPresent&&x.timeSkip.intervalMs==100;},2200);
     decode(finish(e));boundedCadence();
-    std::cout<<"subthreshold empty-scene scores require full dwell and slow saved cadence; healthy uncertainty stays distinct from failure\n";
+    std::cout<<"subthreshold and default uncertain absence require full dwell and slow saved cadence; failed checks clear dwell\n";
 }
 void pauseProvenance(const std::filesystem::path& root) {
-    resetEvidence();Engine e;auto s=configuration(root/L"pause");e.configure(s);e.record();
-    await(e,[](const auto& x){return x.timeSkip.intervalMs>110;});e.setPaused(true);
+    resetEvidence();verdict=0;Engine e;auto s=configuration(root/L"pause");s.timeSkip.quietAfterMs=2000;e.configure(s);e.record();
+    await(e,[](const auto& x){return x.timeSkip.intervalMs>110&&x.timeSkip.reason==TimeSkipReason::NoPersonUncertain;});e.setPaused(true);
     const auto paused=await(e,[](const auto& x){return x.state==State::Paused;});const auto calls=detectorPolls.load();
     require(detectorLive==0,"Paused detector retained model resources");std::this_thread::sleep_for(130ms);
     require(detectorPolls==calls&&e.status().elapsed==paused.elapsed,"Hidden pause continued detector work or clock");
@@ -215,8 +261,17 @@ void pauseProvenance(const std::filesystem::path& root) {
     await(e,[&](const auto& x){return x.state==State::Recording&&detectorStarts>=2&&cameraReports>reportsBeforeResume;});
     require(e.status().timeSkip.intervalMs==100&&detectorSubmits==submitsBeforeResume,"Pre-reset sample borrowed pause time");
     {std::lock_guard<std::mutex> lock(evidenceMutex);require(tokens.size()==2&&tokens[0]!=tokens[1],"Resume reused detector token");}
+    sourceMode=0;
+    const auto recovered=await(e,[](const auto& x){return x.timeSkip.reason==TimeSkipReason::Checking&&x.timeSkip.lastCheckTick>0;},2200);
+    const auto freshDwellAt=recovered.timeSkip.lastCheckTick+uint64_t(s.timeSkip.quietAfterMs);
+    while(GetTickCount64()+100<freshDwellAt){
+        require(e.status().timeSkip.intervalMs==100,"Uncertainty borrowed its pre-pause absence dwell");
+        std::this_thread::sleep_for(3ms);
+    }
+    await(e,[&](const auto& x){return x.timeSkip.reason==TimeSkipReason::NoPersonUncertain&&x.timeSkip.intervalMs>100&&
+        x.timeSkip.lastCheckTick-recovered.timeSkip.lastCheckTick+10>=uint64_t(s.timeSkip.quietAfterMs);},4200);
     decode(finish(e));
-    std::cout<<"pause cleanup and pre-resume source rejection passed\n";
+    std::cout<<"pause cleanup, pre-resume source rejection and fresh uncertainty dwell passed\n";
 }
 void malformedAndDuplicate(const std::filesystem::path& root) {
     resetEvidence();{Engine e;auto s=configuration(root/L"invalid");sourceMode=1;e.configure(s);e.record();
@@ -342,6 +397,7 @@ PersonPoll PersonClient::poll(PersonCheckResult& r)noexcept{
     r.output.reason=verdict==0?unknownReason.load():person::Reason::None;
     r.sufficientDetail=verdict!=0;
     if(ambiguousOutput){r.output={.22945f,.22945f,person::Verdict::Unknown,person::Reason::Ambiguous};r.sufficientDetail=true;}
+    if(highScoreAmbiguity){r.output={.65f,.15f,person::Verdict::Unknown,person::Reason::Ambiguous};r.sufficientDetail=true;}
     return PersonPoll::Complete;
 }
 bool PersonClient::submit(const CameraPersonInput& input)noexcept{if(!impl_->active||impl_->pending)return false;++detectorSubmits;impl_->expected=input.source;impl_->pending=true;impl_->due=GetTickCount64()+static_cast<uint64_t>(inferenceDelay.load());return true;}
