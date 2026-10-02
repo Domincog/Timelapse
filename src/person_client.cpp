@@ -27,7 +27,7 @@ struct Transport {
     person::Shared* shared = nullptr;
     uint64_t next = 0, pending = 0, submitted = 0, contentionSince = 0;
     person::Source expected{}, lastAccepted{};
-    bool ready = false, retired = false;
+    bool ready = false, retired = false, expectedSufficientDetail = false;
     ~Transport() { retire(); if (shared) UnmapViewOfFile(shared); }
     void retire() noexcept {
         retired = true; pending = 0;
@@ -143,6 +143,26 @@ bool validOutput(const person::Output& output) noexcept {
         return output.rawMaxPerson <= person::AbsentThreshold && output.reason == person::Reason::None;
     return output.reason != person::Reason::None;
 }
+bool sufficientPersonDetail(const uint8_t* bgr, size_t bytes) noexcept {
+    // Match the pinned r1 worker's gate on unpadded BGR pixels. That worker gates
+    // QualifiedAbsent only, so its Ambiguous replies need the same check here.
+    if (!bgr || !bytes || bytes > person::MaxBgrBytes || bytes % 3) return false;
+    std::array<uint32_t, 256> histogram{}; uint64_t total = 0;
+    const uint32_t count = uint32_t(bytes / 3);
+    for (size_t at = 0; at < bytes; at += 3) {
+        const unsigned luma = (77u * bgr[at + 2] + 150u * bgr[at + 1] + 29u * bgr[at] + 128u) >> 8;
+        ++histogram[luma]; total += luma;
+    }
+    if (total < uint64_t(12) * count || total > uint64_t(243) * count) return false;
+    const uint32_t rank05 = (5u * count + 99u) / 100u, rank95 = (95u * count + 99u) / 100u;
+    uint32_t cumulative = 0; int low = -1, high = -1;
+    for (int value = 0; value < 256; ++value) {
+        cumulative += histogram[size_t(value)];
+        if (low < 0 && cumulative >= rank05) low = value;
+        if (cumulative >= rank95) { high = value; break; }
+    }
+    return high - low >= 16;
+}
 }
 struct PersonClient::Impl {
     std::shared_ptr<Startup> startup;
@@ -242,6 +262,7 @@ PersonPoll PersonClient::poll(PersonCheckResult& output) noexcept {
         now < transport.submitted || now - transport.submitted >= 3000)
         return state.fail(L"The optional detector returned an invalid result; using normal cadence.");
     output.source = transport.expected; output.output = shared.output;
+    output.sufficientDetail = transport.expectedSufficientDetail;
     // A late but otherwise well-formed source is Unknown, not new absence.
     if (output.source.receivedTick > now || now - output.source.receivedTick > person::SourceFreshnessMs) {
         output.output.verdict = person::Verdict::Unknown; output.output.reason = person::Reason::StaleSource;
@@ -273,6 +294,7 @@ bool PersonClient::submit(const CameraPersonInput& input) noexcept {
         state.fail(L"The optional person detector lost request identity; using normal cadence."); return false;
     }
     transport.expected = source; transport.submitted = now; transport.pending = ++transport.next;
+    transport.expectedSufficientDetail = sufficientPersonDetail(input.bgr.data(), size_t(source.width) * source.height * 3);
     shared.inputSource = source; shared.inputBytes = source.width * source.height * 3;
     std::memcpy(shared.input.data(), input.bgr.data(), shared.inputBytes);
     shared.requested = transport.pending;

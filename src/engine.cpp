@@ -515,17 +515,25 @@ void Engine::run() {
                         personProblem(L"The person-check source image is stale or invalid; using normal cadence.", false);
                     } else {
                         PersonPresence presence = PersonPresence::Unknown;
-                        if (result.output.verdict == person::Verdict::Present) presence = PersonPresence::Present;
-                        else if (result.output.verdict == person::Verdict::QualifiedAbsent) presence = PersonPresence::QualifiedAbsent;
+                        const auto cadenceVerdict = personCadenceVerdict(result.output, result.sufficientDetail);
+                        if (cadenceVerdict == person::Verdict::Present) presence = PersonPresence::Present;
+                        else if (cadenceVerdict == person::Verdict::QualifiedAbsent) presence = PersonPresence::QualifiedAbsent;
                         const auto age = tick - result.source.receivedTick;
                         const int64_t observedAt = std::max<int64_t>(0, activeMilliseconds() - static_cast<int64_t>(age));
                         if (timeSkip.observePerson({presence, result.source.cameraEpoch, result.source.sequence, observedAt})) {
                             observationTicks[1] = result.source.receivedTick;
                             observationProblems[1] = {}; personLastSource = result.source;
                             if (presence == PersonPresence::Unknown) {
-                                personProblem(result.output.reason == person::Reason::InsufficientDetail
-                                    ? L"Too little image detail for absence checks; using normal cadence."
-                                    : L"The person check is uncertain; using normal cadence.", false);
+                                if (result.output.reason != person::Reason::Ambiguous &&
+                                    result.output.reason != person::Reason::InsufficientDetail) {
+                                    personProblem(L"The optional detector could not complete a valid person check; using normal cadence.", false);
+                                } else {
+                                    const wchar_t* detail = result.output.reason == person::Reason::InsufficientDetail || !result.sufficientDetail
+                                        ? L"Too little image detail for absence checks; using normal cadence."
+                                        : L"The person check is uncertain; using normal cadence.";
+                                    auto& message = observationProblems[1];
+                                    std::copy_n(detail, std::min(wcslen(detail), message.size() - 1), message.begin());
+                                }
                             }
                         } else personProblem(L"The person check repeated or regressed its source; using normal cadence.", false);
                     }

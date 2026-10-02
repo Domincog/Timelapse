@@ -267,7 +267,8 @@ void personLayoutAndStatus(){
     Status status;status.state=State::Recording;status.timeSkip.enabled=true;status.timeSkip.intervalMs=20000;
     status.timeSkip.lastCheckTick=GetTickCount64()-2000;status.message=L"Keep original save failure";status.error=true;
     for(auto item:{std::pair{TimeSkipReason::NoPerson,L"No person detected"},std::pair{TimeSkipReason::PersonPresent,L"Person detected"},
-        std::pair{TimeSkipReason::Checking,L"Checking for absence"},std::pair{TimeSkipReason::Unavailable,L"Checks unavailable"}}){
+        std::pair{TimeSkipReason::Checking,L"Checking for absence"},std::pair{TimeSkipReason::Unavailable,L"Checks unavailable"},
+        std::pair{TimeSkipReason::PersonUncertain,L"Person check uncertain"}}){
         status.timeSkip.reason=item.first;applyStatus(status,true);require(app.skipDetailCaption.find(item.second)!=std::wstring::npos &&
             app.skipDetailCaption.find(L"source check")!=std::wstring::npos && statusCaption()==L"Keep original save failure", "Person status lost scope, age or error priority.");}
     const unsigned inspections=lapse::uiPersonPackInspections;for(int i=0;i<10;++i)applyStatus(status);

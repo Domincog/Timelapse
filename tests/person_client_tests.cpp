@@ -12,7 +12,7 @@
 namespace fixture {
 using namespace lapse;
 enum class Fault : LONG { Healthy, InitHang, InvokeHang, Crash, HoldMutex, Abandon, WrongIdentity,
-    BadScore, BadVerdict, BadHeader, RegressPhase, InputIdentity, InputLength, Regression, Delayed };
+    BadScore, BadVerdict, BadHeader, RegressPhase, InputIdentity, InputLength, Regression, Delayed, Ambiguous };
 struct Ack { volatile LONG fault = 0, stage = 0, invocations = 0, release = 1; };
 std::atomic<int64_t> clockOffset{0};
 std::atomic<bool> publishArmed{false}, publishReached{false}, publishRelease{false}, gateTimeout{false};
@@ -141,6 +141,7 @@ int syntheticWorker(const wchar_t* name) {
         if (WaitForSingleObject(mutex.value, 1000) != WAIT_OBJECT_0) return 12;
         shared.outputSource = source;
         shared.output = {.05f, .04f, person::Verdict::QualifiedAbsent, person::Reason::None};
+        if (fault == Fault::Ambiguous) shared.output = {.2294526f, .2294526f, person::Verdict::Unknown, person::Reason::Ambiguous};
         if (fault == Fault::WrongIdentity) ++shared.outputSource.sequence;
         if (fault == Fault::BadScore) shared.output.rawMaxPerson = std::numeric_limits<float>::quiet_NaN();
         if (fault == Fault::BadVerdict) shared.output.rawMaxPerson = .20f;
@@ -191,7 +192,42 @@ std::unique_ptr<CameraPersonInput> input(uint64_t sequence = 1) {
 void start(PersonClient& client) { std::wstring error; require(client.start(91, error), "client start accepted"); }
 void ready(PersonClient& client) { start(client); require(pump(client, PersonPoll::Ready) == PersonPoll::Ready, "client ready"); }
 struct Release { ~Release() { publishRelease = verifyRelease = true; if (ack) InterlockedExchange(&ack->release, 1); } };
+void cadencePolicy() {
+    using person::Output; using person::Reason; using person::Verdict;
+    auto verdict = [](Output output, bool detail = true) { return personCadenceVerdict(output, detail); };
+    require(verdict({.2294526f, .2294526f, Verdict::Unknown, Reason::Ambiguous}) == Verdict::QualifiedAbsent,
+        "ordinary empty-office ambiguous result can qualify cadence absence");
+    require(verdict({std::nextafter(.25f, 0.f), 0, Verdict::Unknown, Reason::Ambiguous}) == Verdict::QualifiedAbsent,
+        "raw score just below person detection threshold qualifies");
+    require(verdict({.25f, .20f, Verdict::Unknown, Reason::Ambiguous}) == Verdict::Unknown &&
+        verdict({.8f, 0, Verdict::Unknown, Reason::Ambiguous}) == Verdict::Unknown,
+        "high raw score without valid detection remains uncertain");
+    require(verdict({.25f, .25f, Verdict::Present, Reason::None}, false) == Verdict::Present,
+        "exact detection boundary and low detail preserve presence");
+    require(verdict({.10f, .04f, Verdict::QualifiedAbsent, Reason::None}) == Verdict::QualifiedAbsent &&
+        verdict({.10001f, .04f, Verdict::QualifiedAbsent, Reason::None}) == Verdict::Unknown,
+        "worker wire absence threshold remains strict");
+    require(verdict({.2f, .1f, Verdict::Unknown, Reason::Ambiguous}, false) == Verdict::Unknown,
+        "uninformative ambiguous image cannot qualify absence");
+    for (const Reason reason : {Reason::InvalidInput, Reason::ModelFailure, Reason::InvalidOutput,
+        Reason::StaleSource, Reason::InsufficientDetail})
+        require(verdict({.2f, .1f, Verdict::Unknown, reason}) == Verdict::Unknown, "unhealthy or stale reply remains unknown");
+    require(verdict({std::numeric_limits<float>::quiet_NaN(), 0, Verdict::Unknown, Reason::Ambiguous}) == Verdict::Unknown &&
+        verdict({.2f, .3f, Verdict::Unknown, Reason::Ambiguous}) == Verdict::Unknown,
+        "invalid scores cannot qualify cadence absence");
+    person::Input pixels{};
+    for (const int level : {0, 12, 128, 243, 255}) {
+        pixels.fill(uint8_t(level)); require(!lapse::sufficientPersonDetail(pixels.data(), pixels.size()), "flat frames fail host detail gate");
+    }
+    for (const auto& boundary : {std::array<int, 3>{4, 20, 1}, {3, 19, 0}, {235, 251, 1}, {236, 252, 0}, {120, 136, 1}, {120, 135, 0}}) {
+        for (size_t at = 0; at < pixels.size(); ++at) pixels[at] = uint8_t((at / 3) % 2 ? boundary[0] : boundary[1]);
+        require(lapse::sufficientPersonDetail(pixels.data(), pixels.size()) == bool(boundary[2]), "host mean/spread boundaries match worker");
+    }
+    require(!lapse::sufficientPersonDetail(nullptr, pixels.size()) &&
+        !lapse::sufficientPersonDetail(pixels.data(), pixels.size() - 1), "invalid host detail input rejected");
+}
 void scenarios(const wchar_t* self, const wchar_t* real) {
+    cadencePolicy();
     workerPath = self;
     DWORD baselineHandles = 0;
     {
@@ -203,6 +239,27 @@ void scenarios(const wchar_t* self, const wchar_t* real) {
         require(client.poll(result) == PersonPoll::Ready && !client.submit(*frame) && read(ack->invocations) == 1, "completion and source not replayed");
         frame = input(2); frame->source.receivedTick = tick() + 1; require(!client.submit(*frame), "future input rejected");
         frame->source.receivedTick = tick() - 4000; require(!client.submit(*frame), "stale input rejected");
+        client.cancel(); terminal();
+    }
+    {
+        reset(Fault::Ambiguous); PersonClient client; ready(client);
+        auto frame = input();
+        for (size_t at = 0; at < frame->bgr.size(); ++at) frame->bgr[at] = uint8_t((at / 3) % 2 ? 64 : 192);
+        require(client.submit(*frame), "informative ambiguous input submitted");
+        frame->bgr.fill(0); // The completion must retain the submitted image's detail.
+        PersonCheckResult result; PersonPoll status = PersonPoll::Pending;
+        const uint64_t end = GetTickCount64() + 2000;
+        while (status == PersonPoll::Pending && GetTickCount64() < end) { status = client.poll(result); Sleep(1); }
+        require(status == PersonPoll::Complete && result.output.verdict == person::Verdict::Unknown &&
+            result.sufficientDetail && personCadenceVerdict(result.output, result.sufficientDetail) == person::Verdict::QualifiedAbsent,
+            "validated ambiguous wire reply qualifies only with matching submitted detail");
+        frame = input(2); require(client.submit(*frame), "flat ambiguous input submitted");
+        for (size_t at = 0; at < frame->bgr.size(); ++at) frame->bgr[at] = uint8_t((at / 3) % 2 ? 64 : 192);
+        status = PersonPoll::Pending; const uint64_t flatEnd = GetTickCount64() + 2000;
+        while (status == PersonPoll::Pending && GetTickCount64() < flatEnd) { status = client.poll(result); Sleep(1); }
+        require(status == PersonPoll::Complete && !result.sufficientDetail &&
+            personCadenceVerdict(result.output, result.sufficientDetail) == person::Verdict::Unknown,
+            "matching flat thumbnail cannot be replaced by later informative pixels");
         client.cancel(); terminal();
     }
     Sleep(10); // The already-terminal observer releases its local startup objects.

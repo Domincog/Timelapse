@@ -82,7 +82,7 @@ void presenceAndUnknown() {
     for (auto presence : {PersonPresence::Present, PersonPresence::Unknown}) {
         accelerate(controller);
         require(report(controller, 13000, 14, presence), "Typed report rejected");
-        returned(controller, 13000, presence == PersonPresence::Present ? TimeSkipReason::PersonPresent : TimeSkipReason::Unavailable);
+        returned(controller, 13000, presence == PersonPresence::Present ? TimeSkipReason::PersonPresent : TimeSkipReason::PersonUncertain);
         require(report(controller, 14000, 15) && controller.inspect(14000).reason == TimeSkipReason::Checking,
                 "First new negative inherited earlier dwell");
         require(report(controller, 15000, 16) && controller.inspect(15000).reason == TimeSkipReason::NoPerson,
@@ -92,6 +92,10 @@ void presenceAndUnknown() {
     require(!report(controller, 13000, 13), "Unavailable replay erased source watermark");
     require(report(controller, 14000, 14) && controller.inspect(14000).reason == TimeSkipReason::Checking,
             "Fresh report after unavailable did not restart dwell");
+    require(report(controller, 15000, 15, PersonPresence::Unknown) &&
+        controller.inspect(18000).reason == TimeSkipReason::PersonUncertain &&
+        controller.inspect(18001).reason == TimeSkipReason::Unavailable,
+        "Healthy uncertain check was confused with missing or stale checks");
     std::cout << "PASS Present/Unknown/stale API clear dwell, preserve identity and recover conservatively\n";
 }
 void rejectedInput() {

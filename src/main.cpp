@@ -572,6 +572,7 @@ void updateSkipText(bool force=false) {
         else {
             const wchar_t* reason=value.reason==TimeSkipReason::Quiet?L"Quiet":value.reason==TimeSkipReason::Manual?L"Scheduled":
                 value.reason==TimeSkipReason::NoPerson?L"No person detected":value.reason==TimeSkipReason::PersonPresent?L"Person detected":
+                value.reason==TimeSkipReason::PersonUncertain?L"Person check uncertain":
                 value.reason==TimeSkipReason::Checking?(skipPerson(app.settings.timeSkip.mode)?L"Checking for absence":L"Checking image changes"):
                 value.reason==TimeSkipReason::Unavailable?L"Checks unavailable":L"Normal cadence";
             detail=reason;

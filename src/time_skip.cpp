@@ -242,7 +242,7 @@ bool TimeSkipController::observePerson(const PersonObservation& input) noexcept 
     if (restart) personUnavailable();
     person_.epoch = input.epoch; person_.sequence = input.sequence;
     person_.observationMs = input.activeMs; person_.initialized = true;
-    person_.presence = input.presence; person_.available = input.presence != PersonPresence::Unknown;
+    person_.presence = input.presence; person_.available = true;
     if (input.presence != PersonPresence::QualifiedAbsent) {
         person_.absentSinceMs = -1; person_.absentCount = 0; baseReturn();
     } else {
@@ -283,6 +283,9 @@ TimeSkipDecision TimeSkipController::evaluate(int64_t activeMs) noexcept {
         }
         if (person_.presence == PersonPresence::Present) {
             baseReturn(); result.reason = TimeSkipReason::PersonPresent; return result;
+        }
+        if (person_.presence == PersonPresence::Unknown) {
+            baseReturn(); result.reason = TimeSkipReason::PersonUncertain; return result;
         }
         if (person_.absentCount < 2 || person_.observationMs - person_.absentSinceMs < settings_.quietAfterMs) {
             baseReturn(); result.reason = TimeSkipReason::Checking; return result;

@@ -32,7 +32,7 @@ struct TimeSkipDescriptor {
 // Fixed sixteen stratified BGRA samples per thumbnail cell; no allocation.
 // This is an image-change descriptor, not semantic activity recognition.
 bool describeTimeSkipFrame(const Frame& frame, TimeSkipDescriptor& output) noexcept;
-enum class TimeSkipReason { Off, Normal, Checking, Quiet, Manual, Unavailable, NoPerson, PersonPresent };
+enum class TimeSkipReason { Off, Normal, Checking, Quiet, Manual, Unavailable, NoPerson, PersonPresent, PersonUncertain };
 enum class PersonPresence { Unknown, Present, QualifiedAbsent };
 struct PersonObservation {
     PersonPresence presence = PersonPresence::Unknown;

@@ -246,7 +246,8 @@ void quietSensitivity() {
         controller.observePerson({PersonPresence::QualifiedAbsent, 1, 2, 1000}); controller.onFrame(1000);
         require(controller.inspect(1000).reason == TimeSkipReason::NoPerson, "Sensitivity changed qualified absence");
         controller.observePerson({PersonPresence::Unknown, 1, 3, 2000});
-        require(controller.inspect(2000).reason == TimeSkipReason::Unavailable, "Sensitivity weakened unknown-person fallback");
+        require(controller.inspect(2000).reason == TimeSkipReason::PersonUncertain &&
+            controller.inspect(2000).intervalMs == 100, "Sensitivity weakened unknown-person fallback");
     }
     std::cout << "PASS quiet sensitivity boundaries/history, chroma, exposure, immediate return, stale/duplicate/reset and person independence\n";
 }
