@@ -116,7 +116,10 @@ void recordingFormats() {
     check(validateEncodingMode(EncodingMode::HardwareHEVC,false,error) && error.empty(), "ordinary HEVC remains valid");
     check(!validateEncodingMode(EncodingMode::HardwareHEVC,true,error) && error.find(L"H.264")!=std::wstring::npos,
           "recovery rejects HEVC with an actionable message, without fallback");
-    for (auto mode : {static_cast<EncodingMode>(-1),static_cast<EncodingMode>(5)})
+    check(validateEncodingMode(EncodingMode::SoftwareAV1,false,error) && error.empty(), "ordinary AV1 remains valid");
+    check(!validateEncodingMode(EncodingMode::SoftwareAV1,true,error) && error.find(L"H.264")!=std::wstring::npos,
+          "recovery rejects AV1 with an actionable message, without fallback");
+    for (auto mode : {static_cast<EncodingMode>(-1),static_cast<EncodingMode>(6)})
         for (bool recovery : {false,true})
             check(!validateEncodingMode(mode,recovery,error) && !error.empty(), "invalid encoder rejected before file creation");
 }

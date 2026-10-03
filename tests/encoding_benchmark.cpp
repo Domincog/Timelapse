@@ -36,7 +36,7 @@ uint64_t privateBytes() {
 }
 int wmain(int argc, wchar_t** argv) {
     if (argc != 8) {
-        std::cerr << "Usage: encoding_benchmark <compatible|efficient|quality-h264|hardware-h264|hardware-hevc> "
+        std::cerr << "Usage: encoding_benchmark <compatible|efficient|quality-h264|hardware-h264|hardware-hevc|av1> "
             "<compact|balanced|detail> <scene:0-3> <width> <height> <frames> <unused-output.mp4>\n"
             "Example: encoding_benchmark efficient balanced 0 1920 1080 180 screen.mp4\n"
             "Pre-renders all source frames (180 x 1080p uses about 1.4 GiB) outside encoding measurements.\n"
@@ -52,6 +52,7 @@ int wmain(int argc, wchar_t** argv) {
         else if (modeName == L"quality-h264") mode = lapse::EncodingMode::QualityH264;
         else if (modeName == L"hardware-h264") mode = lapse::EncodingMode::HardwareH264;
         else if (modeName == L"hardware-hevc") mode = lapse::EncodingMode::HardwareHEVC;
+        else if (modeName == L"av1") mode = lapse::EncodingMode::SoftwareAV1;
         else throw std::runtime_error("Invalid encoding mode");
         lapse::EncodingQuality quality;
         if (qualityName == L"compact") quality = lapse::EncodingQuality::Compact;

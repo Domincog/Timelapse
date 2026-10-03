@@ -302,6 +302,38 @@ void lifecycle(const std::filesystem::path& root, bool recoveryMode = false) {
     for (const auto& path : saved.savedPaths) require(MoveFileExW(path.c_str(), (path + L".moved").c_str(), 0) != FALSE, "Publication guard was not released");
     std::cout << "PASS recovery=" << recoveryMode << " paired sources, matching timestamps, full-frame content, pause/resume, frozen session, owned publication.\n";
 }
+// The Windows AV1 decoder is an optional Store extension; encoding never uses it.
+bool av1Decoder() {
+    MFT_REGISTER_TYPE_INFO input{MFMediaType_Video, MFVideoFormat_AV1}; IMFActivate** list = nullptr; UINT32 count = 0;
+    checked(MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG_ALL & ~MFT_ENUM_FLAG_FIELDOFUSE, &input, nullptr, &list, &count),
+        "AV1 decoder enumeration failed");
+    for (UINT32 i = 0; i < count; ++i) list[i]->Release();
+    CoTaskMemFree(list); return count != 0;
+}
+// Two simultaneous software AV1 encoders through the real engine.
+void av1Pair(const std::filesystem::path& root) {
+    resetFaults(); const auto folder = root / L"av1-pair"; auto config = settings(folder);
+    config.encodingMode = lapse::EncodingMode::SoftwareAV1;
+    lapse::Engine engine; engine.configure(config); engine.record();
+    await(engine, [](const auto& s) { return s.state == lapse::State::Recording && s.frames == 1; });
+    protectedFile(temporary(folder, false)); protectedFile(temporary(folder, true));
+    engine.setPaused(true);
+    await(engine, [](const auto& s) { return s.state == lapse::State::Paused; });
+    engine.setPaused(false);
+    await(engine, [](const auto& s) { return s.state == lapse::State::Recording && s.frames == 2; });
+    engine.finish(); const auto saved = await(engine, [](const auto& s) { return s.state == lapse::State::Idle; });
+    require(!saved.error && !saved.recordingFailed && saved.frames == 2 && saved.savedPaths.size() == 2, "Paired AV1 recording did not complete");
+    for (const auto& path : saved.savedPaths) {
+        ComPtr<IMFSourceReader> reader; checked(MFCreateSourceReaderFromURL(path.c_str(), nullptr, &reader), "Cannot reopen AV1 output");
+        ComPtr<IMFMediaType> type; GUID subtype{};
+        checked(reader->GetNativeMediaType(static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM), 0, &type), "Missing AV1 media type");
+        checked(type->GetGUID(MF_MT_SUBTYPE, &subtype), "Missing AV1 subtype");
+        require(subtype == MFVideoFormat_AV1, "Paired AV1 recording used another codec");
+    }
+    if (av1Decoder()) verifyPaths(saved, 2, 2);
+    else std::cout << "SKIP paired AV1 pixels: the optional Windows AV1 decoder is not installed.\n";
+    std::cout << "PASS paired AV1 sources, pause/resume, owned outputs and decoded full-frame content.\n";
+}
 void singleRecoveryAndInvalidMode(const std::filesystem::path& root) {
     resetFaults(); const auto folder = root / L"single-recovery"; auto config = settings(folder);
     config.separateFiles = false; config.layers = lapse::preset(lapse::Mode::Desktop);
@@ -313,15 +345,18 @@ void singleRecoveryAndInvalidMode(const std::filesystem::path& root) {
     require(!saved.error && saved.savedPaths.size() == 1 && recoveryOpens == recoveryBefore + 1,
         "Single-stream recovery mode did not reach its writer");
     verify(saved.savedPath, 1, false, true);
-    config.folder = (root / L"invalid-recovery-hevc").wstring(); config.encodingMode = lapse::EncodingMode::HardwareHEVC;
-    const unsigned capturesBefore = captures, opensBefore = recoveryOpens;
-    engine.configure(config); engine.record();
-    const auto rejected = await(engine, [](const auto& s) { return s.state == lapse::State::Idle && s.error; });
-    require(rejected.recordingFailed && rejected.frames == 0 && rejected.savedPaths.empty() &&
-        rejected.message.find(L"H.264") != std::wstring::npos && !std::filesystem::exists(config.folder) &&
-        captures == capturesBefore && recoveryOpens == opensBefore,
-        "Unsupported recovery encoder was not rejected before capture or output creation");
-    std::cout << "PASS single recovery and explicit HEVC admission rejection before side effects.\n";
+    for (const auto mode : {lapse::EncodingMode::HardwareHEVC, lapse::EncodingMode::SoftwareAV1}) {
+        config.folder = (root / (mode == lapse::EncodingMode::HardwareHEVC ? L"invalid-recovery-hevc" : L"invalid-recovery-av1")).wstring();
+        config.encodingMode = mode;
+        const unsigned capturesBefore = captures, opensBefore = recoveryOpens;
+        engine.configure(config); engine.record();
+        const auto rejected = await(engine, [](const auto& s) { return s.state == lapse::State::Idle && s.error; });
+        require(rejected.recordingFailed && rejected.frames == 0 && rejected.savedPaths.empty() &&
+            rejected.message.find(L"H.264") != std::wstring::npos && !std::filesystem::exists(config.folder) &&
+            captures == capturesBefore && recoveryOpens == opensBefore,
+            "Unsupported recovery encoder was not rejected before capture or output creation");
+    }
+    std::cout << "PASS single recovery and explicit HEVC/AV1 admission rejection before side effects.\n";
 }
 void failure(const std::filesystem::path& root, Fault selected, bool failFirstWrite = false) {
     resetFaults(); const auto folder = root / (L"fault-" + std::to_wstring(static_cast<int>(selected)) + (failFirstWrite ? L"-first" : L""));
@@ -484,14 +519,14 @@ int main(int argc, char** argv) {
             MFShutdown(); CoUninitialize(); return 0;
         }
         cursorPolicy(root); lifecycle(root);
-        lifecycle(root, true); singleRecoveryAndInvalidMode(root);
+        lifecycle(root, true); singleRecoveryAndInvalidMode(root); av1Pair(root);
         for (const auto selected : {Fault::OpenDesktop, Fault::OpenCamera, Fault::WriteDesktop, Fault::WriteCamera,
             Fault::FinishDesktop, Fault::FinishCamera, Fault::SecondPublicationAllocation}) failure(root, selected);
         failure(root, Fault::WriteDesktop, true); failure(root, Fault::WriteCamera, true);
         collision(root, false); collision(root, true); sourceFailure(root, false); sourceFailure(root, true); shutdown(root);
         intervalAndCommit(root); warmupAndInvalidSource(root);
         std::filesystem::remove_all(root);
-        std::cout << "Separate engine: 20 synthetic real-encoder case groups passed.\n";
+        std::cout << "Separate engine: 21 synthetic real-encoder case groups passed.\n";
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; std::wcerr << L"Artifacts kept at " << root.wstring() << L'\n'; result = 1; }
     MFShutdown(); CoUninitialize(); return result;
 }

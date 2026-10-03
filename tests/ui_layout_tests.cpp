@@ -537,7 +537,7 @@ void customGeometry(int dpi){
         GetTextExtentPoint32W(dc,label,static_cast<int>(std::wcslen(label)),&extent);SelectObject(dc,previous);ReleaseDC(child,dc);
         require(extent.cx+app.scale(padding)<=bounds(child).right-bounds(child).left,"Custom value or explanatory encoding label truncates at minimum width/DPI.");};
     for(HWND child:{app.interval,app.videoSize,app.stopAfter})fits(child,30);
-    for(int i=0;i<5;++i){choose(app.encodingMode,i);fits(app.encodingMode,30);}
+    for(int i=0;i<static_cast<int>(std::size(EncodingModeLabels));++i){choose(app.encodingMode,i);fits(app.encodingMode,30);}
     fits(app.advanced,18);require(app.advancedTooltip.find(formatDuration(int64_t(INT_MAX)*1000))!=std::wstring::npos,"Collapsed finite-stop tooltip lost the exact maximum value.");
     for(const auto& size: {std::pair<int,int>{1000,1000},{1080,1920},{3840,2160},{48,4096},{4096,48}}){
         app.settings.width=size.first;app.settings.height=size.second;app.settings.layers=preset(Mode::Overlay);app.selected=1;

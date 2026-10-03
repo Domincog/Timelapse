@@ -83,12 +83,12 @@ bool checkAperture(IMFMediaType* type,REFGUID key,int width,int height) {
         "Visible display crop changed");
     return true;
 }
-void verify(const std::filesystem::path& path,int width,int height,int expected) {
+void verify(const std::filesystem::path& path,int width,int height,int expected,REFGUID codec) {
     ComPtr<IMFSourceReader> reader;
     check(MFCreateSourceReaderFromURL(path.c_str(),nullptr,&reader),"Open geometry video");
     ComPtr<IMFMediaType> native;check(reader->GetNativeMediaType(video,0,&native),"Read geometry native type");
     GUID subtype{};check(native->GetGUID(MF_MT_SUBTYPE,&subtype),"Read geometry codec");
-    require(subtype==MFVideoFormat_H264,"Geometry codec changed");
+    require(subtype==codec,"Geometry codec changed");
     UINT32 nativeWidth=0,nativeHeight=0;
     check(MFGetAttributeSize(native.Get(),MF_MT_FRAME_SIZE,&nativeWidth,&nativeHeight),"Read native geometry");
     require(nativeWidth>=unsigned(width)&&nativeHeight>=unsigned(height)&&
@@ -159,9 +159,16 @@ void exercise(const std::filesystem::path& directory,int width,int height,lapse:
     lapse::Frame frame{width,height,std::vector<BYTE>(size_t(width)*height*4)};
     for(int i=0;i<count;++i){pattern(frame,i);encoded(encoder.write(frame,error),error);}
     const bool finished=encoder.finish(error);
-    if(count){encoded(finished,error);verify(path,width,height,count);}
+    if(count){encoded(finished,error);verify(path,width,height,count,mode==lapse::EncodingMode::SoftwareAV1?MFVideoFormat_AV1:MFVideoFormat_H264);}
     else require(!finished&&!error.empty()&&!std::filesystem::exists(path),"Empty custom recording must report no frames and remove its owned output");
     std::wcout<<L"PASS "<<name<<L" visible geometry, color edges, frame timing and finalization\n";
+}
+// The Windows AV1 decoder is an optional Store extension; encoding never uses it.
+bool av1Decoder() {
+    MFT_REGISTER_TYPE_INFO input{MFMediaType_Video,MFVideoFormat_AV1};IMFActivate** list=nullptr;UINT32 count=0;
+    check(MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER,MFT_ENUM_FLAG_ALL&~MFT_ENUM_FLAG_FIELDOFUSE,&input,nullptr,&list,&count),"AV1 decoder enumeration failed");
+    for(UINT32 i=0;i<count;++i)list[i]->Release();
+    CoTaskMemFree(list);return count!=0;
 }
 void invalid(const std::filesystem::path& directory) {
     std::wstring error;lapse::Encoder encoder;const auto path=directory/L"invalid.mp4";
@@ -190,6 +197,11 @@ int main() {
         exercise(directory,638,478,lapse::EncodingMode::QualityH264);
         exercise(directory,638,478,lapse::EncodingMode::Efficient,1);
         exercise(directory,48,48,lapse::EncodingMode::Compatible,0);
+        exercise(directory,48,48,lapse::EncodingMode::SoftwareAV1,0);
+        if(av1Decoder()) {
+            for(auto size:{std::pair<int,int>{48,48},{638,478},{478,638},{4096,2160},{2160,3840}})
+                exercise(directory,size.first,size.second,lapse::EncodingMode::SoftwareAV1);
+        } else std::cout<<"SKIP AV1 geometry pixels: the optional Windows AV1 decoder is not installed\n";
         std::filesystem::remove_all(directory);
         std::cout<<"All synthetic encoder geometry contracts passed.\n";
     } catch(const std::exception& error) {std::cerr<<error.what()<<'\n';result=1;}

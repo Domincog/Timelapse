@@ -213,9 +213,10 @@ void lifecycle(const std::filesystem::path& directory) {
 void failurePaths(const std::filesystem::path& directory) {
     std::wstring error; lapse::Encoder encoder; const auto invalid=directory/L"invalid.mp4";
     const unsigned before=sinkCreations;
-    require(!encoder.open(invalid.wstring(),width,height,fps,error,lapse::EncodingQuality::Balanced,
-        lapse::EncodingMode::HardwareHEVC,true) && error.find(L"H.264")!=std::wstring::npos &&
-        !std::filesystem::exists(invalid) && sinkCreations==before,"Invalid codec opened recovery output");
+    for (auto mode:{lapse::EncodingMode::HardwareHEVC,lapse::EncodingMode::SoftwareAV1})
+        require(!encoder.open(invalid.wstring(),width,height,fps,error,lapse::EncodingQuality::Balanced,
+            mode,true) && error.find(L"H.264")!=std::wstring::npos &&
+            !std::filesystem::exists(invalid) && sinkCreations==before,"Invalid codec opened recovery output");
     for (bool* flag:{&failSink,&failWriter}) {
         *flag=true; const bool opened=encoder.open(invalid.wstring(),width,height,fps,error,
             lapse::EncodingQuality::Balanced,lapse::EncodingMode::Efficient,true); *flag=false;

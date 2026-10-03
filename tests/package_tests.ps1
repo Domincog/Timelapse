@@ -26,6 +26,7 @@ $personSources = @('person-pack/README.md', 'person-pack/CMakeLists.txt', 'perso
     'person-pack/model.cpp', 'person-pack/model.h', 'person-pack/model.rc.in', 'person-pack/resources.h', 'person-pack/worker.cpp',
     'person-pack/tests/model_fixture.cpp', 'person-pack/tests/model_tests.cpp', 'person-pack/tests/worker_tests.cpp',
     'person-pack/NOTICE.txt', 'person-pack/NanoDet-LICENSE.txt', 'person-pack/ncnn-LICENSE.txt', 'third-party/ncnn-LICENSE.txt')
+$av1Sources = @('third-party/libaom.cmake', 'third-party/libaom-LICENSE.txt', 'third-party/libaom-PATENTS.txt')
 
 function Assert([bool]$Condition, [string]$Message) { if (-not $Condition) { throw $Message } }
 function Write-Text([string]$Path, [string]$Text) { [System.IO.File]::WriteAllText($Path, $Text, $utf8) }
@@ -84,7 +85,7 @@ function New-Fixture([string]$Name, [string]$Script = $PackageScript) {
     Write-Text (Join-Path $root 'src/app.cpp') "// Owned synthetic app input.`n"
     Write-Text (Join-Path $root 'src/helper.h') "// Owned synthetic header input.`n"
     Write-WorkerMetadata $root
-    foreach ($name in $personSources) { Write-Text (Join-Path $root $name) "Owned public source or notice sentinel: $name`n" }
+    foreach ($name in ($personSources + $av1Sources)) { Write-Text (Join-Path $root $name) "Owned public source or notice sentinel: $name`n" }
     Write-Text (Join-Path $root 'person-pack/build/generated.cpp') "Unselected generated build sentinel.`n"
     Write-Text (Join-Path $root 'person-pack/model-archive.zip') "Unselected archive sentinel.`n"
     Write-Text (Join-Path $root 'person-pack/evaluation.jpg') "Unselected photograph sentinel.`n"
@@ -188,7 +189,7 @@ function Assert-Package([string]$Root, [string]$UseVersion = $version, [bool]$Ha
         Assert ($parts.Count -eq 2 -and (File-Sha (Join-Path $packages $parts[1])) -eq $parts[0]) 'External archive checksum mismatch.'
     }
     $expected = @('.gitignore', 'README.md', 'NIGHT_VALIDATION.md', 'media/night-v032-synthetic.png', 'CMakeLists.txt', 'build.ps1', 'package.ps1', 'src/app.cpp', 'src/helper.h', 'tests/probe.cpp', 'tests/fixture.cmake', 'tests/package_tests.ps1', 'tests/build_tests.ps1', 'tools/verify-encoding-quality.ps1', 'tools/night_camera_lab.cpp', 'installer/Timelapse.iss', 'installer/build-installer.ps1', 'tests/installer_tests.ps1')
-    $expected += @('src/person_pack_metadata.h') + $personSources
+    $expected += @('src/person_pack_metadata.h') + $personSources + $av1Sources
     if ($HasWorker) {
         $metadata = [IO.File]::ReadAllText((Join-Path $Root 'src/person_pack_metadata.h'))
         $size = [uint64][regex]::Match($metadata, 'PersonPackExpectedBytes\s*=\s*([0-9]+)').Groups[1].Value

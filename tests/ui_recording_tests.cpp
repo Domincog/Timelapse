@@ -200,7 +200,7 @@ struct HiddenFixture {
         require(app.window&&!IsWindowVisible(app.window),"Hidden parent creation failed");
         auto child=[&](const wchar_t* cls,DWORD style){auto w=CreateWindowExW(0,cls,L"",WS_CHILD|style,0,0,100,100,app.window,nullptr,nullptr,nullptr);require(w!=nullptr,"Hidden child failed");return w;};
         auto combo=[&](int count){auto w=child(L"COMBOBOX",CBS_DROPDOWNLIST);for(int i=0;i<count;++i)add(w,std::to_wstring(i));choose(w,0);return w;};
-        app.mode=combo(6);app.interval=combo(6);choose(app.interval,5);app.videoSize=combo(2);app.encodingQuality=combo(3);app.encodingMode=combo(5);
+        app.mode=combo(6);app.interval=combo(6);choose(app.interval,5);app.videoSize=combo(2);app.encodingQuality=combo(3);app.encodingMode=combo(static_cast<int>(std::size(EncodingModeLabels)));
         app.startDelay=combo(6);
         app.recoveryMode=child(L"BUTTON",BS_AUTOCHECKBOX);
         app.monitor=combo(1);app.camera=combo(0);app.monitors={{L"Synthetic",{0,0,640,360},L"owned-display"}};app.cameras.clear();

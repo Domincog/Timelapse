@@ -209,7 +209,7 @@ struct HiddenFixture {
             auto handle=child(L"COMBOBOX",CBS_DROPDOWNLIST);
             for(int i=0;i<count;++i)add(handle,std::to_wstring(i)); choose(handle,0); return handle;
         };
-        app.mode=combo(6); app.interval=combo(6); app.videoSize=combo(2); app.encodingQuality=combo(3); app.encodingMode=combo(5);app.stopAfter=combo(6);
+        app.mode=combo(6); app.interval=combo(6); app.videoSize=combo(2); app.encodingQuality=combo(3); app.encodingMode=combo(static_cast<int>(std::size(EncodingModeLabels)));app.stopAfter=combo(6);
         app.splitEvery=combo(5);app.segmentLabel=child(L"STATIC",0);app.hasCustomSegment=false;app.committedSegment=0;app.customSegmentSeconds=900;app.advancedSegmentSeconds=-1;
         app.lowDisk=child(L"BUTTON",BS_AUTOCHECKBOX);SendMessageW(app.lowDisk,BM_SETCHECK,BST_CHECKED,0);
         app.recoveryMode=child(L"BUTTON",BS_AUTOCHECKBOX);
@@ -568,9 +568,9 @@ void indexLoads() {
         require(app.settings.intervalMs==input.seconds*1000&&app.settings.width==input.width&&app.settings.encodingQuality==input.expected&&choice(app.mode)==0,
                 "Persisted option index mapping/clamping failed.");
     }
-    for(UINT mode:{0u,1u,2u,3u,4u,5u,999u,static_cast<UINT>(-1)}){
+    for(UINT mode:{0u,1u,2u,3u,4u,5u,6u,999u,static_cast<UINT>(-1)}){
         overrideIndexes=true;savedEncodingMode=mode;preferences(false);configure();
-        require(app.settings.encodingMode==static_cast<EncodingMode>(mode<=4?mode:0),"Persisted encoding mode mapping failed.");
+        require(app.settings.encodingMode==static_cast<EncodingMode>(mode<std::size(EncodingModeLabels)?mode:0),"Persisted encoding mode mapping failed.");
     }
     savedEncodingMode=0;
     const int seconds[]={0,900,3600,14400,28800,86400};

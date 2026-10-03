@@ -34,7 +34,7 @@ bool validateVideoSize(int width, int height, std::wstring& error);
 // Keep exact supported sizes; otherwise downscale and round down to even pixels
 // within the video bounds. Return {0,0} if no usable fit exists. No allocation.
 std::pair<int, int> sourceVideoDimensions(int64_t width, int64_t height) noexcept;
-// Recovery mode uses the native fragmented sink, which accepts H.264 only.
+// Recovery mode uses the native fragmented sink and is supported for H.264 only.
 bool validateEncodingMode(EncodingMode mode, bool recoveryMode, std::wstring& error);
 // Largest exact single unit requiring at most three fractional digits.
 std::wstring formatDuration(int64_t milliseconds, bool compact = false);

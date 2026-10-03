@@ -190,11 +190,12 @@ bool validateVideoSize(int width, int height, std::wstring& error) {
 bool validateEncodingMode(EncodingMode mode, bool recoveryMode, std::wstring& error) {
     error.clear();
     if (mode != EncodingMode::Compatible && mode != EncodingMode::Efficient &&
-        mode != EncodingMode::HardwareH264 && mode != EncodingMode::HardwareHEVC && mode != EncodingMode::QualityH264) {
+        mode != EncodingMode::HardwareH264 && mode != EncodingMode::HardwareHEVC && mode != EncodingMode::QualityH264 &&
+        mode != EncodingMode::SoftwareAV1) {
         error = L"Choose a valid encoding mode.";
         return false;
     }
-    if (recoveryMode && mode == EncodingMode::HardwareHEVC) {
+    if (recoveryMode && (mode == EncodingMode::HardwareHEVC || mode == EncodingMode::SoftwareAV1)) {
         error = L"MP4 recovery mode requires H.264. Choose an H.264 encoder or turn recovery mode off.";
         return false;
     }

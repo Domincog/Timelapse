@@ -1,4 +1,4 @@
-param([string]$Version = '0.36.0', [string]$BuildDirectory = 'build', [string]$InstallerCompiler = '', [string]$PersonWorker = '')
+param([string]$Version = '0.37.0', [string]$BuildDirectory = 'build', [string]$InstallerCompiler = '', [string]$PersonWorker = '')
 $ErrorActionPreference = 'Stop'
 if ($Version -notmatch '^\d+\.\d+\.\d+([-.][A-Za-z0-9.-]+)?$') { throw 'Use a version such as 0.1.0 or 0.1.0-beta.1.' }
 $projectRoot = $PSScriptRoot
@@ -57,7 +57,8 @@ try {
         'person-pack/README.md', 'person-pack/CMakeLists.txt', 'person-pack/build.ps1',
         'person-pack/model.cpp', 'person-pack/model.h', 'person-pack/model.rc.in', 'person-pack/resources.h', 'person-pack/worker.cpp',
         'person-pack/tests/model_fixture.cpp', 'person-pack/tests/model_tests.cpp', 'person-pack/tests/worker_tests.cpp',
-        'person-pack/NOTICE.txt', 'person-pack/NanoDet-LICENSE.txt', 'person-pack/ncnn-LICENSE.txt', 'third-party/ncnn-LICENSE.txt')) {
+        'person-pack/NOTICE.txt', 'person-pack/NanoDet-LICENSE.txt', 'person-pack/ncnn-LICENSE.txt', 'third-party/ncnn-LICENSE.txt',
+        'third-party/libaom.cmake', 'third-party/libaom-LICENSE.txt', 'third-party/libaom-PATENTS.txt')) {
         $sourceFiles += @{ Path = (Join-Path $projectRoot $name); Name = $name }
     }
     foreach ($directory in @('src', 'tests')) {

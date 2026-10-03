@@ -57,7 +57,9 @@ constexpr wchar_t SegmentHelp[] = L"Split by active recording time, not video le
 constexpr int NightDurations[] = {0,1000,2000,5000,10000,30000};
 constexpr const wchar_t* NightDurationLabels[] = {L"Auto",L"1 second",L"2 seconds",L"5 seconds",L"10 seconds",L"30 seconds"};
 constexpr int NightTargets[] = {64,96,128};
-constexpr const wchar_t* EncodingModeLabels[] = {L"Compatible H.264 (default)",L"Efficient H.264 (bitrate target)",L"Hardware H.264 (CPU offload)",L"Hardware HEVC (HEVC player)",L"Quality H.264 (detail)"};
+constexpr const wchar_t* EncodingModeLabels[] = {L"Compatible H.264 (default)",L"Efficient H.264 (bitrate target)",L"Hardware H.264 (CPU offload)",L"Hardware HEVC (HEVC player)",L"Quality H.264 (detail)",L"AV1 (smallest files)"};
+// Selection index is the saved EncodingMode value; one label per mode.
+static_assert(std::size(EncodingModeLabels)==static_cast<size_t>(EncodingMode::SoftwareAV1)+1);
 constexpr const wchar_t* SkipModeLabels[] = {L"Off",L"Scene is quiet",L"Inside scheduled ranges",L"Quiet scene + schedule",L"No person detected (camera)",L"No person + schedule (camera)"};
 constexpr int SkipMultipliers[] = {2,4,8,16,32,64}, SkipRamps[] = {15,30,60};
 constexpr int SeparateFilesMode = 5;
@@ -931,7 +933,7 @@ void configure() {
     app.committedSize=std::clamp(sizeSelection,0,app.hasCustomSize?2:1);
     app.committedLimit=std::clamp(choice(app.stopAfter),0,app.hasCustomLimit?6:5);
     app.settings.encodingQuality = static_cast<EncodingQuality>(std::clamp(choice(app.encodingQuality),0,2));
-    app.settings.encodingMode = static_cast<EncodingMode>(std::clamp(choice(app.encodingMode),0,4));
+    app.settings.encodingMode = static_cast<EncodingMode>(std::clamp(choice(app.encodingMode),0,static_cast<int>(std::size(EncodingModeLabels))-1));
     app.settings.recoveryMode = app.recoveryMode && SendMessageW(app.recoveryMode,BM_GETCHECK,0,0)==BST_CHECKED;
     validateEncodingMode(app.settings.encodingMode,app.settings.recoveryMode,app.encodingValidation);
     app.settings.recordingLimitSeconds = selectedLimit();
@@ -2875,7 +2877,7 @@ void preferences(bool save) {
         choose(app.videoSize,std::clamp(videoSize,0,1));
         choose(app.encodingQuality,std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Settings",L"EncodingQuality",1,path)),0,2));
         const UINT encodingMode=GetPrivateProfileIntW(L"Settings",L"EncodingMode",0,path);
-        choose(app.encodingMode,encodingMode<=4?static_cast<int>(encodingMode):0);
+        choose(app.encodingMode,encodingMode<std::size(EncodingModeLabels)?static_cast<int>(encodingMode):0);
         const UINT recordingLimit=GetPrivateProfileIntW(L"Settings",L"RecordingLimit",0,path);
         choose(app.stopAfter,recordingLimit<=5?static_cast<int>(recordingLimit):0);
         const auto exactInteger=[&](const wchar_t* key,int minimum,int maximum,int& output){
@@ -3326,7 +3328,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         TOOLINFOW tip{sizeof(tip)};tip.uFlags=TTF_IDISHWND|TTF_SUBCLASS;tip.hwnd=w;tip.uId=reinterpret_cast<UINT_PTR>(app.statusText);tip.lpszText=LPSTR_TEXTCALLBACKW;
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));SendMessageW(app.tooltip,TTM_SETMAXTIPWIDTH,0,app.scale(520));
         tip.uId=reinterpret_cast<UINT_PTR>(app.encodingMode);
-        tip.lpszText=const_cast<LPWSTR>(L"Compatible keeps the original software H.264 settings. Efficient uses a bitrate target at every quality level. Quality H.264 and hardware modes use fixed quantization; detailed or changing scenes can make much larger files. Hardware modes require a supported encoder and do not switch to software if unavailable. HEVC playback needs a compatible player or decoder. File size and image quality depend on the scene and encoder.");
+        tip.lpszText=const_cast<LPWSTR>(L"Compatible keeps the original software H.264 settings. Efficient uses a bitrate target at every quality level. Quality H.264, AV1 and hardware modes use fixed quantization; detailed or changing scenes can make much larger files. Hardware modes require a supported encoder and do not switch to software if unavailable. HEVC playback needs a compatible player or decoder. AV1 uses more processor time to make much smaller files; playback needs a player or decoder with AV1 support. File size and image quality depend on the scene and encoder.");
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
         tip.uId=reinterpret_cast<UINT_PTR>(app.mode);
         tip.lpszText=const_cast<LPWSTR>(L"Separate files records full-frame desktop and camera videos together. The side-by-side preview is only for monitoring; each source has its own MP4.");

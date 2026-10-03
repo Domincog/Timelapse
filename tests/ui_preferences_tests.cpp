@@ -121,7 +121,7 @@ struct HiddenControls {
             require(window!=nullptr,"Cannot create owned option control.");
             for(int i=0;i<count;++i)add(window,std::to_wstring(i));choose(window,0);return window;
         };
-        app.mode=combo(6);app.interval=combo(6);app.videoSize=combo(2);app.encodingQuality=combo(3);app.encodingMode=combo(5);app.stopAfter=combo(6);
+        app.mode=combo(6);app.interval=combo(6);app.videoSize=combo(2);app.encodingQuality=combo(3);app.encodingMode=combo(static_cast<int>(std::size(EncodingModeLabels)));app.stopAfter=combo(6);
         app.splitEvery=combo(5);app.startDelay=combo(6);app.committedStartDelay=0;
         app.lowDisk=CreateWindowExW(0,L"BUTTON",L"Stop on low disk space",WS_CHILD|BS_AUTOCHECKBOX,0,0,200,30,app.window,nullptr,nullptr,nullptr);
         require(app.lowDisk!=nullptr,"Cannot create owned low disk option.");SendMessageW(app.lowDisk,BM_SETCHECK,BST_CHECKED,0);
@@ -263,11 +263,13 @@ void migrateAnsi(){
 void encodingModes(){
     PreferencesFixture fixture;fixture.seed(legacy);reload();
     require(choice(app.encodingMode)==0,"Old preferences changed the encoder without an explicit selection.");
-    for(int mode=0;mode<5;++mode){
-        choose(app.encodingMode,mode);preferences(true);choose(app.encodingMode,(mode+1)%5);reload();
+    const int modes=static_cast<int>(std::size(EncodingModeLabels));
+    require(modes==6,"Encoding mode list does not match the saved mode values.");
+    for(int mode=0;mode<modes;++mode){
+        choose(app.encodingMode,mode);preferences(true);choose(app.encodingMode,(mode+1)%modes);reload();
         require(choice(app.encodingMode)==mode,"Encoding mode did not survive a real preference roundtrip.");
     }
-    for(const wchar_t* invalid:{L"-1",L"5",L"999"}){
+    for(const wchar_t* invalid:{L"-1",L"6",L"999"}){
         require(WritePrivateProfileStringW(L"Settings",L"EncodingMode",invalid,app.preferences.c_str())!=FALSE,"Cannot seed invalid mode.");
         reload();require(choice(app.encodingMode)==0,"Invalid encoder setting selected a different codec.");
     }

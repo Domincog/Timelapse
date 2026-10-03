@@ -13,6 +13,9 @@
 using Microsoft::WRL::ComPtr;
 namespace {
 constexpr int width = 1280, height = 720, fps = 30, frames = 45;
+// AV1 Smaller file must be at least this many times smaller than Compatible
+// Balanced. Measured minimum on this corpus: 2.5 (textured motion).
+constexpr uint64_t av1CompactSizeRatio = 2;
 constexpr DWORD stream = static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM);
 void require(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
 void checked(HRESULT hr, const char* message) {
@@ -109,15 +112,29 @@ double verify(const std::filesystem::path& path, int scene) {
     return mse == 0 ? 99 : 10 * std::log10(255.0 * 255.0 / mse);
 }
 struct Result { uint64_t bytes; double psnr; ULONGLONG milliseconds; };
+#ifndef TIMELAPSE_BASELINE
+// The Windows AV1 decoder is an optional Store extension; encoding never uses it.
+bool av1Decoder() {
+    MFT_REGISTER_TYPE_INFO input{MFMediaType_Video, MFVideoFormat_AV1}; IMFActivate** list = nullptr; UINT32 count = 0;
+    checked(MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG_ALL & ~MFT_ENUM_FLAG_FIELDOFUSE, &input, nullptr, &list, &count),
+        "AV1 decoder enumeration failed");
+    for (UINT32 i = 0; i < count; ++i) list[i]->Release();
+    CoTaskMemFree(list); return count != 0;
+}
+#endif
+#ifdef TIMELAPSE_BASELINE
 Result run(const std::filesystem::path& path, int scene, int quality) {
     lapse::Encoder encoder;
     std::wstring error;
     const auto start = GetTickCount64();
-#ifdef TIMELAPSE_BASELINE
     (void)quality;
     encoded(encoder.open(path.wstring(), width, height, fps, error), error);
 #else
-    encoded(encoder.open(path.wstring(), width, height, fps, error, static_cast<lapse::EncodingQuality>(quality)), error);
+Result run(const std::filesystem::path& path, int scene, int quality, lapse::EncodingMode mode = lapse::EncodingMode::Compatible) {
+    lapse::Encoder encoder;
+    std::wstring error;
+    const auto start = GetTickCount64();
+    encoded(encoder.open(path.wstring(), width, height, fps, error, static_cast<lapse::EncodingQuality>(quality), mode), error);
 #endif
     for (int i = 0; i < frames; ++i) encoded(encoder.write(pattern(scene, i), error), error);
     encoded(encoder.finish(error), error);
@@ -135,13 +152,14 @@ int main(int argc, char**) {
     try {
         require(std::filesystem::create_directory(directory), "Could not create benchmark directory");
         std::cout << "scene,quality,bytes,luma_psnr_db,encode_ms\n" << std::fixed << std::setprecision(3);
+        std::array<std::array<Result, 3>, 3> compatible{};
         for (int scene = 0; scene < 3; ++scene) {
 #ifdef TIMELAPSE_BASELINE
             constexpr int qualities = 1;
 #else
             constexpr int qualities = 3;
 #endif
-            std::array<Result, 3> results{};
+            auto& results = compatible[size_t(scene)];
             for (int quality = 0; quality < qualities; ++quality) {
                 const auto path = directory / (std::to_wstring(scene) + L"-" + std::to_wstring(quality) + L".mp4");
                 results[quality] = run(path, scene, quality);
@@ -156,6 +174,34 @@ int main(int argc, char**) {
                     "Quality presets did not preserve increasing image detail");
 #endif
         }
+#ifndef TIMELAPSE_BASELINE
+        if (av1Decoder()) {
+            std::cout << "av1_scene,quality,bytes,luma_psnr_db,encode_ms\n";
+            for (int scene = 0; scene < 3; ++scene) {
+                std::array<Result, 3> av1{};
+                for (int quality = 0; quality < 3; ++quality) {
+                    const auto path = directory / (L"av1-" + std::to_wstring(scene) + L"-" + std::to_wstring(quality) + L".mp4");
+                    av1[size_t(quality)] = run(path, scene, quality, lapse::EncodingMode::SoftwareAV1);
+                    const auto& r = av1[size_t(quality)];
+                    std::cout << scene << ',' << quality << ',' << r.bytes << ',' << r.psnr << ',' << r.milliseconds << '\n';
+                    require(r.psnr > 27, "AV1 image quality fell below the corpus floor");
+                }
+                // Near-lossless flat graphics can make More detail no larger
+                // than Balanced; Smaller file must still be the smallest.
+                require(argc > 1 || (av1[0].bytes < av1[1].bytes && av1[0].bytes < av1[2].bytes),
+                        "AV1 Smaller file preset did not produce the smallest file");
+                require(argc > 1 || (av1[0].psnr < av1[1].psnr && av1[1].psnr < av1[2].psnr),
+                        "AV1 quality presets did not preserve increasing image detail");
+                // The mode's purpose, against default Compatible H.264 Balanced:
+                // AV1 Balanced is smaller with more detail, and even Smaller
+                // file is several times smaller while keeping more detail.
+                const auto& reference = compatible[size_t(scene)][1];
+                require(argc > 1 || (av1[1].bytes < reference.bytes && av1[1].psnr > reference.psnr &&
+                        av1[0].bytes * av1CompactSizeRatio < reference.bytes && av1[0].psnr > reference.psnr),
+                        "AV1 lost its size or detail advantage over Compatible H.264");
+            }
+        } else std::cout << "SKIP AV1 quality: the optional Windows AV1 decoder is not installed.\n";
+#endif
         if (argc > 1) std::cout << "Artifacts kept at " << directory.string() << '\n';
         else std::filesystem::remove_all(directory);
     } catch (const std::exception& e) {

@@ -35,8 +35,10 @@ void completed(bool value, const std::wstring& error) {
         throw std::runtime_error("Recording operation failed");
     }
 }
-void withinDeadline(ULONGLONG start) {
-    require(GetTickCount64() - start < 80000, "Recording soak exceeded its 80-second work budget");
+// Software AV1 does several times the encoding work of H.264 (33 s versus
+// 16 s on the reference 8-core laptop), so it has a proportionally larger budget.
+void withinDeadline(ULONGLONG start, bool av1) {
+    require(GetTickCount64() - start < (av1 ? 200000u : 80000u), "Recording soak exceeded its work budget");
 }
 
 struct Resources {
@@ -173,7 +175,19 @@ void verifyColors(IMFSample* sample, int index) {
     }
 }
 
-void verifyVideo(const std::filesystem::path& path, ULONGLONG start) {
+// The Windows AV1 decoder is an optional Store extension; encoding never uses it.
+bool av1Decoder() {
+    MFT_REGISTER_TYPE_INFO input{MFMediaType_Video, MFVideoFormat_AV1};
+    IMFActivate** list = nullptr;
+    UINT32 count = 0;
+    checked(MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG_ALL & ~MFT_ENUM_FLAG_FIELDOFUSE, &input, nullptr, &list, &count),
+            "AV1 decoder enumeration failed");
+    for (UINT32 i = 0; i < count; ++i) list[i]->Release();
+    CoTaskMemFree(list);
+    return count != 0;
+}
+
+void verifyVideo(const std::filesystem::path& path, ULONGLONG start, bool av1) {
     ComPtr<IMFSourceReader> reader;
     checked(MFCreateSourceReaderFromURL(path.c_str(), nullptr, &reader), "Could not open recorded MP4");
     checked(reader->SetStreamSelection(allStreams, FALSE), "Could not deselect other streams");
@@ -182,7 +196,7 @@ void verifyVideo(const std::filesystem::path& path, ULONGLONG start) {
     checked(reader->GetNativeMediaType(videoStream, 0, &native), "No encoded video type");
     GUID subtype{};
     checked(native->GetGUID(MF_MT_SUBTYPE, &subtype), "No encoded video subtype");
-    require(subtype == MFVideoFormat_H264, "Recorded video is not H.264");
+    require(subtype == (av1 ? MFVideoFormat_AV1 : MFVideoFormat_H264), "Recorded video codec changed");
     UINT32 encodedWidth = 0, encodedHeight = 0;
     checked(MFGetAttributeSize(native.Get(), MF_MT_FRAME_SIZE, &encodedWidth, &encodedHeight), "No video dimensions");
     require(encodedWidth == width && encodedHeight == height, "Recorded video is not 1920 by 1080");
@@ -194,16 +208,20 @@ void verifyVideo(const std::filesystem::path& path, ULONGLONG start) {
         std::llabs(int64_t(duration.uhVal.QuadPart) - expectedDuration) < 20000;
     PropVariantClear(&duration);
     require(validDuration, "MP4 duration does not match 600 frames at 30 fps");
+    if (av1 && !av1Decoder()) {
+        std::cout << "SKIP AV1 soak pixels: the optional Windows AV1 decoder is not installed.\n";
+        return;
+    }
 
     ComPtr<IMFMediaType> output;
     checked(MFCreateMediaType(&output), "Could not allocate decoder type");
     checked(output->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video), "Could not set video major type");
     checked(output->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12), "Could not select NV12 decoder output");
-    checked(reader->SetCurrentMediaType(videoStream, nullptr, output.Get()), "Could not decode recorded H.264");
+    checked(reader->SetCurrentMediaType(videoStream, nullptr, output.Get()), "Could not decode recorded video");
     int count = 0;
     bool ended = false;
     for (int attempt = 0; attempt < frameCount + 100; ++attempt) {
-        withinDeadline(start);
+        withinDeadline(start, av1);
         DWORD flags = 0;
         LONGLONG timestamp = 0;
         ComPtr<IMFSample> sample;
@@ -221,9 +239,10 @@ void verifyVideo(const std::filesystem::path& path, ULONGLONG start) {
     require(ended && count == frameCount, "Recorded MP4 lost frames");
 }
 
-void run(const std::filesystem::path& directory) {
+void run(const std::filesystem::path& directory, lapse::EncodingMode mode) {
+    const bool av1 = mode == lapse::EncodingMode::SoftwareAV1;
     const auto start = GetTickCount64();
-    const auto path = directory / L"1080p-soak.mp4";
+    const auto path = directory / (av1 ? L"1080p-soak-av1.mp4" : L"1080p-soak.mp4");
     lapse::Frame desktop{320, 180, std::vector<uint8_t>(320 * 180 * 4)};
     lapse::Frame camera{160, 90, std::vector<uint8_t>(160 * 90 * 4)};
     lapse::Frame composed;
@@ -232,10 +251,10 @@ void run(const std::filesystem::path& directory) {
     std::wstring error;
     lapse::Encoder encoder;
     ResourceMonitor monitor;
-    completed(encoder.open(path.wstring(), width, height, fps, error), error);
+    completed(encoder.open(path.wstring(), width, height, fps, error, lapse::EncodingQuality::Balanced, mode), error);
     monitor.sample(0);
     for (int index = 0; index < frameCount; ++index) {
-        withinDeadline(start);
+        withinDeadline(start, av1);
         if (index == frameCount / 2) {
             fill(desktop, 255, 0, 0);
             fill(camera, 255, 255, 255);
@@ -247,13 +266,13 @@ void run(const std::filesystem::path& directory) {
     require(encoder.frames() == frameCount, "Encoder did not accept all 600 frames");
     completed(encoder.finish(error), error);
     monitor.sample(frameCount);
-    withinDeadline(start);
+    withinDeadline(start, av1);
     const auto size = std::filesystem::file_size(path);
     require(size > 1000 && size <= 40 * mib, "Soak MP4 is empty or exceeds its 40 MiB size budget");
     const auto encodeMilliseconds = GetTickCount64() - start;
-    verifyVideo(path, start);
-    withinDeadline(start);
-    std::cout << "1080p recording soak: 600 decoded frames, 20 seconds, five changing layouts, "
+    verifyVideo(path, start, av1);
+    withinDeadline(start, av1);
+    std::cout << (av1 ? "AV1 " : "H.264 ") << "1080p recording soak: 600 decoded frames, 20 seconds, five changing layouts, "
                  "timestamps and colors passed.\n"
               << "Private memory after warmup: " << monitor.baseline.privateBytes / mib
               << " MiB; peak: " << monitor.peak.privateBytes / mib
@@ -274,7 +293,8 @@ int main() {
         (L"recording-soak-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
     try {
         require(std::filesystem::create_directory(directory), "Could not create an isolated soak directory");
-        run(directory);
+        run(directory, lapse::EncodingMode::Compatible);
+        run(directory, lapse::EncodingMode::SoftwareAV1);
         std::filesystem::remove_all(directory);
     } catch (const std::exception& error) {
         std::cerr << error.what() << "\nArtifacts kept at " << directory.string() << '\n';

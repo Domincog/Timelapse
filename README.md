@@ -1,6 +1,6 @@
 # Timelapse
 
-A small native Windows timelapse recorder. Record a display, a camera, or both into H.264 or HEVC MP4 files. Use the Windows installer or the portable ZIP. No bundled browser, external encoder, or .NET runtime is required.
+A small native Windows timelapse recorder. Record a display, a camera, or both into H.264, HEVC or AV1 MP4 files. Use the Windows installer or the portable ZIP. No bundled browser, external encoder, or .NET runtime is required.
 
 ## Use
 
@@ -62,7 +62,7 @@ This is a best-effort headroom check, not reserved disk space: another program, 
 
 **MP4 recovery mode:** Advanced offers an optional H.264 recording format that writes small completed sections as recording proceeds. After a forced app termination, completed sections in the retained `.recording.mp4` file may play in a compatible player without first pressing Finish. Recent frames and files interrupted before initialization may still be lost. This does not guarantee recovery after power loss, drive failure or every type of interruption, and it does not repair existing recordings.
 
-Recovery mode is off by default. It adds container bytes and processing work without changing the selected H.264 compression settings. Some players and editors may not accept fragmented MP4; use ordinary MP4 for the widest compatibility. Recovery works with any available H.264 encoder and with single or separate files, Night blending and time compression. Hardware HEVC requires recovery mode to be off; an incompatible selection stays visible and blocks Record until corrected. Finish still saves the file normally. The option is remembered and locked during a recording.
+Recovery mode is off by default. It adds container bytes and processing work without changing the selected H.264 compression settings. Some players and editors may not accept fragmented MP4; use ordinary MP4 for the widest compatibility. Recovery works with any available H.264 encoder and with single or separate files, Night blending and time compression. Hardware HEVC and AV1 require recovery mode to be off; an incompatible selection stays visible and blocks Record until corrected. Finish still saves the file normally. The option is remembered and locked during a recording.
 
 Accepted settings are saved before a new recording starts as well as on normal exit. A preferences-write failure does not prevent recording and leaves the previous saved settings intact.
 
@@ -129,10 +129,17 @@ Expand Advanced to choose an encoding mode separately from resolution and qualit
 | Hardware H.264 | Uses an available hardware encoder to reduce CPU work, with broad H.264 playback support. |
 | Hardware HEVC | Uses an available hardware HEVC encoder. Playback requires a compatible player or installed HEVC decoder. |
 | Quality H.264 | Software encoding that prioritizes detail. Static screens can produce small files; frequent changes can produce much larger files. |
+| AV1 | Built-in software AV1 encoding for the smallest files at the same or better measured detail. Uses noticeably more processor time; playback needs AV1 support. |
+
+**AV1:** Timelapse includes the libaom AV1 encoder, so this mode works on any supported PC without a special GPU; it runs on the processor rather than offloading work to graphics hardware. Each quality level keeps a fixed quality target, and desktop text is detected and coded with AV1's screen-content tools. In the synthetic measurements below, Balanced AV1 files were 2–13 times smaller than Compatible H.264 Balanced files while measuring higher detail, with the largest savings on desktop and text content and the smallest on camera-like noise. A scene that changed completely at every capture produced a larger file than the bitrate-targeted H.264 modes, with much more detail, as fixed-quality modes do.
+
+AV1 encodes each frame as it is captured, using up to four processor threads. In testing on an 8-core laptop processor, a 1080p frame took about 40–130 ms on desktop and camera-like scenes and about 450 ms when the whole picture changed, using roughly 4–15 times the processor time of Efficient H.264. Keyframes, every ten seconds of playback, take longer (over a second at 1080p), and completely changing 4K frames took about two seconds each. When encoding cannot keep up with a short capture interval, capture slots are skipped as usual, and Pause or Finish can wait for a frame already being encoded. Each AV1 output used about 135 MiB of additional memory at 1080p (about 460 MiB at 4K). Desktop + camera (2 files) runs two encoders.
+
+AV1 playback requires an AV1-capable player or decoder. Windows playback may need the AV1 Video Extension. Some older players, editors and TVs cannot open these files. MP4 recovery mode requires H.264. Writing AV1 MP4 uses Windows Media Foundation and has been verified on Windows 11; Windows 10 AV1 MP4 writing has not been verified. If Windows cannot write AV1 MP4, recording reports an error when it starts and no file remains.
 
 Hardware support depends on the computer and driver. If a hardware mode is unavailable, choose Compatible H.264 or Efficient H.264. The app verifies that hardware modes actually use a hardware encoder. Encoding and quality choices are saved and remain locked during a recording.
 
-Efficient uses variable bitrate at all three quality levels. Its bitrate is a target, not a strict file-size cap. Quality H.264 and the hardware modes use fixed quantization settings: detailed scenes, noise and frequent changes can need substantially more data. A long capture interval reduces the number of frames but can also make consecutive frames less alike. The quality labels describe a tradeoff within each mode and do not promise identical image quality or file size across different codecs. Hardware encoding can reduce CPU use while keeping a dedicated GPU awake, so lower CPU use does not establish better battery life.
+Efficient uses variable bitrate at all three quality levels. Its bitrate is a target, not a strict file-size cap. Quality H.264, AV1 and the hardware modes use fixed quantization settings: detailed scenes, noise and frequent changes can need substantially more data. A long capture interval reduces the number of frames but can also make consecutive frames less alike. The quality labels describe a tradeoff within each mode and do not promise identical image quality or file size across different codecs. Hardware encoding can reduce CPU use while keeping a dedicated GPU awake, so lower CPU use does not establish better battery life.
 
 Desktop capture excludes this app's window on supported Windows versions. Minimize or close the window to stop preview updates while recording continues. Camera modes activate the camera for preview and recording. The app starts in Desktop mode so opening it does not silently activate a camera.
 
@@ -148,7 +155,11 @@ Frame and video-time statistics describe samples accepted by the encoder, includ
 
 ## Build and verify
 
-Install CMake 3.20 or later (3.21 or later for Visual Studio 2022) and Visual Studio 2019 or 2022 Build Tools with the Desktop development with C++ workload and Windows 10 SDK. Run from PowerShell:
+Install CMake 3.20 or later (3.21 or later for Visual Studio 2022) and Visual Studio 2019 or 2022 Build Tools with the Desktop development with C++ workload and Windows 10 SDK. The built-in AV1 encoder also needs Perl, which Git for Windows includes; the build finds it next to `git`, or set `-DTIMELAPSE_PERL_EXECUTABLE=<path>`.
+
+The first build downloads the pinned [libaom](https://aomedia.googlesource.com/aom/) 3.15.1 release and the NASM 3.02 assembler used to build it, and verifies each against a fixed SHA-256 digest (see `third-party/libaom.cmake`). This adds a few minutes to the first build only. For an offline build, download the same files and pass `-DTIMELAPSE_LIBAOM_ARCHIVE=<path>\libaom-3.15.1.tar.gz -DTIMELAPSE_NASM_ARCHIVE=<path>\nasm-3.02-win64.zip` when configuring; they are verified the same way. libaom is configured in its own isolated build tree (`build/aom`) and compiled into the app; nothing is installed system-wide. Keep the build path reasonably short, because libaom's intermediate file paths are long.
+
+Run from PowerShell:
 
 ```powershell
 .\build.ps1 -Test
@@ -210,6 +221,24 @@ MB means 1,000,000 bytes. Encoding CPU is accumulated process CPU time, includin
 
 Independent decoding found a modest fidelity tradeoff: Efficient's pooled luma PSNR was 0.86 dB lower on the static scene and 0.31 dB lower on frequent cuts, but 1.08 dB higher on scrolling and 0.54 dB higher on motion. Motion's worst-frame block SSIM improved from 0.896 to 0.919; frequent cuts stayed close at 0.731 versus 0.730. All frames, timestamps, durations, dimensions and color tags passed verification. These metrics describe the test clips, not perceptual quality for every source.
 
+The AV1 mode was measured with the same four clips, machine and method (Balanced quality; CPU is the mean of two alternating runs, which produced identical files). Pooled luma PSNR is from independent decoding by both Windows and FFmpeg/dav1d:
+
+| Scene | File size (MB): Compatible / Efficient / AV1 | Luma PSNR (dB): Compatible / Efficient / AV1 | Encoding CPU (s): Compatible / Efficient / AV1 |
+| --- | --- | --- | --- |
+| Mostly static desktop text | 0.878 / 0.349 / 0.066 | 54.54 / 53.69 / 70.00 | 4.04 / 3.52 / 15.78 |
+| Scrolling and cuts | 3.105 / 2.875 / 0.317 | 52.44 / 53.52 / 56.44 | 5.37 / 4.12 / 29.53 |
+| Textured motion and noise | 6.385 / 5.110 / 2.911 | 37.96 / 38.50 / 38.85 | 23.41 / 9.38 / 64.12 |
+| Large changes every frame | 7.042 / 5.213 / 27.701 | 32.20 / 31.90 / 38.53 | 31.95 / 16.38 / 239.73 |
+
+AV1 Balanced also had the lowest small-text edge error (0.27 and 1.55 versus 1.66 and 2.22 for Compatible on the two screen scenes). On the last scene its fixed quality target kept far more detail (block SSIM 0.945 versus 0.757) at a much larger size than the bitrate-targeted modes; Quality H.264 needed 53.5 MB for 39.25 dB there. AV1's three quality levels measured:
+
+| Scene | Smaller file | Balanced | More detail |
+| --- | --- | --- | --- |
+| Mostly static desktop text | 0.058 MB, 66.88 dB | 0.066 MB, 70.00 dB | 0.072 MB, 72.29 dB |
+| Scrolling and cuts | 0.193 MB, 53.41 dB | 0.317 MB, 56.44 dB | 0.519 MB, 59.41 dB |
+| Textured motion and noise | 1.632 MB, 36.15 dB | 2.911 MB, 38.85 dB | 6.337 MB, 40.83 dB |
+| Large changes every frame | 11.603 MB, 34.79 dB | 27.701 MB, 38.53 dB | 39.376 MB, 40.98 dB |
+
 Optional tools generate synthetic desktop text, scrolling/cuts, camera-like motion/noise, and large changes between captures. They do not capture a display or camera. Build them separately:
 
 ```powershell
@@ -220,7 +249,7 @@ cmake --build build-benchmark --config Release --target encoding_benchmark encod
 .\build-benchmark\Release\encoding_quality_verifier.exe screen.mp4 0 1920 1080 180
 ```
 
-Use a new output filename for every run. Modes are `compatible`, `efficient`, `hardware-h264`, `hardware-hevc`, and `quality-h264`; qualities are `compact`, `balanced`, and `detail`. Scenes `0`, `1`, and `2` exercise a mostly static screen, scrolling/cuts, and textured motion/noise. Scene `3` stresses large changes and frequent cuts between captures. A 180-frame clip crosses the new modes' five-second keyframe boundary.
+Use a new output filename for every run. Modes are `compatible`, `efficient`, `hardware-h264`, `hardware-hevc`, `quality-h264`, and `av1`; qualities are `compact`, `balanced`, and `detail`. Scenes `0`, `1`, and `2` exercise a mostly static screen, scrolling/cuts, and textured motion/noise. Scene `3` stresses large changes and frequent cuts between captures. A 180-frame clip crosses the five-second keyframe boundary of the H.264 modes other than Compatible; AV1 places keyframes ten seconds apart.
 
 The benchmark pre-renders its input outside the encoding measurement. At 180 frames of 1080p this requires about 1.4 GiB of temporary benchmark memory; the recorder itself streams frames. CSV output reports total encoding CPU time, wall time, setup/submission/finalization CPU time, and sampled additional process-private memory. GPU memory and energy are not included. Repeat modes in alternating order without other benchmark or build jobs running.
 
@@ -242,6 +271,7 @@ This also checks BT.709 limited-range color metadata. FFmpeg is used only by the
 - `CMakeLists.txt` and `build.ps1`: build and test the app.
 - `package.ps1`: create a portable release ZIP and a source ZIP from a Release build.
 - `installer/`: Inno Setup source and compiler wrapper for the per-user installer.
+- `third-party/`: the pinned libaom build recipe (`libaom.cmake`) and its license and patent texts.
 - `person-pack/`: separately built optional detector, pinned dependency instructions, licenses and model/protocol checks. A normal app build needs no model download.
 
 After building and testing, run `./package.ps1` to create both archives in `packages/`. The release ZIP is intended for GitHub Releases. Extract the source ZIP into an empty folder, then run the build commands from that folder; build outputs, test recordings, and local settings are excluded.
@@ -361,3 +391,146 @@ Redistributions in binary form must reproduce the above copyright notice, this l
 Neither the name of [copyright holder] nor the names of its contributors may be used to endorse or promote products derived from this software without specific prior written permission.
 
 THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+## AV1 encoder notices
+
+The AV1 encoding mode compiles in libaom 3.15.1 from the Alliance for Open Media, unmodified. Its license and the AOMedia patent license follow; the same texts are in `third-party/`.
+
+```text
+Copyright (c) 2016, Alliance for Open Media. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in
+   the documentation and/or other materials provided with the
+   distribution.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+```
+
+```text
+Alliance for Open Media Patent License 1.0
+
+1. License Terms.
+
+1.1. Patent License. Subject to the terms and conditions of this License, each
+     Licensor, on behalf of itself and successors in interest and assigns,
+     grants Licensee a non-sublicensable, perpetual, worldwide, non-exclusive,
+     no-charge, royalty-free, irrevocable (except as expressly stated in this
+     License) patent license to its Necessary Claims to make, use, sell, offer
+     for sale, import or distribute any Implementation.
+
+1.2. Conditions.
+
+1.2.1. Availability. As a condition to the grant of rights to Licensee to make,
+       sell, offer for sale, import or distribute an Implementation under
+       Section 1.1, Licensee must make its Necessary Claims available under
+       this License, and must reproduce this License with any Implementation
+       as follows:
+
+       a. For distribution in source code, by including this License in the
+          root directory of the source code with its Implementation.
+
+       b. For distribution in any other form (including binary, object form,
+          and/or hardware description code (e.g., HDL, RTL, Gate Level Netlist,
+          GDSII, etc.)), by including this License in the documentation, legal
+          notices, and/or other written materials provided with the
+          Implementation.
+
+1.2.2. Additional Conditions. This license is directly from Licensor to
+       Licensee.  Licensee acknowledges as a condition of benefiting from it
+       that no rights from Licensor are received from suppliers, distributors,
+       or otherwise in connection with this License.
+
+1.3. Defensive Termination. If any Licensee, its Affiliates, or its agents
+     initiates patent litigation or files, maintains, or voluntarily
+     participates in a lawsuit against another entity or any person asserting
+     that any Implementation infringes Necessary Claims, any patent licenses
+     granted under this License directly to the Licensee are immediately
+     terminated as of the date of the initiation of action unless 1) that suit
+     was in response to a corresponding suit regarding an Implementation first
+     brought against an initiating entity, or 2) that suit was brought to
+     enforce the terms of this License (including intervention in a third-party
+     action by a Licensee).
+
+1.4. Disclaimers. The Reference Implementation and Specification are provided
+     "AS IS" and without warranty. The entire risk as to implementing or
+     otherwise using the Reference Implementation or Specification is assumed
+     by the implementer and user. Licensor expressly disclaims any warranties
+     (express, implied, or otherwise), including implied warranties of
+     merchantability, non-infringement, fitness for a particular purpose, or
+     title, related to the material. IN NO EVENT WILL LICENSOR BE LIABLE TO
+     ANY OTHER PARTY FOR LOST PROFITS OR ANY FORM OF INDIRECT, SPECIAL,
+     INCIDENTAL, OR CONSEQUENTIAL DAMAGES OF ANY CHARACTER FROM ANY CAUSES OF
+     ACTION OF ANY KIND WITH RESPECT TO THIS LICENSE, WHETHER BASED ON BREACH
+     OF CONTRACT, TORT (INCLUDING NEGLIGENCE), OR OTHERWISE, AND WHETHER OR
+     NOT THE OTHER PARTY HAS BEEN ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+2. Definitions.
+
+2.1. Affiliate.  "Affiliate" means an entity that directly or indirectly
+     Controls, is Controlled by, or is under common Control of that party.
+
+2.2. Control. "Control" means direct or indirect control of more than 50% of
+     the voting power to elect directors of that corporation, or for any other
+     entity, the power to direct management of such entity.
+
+2.3. Decoder.  "Decoder" means any decoder that conforms fully with all
+     non-optional portions of the Specification.
+
+2.4. Encoder.  "Encoder" means any encoder that produces a bitstream that can
+     be decoded by a Decoder only to the extent it produces such a bitstream.
+
+2.5. Final Deliverable.  "Final Deliverable" means the final version of a
+     deliverable approved by the Alliance for Open Media as a Final
+     Deliverable.
+
+2.6. Implementation.  "Implementation" means any implementation, including the
+     Reference Implementation, that is an Encoder and/or a Decoder. An
+     Implementation also includes components of an Implementation only to the
+     extent they are used as part of an Implementation.
+
+2.7. License. "License" means this license.
+
+2.8. Licensee. "Licensee" means any person or entity who exercises patent
+     rights granted under this License.
+
+2.9. Licensor.  "Licensor" means (i) any Licensee that makes, sells, offers
+     for sale, imports or distributes any Implementation, or (ii) a person
+     or entity that has a licensing obligation to the Implementation as a
+     result of its membership and/or participation in the Alliance for Open
+     Media working group that developed the Specification.
+
+2.10. Necessary Claims.  "Necessary Claims" means all claims of patents or
+      patent applications, (a) that currently or at any time in the future,
+      are owned or controlled by the Licensor, and (b) (i) would be an
+      Essential Claim as defined by the W3C Policy as of February 5, 2004
+      (https://www.w3.org/Consortium/Patent-Policy-20040205/#def-essential)
+      as if the Specification was a W3C Recommendation; or (ii) are infringed
+      by the Reference Implementation.
+
+2.11. Reference Implementation. "Reference Implementation" means an Encoder
+      and/or Decoder released by the Alliance for Open Media as a Final
+      Deliverable.
+
+2.12. Specification. "Specification" means the specification designated by
+      the Alliance for Open Media as a Final Deliverable for which this
+      License was issued.
+```
