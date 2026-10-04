@@ -7,7 +7,9 @@ namespace lapse {
 constexpr unsigned TimeSkipMaxRanges = 16;
 constexpr int TimeSkipWidth = 64, TimeSkipHeight = 36;
 constexpr int TimeSkipObservationMs = 1000;
-enum class TimeSkipMode { Off, Quiet, Manual, QuietWithinSchedule, NoPerson, NoPersonWithinSchedule };
+// Values are saved in preferences; append new modes only. PersonOnly saves
+// nothing while no person is detected, after quietAfterMs of absence.
+enum class TimeSkipMode { Off, Quiet, Manual, QuietWithinSchedule, NoPerson, NoPersonWithinSchedule, PersonOnly };
 enum class QuietSensitivity { Low, Standard, High };
 struct TimeSkipRange { int startSeconds = 0, endSeconds = 0; };
 struct TimeSkipSettings {
@@ -49,6 +51,8 @@ struct TimeSkipDecision {
     bool insideSchedule = false;
     bool accelerated = false;
     bool returnToBase = false; // One-shot request to bring the engine deadline forward.
+    // PersonOnly: admit no frame until a check ends absence (returnToBase).
+    bool suspended = false;
 };
 class TimeSkipController {
 public:
@@ -96,9 +100,10 @@ private:
     std::array<int64_t, 2 * MaxOutputFps + 1> intervals_{}, returnSpans_{};
     int64_t baseMs_ = 1000, lastInspectMs_ = -1, lastFrameMs_ = -1, windowStartMs_ = -1, windowEndMs_ = 0;
     unsigned sourceMask_ = 0, phase_ = 0;
-    bool valid_ = false, descending_ = false, finished_ = false, returnPending_ = false;
+    bool valid_ = false, descending_ = false, finished_ = false, returnPending_ = false, suspended_ = false;
     void buildIntervals() noexcept;
     void baseReturn() noexcept;
     TimeSkipDecision evaluate(int64_t activeMs) noexcept;
+    TimeSkipDecision evaluateCore(int64_t activeMs) noexcept;
 };
 }

@@ -44,7 +44,7 @@ constexpr int StageMinHeight = HeaderTop + HeaderHeight + PreviewGap + PreviewMi
 // Horizontal space the Advanced disclosure reserves beside its caption text:
 // left inset, chevron, the gap before it and the right inset.
 constexpr int DisclosureChrome = 46;
-enum Id { ModeBox = 100, IntervalBox, SizeBox, EncodingQualityBox, MonitorBox, CameraBox, Refresh, Record, Pause, Finish, Folder, OpenFolder, Reset, Forward, Preview, EncodingModeBox, AdvancedToggle, StopAfterBox, LowDiskBox, NightBox, NightDurationBox, NightTargetBox, NightHint, NightDetail, SkipConfigure, SkipSummary, SkipDetail, RecoveryBox, SegmentBox, WatermarkConfigure, WatermarkSummary, StatusDetails, CursorBox, StartDelayBox, PlaybackConfigure };
+enum Id { ModeBox = 100, IntervalBox, SizeBox, EncodingQualityBox, MonitorBox, CameraBox, Refresh, Record, Pause, Finish, Folder, OpenFolder, Reset, Forward, Preview, EncodingModeBox, AdvancedToggle, StopAfterBox, LowDiskBox, NightBox, NightDurationBox, NightTargetBox, NightHint, NightDetail, SkipConfigure, SkipSummary, SkipDetail, RecoveryBox, SegmentBox, WatermarkConfigure, WatermarkSummary, StatusDetails, CursorBox, StartDelayBox, PlaybackConfigure, AlsoDesktopBox, AlsoCameraBox };
 constexpr int StartDelays[] = {0,5,10,30,60,300};
 constexpr const wchar_t* StartDelayLabels[] = {L"None",L"5 seconds",L"10 seconds",L"30 seconds",L"1 minute",L"5 minutes"};
 constexpr int RecordingLimits[] = {0,900,3600,14400,28800,86400};
@@ -53,20 +53,24 @@ constexpr const wchar_t* RecordingLimitLabels[] = {L"Never",L"15 minutes",L"1 ho
 constexpr const wchar_t* RecordingLimitShortLabels[] = {L"Never",L"15 min",L"1 hour",L"4 hours",L"8 hours",L"24 hours"};
 constexpr int SegmentDurations[] = {0,900,3600,21600,86400};
 constexpr const wchar_t* SegmentLabels[] = {L"Never",L"15 minutes",L"1 hour",L"6 hours",L"24 hours"};
-constexpr wchar_t SegmentHelp[] = L"Split by active recording time, not video length. Pauses and initial preparation do not count; automatic saving does. Empty periods create no files. Shorter parts add processing and file overhead. Paired desktop/camera files share each part. No crash or power-loss guarantee.";
+constexpr wchar_t SegmentHelp[] = L"Split by active recording time, not video length. Pauses and initial preparation do not count; automatic saving does. Empty periods create no files. Shorter parts add processing and file overhead. Every file from one recording shares each part. No crash or power-loss guarantee.";
 constexpr int NightDurations[] = {0,1000,2000,5000,10000,30000};
 constexpr const wchar_t* NightDurationLabels[] = {L"Auto",L"1 second",L"2 seconds",L"5 seconds",L"10 seconds",L"30 seconds"};
 constexpr int NightTargets[] = {64,96,128};
 constexpr const wchar_t* EncodingModeLabels[] = {L"Compatible H.264 (default)",L"Efficient H.264 (bitrate target)",L"Hardware H.264 (CPU offload)",L"Hardware HEVC (HEVC player)",L"Quality H.264 (detail)",L"AV1 (smallest files)"};
 // Selection index is the saved EncodingMode value; one label per mode.
 static_assert(std::size(EncodingModeLabels)==static_cast<size_t>(EncodingMode::SoftwareAV1)+1);
-constexpr const wchar_t* SkipModeLabels[] = {L"Off",L"Scene is quiet",L"Inside scheduled ranges",L"Quiet scene + schedule",L"No person detected (camera)",L"No person + schedule (camera)"};
+constexpr const wchar_t* SkipModeLabels[] = {L"Off",L"Scene is quiet",L"Inside scheduled ranges",L"Quiet scene + schedule",L"No person detected (camera)",L"No person + schedule (camera)",L"No person detected: pause capture (camera)"};
+// Selection index is the saved TimeSkipMode value; one label per mode.
+static_assert(std::size(SkipModeLabels)==static_cast<size_t>(TimeSkipMode::PersonOnly)+1);
 constexpr int SkipMultipliers[] = {2,4,8,16,32,64}, SkipRamps[] = {15,30,60};
 constexpr int SeparateFilesMode = 5;
 constexpr wchar_t SeparateFilesLabel[] = L"Desktop + camera (2 files)";
 constexpr UINT TrayMessage = WM_APP + 1, ShowExistingMessage = WM_APP + 2;
 constexpr UINT CancelOwnedWorkMessage = WM_APP + 3;
 constexpr UINT TrayShow = 4001, TrayPause = 4002, TrayFinish = 4003, TrayExit = 4004, TrayProgress = 4005;
+// Tray Source submenu: one command per live layout mode (Desktop..Custom collage).
+constexpr UINT TraySourceFirst = 4010, TraySourceCount = 5;
 constexpr UINT ExitSystemCommand = 0x1000;
 constexpr int FirstRecordingHotkeyId = 4401, LastRecordingHotkeyId = 4404;
 constexpr wchar_t InstanceMutexName[] = L"Local\\Timelapse.Application.{DC32D155-1B8D-4880-9902-CE6245D34923}";
@@ -99,11 +103,15 @@ struct App {
     HWND watermarkConfigure{},watermarkSummary{},playbackConfigure{};
     uint16_t pauseHotkey=0,stopHotkey=0;
     int pauseHotkeyId=0,stopHotkeyId=0,recordedOutputFps=DefaultOutputFps;
+    // Frozen at Record: the number of output files.
+    size_t recordedOutputs=1;
     std::wstring hotkeyWarning;
     HWND mode{}, interval{}, videoSize{}, encodingQuality{}, encodingMode{}, monitor{}, camera{}, refresh{}, record{}, pause{}, finish{}, folder{}, openFolder{}, reset{}, forward{};
     HWND advanced{}, stopAfter{}, lowDisk{}, recoveryMode{}, nightEnabled{}, nightDuration{}, nightTarget{}, nightHint{}, nightDetail{}, labels[10]{};
     HWND segmentLabel{}, splitEvery{}, captureCursor{};
     HWND startDelayLabel{}, startDelay{}, startDelayHint{};
+    // Optional single-source companions for a collage, written from the same captures.
+    HWND alsoLabel{}, alsoDesktop{}, alsoCamera{};
     HFONT font{}, titleFont{}, smallFont{}, strongFont{}, headerFont{};
     HBRUSH background = CreateSolidBrush(Background), panelBrush = CreateSolidBrush(Panel);
     HICON appIcons[2]{};
@@ -151,7 +159,8 @@ struct App {
     UINT taskbarCreated = 0;
     std::wstring trayTooltip;
     State trayState = State::Idle;
-    bool trayStateValid = false, trayFailure = false, traySeparate = false;
+    bool trayStateValid = false, trayFailure = false;
+    size_t trayOutputs = 0;
     HICON trayIcons[5]{};
     int contentWidth = 0, contentHeight = 0, scrollX = 0, scrollY = 0;
     int wheelVertical = 0, wheelHorizontal = 0, wheelPanel = 0;
@@ -448,6 +457,9 @@ void normalizeCustomSelections() {
     if(app.hasCustomNightDuration)for(int i=0;i<6;++i)if(NightDurations[i]==app.customNightDurationMs){app.hasCustomNightDuration=false;app.committedNightDuration=i;break;}
 }
 bool hasSource(Source source) { if(app.settings.separateFiles)return true;for (auto& l : app.settings.layers) if (l.source == source) return true; return false; }
+// Collages already capture both sources, so companion files add no capture.
+bool collageLayout() { return !app.settings.separateFiles && app.settings.layers.size()>1; }
+bool isChecked(HWND box) { return box && SendMessageW(box,BM_GETCHECK,0,0)==BST_CHECKED; }
 bool sameSourceId(const std::wstring& a, const std::wstring& b) {
     return !a.empty() && !b.empty() && CompareStringOrdinal(a.c_str(),-1,b.c_str(),-1,TRUE)==CSTR_EQUAL;
 }
@@ -543,7 +555,12 @@ void layout();
 bool skipEnabled() { return app.settings.timeSkip.mode!=TimeSkipMode::Off; }
 bool skipScheduled(TimeSkipMode mode) { return mode==TimeSkipMode::Manual || mode==TimeSkipMode::QuietWithinSchedule || mode==TimeSkipMode::NoPersonWithinSchedule; }
 bool skipAutomatic(TimeSkipMode mode) { return mode==TimeSkipMode::Quiet || mode==TimeSkipMode::QuietWithinSchedule; }
-bool skipPerson(TimeSkipMode mode) { return mode==TimeSkipMode::NoPerson || mode==TimeSkipMode::NoPersonWithinSchedule; }
+bool skipPerson(TimeSkipMode mode) { return mode==TimeSkipMode::NoPerson || mode==TimeSkipMode::NoPersonWithinSchedule || mode==TimeSkipMode::PersonOnly; }
+// Person-only recording has no speed-up ramp: it captures normally or not at all.
+bool skipSpeeds(TimeSkipMode mode) { return mode!=TimeSkipMode::Off && mode!=TimeSkipMode::PersonOnly; }
+std::wstring skipCaption() {
+    return app.settings.timeSkip.mode==TimeSkipMode::PersonOnly?L"person only":std::to_wstring(app.settings.timeSkip.multiplier)+L"\u00d7";
+}
 bool skipObserved(TimeSkipMode mode) { return skipAutomatic(mode) || skipPerson(mode); }
 TimeSkipMode skipMode(HWND control) { return static_cast<TimeSkipMode>(std::clamp(choice(control),0,static_cast<int>(std::size(SkipModeLabels))-1)); }
 std::wstring personAvailability() {
@@ -556,6 +573,8 @@ std::wstring personAvailability() {
 }
 std::wstring skipSummary(const TimeSkipSettings& policy,int intervalMs) {
     if(policy.mode==TimeSkipMode::Off)return L"Off";
+    if(policy.mode==TimeSkipMode::PersonOnly)
+        return std::wstring(SkipModeLabels[static_cast<int>(TimeSkipMode::PersonOnly)])+L" · keeps recording "+formatDuration(policy.quietAfterMs,true)+L" after";
     return std::wstring(SkipModeLabels[std::clamp(static_cast<int>(policy.mode),0,static_cast<int>(std::size(SkipModeLabels))-1)])+L" · up to "+std::to_wstring(policy.multiplier)+
         L"× · target up to "+formatDuration(int64_t(intervalMs)*policy.multiplier,true)+L" between frames";
 }
@@ -580,7 +599,8 @@ void updateSkipText(bool force=false) {
                 value.reason==TimeSkipReason::Checking?(skipPerson(app.settings.timeSkip.mode)?L"Checking for absence":L"Checking image changes"):
                 value.reason==TimeSkipReason::Unavailable?L"Checks unavailable":L"Normal cadence";
             detail=reason;
-            if(value.intervalMs>0)detail+=L" · target every "+formatDuration(value.intervalMs,true);
+            if(value.suspended)detail+=L" · capture paused until someone appears";
+            else if(value.intervalMs>0)detail+=L" · target every "+formatDuration(value.intervalMs,true);
             if(skipObserved(app.settings.timeSkip.mode)){
                 const uint64_t now=GetTickCount64();
                 app.skipCheckAge=value.lastCheckTick && now>=value.lastCheckTick?(now-value.lastCheckTick)/1000:UINT64_MAX;
@@ -592,7 +612,12 @@ void updateSkipText(bool force=false) {
     }
     if(force || detail!=app.skipDetailCaption){SetWindowTextW(app.skipDetail,detail.c_str());app.skipDetailCaption=std::move(detail);}
 }
-int nightRow() { return hasSource(Source::Camera) ? (app.settings.night.enabled?2:1) : 0; }
+int nightRow() {
+    // A session recorded without Night shows no checked-but-inactive option
+    // when a live layout change brings the camera in.
+    if(app.active() && !app.settings.night.enabled && isChecked(app.nightEnabled))return 0;
+    return hasSource(Source::Camera) ? (app.settings.night.enabled?2:1) : 0;
+}
 bool cameraListUnavailable() {
     if(app.active() || app.cameraListError.empty() || !hasSource(Source::Camera))return false;
     const int selected=choice(app.camera);
@@ -849,7 +874,7 @@ void updateAdvanced() {
         else if(selection)caption+=L" · stop after "+(choice(app.stopAfter)<6?std::wstring(RecordingLimitLabels[std::clamp(choice(app.stopAfter),0,5)]):formatDuration(int64_t(selection)*1000,true));
         if(delay && night!=2 && recovery!=2 && app.watermarkValidation.empty())caption+=L" · delay "+formatDuration(int64_t(delay)*1000,true);
         if(recovery==1 && night!=2 && app.watermarkValidation.empty())caption+=L" · recovery";
-        if(skipEnabled() && night!=2 && recovery!=2 && app.watermarkValidation.empty())caption+=L" · "+std::to_wstring(app.settings.timeSkip.multiplier)+L"×";
+        if(skipEnabled() && night!=2 && recovery!=2 && app.watermarkValidation.empty())caption+=L" · "+skipCaption();
         if(segment && night!=2 && recovery!=2 && app.watermarkValidation.empty())caption+=L" · split "+formatDuration(int64_t(segment)*1000,true);
         if(app.settings.watermark.enabled && app.watermarkValidation.empty() && night!=2 && recovery!=2)caption+=L" · watermark";
         if(cursor==1 && app.watermarkValidation.empty() && night!=2 && recovery!=2)caption+=L" · cursor off";
@@ -861,7 +886,7 @@ void updateAdvanced() {
                 GetTextExtentPoint32W(dc,caption.c_str(),static_cast<int>(caption.size()),&size);
                 SelectObject(dc,previous);ReleaseDC(app.advanced,dc);
                 if(size.cx+app.scale(DisclosureChrome)>bounds.right)caption=delay?L"&Advanced · delay "+formatDuration(int64_t(delay)*1000,true):cursor==1?L"&Advanced · cursor off + options":app.settings.watermark.enabled?L"&Advanced · watermark + options":segment?L"&Advanced · split + options":recovery?L"&Advanced · recovery + options":skipEnabled()?L"&Advanced · "+std::wstring(night?L"night/":L"")+
-                    (selection?L"stop/":L"")+std::to_wstring(app.settings.timeSkip.multiplier)+L"×":night?L"&Advanced · night + stop":selection?L"&Advanced · timed stop":L"&Advanced · "+std::to_wstring(app.settings.outputFps)+L" fps";
+                    (selection?L"stop/":L"")+skipCaption():night?L"&Advanced · night + stop":selection?L"&Advanced · timed stop":L"&Advanced · "+std::to_wstring(app.settings.outputFps)+L" fps";
             }
         }
         const bool warning=recovery==2 || night==2 || !app.watermarkValidation.empty() || !app.hotkeyWarning.empty();
@@ -884,7 +909,7 @@ void updateAdvanced() {
         }
         if(app.settings.recoveryMode)app.advancedTooltip+=L" MP4 recovery mode (H.264) is on; recent frames can still be lost after interruption.";
         if(!app.encodingValidation.empty())app.advancedTooltip+=L" "+app.encodingValidation;
-        if(app.settings.watermark.enabled)app.advancedTooltip+=L" Watermark: "+watermarkSummary(app.settings.watermark)+L". Same placement in both files.";
+        if(app.settings.watermark.enabled)app.advancedTooltip+=L" Watermark: "+watermarkSummary(app.settings.watermark)+L". Same placement in every file.";
         if(!app.watermarkValidation.empty())app.advancedTooltip+=L" "+app.watermarkValidation;
         const auto captionWatermark=watermarkSummary(app.settings.watermark);
         if(captionWatermark!=app.watermarkCaption){SetWindowTextW(app.watermarkSummary,captionWatermark.c_str());app.watermarkCaption=captionWatermark;}
@@ -921,6 +946,15 @@ void updateAdvanced() {
     updateSkipText(true);
 }
 
+// The layout (not devices, size or files) can change while recording or
+// paused. Separate files keep their fixed desktop/camera pair.
+bool sourceEditable() {
+    return !app.closeWhenDone && (app.status.state==State::Idle ||
+        ((app.status.state==State::Recording || app.status.state==State::Paused) && !app.settings.separateFiles));
+}
+// Companion checkboxes are shown for a collage; while recording, only when
+// the session actually writes companion files.
+bool companionRow() { return collageLayout() && (!app.active() || app.recordedOutputs>1); }
 bool intervalEditable() {
     return !app.closeWhenDone && (app.status.state==State::Idle || app.status.state==State::Recording || app.status.state==State::Paused);
 }
@@ -957,10 +991,14 @@ void configure() {
     app.committedSegment=app.splitEvery?std::clamp(choice(app.splitEvery),0,app.hasCustomSegment?5:4):0;
     app.settings.stopOnLowDiskSpace = !app.lowDisk || SendMessageW(app.lowDisk,BM_GETCHECK,0,0)!=BST_UNCHECKED;
     app.settings.captureCursor = !app.captureCursor || SendMessageW(app.captureCursor,BM_GETCHECK,0,0)!=BST_UNCHECKED;
-    app.settings.night.enabled = app.nightEnabled && SendMessageW(app.nightEnabled,BM_GETCHECK,0,0)==BST_CHECKED && hasSource(Source::Camera);
-    app.settings.night.durationMs = selectedNightDuration();
-    app.committedNightDuration=app.nightDuration?std::clamp(choice(app.nightDuration),0,app.hasCustomNightDuration?6:5):0;
-    app.settings.night.targetBrightness = NightTargets[app.nightTarget?std::clamp(choice(app.nightTarget),0,2):1];
+    if(!app.active()) {
+        app.settings.alsoSaveDesktop = collageLayout() && isChecked(app.alsoDesktop);
+        app.settings.alsoSaveCamera = collageLayout() && isChecked(app.alsoCamera);
+        app.settings.night.enabled =app.nightEnabled && SendMessageW(app.nightEnabled,BM_GETCHECK,0,0)==BST_CHECKED && hasSource(Source::Camera);
+        app.settings.night.durationMs = selectedNightDuration();
+        app.committedNightDuration=app.nightDuration?std::clamp(choice(app.nightDuration),0,app.hasCustomNightDuration?6:5):0;
+        app.settings.night.targetBrightness = NightTargets[app.nightTarget?std::clamp(choice(app.nightTarget),0,2):1];
+    }
     app.nightValidation.clear();
     if(app.settings.night.enabled && app.settings.intervalMs<NightMinDurationMs)
         app.nightValidation=L"Night camera needs a capture interval of at least 1 second. Choose a longer interval or turn off Night camera.";
@@ -1008,8 +1046,9 @@ void refreshSources() {
 }
 void updateControls() {
     const bool idle = !app.active();
-    for (auto control : {app.mode,app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.splitEvery,app.startDelay,app.lowDisk,app.recoveryMode,app.nightEnabled,app.nightDuration,app.nightTarget,app.refresh,app.folder}) EnableWindow(control,idle);
+    for (auto control : {app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.splitEvery,app.startDelay,app.lowDisk,app.recoveryMode,app.nightEnabled,app.nightDuration,app.nightTarget,app.refresh,app.folder,app.alsoDesktop,app.alsoCamera}) EnableWindow(control,idle);
     EnableWindow(app.interval,intervalEditable());
+    EnableWindow(app.mode,sourceEditable());
     EnableWindow(app.monitor,idle && hasSource(Source::Desktop));
     EnableWindow(app.captureCursor,idle && hasSource(Source::Desktop));
     EnableWindow(app.camera,idle && hasSource(Source::Camera) && !app.cameras.empty());
@@ -1112,14 +1151,17 @@ HICON trayIcon(int state) {
 bool updateTray(bool addIcon=false) {
     if(!app.trayRegistered && !addIcon)return false;
     if(addIcon && !app.taskbarCreated){app.taskbarCreated=RegisterWindowMessageW(L"TaskbarCreated");if(!app.taskbarCreated)return false;}
+    // Live layout edits can only drop a duplicate companion from the plan,
+    // never add files, so the recorded count bounds an active session.
+    const size_t outputs=app.active()?std::max(app.recordedOutputs,outputPlan(app.settings).count):outputPlan(app.settings).count;
     if(!addIcon && app.trayStateValid && app.trayState==app.status.state &&
-       app.trayFailure==app.status.recordingFailed && app.traySeparate==app.settings.separateFiles)return true;
+       app.trayFailure==app.status.recordingFailed && app.trayOutputs==outputs)return true;
     const wchar_t* state=app.status.state==State::Recording?L"Recording":app.status.state==State::Paused?L"Paused":
         app.status.state==State::Waiting?L"Waiting to start":app.status.state==State::Starting?L"Preparing":app.status.state==State::Finishing?L"Saving":app.status.recordingFailed?L"Recording failed":L"Ready";
     std::wstring tip=L"Timelapse - ";tip+=state;
-    if(app.active())tip+=app.settings.separateFiles?L" - desktop + camera files":L"";
+    if(app.active() && outputs>1)tip+=app.settings.separateFiles?L" - desktop + camera files":L" - "+std::to_wstring(outputs)+L" files";
     if(!addIcon && tip==app.trayTooltip){
-        app.trayState=app.status.state;app.trayFailure=app.status.recordingFailed;app.traySeparate=app.settings.separateFiles;app.trayStateValid=true;
+        app.trayState=app.status.state;app.trayFailure=app.status.recordingFailed;app.trayOutputs=outputs;app.trayStateValid=true;
         return true;
     }
     const int icon=app.status.recordingFailed&&!app.active()?4:app.status.state==State::Recording?1:app.status.state==State::Paused?2:app.active()?3:0;
@@ -1129,7 +1171,7 @@ bool updateTray(bool addIcon=false) {
         Shell_NotifyIconW(NIM_DELETE,&data);app.trayRegistered=false;app.trayVersion4=false;app.trayTooltip.clear();app.trayStateValid=false;return false;
     }
     app.trayRegistered=true;app.trayTooltip=std::move(tip);
-    app.trayState=app.status.state;app.trayFailure=app.status.recordingFailed;app.traySeparate=app.settings.separateFiles;app.trayStateValid=true;
+    app.trayState=app.status.state;app.trayFailure=app.status.recordingFailed;app.trayOutputs=outputs;app.trayStateValid=true;
     if(addIcon){data.uVersion=NOTIFYICON_VERSION_4;app.trayVersion4=Shell_NotifyIconW(NIM_SETVERSION,&data)!=FALSE;}
     return true;
 }
@@ -1236,6 +1278,14 @@ void trayMenu(POINT at={},bool usePoint=false) {
     const bool starting=app.status.state==State::Waiting || app.status.state==State::Starting;
     const bool finishAllowed=!app.closeWhenDone&&(pauseAllowed||starting);
     AppendMenuW(menu,MF_STRING|(finishAllowed?MF_ENABLED:MF_GRAYED),TrayFinish,starting?L"Cancel s&tart":L"&Finish recording");
+    // Switch what the recording shows without reopening the window.
+    if(pauseAllowed && sourceEditable()) {
+        if(HMENU sources=CreatePopupMenu()) {
+            static constexpr const wchar_t* Labels[TraySourceCount]={L"&Desktop",L"&Camera",L"Desktop &+ camera",L"&Side by side",L"C&ustom collage"};
+            for(UINT i=0;i<TraySourceCount;++i)AppendMenuW(sources,MF_STRING|(app.modeIndex==static_cast<int>(i)?MF_CHECKED:MF_UNCHECKED),TraySourceFirst+i,Labels[i]);
+            if(!AppendMenuW(menu,MF_POPUP,reinterpret_cast<UINT_PTR>(sources),L"S&ource"))DestroyMenu(sources);
+        }
+    }
     AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING|(app.closeWhenDone?MF_GRAYED:MF_ENABLED),TrayExit,L"E&xit Timelapse");
     SetMenuDefaultItem(menu,TrayShow,FALSE);if(!usePoint)GetCursorPos(&at);SetForegroundWindow(app.window);
     app.trayMenuOpen=true;app.trayMenuCanceled=false;
@@ -1265,7 +1315,7 @@ void showControl(HWND child,bool show) {
 // Settings-panel membership decides scrolling, focus reveal and background.
 bool panelControl(HWND child) {
     if(!child)return false;
-    for(HWND member:{app.labels[0],app.mode,app.labels[4],app.monitor,app.labels[5],app.camera,app.refresh,app.labels[1],app.interval,app.labels[2],app.videoSize,
+    for(HWND member:{app.labels[0],app.mode,app.labels[4],app.monitor,app.labels[5],app.camera,app.alsoLabel,app.alsoDesktop,app.alsoCamera,app.refresh,app.labels[1],app.interval,app.labels[2],app.videoSize,
         app.labels[3],app.encodingQuality,app.folder,app.openFolder,app.advanced,app.labels[6],app.encodingMode,app.recoveryMode,app.labels[7],app.stopAfter,
         app.segmentLabel,app.splitEvery,app.startDelayLabel,app.startDelay,app.startDelayHint,app.lowDisk,app.captureCursor,app.skipConfigure,app.skipSummary,
         app.skipDetail,app.watermarkConfigure,app.watermarkSummary,app.playbackConfigure,app.nightEnabled,app.labels[8],app.nightDuration,app.labels[9],
@@ -1276,12 +1326,14 @@ bool panelControl(HWND child) {
 // for editable collages. Hidden controls drop out of Tab order and mnemonics.
 void updateSourceRows() {
     const bool desktop=hasSource(Source::Desktop),camera=hasSource(Source::Camera);
-    app.collageTools=!app.settings.separateFiles && app.settings.layers.size()>1;
+    app.collageTools=collageLayout();
     const HWND focused=GetFocus();
     if(focused && ((!desktop && focused==app.monitor) || (!camera && focused==app.camera)))SetFocus(app.mode);
+    if(focused && !companionRow() && (focused==app.alsoDesktop || focused==app.alsoCamera))SetFocus(app.mode);
     if(focused && !app.collageTools && (focused==app.reset || focused==app.forward))SetFocus(app.preview);
     for(HWND child:{app.labels[4],app.monitor})showControl(child,desktop);
     for(HWND child:{app.labels[5],app.camera})showControl(child,camera);
+    for(HWND child:{app.alsoLabel,app.alsoDesktop,app.alsoCamera})showControl(child,companionRow());
     for(HWND child:{app.reset,app.forward})showControl(child,app.collageTools);
 }
 int wrappedHeight(HWND child,int width,HFONT font,int minimum) {
@@ -1313,6 +1365,12 @@ int placePanel(bool place,int left,int offset) {
     combo(app.labels[0],app.mode,230);
     combo(app.labels[4],app.monitor,220,hasSource(Source::Desktop));
     combo(app.labels[5],app.camera,220,hasSource(Source::Camera));
+    {   // Collage companions: label, then both checkboxes on one row.
+        const int half=(width-app.scale(8))/2;
+        put(app.alsoLabel,y,labelH);
+        put(app.alsoDesktop,y+comboTop,check,0,half);put(app.alsoCamera,y+comboTop,check,width-half,half);
+        if(companionRow())y+=comboTop+check+app.scale(14);
+    }
     rule();section(1);
     combo(app.labels[1],app.interval,220);
     combo(app.labels[2],app.videoSize,140);
@@ -1692,7 +1750,7 @@ struct StatusFilesTask {
 };
 std::vector<std::wstring> statusDetailsFiles(const Status& status,std::wstring& folder) {
     folder.clear();
-    if(status.savedPaths.size()>2)return {};
+    if(status.savedPaths.size()>MaxRecordingOutputs)return {};
     auto files=status.savedPaths;
     if(files.empty()&&!status.savedPath.empty())files.push_back(status.savedPath);
     std::wstring parent;
@@ -1704,22 +1762,25 @@ std::vector<std::wstring> statusDetailsFiles(const Status& status,std::wstring& 
         if(current.empty()||(!parent.empty()&&CompareStringOrdinal(parent.c_str(),-1,current.c_str(),-1,TRUE)!=CSTR_EQUAL))return {};
         parent=current;
     }
+    // One recording never reports the same file twice; treat that as malformed.
+    for(size_t i=0;i<files.size();++i)for(size_t j=i+1;j<files.size();++j)
+        if(CompareStringOrdinal(files[i].c_str(),-1,files[j].c_str(),-1,TRUE)==CSTR_EQUAL)return {};
     folder=std::move(parent);return files;
 }
 HRESULT selectStatusFiles(StatusFilesTask& task) {
     // Shell parsing can block on storage/providers. This worker owns all inputs
     // and resources and never reads App, a window, or the dialog's lifetime.
-    if(task.files.empty()||task.files.size()>2||task.folder.empty())return E_INVALIDARG;
+    if(task.files.empty()||task.files.size()>MaxRecordingOutputs||task.folder.empty())return E_INVALIDARG;
     struct Com {HRESULT result=CoInitializeEx(nullptr,COINIT_APARTMENTTHREADED);~Com(){if(SUCCEEDED(result))CoUninitialize();}} com;
     if(FAILED(com.result))return com.result;
     const auto cancelled=[&]{return task.phase.load()==StatusFilesPhase::Cancelled;};
     if(cancelled())return HRESULT_FROM_WIN32(ERROR_CANCELLED);
-    struct Pidl {PIDLIST_ABSOLUTE value{};~Pidl(){CoTaskMemFree(value);}} folder,files[2];
+    struct Pidl {PIDLIST_ABSOLUTE value{};~Pidl(){CoTaskMemFree(value);}} folder,files[MaxRecordingOutputs];
     SFGAOF attributes=0;
     HRESULT result=SHParseDisplayName(task.folder.c_str(),nullptr,&folder.value,SFGAO_FILESYSTEM|SFGAO_FOLDER,&attributes);
     if(FAILED(result))return result;
     if(!folder.value||(attributes&(SFGAO_FILESYSTEM|SFGAO_FOLDER))!=(SFGAO_FILESYSTEM|SFGAO_FOLDER))return HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND);
-    std::array<PCUITEMID_CHILD,2> children{};
+    std::array<PCUITEMID_CHILD,MaxRecordingOutputs> children{};
     for(size_t i=0;i<task.files.size();++i){
         if(cancelled())return HRESULT_FROM_WIN32(ERROR_CANCELLED);
         attributes=0;result=SHParseDisplayName(task.files[i].c_str(),nullptr,&files[i].value,SFGAO_FILESYSTEM|SFGAO_FOLDER,&attributes);
@@ -2105,11 +2166,12 @@ void skipLayout(HWND window,SkipDraft& draft) {
     if(draft.layingOut)return;draft.layingOut=true;
     const auto mode=skipMode(draft.mode);
     const bool enabled=mode!=TimeSkipMode::Off,observed=skipObserved(mode),scheduled=skipScheduled(mode),person=skipPerson(mode),quiet=skipAutomatic(mode);
+    const bool speeds=skipSpeeds(mode);
     const auto show=[](HWND h,bool yes){if(h)ShowWindow(h,yes?SW_SHOWNA:SW_HIDE);};
-    for(HWND h:{draft.labels[1],draft.speed,draft.fine})show(h,enabled);
+    for(HWND h:{draft.labels[1],draft.speed,draft.fine})show(h,speeds);
     for(HWND h:{draft.labels[3],draft.quiet,draft.quietUnits})show(h,observed);
     show(draft.labels[7],false);
-    for(HWND h:{draft.labels[2],draft.ramp})show(h,enabled&&draft.fineExpanded);
+    for(HWND h:{draft.labels[2],draft.ramp})show(h,speeds&&draft.fineExpanded);
     for(HWND h:{draft.sensitivityLabel,draft.sensitivity})show(h,quiet&&draft.fineExpanded);
     for(HWND h:{draft.labels[4],draft.ranges,draft.add,draft.edit,draft.remove,draft.labels[5],draft.repeat,draft.labels[6],draft.repeatUnits})show(h,scheduled);
     for(HWND h:{draft.uncertain,draft.packInfo,draft.packManage})show(h,person);
@@ -2127,8 +2189,8 @@ void skipLayout(HWND window,SkipDraft& draft) {
         packHeight=person?wrap(draft.packInfo,width-2*pad-gap-packButtonWidth,draft.scale(28)):0;
         scheduleTop=packTop+(person?packHeight+draft.scale(14):0);
         fineTop=scheduleTop+(scheduled?draft.scale(214):0);
-        tuneTop=fineTop+(enabled?draft.scale(42):0);
-        helpTop=tuneTop+(enabled&&draft.fineExpanded?draft.scale(62):0);
+        tuneTop=fineTop+(speeds?draft.scale(42):0);
+        helpTop=tuneTop+(speeds&&draft.fineExpanded?draft.scale(62):0);
         helpHeight=wrap(draft.help,width-2*pad,draft.scale(32));
         errorTop=helpTop+helpHeight+draft.scale(10);errorHeight=wrap(draft.error,width-2*pad,draft.scale(20));
         buttonTop=errorTop+errorHeight+draft.scale(8);minHeight=buttonTop+draft.scale(44);
@@ -2145,7 +2207,10 @@ void skipLayout(HWND window,SkipDraft& draft) {
     auto move=[&](HWND h,int x,int y,int w,int heightPixels){MoveWindow(h,x-draft.scrollX,y-draft.scrollY,w,heightPixels,TRUE);};
     move(draft.labels[0],pad,draft.scale(16),width-2*pad,draft.scale(20));move(draft.mode,pad,draft.scale(38),width-2*pad,draft.scale(180));
     move(draft.labels[1],pad,bodyTop,half,draft.scale(20));move(draft.speed,pad,bodyTop+draft.scale(22),half,draft.scale(200));
-    move(draft.labels[3],x2,bodyTop,half,draft.scale(20));move(draft.quiet,x2,bodyTop+draft.scale(22),half/2-draft.scale(4),draft.scale(28));move(draft.quietUnits,x2+half/2+draft.scale(4),bodyTop+draft.scale(22),half/2-draft.scale(4),draft.scale(160));
+    // Without a speed column, the wait field takes the first column and its
+    // longer label the full width.
+    const int quietX=speeds?x2:pad;
+    move(draft.labels[3],quietX,bodyTop,speeds?half:width-2*pad,draft.scale(20));move(draft.quiet,quietX,bodyTop+draft.scale(22),half/2-draft.scale(4),draft.scale(28));move(draft.quietUnits,quietX+half/2+draft.scale(4),bodyTop+draft.scale(22),half/2-draft.scale(4),draft.scale(160));
     move(draft.uncertain,pad,uncertainTop,width-2*pad,uncertainHeight);
     move(draft.packInfo,pad,packTop,width-2*pad-gap-packButtonWidth,packHeight);move(draft.packManage,width-pad-packButtonWidth,packTop,packButtonWidth,draft.scale(28));
     move(draft.labels[4],pad,scheduleTop,width-2*pad,draft.scale(20));move(draft.ranges,pad,scheduleTop+draft.scale(22),width-2*pad,draft.scale(76));
@@ -2172,19 +2237,23 @@ void skipReveal(HWND window,SkipDraft& draft,HWND child) {
 }
 void skipHelp(SkipDraft& draft) {
     const auto mode=skipMode(draft.mode);
-    SetWindowTextW(draft.labels[3],skipPerson(mode)?L"No &person for":L"&Quiet for");
+    SetWindowTextW(draft.labels[3],mode==TimeSkipMode::PersonOnly?L"&Keep recording after a person leaves for":skipPerson(mode)?L"No &person for":L"&Quiet for");
     std::wstring text=mode==TimeSkipMode::Off?L"Keeps your Capture every interval unchanged.":
         mode==TimeSkipMode::Manual?L"Speeds up inside your active-time ranges, even when something moves.":
+        mode==TimeSkipMode::PersonOnly?L"Saves frames at your Capture every interval only while a person is detected in the camera. After nobody is detected for the time below, capture pauses until someone appears again; 1 second stops almost at once. The first frame is saved when recording starts. Checks can miss people. Missing, failed or stale results keep recording normally.":
         skipPerson(mode)?L"Detects people in the camera only, even when other things move. Checks can miss people. Missing, failed or stale results keep normal speed.":
         L"Detects image changes in either selected source, not people. Visible activity returns to normal speed; brief or small changes can be missed. Unavailable or stale checks keep normal speed.";
-    if(skipPerson(mode))text+=SendMessageW(draft.uncertain,BM_GETCHECK,0,0)==BST_CHECKED?
+    if(mode==TimeSkipMode::PersonOnly)text+=SendMessageW(draft.uncertain,BM_GETCHECK,0,0)==BST_CHECKED?
+        L" Uncertain checks count as no person and can pause capture. Clear the checkbox to keep recording when uncertain.":
+        L" Uncertain checks keep recording. Select the checkbox to count them as no person.";
+    else if(skipPerson(mode))text+=SendMessageW(draft.uncertain,BM_GETCHECK,0,0)==BST_CHECKED?
         L" Uncertain checks count toward the no-person waiting time. Clear the checkbox to keep normal speed when uncertain.":
         L" Uncertain checks keep normal speed. Select the checkbox to count them as no person.";
     if(mode==TimeSkipMode::QuietWithinSchedule)text+=L" Speeds up only when quiet AND inside a range.";
     if(mode==TimeSkipMode::NoPersonWithinSchedule)text+=L" Speeds up only when no-person checks qualify AND inside a range.";
     if(skipObserved(mode))text+=L" Waiting time excludes pauses.";
     if(skipScheduled(mode))text+=L" Ranges exclude pauses and initial preparation; 0 repeat runs them once.";
-    if(draft.fineExpanded && mode!=TimeSkipMode::Off){
+    if(draft.fineExpanded && skipSpeeds(mode)){
         if(skipAutomatic(mode))text+=L"\n\nLow sensitivity ignores more small differences. High reacts to smaller differences but noisy sources may stay at normal speed. Checks are best effort, about once a second.";
         if(skipObserved(mode)){
             text+=skipPerson(mode)?L" Detected people return to normal speed promptly, interrupting the transition.":L" Detected image changes return to normal speed promptly, interrupting the transition.";
@@ -2735,7 +2804,7 @@ std::array<std::wstring,8> skipValues(const TimeSkipSettings& policy) {
 }
 bool parseSkipValues(const std::array<std::wstring,8>& values,TimeSkipSettings& output) {
     TimeSkipSettings policy;int64_t value=0;
-    if(!skipInteger(values[0],0,static_cast<int>(TimeSkipMode::NoPersonWithinSchedule),value))return false;policy.mode=static_cast<TimeSkipMode>(value);
+    if(!skipInteger(values[0],0,static_cast<int>(TimeSkipMode::PersonOnly),value))return false;policy.mode=static_cast<TimeSkipMode>(value);
     if(!skipInteger(values[1],2,64,value))return false;policy.multiplier=static_cast<int>(value);
     if(!skipInteger(values[2],1000,int64_t(INT_MAX)*1000,value) || value%1000)return false;policy.quietAfterMs=value;
     if(!skipInteger(values[3],15,60,value))return false;policy.rampFrames=static_cast<int>(value);
@@ -2866,6 +2935,8 @@ bool savePreferences() {
         if(saved)saved=WritePrivateProfileStringW(L"Settings",L"OutputFps",outputFps.c_str(),pending.path) &&
             WritePrivateProfileStringW(L"Settings",L"PauseHotkey",pauseHotkey.c_str(),pending.path) &&
             WritePrivateProfileStringW(L"Settings",L"StopHotkey",stopHotkey.c_str(),pending.path);
+        if(saved)saved=WritePrivateProfileStringW(L"Settings",L"AlsoSaveDesktop",isChecked(app.alsoDesktop)?L"1":L"0",pending.path) &&
+            WritePrivateProfileStringW(L"Settings",L"AlsoSaveCamera",isChecked(app.alsoCamera)?L"1":L"0",pending.path);
         // This cache-flush form returns zero even when successful.
         WritePrivateProfileStringW(nullptr,nullptr,nullptr,pending.path);
         if(!saved)return false;
@@ -2934,6 +3005,11 @@ void preferences(bool save) {
         SendMessageW(app.captureCursor,BM_SETCHECK,std::wcscmp(captureCursor,L"0")==0?BST_UNCHECKED:BST_CHECKED,0);
         wchar_t nightEnabled[16]{};GetPrivateProfileStringW(L"Settings",L"NightEnabled",L"0",nightEnabled,16,path);
         SendMessageW(app.nightEnabled,BM_SETCHECK,std::wcscmp(nightEnabled,L"1")==0?BST_CHECKED:BST_UNCHECKED,0);
+        // Companion choices apply only to collages, which launch never restores.
+        for(const auto& [key,box]:{std::pair<const wchar_t*,HWND>{L"AlsoSaveDesktop",app.alsoDesktop},{L"AlsoSaveCamera",app.alsoCamera}}){
+            wchar_t value[16]{};GetPrivateProfileStringW(L"Settings",key,L"0",value,16,path);
+            SendMessageW(box,BM_SETCHECK,std::wcscmp(value,L"1")==0?BST_CHECKED:BST_UNCHECKED,0);
+        }
         const auto loadNightChoice=[&](const wchar_t* key,HWND box,const auto& values,int fallback){
             const auto defaultValue=std::to_wstring(values[fallback]);wchar_t value[32]{};
             GetPrivateProfileStringW(L"Settings",key,defaultValue.c_str(),value,32,path);
@@ -2992,7 +3068,12 @@ StateLook stateLook() {
 }
 std::wstring stageHint() {
     if(app.settings.separateFiles)return L"Desktop and camera each save to their own MP4.";
-    if(app.settings.layers.size()>1)return L"Drag a layer to move it. Pull its corner to resize.";
+    if(app.settings.layers.size()>1){
+        if(app.settings.alsoSaveDesktop && app.settings.alsoSaveCamera)return L"Drag to edit. Also saves desktop + camera files.";
+        if(app.settings.alsoSaveDesktop || app.settings.alsoSaveCamera)
+            return app.settings.alsoSaveDesktop?L"Drag to edit. Also saves a desktop file.":L"Drag to edit. Also saves a camera file.";
+        return L"Drag a layer to move it. Pull its corner to resize.";
+    }
     return L"Preview · "+sizeText(app.settings.width,app.settings.height)+L" at "+std::to_wstring(app.settings.outputFps)+L" fps";
 }
 // Antialiased glyph from a signed-distance function in box pixels; the box is
@@ -3116,7 +3197,8 @@ void paintStats(HDC dc) {
         secondary=std::to_wstring(app.status.frames)+L" frames  ·  "+timeText(double(app.status.frames)/std::clamp(app.recordedOutputFps,MinOutputFps,MaxOutputFps),false)+L" video";
     } else if(skipEnabled()) {
         primary=L"Base interval "+formatDuration(app.settings.intervalMs);
-        secondary=L"Time compression up to "+std::to_wstring(app.settings.timeSkip.multiplier)+L"×";
+        secondary=app.settings.timeSkip.mode==TimeSkipMode::PersonOnly?L"Records only while a person is detected":
+            L"Time compression up to "+std::to_wstring(app.settings.timeSkip.multiplier)+L"×";
     } else {
         primary=L"Every "+formatDuration(app.settings.intervalMs);
         wchar_t buffer[96]{};const double videoSeconds=3600000.0/(double(std::max(MinCaptureIntervalMs,app.settings.intervalMs))*app.settings.outputFps);
@@ -3305,6 +3387,9 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         app.refresh=button(L"Re&fresh",Refresh);
         app.mode=combo(0,L"&Source",ModeBox);for(auto s:{L"Desktop",L"Camera",L"Desktop + camera",L"Side by side",L"Custom collage",SeparateFilesLabel})add(app.mode,s);
         app.monitor=combo(4,L"&Display",MonitorBox);app.camera=combo(5,L"Ca&mera",CameraBox);
+        app.alsoLabel=requiredControl(L"STATIC",L"Also save separate files",SS_NOPREFIX,214);
+        app.alsoDesktop=requiredControl(L"BUTTON",L"Desktop",WS_TABSTOP|BS_AUTOCHECKBOX,AlsoDesktopBox);
+        app.alsoCamera=requiredControl(L"BUTTON",L"Camera",WS_TABSTOP|BS_AUTOCHECKBOX,AlsoCameraBox);
         app.interval=combo(1,L"Capture &every",IntervalBox);for(auto s:{L"1 second",L"2 seconds",L"5 seconds",L"10 seconds",L"30 seconds",L"60 seconds"})add(app.interval,s);
         app.videoSize=combo(2,L"Video si&ze",SizeBox);add(app.videoSize,L"720p");add(app.videoSize,L"1080p");
         app.encodingQuality=combo(3,L"Video &quality",EncodingQualityBox);for(auto s:{L"Smaller file",L"Balanced",L"More detail"})add(app.encodingQuality,s);
@@ -3347,8 +3432,13 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         tip.lpszText=const_cast<LPWSTR>(L"Compatible keeps the original software H.264 settings. Efficient uses a bitrate target at every quality level. Quality H.264, AV1 and hardware modes use fixed quantization; detailed or changing scenes can make much larger files. Hardware modes require a supported encoder and do not switch to software if unavailable. HEVC playback needs a compatible player or decoder. AV1 uses more processor time to make much smaller files; playback needs a player or decoder with AV1 support. File size and image quality depend on the scene and encoder.");
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
         tip.uId=reinterpret_cast<UINT_PTR>(app.mode);
-        tip.lpszText=const_cast<LPWSTR>(L"Separate files records full-frame desktop and camera videos together. The side-by-side preview is only for monitoring; each source has its own MP4.");
+        tip.lpszText=const_cast<LPWSTR>(L"Separate files records full-frame desktop and camera videos together. The side-by-side preview is only for monitoring; each source has its own MP4. A collage can also save separate desktop and camera files at the same time.");
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
+        for(HWND child:{app.alsoDesktop,app.alsoCamera}){
+            tip.uId=reinterpret_cast<UINT_PTR>(child);
+            tip.lpszText=const_cast<LPWSTR>(L"Save the full desktop or camera picture to its own MP4 alongside the collage (-desktop or -camera). Every file uses the same captures, timing, pauses and splits; each extra file adds encoding work and disk space. Collage edits change only the combined video.");
+            SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
+        }
         tip.uId=reinterpret_cast<UINT_PTR>(app.interval);
         tip.lpszText=const_cast<LPWSTR>(L"Change capture timing before or during recording, including while paused. Longer intervals make that part of the video shorter. Captures already underway finish first. Playback FPS stays fixed. Night camera requires an interval at least as long as its blend duration.");
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
@@ -3500,6 +3590,19 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
             if(customBox && choice(customBox)==customAction && SendMessageW(customBox,CB_GETCOUNT,0,0)>customAction){
                 SendMessageW(customBox,CB_SHOWDROPDOWN,FALSE,0);editCustom(id==IntervalBox?CustomKind::Interval:id==SizeBox?CustomKind::Size:id==SegmentBox?CustomKind::Segment:id==NightDurationBox?CustomKind::Night:CustomKind::Limit);return 0;
             }
+            if(id==ModeBox && app.active()) {
+                const int selected=choice(app.mode);
+                const bool camera=selected!=static_cast<int>(Mode::Desktop),desktop=selected!=static_cast<int>(Mode::Camera);
+                const wchar_t* problem=nullptr;
+                if(selected==SeparateFilesMode)problem=L"Desktop + camera (2 files) can be chosen only before recording. To also keep separate files with a collage, select Also save separate files before you record.";
+                else if(camera && app.settings.cameraId.empty())problem=L"No camera was selected when this recording started. Select a camera before recording to add it later.";
+                else if(desktop && app.settings.monitorId.empty())problem=L"No display was selected when this recording started. Select a display before recording to add it later.";
+                if(!sourceEditable() || problem){
+                    choose(app.mode,app.modeIndex);
+                    if(problem)MessageBoxW(w,problem,L"Source",MB_OK|MB_ICONINFORMATION);
+                    return 0;
+                }
+            }
             if(id==ModeBox)changeLayout(false);
             else {
                 if(id==IntervalBox && app.active()) {
@@ -3520,6 +3623,12 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
             }
             InvalidateRect(w,nullptr,FALSE);return 0;
         }
+        if(id>=static_cast<int>(TraySourceFirst) && id<static_cast<int>(TraySourceFirst+TraySourceCount)) {
+            // Same validation as the Source list; ignored once the session ends.
+            if(app.active() && sourceEditable()){choose(app.mode,id-static_cast<int>(TraySourceFirst));
+                windowProc(w,WM_COMMAND,MAKEWPARAM(ModeBox,CBN_SELCHANGE),reinterpret_cast<LPARAM>(app.mode));}
+            return 0;
+        }
         switch(id) {
         case StatusDetails:if(code==BN_CLICKED)showStatusDetails();break;
         case AdvancedToggle:toggleAdvanced();break;
@@ -3527,6 +3636,12 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         case WatermarkConfigure:if(code==BN_CLICKED)editWatermark();break;
         case PlaybackConfigure:if(code==BN_CLICKED)editPlayback();break;
         case LowDiskBox:if(!app.active())configure();break;
+        case AlsoDesktopBox:case AlsoCameraBox:
+            if(code!=BN_CLICKED)break;
+            // Companion files are part of the frozen recording plan.
+            if(app.active())SendMessageW(id==AlsoDesktopBox?app.alsoDesktop:app.alsoCamera,BM_SETCHECK,(id==AlsoDesktopBox?app.settings.alsoSaveDesktop:app.settings.alsoSaveCamera)?BST_CHECKED:BST_UNCHECKED,0);
+            else {configure();updateControls();invalidateCanvas(app.headerRect);}
+            break;
         case CursorBox:
             if(code!=BN_CLICKED)break;
             if(app.active() || !hasSource(Source::Desktop))SendMessageW(app.captureCursor,BM_SETCHECK,app.settings.captureCursor?BST_CHECKED:BST_UNCHECKED,0);
@@ -3551,6 +3666,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
                 // As on shutdown, preference failure must not prevent recording.
                 if(app.startupComplete)preferences(true);
                 app.recordedOutputFps=app.settings.outputFps;
+                app.recordedOutputs=outputPlan(app.settings).count;
                 app.engine->record();
             }
             applyStatus(app.engine->status(),true);acknowledgeVisibleFailure();break;
@@ -3574,7 +3690,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         }break;
     case WM_CTLCOLORSTATIC: {
         const auto child=reinterpret_cast<HWND>(lp);const bool warning=(child==app.statusText && statusCaptionError()) || (child==app.nightHint && !app.nightValidation.empty());
-        bool label=child==app.segmentLabel || child==app.startDelayLabel;
+        bool label=child==app.segmentLabel || child==app.startDelayLabel || child==app.alsoLabel;
         for(HWND value:app.labels)label=label || child==value;
         const bool panel=panelControl(child);
         SetBkColor(reinterpret_cast<HDC>(wp),panel?Panel:Background);SetTextColor(reinterpret_cast<HDC>(wp),warning?Danger:label?Ink:Muted);

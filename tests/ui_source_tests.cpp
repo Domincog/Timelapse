@@ -465,11 +465,16 @@ void activeControls() {
     seed(true);
     for(auto state:{State::Starting,State::Recording,State::Paused,State::Finishing}) {
         app.status.state=state; updateControls();
-        for(auto control:{app.refresh,app.mode,app.monitor,app.camera,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.splitEvery,app.lowDisk,app.nightEnabled,app.nightDuration,app.nightTarget,app.folder,app.record})
+        for(auto control:{app.refresh,app.monitor,app.camera,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.splitEvery,app.lowDisk,app.nightEnabled,app.nightDuration,app.nightTarget,app.folder,app.record})
             require(!IsWindowEnabled(control),"An active-session source/settings control remained enabled.");
         require((IsWindowEnabled(app.interval)!=FALSE)==(state==State::Recording || state==State::Paused),"Live interval availability did not follow session state");
+        require((IsWindowEnabled(app.mode)!=FALSE)==(state==State::Recording || state==State::Paused),"Live source availability did not follow session state");
     }
-    std::cout<<"PASS capture interval editable in Recording/Paused; other source/settings controls remain locked.\n";
+    app.status=lapse::fixtureStatus={};updateControls();
+    sourceMode(static_cast<Mode>(SeparateFilesMode));app.status.state=State::Recording;updateControls();
+    require(app.settings.separateFiles&&!IsWindowEnabled(app.mode),"A separate-files session offered a live source change.");
+    app.status=lapse::fixtureStatus={};updateControls();
+    std::cout<<"PASS capture interval and source layout editable in Recording/Paused; devices, files and other settings remain locked.\n";
 }
 void resetKnownFolders(){
     require(knownFolderBuffers.empty(),"A previous known-folder lookup leaked its returned buffer.");
@@ -691,6 +696,74 @@ void recoverySettings(){
     std::cout<<"PASS recovery H.264 modes, HEVC validation/error priority, actual Record guard, paired/Night settings and active command locks\n";
 }
 }
+void companionFiles() {
+    // Own the optional companion checkboxes only for this case.
+    const auto box=[](int id){HWND value=CreateWindowExW(0,L"BUTTON",L"",WS_CHILD|BS_AUTOCHECKBOX,0,0,100,30,app.window,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),nullptr,nullptr);require(value!=nullptr,"Cannot create companion checkbox.");return value;};
+    app.alsoDesktop=box(AlsoDesktopBox);app.alsoCamera=box(AlsoCameraBox);
+    const auto click=[](HWND target,int id,bool value){
+        SendMessageW(target,BM_SETCHECK,value?BST_CHECKED:BST_UNCHECKED,0);
+        windowProc(app.window,WM_COMMAND,MAKEWPARAM(id,BN_CLICKED),reinterpret_cast<LPARAM>(target));
+    };
+    seed(false);
+    click(app.alsoDesktop,AlsoDesktopBox,true);click(app.alsoCamera,AlsoCameraBox,true);
+    require(!app.settings.alsoSaveDesktop&&!app.settings.alsoSaveCamera&&!shown(app.alsoDesktop)&&!shown(app.alsoCamera),
+        "A single-source layout offered or requested companion files.");
+    for(Mode mode:{Mode::Overlay,Mode::SideBySide,Mode::Custom}){
+        sourceMode(mode);
+        require(app.settings.alsoSaveDesktop&&app.settings.alsoSaveCamera&&lapse::configured.alsoSaveDesktop&&lapse::configured.alsoSaveCamera&&
+            shown(app.alsoDesktop)&&shown(app.alsoCamera)&&IsWindowEnabled(app.alsoDesktop)&&outputPlan(lapse::configured).count==3,
+            "A collage did not offer or request both companion files.");
+    }
+    require(stageHint()==L"Drag to edit. Also saves desktop + camera files.","Collage hint did not mention both companion files.");
+    click(app.alsoCamera,AlsoCameraBox,false);
+    require(app.settings.alsoSaveDesktop&&!app.settings.alsoSaveCamera&&stageHint()==L"Drag to edit. Also saves a desktop file.",
+        "Clearing the camera companion was not applied.");
+    record();
+    require(lapse::recordCalls==1&&lapse::recorded.alsoSaveDesktop&&!lapse::recorded.alsoSaveCamera,"Record lost the companion choice.");
+    for(State state:{State::Starting,State::Recording,State::Paused,State::Finishing}){
+        app.status.state=state;updateControls();const auto configurations=lapse::configurationCalls;
+        require(!IsWindowEnabled(app.alsoDesktop)&&!IsWindowEnabled(app.alsoCamera),"Active session exposed companion edits.");
+        click(app.alsoCamera,AlsoCameraBox,true);click(app.alsoDesktop,AlsoDesktopBox,false);
+        require(lapse::configurationCalls==configurations&&!isChecked(app.alsoCamera)&&isChecked(app.alsoDesktop)&&
+            app.settings.alsoSaveDesktop&&!app.settings.alsoSaveCamera,"Forged active companion command changed the session or its display.");
+    }
+    app.status=lapse::fixtureStatus={};updateControls();
+    sourceMode(static_cast<Mode>(SeparateFilesMode));
+    require(!app.settings.alsoSaveDesktop&&!shown(app.alsoDesktop)&&outputPlan(app.settings).count==2,"Separate files gained a companion or combined output.");
+    sourceMode(Mode::Desktop);
+    require(!app.settings.alsoSaveDesktop&&isChecked(app.alsoDesktop),"Leaving a collage lost the remembered companion choice.");
+    DestroyWindow(app.alsoDesktop);DestroyWindow(app.alsoCamera);app.alsoDesktop=app.alsoCamera=nullptr;configure();
+    std::cout<<"PASS companion files: collage-only choices, hint, Record snapshot, active locks and separate/single-source modes\n";
+}
+void liveSourceSwitching() {
+    seed(false);record();
+    require(lapse::recordCalls==1&&lapse::recorded.layers.size()==1,"Desktop recording did not start.");
+    app.status.state=State::Recording;updateControls();
+    require(IsWindowEnabled(app.mode)!=FALSE,"Recording did not offer a live source change.");
+    const auto configurations=lapse::configurationCalls;
+    sourceMode(Mode::Overlay);
+    require(lapse::configurationCalls>configurations&&lapse::configured.layers.size()==2&&choice(app.mode)==static_cast<int>(Mode::Overlay)&&
+        !lapse::configured.separateFiles&&!lapse::configured.alsoSaveDesktop&&!lapse::configured.alsoSaveCamera,
+        "A live overlay change did not reach the engine or changed recorded files.");
+    startupMessage.clear();sourceMode(static_cast<Mode>(SeparateFilesMode));
+    require(choice(app.mode)==static_cast<int>(Mode::Overlay)&&!app.settings.separateFiles&&
+        startupMessage.find(L"only before recording")!=std::wstring::npos,"A live change into separate files was not refused.");
+    startupMessage.clear();sourceMode(Mode::Desktop);
+    require(choice(app.mode)==0&&startupMessage.empty()&&lapse::configured.layers.size()==1,"Removing the camera live was refused.");
+    app.status.state=State::Paused;updateControls();sourceMode(Mode::SideBySide);
+    require(choice(app.mode)==static_cast<int>(Mode::SideBySide)&&lapse::configured.layers.size()==2,"Paused recording rejected a live source change.");
+    // A recording started with no camera connected cannot add one later.
+    app.status=lapse::fixtureStatus={};updateControls();sourceMode(Mode::Desktop);
+    app.settings.cameraId.clear();lapse::listedCameras.clear();SendMessageW(app.camera,CB_RESETCONTENT,0,0);refreshSources();
+    require(app.settings.cameraId.empty(),"Fixture kept a camera selection.");
+    record();app.status.state=State::Recording;updateControls();startupMessage.clear();
+    sourceMode(Mode::Camera);
+    require(choice(app.mode)==0&&startupMessage.find(L"No camera was selected")!=std::wstring::npos&&lapse::configured.layers.size()==1,
+        "Adding a camera that was never selected was not refused.");
+    app.status=lapse::fixtureStatus={};updateControls();lapse::listedCameras={cameraA,cameraB};refreshSources();sourceMode(Mode::Desktop);
+    std::cout<<"PASS live source changes while recording/paused; separate files and unselected devices refused\n";
+}
 int main() {
     std::cout<<std::unitbuf; std::wcout<<std::unitbuf;
     try {
@@ -706,7 +779,7 @@ int main() {
             unavailableSelection(camera);emptyListRecovery(camera);explicitReplacement(camera);
             modeSwitchPreservesMissingChoice(camera);changedMetadata(camera);
         }
-        activeControls();indexLoads();separateSources();nightSettings();recoverySettings();cursorSettings();
+        activeControls();indexLoads();separateSources();nightSettings();recoverySettings();cursorSettings();companionFiles();liveSourceSwitching();
         enumerationDiagnostics();enumerationPrecedence();enumerationTooltipSafety();
         require(!IsWindowVisible(app.window)&&!IsWindowVisible(app.preview),"Fixture became visible.");
         std::cout<<"All source selection and settings assertions passed with hidden controls. No actual source was opened.\n";

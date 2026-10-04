@@ -330,10 +330,54 @@ void boundedMemoryAndLargeTime() {
     std::cout << "PASS 10,000 allocation-free reports, bounded state, 64-bit intervals and extreme active times\n";
 }
 }
+void personOnly() {
+    static_assert(int(TimeSkipMode::PersonOnly) == 6, "Saved mode values are append-only");
+    TimeSkipController controller; std::wstring error;
+    auto settings = policy(2000); settings.mode = TimeSkipMode::PersonOnly;
+    require(normalizeTimeSkipSettings(settings, error), "Person-only policy rejected");
+    for (unsigned mask : {0u, 1u}) require(!controller.reset(settings, 100, mask), "Camera-less person-only policy enabled");
+    require(controller.reset(settings, 100, 2), "Person-only reset");
+    // Before any check, recording continues normally (fail-open).
+    auto value = controller.inspect(0);
+    require(!value.suspended && value.intervalMs == 100 && value.reason == TimeSkipReason::Unavailable, "Unchecked person-only recording paused");
+    require(report(controller, 0, 1, PersonPresence::Present), "Present report");
+    value = controller.inspect(500);
+    require(!value.suspended && value.reason == TimeSkipReason::PersonPresent && controller.onFrame(500) == 100,
+            "A present person did not keep the base cadence");
+    // Absence must span the whole keep-recording time before capture pauses.
+    require(report(controller, 1000, 2) && report(controller, 2000, 3), "First absences");
+    value = controller.inspect(2000);
+    require(!value.suspended && value.reason == TimeSkipReason::Checking, "Person-only paused before its buffer elapsed");
+    require(report(controller, 3000, 4), "Buffer absence");
+    value = controller.inspect(3000);
+    require(value.suspended && !value.accelerated && value.intervalMs == 100 && value.reason == TimeSkipReason::NoPerson && !value.returnToBase,
+            "Elapsed absence did not pause capture without a speed ramp");
+    require(controller.inspect(3500).suspended, "The pause did not persist");
+    // A returning person resumes at once, with exactly one prompt return.
+    require(report(controller, 4000, 5, PersonPresence::Present), "Return report");
+    value = controller.inspect(4000);
+    require(!value.suspended && value.returnToBase && value.reason == TimeSkipReason::PersonPresent, "A returning person did not resume capture promptly");
+    require(!controller.inspect(4100).returnToBase && controller.onFrame(4200) == 100, "Resume return was not one-shot");
+    // Stale checks keep recording (fail-open) and also resume promptly.
+    for (int i = 0; i < 3; ++i) require(report(controller, 5000 + i * 1000, 6 + i), "Second absence");
+    require(controller.inspect(7000).suspended, "Second absence did not pause capture");
+    value = controller.inspect(11000);
+    require(!value.suspended && value.returnToBase && value.reason == TimeSkipReason::Unavailable, "Stale checks kept capture paused");
+    // Uncertain checks follow the uncertainty policy.
+    settings.uncertainAsAbsent = false; require(controller.reset(settings, 100, 2), "Strict reset");
+    for (int i = 0; i < 4; ++i) require(report(controller, i * 1000, i + 1, PersonPresence::Unknown), "Uncertain report");
+    value = controller.inspect(3000);
+    require(!value.suspended && value.reason == TimeSkipReason::PersonUncertain, "Strict uncertainty paused capture");
+    settings.uncertainAsAbsent = true; require(controller.reset(settings, 100, 2), "Default reset");
+    for (int i = 0; i < 4; ++i) require(report(controller, i * 1000, i + 1, PersonPresence::Unknown), "Counted uncertain report");
+    value = controller.inspect(3000);
+    require(value.suspended && value.reason == TimeSkipReason::NoPersonUncertain, "Counted uncertainty did not pause capture");
+    std::cout << "PASS person-only: fail-open start, full buffer, pause without ramp, prompt one-shot return, stale and uncertain safety\n";
+}
 int main() {
     try {
         configuration(); fullObservedDwell(); presenceAndUnknown(); configurableUncertainty(); rejectedInput(); gapsAndEpochs(); inputIsolation();
-        schedules(); rampEquivalence(); scheduledStaleHistory(); boundedMemoryAndLargeTime();
+        schedules(); rampEquivalence(); scheduledStaleHistory(); boundedMemoryAndLargeTime(); personOnly();
         std::cout << "Person policy passed. Controller bytes: " << sizeof(TimeSkipController)
                   << "; observation bytes: " << sizeof(PersonObservation) << "; settings bytes: " << sizeof(TimeSkipSettings) << '\n';
         return 0;

@@ -26,8 +26,8 @@ lapse_startup_insert_unique("session.emplace(cfg);"
     "{ probe::Scope scope(probe::Stage::Session); session.emplace(cfg); }")
 lapse_startup_insert_unique("if (!camera) camera.emplace();"
     "if (!camera) { probe::Scope scope(probe::Stage::Camera); camera.emplace(); }")
-lapse_startup_insert_unique("if (!encoder) encoder.emplace();"
-    "if (!encoder) { probe::Scope scope(probe::Stage::Encoder); encoder.emplace(); }")
+lapse_startup_insert_unique("if (!encoders[0]) encoders[0].emplace();"
+    "if (!encoders[0]) { probe::Scope scope(probe::Stage::Encoder); encoders[0].emplace(); }")
 lapse_startup_insert_unique("auto closeRecording = [&](const std::wstring& reason) {"
     "auto closeRecording = [&](const std::wstring& reason) { probe::Scope scope(probe::Stage::Close);")
 

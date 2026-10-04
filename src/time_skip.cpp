@@ -8,7 +8,7 @@ namespace {
 constexpr int pixels = TimeSkipWidth * TimeSkipHeight;
 enum class Invalid { None, Mode, Multiplier, Quiet, Sensitivity, Ramp, Repeat, Count, Range, Period, Empty };
 Invalid normalize(TimeSkipSettings& value) noexcept {
-    if (value.mode < TimeSkipMode::Off || value.mode > TimeSkipMode::NoPersonWithinSchedule) return Invalid::Mode;
+    if (value.mode < TimeSkipMode::Off || value.mode > TimeSkipMode::PersonOnly) return Invalid::Mode;
     if (value.multiplier < 2 || value.multiplier > 64) return Invalid::Multiplier;
     if (value.quietAfterMs < 1000 || value.quietAfterMs > int64_t(INT_MAX) * 1000 || value.quietAfterMs % 1000) return Invalid::Quiet;
     if (value.quietSensitivity < QuietSensitivity::Low || value.quietSensitivity > QuietSensitivity::High) return Invalid::Sensitivity;
@@ -36,7 +36,9 @@ Invalid normalize(TimeSkipSettings& value) noexcept {
     return Invalid::None;
 }
 bool automatic(TimeSkipMode mode) noexcept { return mode == TimeSkipMode::Quiet || mode == TimeSkipMode::QuietWithinSchedule; }
-bool personMode(TimeSkipMode mode) noexcept { return mode == TimeSkipMode::NoPerson || mode == TimeSkipMode::NoPersonWithinSchedule; }
+bool personMode(TimeSkipMode mode) noexcept {
+    return mode == TimeSkipMode::NoPerson || mode == TimeSkipMode::NoPersonWithinSchedule || mode == TimeSkipMode::PersonOnly;
+}
 int64_t addBounded(int64_t a, int64_t b) noexcept {
     return b > INT64_MAX - a ? INT64_MAX : a + b;
 }
@@ -128,7 +130,9 @@ bool normalizeTimeSkipSettings(TimeSkipSettings& settings, std::wstring& error) 
     case Invalid::None: settings = candidate; return true;
     case Invalid::Mode: error = L"Choose a valid time-compression mode."; break;
     case Invalid::Multiplier: error = L"Time-compression speed must be between 2 and 64 times the normal capture interval."; break;
-    case Invalid::Quiet: error = personMode(settings.mode)
+    case Invalid::Quiet: error = settings.mode == TimeSkipMode::PersonOnly
+        ? L"Keep-recording time must be a whole number of seconds between 1 and 2147483647."
+        : personMode(settings.mode)
         ? L"No-person time must be a whole number of seconds between 1 and 2147483647."
         : L"Quiet time must be a whole number of seconds between 1 and 2147483647."; break;
     case Invalid::Sensitivity: error = L"Choose a valid quiet-scene sensitivity."; break;
@@ -161,7 +165,7 @@ bool describeTimeSkipFrame(const Frame& input, TimeSkipDescriptor& output) noexc
 bool TimeSkipController::reset(const TimeSkipSettings& settings, int64_t base, unsigned mask, int fps) noexcept {
     settings_ = settings; valid_ = false; sourceMask_ = mask;
     baseMs_ = base >= 100 && base <= 86400000 ? base : 1000;
-    phase_ = 0; descending_ = finished_ = returnPending_ = false;
+    phase_ = 0; descending_ = finished_ = returnPending_ = suspended_ = false;
     lastInspectMs_ = lastFrameMs_ = windowStartMs_ = -1; windowEndMs_ = 0;
     for (auto& source : sources_) { source.initialized = source.available = source.compared = false; source.observationMs = -1; source.weak = 0; }
     person_ = {};
@@ -263,6 +267,14 @@ bool TimeSkipController::observePerson(const PersonObservation& input) noexcept 
     return true;
 }
 TimeSkipDecision TimeSkipController::evaluate(int64_t activeMs) noexcept {
+    auto result = evaluateCore(activeMs);
+    // Leaving a person-only suspension requests a prompt capture; the ramp
+    // phase never advances in that mode, so baseReturn() cannot signal it.
+    if (suspended_ && !result.suspended) returnPending_ = true;
+    suspended_ = result.suspended;
+    return result;
+}
+TimeSkipDecision TimeSkipController::evaluateCore(int64_t activeMs) noexcept {
     TimeSkipDecision result; result.intervalMs = baseMs_;
     if (!valid_ || settings_.mode == TimeSkipMode::Off) return result;
     if (activeMs < 0 || (lastInspectMs_ >= 0 && activeMs < lastInspectMs_)) {
@@ -302,6 +314,7 @@ TimeSkipDecision TimeSkipController::evaluate(int64_t activeMs) noexcept {
             baseReturn(); result.reason = TimeSkipReason::Checking; return result;
         }
         result.reason = person_.presence == PersonPresence::Unknown ? TimeSkipReason::NoPersonUncertain : TimeSkipReason::NoPerson;
+        if (settings_.mode == TimeSkipMode::PersonOnly) { result.suspended = true; return result; }
     } else if (automatic(settings_.mode)) {
         bool quiet = true;
         for (unsigned i = 0; i < sources_.size(); ++i) if (sourceMask_ & (1u << i)) {
@@ -324,6 +337,8 @@ int64_t TimeSkipController::onFrame(int64_t activeMs) noexcept {
     const auto status = evaluate(activeMs);
     if (activeMs < 0 || activeMs <= lastFrameMs_) return status.intervalMs;
     lastFrameMs_ = activeMs; returnPending_ = false;
+    // Person-only recording either captures at the base cadence or not at all.
+    if (settings_.mode == TimeSkipMode::PersonOnly) return baseMs_;
     if (status.reason != TimeSkipReason::Quiet && status.reason != TimeSkipReason::Manual &&
         status.reason != TimeSkipReason::NoPerson && status.reason != TimeSkipReason::NoPersonUncertain) return baseMs_;
     if (finished_) return baseMs_;

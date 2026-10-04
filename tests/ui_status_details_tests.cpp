@@ -105,7 +105,7 @@ PIDLIST_ABSOLUTE clonePidl(PCIDLIST_ABSOLUTE value){if(failFileClone)return null
 BOOL WINAPI equalPidl(PCIDLIST_ABSOLUTE first,PCIDLIST_ABSOLUTE second){const auto bytes=ILGetSize(first);return bytes==ILGetSize(second)&&std::memcmp(first,second,bytes)==0;}
 std::wstring pidlPath(PCUIDLIST_RELATIVE value){return value?reinterpret_cast<const wchar_t*>(reinterpret_cast<const BYTE*>(value)+sizeof(USHORT)):L"";}
 HRESULT WINAPI selectFiles(PCIDLIST_ABSOLUTE folder,UINT count,PCUITEMID_CHILD_ARRAY children,DWORD flags){
-    if(GetCurrentThreadId()==ownerThread || count<1 || count>2 || flags)fileProbeError=true;
+    if(GetCurrentThreadId()==ownerThread || count<1 || count>lapse::MaxRecordingOutputs || flags)fileProbeError=true;
     {std::lock_guard<std::mutex> lock(fileMutex);selectedFolder=pidlPath(folder);selectedFiles.clear();for(UINT i=0;i<count;++i)selectedFiles.push_back((std::filesystem::path(selectedFolder)/pidlPath(children[i])).wstring());}
     ++fileSelections;return fileSelectResult;
 }
@@ -699,7 +699,7 @@ void fileSnapshotSelection(){
 }
 void fileEligibility(){
     OwnedFiles files;Fixture fixture;
-    for(int kind=0;kind<6;++kind){
+    for(int kind=0;kind<7;++kind){
         auto report=files.report();
         if(kind==0){report.savedPaths.clear();report.savedPath=files.files[0];}
         if(kind==1){report.savedPaths.clear();report.savedPath.clear();report.message=L"Failure text mentions C:\\unfinalized.recording.mp4 only.";}
@@ -707,6 +707,7 @@ void fileEligibility(){
         if(kind==3)report.savedPaths.push_back(files.files[0]);
         if(kind==4)report.savedPaths[1]=(files.folder.parent_path()/L"other-folder/file.mp4").wstring();
         if(kind==5)report.savedPaths[0]+=std::wstring(1,L'\0')+L"suffix";
+        if(kind==6)for(const wchar_t* name:{L"third.mp4",L"fourth.mp4"})report.savedPaths.push_back((files.folder/name).wstring());
         fixture.publish(report);detailsProbe::script=[&](HWND window){
             const HWND button=GetDlgItem(window,StatusDetailsFiles);require((button!=nullptr)==(kind==0),"Malformed/unfinalized status offered Show files or compatible savedPath fallback was lost.");
             require(textOf(classChild(window,L"EDIT"))==nativeLines(report.message),"Selection eligibility changed the original report.");
@@ -715,6 +716,22 @@ void fileEligibility(){
     }
     files.assertClean(1);require(detailsProbe::fileThreadStarts==1,"Opening Details itself started filesystem work.");
     std::cout<<"PASS bounded finalized-path eligibility, single savedPath compatibility, and no text-parsed recovery guesses\n";
+}
+void threeFileSelection(){
+    OwnedFiles files;Fixture fixture;
+    const auto combined=(files.folder/L"Timelapse-three-files.mp4").wstring();
+    {std::ofstream output(std::filesystem::path(combined),std::ios::binary);output<<"Owned synthetic selection fixture; not a real recording.";require(output.good(),"Cannot create third owned file fixture.");}
+    auto report=files.report();report.savedPaths.insert(report.savedPaths.begin(),combined);report.savedPath=combined;
+    fixture.publish(report);
+    detailsProbe::script=[&](HWND window){
+        require(GetDlgItem(window,StatusDetailsFiles)!=nullptr,"A combined video with two companion files did not offer Show files.");
+        clickFiles(window);completeFiles(window);
+        require(detailsProbe::fileSelections==1&&detailsProbe::selectedFiles==report.savedPaths&&detailsProbe::selectedFolder==files.folder.wstring(),
+            "Show files did not select the whole three-file set in order.");
+        closeDetails(window);
+    };fixture.command(StatusDetails);
+    waitFileWorker();files.assertClean(1);
+    std::cout<<"PASS three-file companion set selects every saved file\n";
 }
 void fileFailures(){
     for(int fault=0;fault<11;++fault){
@@ -799,6 +816,6 @@ int main(){try{
     detailsProbe::ownerThread=GetCurrentThreadId();
     INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_WIN95_CLASSES};require(InitCommonControlsEx(&controls)!=FALSE,"Common controls unavailable.");
     exactSelectableReports();outcomeAndPrimaryPrecedence();keyboardAndCompactLayout();stableSnapshot();modalLifecycle();failuresAndUnchangedTicks();distinctMainMnemonics();cursorKeyboard();delayKeyboard();
-    fileSnapshotSelection();fileEligibility();fileFailures();filePendingLifecycle();fileReopenedAndKeyboard();sharedFolderSlot();
+    fileSnapshotSelection();fileEligibility();threeFileSelection();fileFailures();filePendingLifecycle();fileReopenedAndKeyboard();sharedFolderSlot();
     std::cout<<"All fifteen status/keyboard/file groups passed with inert engine, owned native windows and intercepted Shell selection.\n";return 0;
 }catch(const std::exception& error){std::cerr<<"STATUS DETAILS FAILURE: "<<error.what()<<'\n';return 1;}}

@@ -204,7 +204,11 @@ void liveIntervals(const std::filesystem::path& root,bool paired) {
     std::this_thread::sleep_for(250ms);require(engine.status().frames==paused.frames,"Live paused edit admitted a frame");
     engine.setPaused(false);await(engine,[&](const auto& s){return s.frames>=paused.frames+3;},1200);
     auto values=submitted();std::vector<Write> primary;for(const auto& value:values)if(!value.secondary)primary.push_back(value);
-    require(primary.back().microseconds-primary[primary.size()-2].microseconds>=145000,"Resume lost the edited interval");
+    // Captures follow an absolute schedule, so one late write shortens only the
+    // gap after it. Average every post-resume gap: 150ms cadence versus 100ms stale.
+    require(primary.size()>=paused.frames+3,"Resume admitted too few frames");
+    const auto resumedGaps=static_cast<int64_t>(primary.size()-1-paused.frames);
+    require((primary.back().microseconds-primary[paused.frames].microseconds)/resumedGaps>=125000,"Resume lost the edited interval");
     settings.intervalMs=MaxCaptureIntervalMs;engine.configure(settings);std::this_thread::sleep_for(150ms);
     const auto held=engine.status().frames;
     settings.intervalMs=99;engine.configure(settings);std::this_thread::sleep_for(250ms);

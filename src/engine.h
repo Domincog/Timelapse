@@ -4,6 +4,7 @@
 #include "night.h"
 #include "time_skip.h"
 #include "watermark.h"
+#include <array>
 #include <mutex>
 #include <thread>
 #include <condition_variable>
@@ -30,6 +31,10 @@ struct Settings {
     bool preview = true;
     // Capture both selected sources on one schedule into independent videos.
     bool separateFiles = false;
+    // With a layout, also write each selected source to its own full-frame
+    // MP4 (-desktop/-camera) from the same samples. Ignored for separate files
+    // and when the layout already shows only that source. Frozen at Record.
+    bool alsoSaveDesktop = false, alsoSaveCamera = false;
     // Active recording time, excluding initial startup and pauses. Nonpositive
     // values keep recording until the user finishes or a capture/save fails.
     int recordingLimitSeconds = 0;
@@ -53,6 +58,39 @@ struct Settings {
     // session; dedicated desktop Quiet observations always omit the cursor.
     bool captureCursor = true;
 };
+// Every recording writes one to three MP4 outputs from the same admitted
+// samples, sharing their capture schedule, pauses, splits and frame count.
+enum class OutputKind { Layout, Desktop, Camera };
+constexpr size_t MaxRecordingOutputs = 3;
+struct OutputPlan {
+    std::array<OutputKind, MaxRecordingOutputs> kinds{};
+    size_t count = 0;
+};
+// Separate files keep their desktop/camera pair. Otherwise the layout comes
+// first, followed by requested single-source companions that differ from it.
+inline OutputPlan outputPlan(const Settings& settings) noexcept {
+    OutputPlan plan;
+    if (settings.separateFiles) {
+        plan.kinds[0] = OutputKind::Desktop; plan.kinds[1] = OutputKind::Camera; plan.count = 2;
+        return plan;
+    }
+    unsigned layout = 0;
+    for (const auto& layer : settings.layers) layout |= layer.source == Source::Desktop ? 1u : 2u;
+    plan.kinds[plan.count++] = OutputKind::Layout;
+    // A companion matching a single-source layout would only duplicate it.
+    if (settings.alsoSaveDesktop && layout != 1u) plan.kinds[plan.count++] = OutputKind::Desktop;
+    if (settings.alsoSaveCamera && layout != 2u) plan.kinds[plan.count++] = OutputKind::Camera;
+    return plan;
+}
+// Bit 0: desktop, bit 1: camera; every source any planned output needs.
+inline unsigned recordingSources(const Settings& settings) noexcept {
+    unsigned mask = 0;
+    for (const auto& layer : settings.layers) mask |= layer.source == Source::Desktop ? 1u : 2u;
+    const auto plan = outputPlan(settings);
+    for (size_t i = 0; i < plan.count; ++i)
+        if (plan.kinds[i] != OutputKind::Layout) mask |= plan.kinds[i] == OutputKind::Desktop ? 1u : 2u;
+    return mask;
+}
 struct TimeSkipStatus {
     bool enabled = false;
     TimeSkipReason reason = TimeSkipReason::Off;
@@ -61,6 +99,8 @@ struct TimeSkipStatus {
     // Oldest required source receipt, in GetTickCount64's time domain.
     uint64_t lastCheckTick = 0;
     bool observationDelayed = false;
+    // Person-only recording is admitting no frames until a person returns.
+    bool suspended = false;
     std::array<wchar_t, 256> diagnostic{};
 };
 struct CameraInputSize {
@@ -80,12 +120,12 @@ struct Status {
     uint64_t startDeadlineTick = 0;
     std::wstring message = L"Choose a source, then record.";
     std::wstring savedPath;
-    // Latest finalized output set (at most two paths), including retained
+    // Latest finalized output set (at most three paths), including retained
     // .recording.mp4 files. Earlier split parts remain in the session folder.
     // savedPath remains the first entry for existing single-file callers.
     std::vector<std::wstring> savedPaths;
     // Fully published segment sets in a split session; zero when splitting is
-    // off. Paired desktop/camera files count as one set. Never resets at rollover.
+    // off. A set's files (layout and/or sources) count once. Never resets at rollover.
     uint64_t completedSegments = 0;
     bool error = false;
     // Preview errors do not change the outcome of the last recording attempt.
@@ -134,6 +174,10 @@ private:
     uint64_t delayedWakeEpoch_ = 0;
     bool delayedStartPending_ = false, delayedCancel_ = false;
     bool previewProblem_ = false;
+    // A live-added optional source is missing; recording continues without it.
+    bool sourceWarning_ = false;
+    // The active session's frozen files, for status text set outside the worker.
+    OutputPlan sessionPlan_{};
     bool quit_ = false, start_ = false, stop_ = false, pauseRequested_ = false, pauseTarget_ = false, retrySources_ = false;
     std::thread worker_;
 };

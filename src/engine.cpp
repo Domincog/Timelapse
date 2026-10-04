@@ -27,15 +27,28 @@ Clock::duration nextSegmentCut(Clock::duration active, int seconds) {
     if (bucket >= Clock::duration::max() / span) throw std::overflow_error("Recording segment clock exhausted");
     return span * (bucket + 1);
 }
-const wchar_t* recordingMessage(bool separateFiles) {
-    return separateFiles ? L"Recording desktop and camera to separate files." : L"Recording. You can adjust the collage live.";
+const wchar_t* recordingMessage(const OutputPlan& plan) {
+    if (plan.count < 2) return L"Recording. You can adjust the collage live.";
+    if (plan.kinds[0] != OutputKind::Layout) return L"Recording desktop and camera to separate files.";
+    if (plan.count == 3) return L"Recording the combined video plus separate desktop and camera files.";
+    return plan.kinds[1] == OutputKind::Desktop ? L"Recording the combined video plus a separate desktop file."
+        : L"Recording the combined video plus a separate camera file.";
+}
+// Report and error prefixes name each file only when a set has several.
+const wchar_t* outputLabel(OutputKind kind) {
+    return kind == OutputKind::Desktop ? L"Desktop" : kind == OutputKind::Camera ? L"Camera" : L"Combined";
+}
+const wchar_t* outputNoun(OutputKind kind) {
+    return kind == OutputKind::Desktop ? L"desktop" : kind == OutputKind::Camera ? L"camera" : L"combined";
+}
+const wchar_t* outputSuffix(OutputKind kind) {
+    return kind == OutputKind::Desktop ? L"-desktop" : kind == OutputKind::Camera ? L"-camera" : L"";
 }
 bool usesNightCamera(const Settings& settings) {
-    return settings.night.enabled && (settings.separateFiles || std::any_of(settings.layers.begin(), settings.layers.end(),
-        [](const Layer& layer) { return layer.source == Source::Camera; }));
+    return settings.night.enabled && (recordingSources(settings) & 2u) != 0;
 }
 bool usesPersonChecks(TimeSkipMode mode) noexcept {
-    return mode == TimeSkipMode::NoPerson || mode == TimeSkipMode::NoPersonWithinSchedule;
+    return mode == TimeSkipMode::NoPerson || mode == TimeSkipMode::NoPersonWithinSchedule || mode == TimeSkipMode::PersonOnly;
 }
 int nightWindowDuration(const Settings& settings, int suggested) {
     const int maximum = std::min(NightMaxDurationMs, settings.intervalMs);
@@ -102,7 +115,7 @@ std::wstring recordingDirectoryIO(const std::wstring& absoluteFolder) {
 struct RecordingSpace {
     ULONGLONG available = 0;
     DWORD failure = ERROR_SUCCESS;
-    bool enough(bool separateFiles) const { return failure == ERROR_SUCCESS && available > RecordingReservePerVideo * (separateFiles ? 2 : 1); }
+    bool enough(size_t outputs) const { return failure == ERROR_SUCCESS && available > RecordingReservePerVideo * std::max<size_t>(outputs, 1); }
 };
 RecordingSpace queryRecordingSpace(const std::wstring& folderIO) {
     ULARGE_INTEGER available{};
@@ -114,11 +127,13 @@ RecordingSpace queryRecordingSpace(const std::wstring& folderIO) {
     // be much larger. Check the combined reserve before admitting either write.
     return {available.QuadPart, ERROR_SUCCESS};
 }
-std::wstring recordingSpaceProblem(const RecordingSpace& space, bool separateFiles) {
+std::wstring recordingSpaceProblem(const RecordingSpace& space, size_t outputs) {
     if (space.failure != ERROR_SUCCESS)
         return L"Cannot check available space in the save folder. " + errorText(HRESULT_FROM_WIN32(space.failure));
-    return std::wstring(L"The save folder needs more than ") + (separateFiles ? L"128" : L"64") +
-        L" MiB available to leave room for finishing the video. Free space or choose another folder.";
+    const auto reserveMiB = RecordingReservePerVideo / (1024 * 1024) * std::max<size_t>(outputs, 1);
+    return L"The save folder needs more than " + std::to_wstring(reserveMiB) +
+        (outputs > 1 ? L" MiB available to leave room for finishing the videos." : L" MiB available to leave room for finishing the video.") +
+        L" Free space or choose another folder.";
 }
 // Applies only to this worker thread. Releasing the request restores normal
 // Windows sleep behavior; no persistent power settings are changed.
@@ -150,7 +165,7 @@ Engine::~Engine() {
 }
 void Engine::configure(const Settings& s) {
     { std::lock_guard<std::mutex> lock(mutex_);
-      auto sources = [](const Settings& config) { int mask = config.separateFiles ? 3 : 0; for (const auto& layer : config.layers) mask |= layer.source == Source::Desktop ? 1 : 2; return mask; };
+      const auto sources = [](const Settings& config) { return static_cast<int>(recordingSources(config)); };
       const int mask = sources(s);
       const bool cameraTierChanged = status_.state == State::Idle && (mask & 2) &&
           cameraResolutionForOutput(s.width, s.height) != cameraResolutionForOutput(settings_.width, settings_.height);
@@ -176,10 +191,10 @@ void Engine::retirePreview(bool visualOnly) {
     if (visualOnly) ++visualPreviewGeneration_;
     else ++previewGeneration_;
     status_.preview.reset();
-    if (!previewProblem_) return;
-    previewProblem_ = false;
+    if (!previewProblem_ && !sourceWarning_) return;
+    previewProblem_ = sourceWarning_ = false;
     status_.error = false;
-    status_.message = status_.state == State::Recording ? recordingMessage(settings_.separateFiles)
+    status_.message = status_.state == State::Recording ? recordingMessage(sessionPlan_)
         : status_.state == State::Paused ? L"Paused. Resume when you are ready."
         : status_.state == State::Starting ? L"Preparing recording..."
         : status_.state == State::Waiting ? L"Waiting to start recording..."
@@ -195,7 +210,7 @@ void Engine::refreshSources() {
           !status_.savedPath.empty() || !status_.savedPaths.empty());
       retireCameraInput();
       retirePreview();
-      retrySources_ = true; previewProblem_ = false;
+      retrySources_ = true; previewProblem_ = sourceWarning_ = false;
       if (!retainOutcome) { status_.error = false; status_.message = L"Ready to record."; } }
     wake_.notify_one();
 }
@@ -218,7 +233,7 @@ void Engine::record() {
       if (request) message = !rejection.empty() ? std::move(rejection) : L"Waiting to start recording...";
       std::wstring cancellation;
       if (delayed) cancellation = L"Delayed start cancelled.";
-      ++previewGeneration_; previewProblem_ = false;
+      ++previewGeneration_; previewProblem_ = sourceWarning_ = false;
       stop_ = pauseRequested_ = pauseTarget_ = false;
       requestedCursor_ = request ? request->captureCursor : settings_.captureCursor;
       requestedOutputFps_ = request ? request->outputFps : settings_.outputFps;
@@ -270,8 +285,14 @@ void Engine::run() {
         std::optional<CameraClient> camera;
         std::optional<PersonClient> personClient;
         std::unique_ptr<CameraPersonInput> personInput;
-        std::optional<Encoder> encoder;
-        std::optional<Encoder> cameraEncoder;
+        // One writer per planned output. Index 0 is the primary output, whose
+        // frame count opens split parts; every writer receives the same samples.
+        std::array<std::optional<Encoder>, MaxRecordingOutputs> encoders;
+        OutputPlan plan;
+        // Sources needed when Record was accepted; later additions are optional.
+        unsigned requiredSources = 0;
+        std::vector<Layer> visibleLayers;
+        bool omissionShown = false;
         RecordingPower power;
         std::optional<Settings> session;
         std::optional<Settings> delayedRequest;
@@ -303,8 +324,13 @@ void Engine::run() {
         // Capture and encode storage belongs only to the worker. Retain its
         // allocation across samples instead of allocating several megabytes on
         // every refresh. Published preview frames never share this storage.
-        Frame desktop, webcam, composed, cameraComposed;
-        std::vector<Layer> desktopLayers, cameraLayers;
+        Frame desktop, webcam;
+        std::array<Frame, MaxRecordingOutputs> composed;
+        std::vector<Layer> desktopLayers = preset(Mode::Desktop), cameraLayers = preset(Mode::Camera);
+        auto releaseFrames = [&](bool sources) noexcept {
+            if (sources) { desktop = {}; webcam = {}; }
+            for (auto& frame : composed) frame = {};
+        };
         std::shared_ptr<Frame> previewBuffer;
         auto preparePreviewBuffer = [&]() -> Frame& {
             // Keep at most one retired frame for reuse. A UI snapshot can keep
@@ -312,13 +338,23 @@ void Engine::run() {
             if (!previewBuffer || previewBuffer.use_count() != 1) previewBuffer = std::make_shared<Frame>();
             return *previewBuffer;
         };
-        std::wstring activeCamera, temporary, finalPath, temporaryIO, finalPathIO, sourceError, recordingFolder, recordingFolderIO;
+        std::wstring activeCamera, sourceError, recordingFolder, recordingFolderIO;
         CameraResolution activeCameraResolution = CameraResolution::Standard720;
-        std::wstring cameraTemporary, cameraFinalPath, cameraTemporaryIO, cameraFinalPathIO;
+        std::array<std::wstring, MaxRecordingOutputs> temporaries, finals, temporariesIO, finalsIO;
         bool cameraRunning = false, pending = false, writing = false, paused = false;
-        bool cameraWriting = false, segmentWriting = false, sessionStarted = false, segmentFailed = false;
+        bool sessionStarted = false, segmentFailed = false;
+        // Writers opened for the current part; [0] is the primary writer.
+        std::array<bool, MaxRecordingOutputs> partOpen{};
+        bool& segmentWriting = partOpen[0];
         uint64_t segmentOrdinal = 0, completedSegments = 0;
-        std::array<uint64_t, 2> closedFrames{};
+        std::array<uint64_t, MaxRecordingOutputs> closedFrames{};
+        auto sessionFrames = [&]() -> uint64_t {
+            // Every output receives the same samples; report the common count.
+            uint64_t frames = UINT64_MAX;
+            for (size_t i = 0; i < plan.count; ++i)
+                frames = std::min(frames, segmentFrameTotal(closedFrames[i], encoders[i] ? encoders[i]->frames() : 0));
+            return plan.count ? frames : 0;
+        };
         Clock::duration nextSegmentBoundary{};
         std::wstring sessionStem;
         bool nightMode = false, nightQueued = false, nightFrameReady = false;
@@ -448,6 +484,7 @@ void Engine::run() {
             if (skipDecision.returnToBase) returnToBase();
             skipStatus.reason = skipDecision.reason;
             skipStatus.intervalMs = skipDecision.intervalMs;
+            skipStatus.suspended = skipDecision.suspended;
             if (skipStatus.observationDelayed && !skipStatus.diagnostic[0]) {
                 const wchar_t* delayed = personMode ? L"Person checks are delayed. Normal cadence resumes when source images become stale."
                     : L"Activity checks are delayed; unseen activity may be missed. Normal cadence resumes when observations become stale.";
@@ -670,12 +707,12 @@ void Engine::run() {
                 activeDuration >= std::chrono::seconds(session->recordingLimitSeconds);
         };
         auto segmentDeadline = [&] {
-            return writing && !paused && session && session->segmentDurationSeconds > 0 && segmentWriting && encoder->frames()
+            return writing && !paused && session && session->segmentDurationSeconds > 0 && segmentWriting && encoders[0]->frames()
                 ? lastTick + (nextSegmentBoundary - activeDuration) : Clock::time_point::max();
         };
         auto segmentExpired = [&] {
             return writing && !paused && session && session->segmentDurationSeconds > 0 && segmentWriting &&
-                encoder->frames() && activeDuration >= nextSegmentBoundary;
+                encoders[0]->frames() && activeDuration >= nextSegmentBoundary;
         };
         auto publishError = [&](const std::wstring& message, bool reset) {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -683,8 +720,31 @@ void Engine::run() {
             if (start_) return;
             if (reset && status_.state != State::Idle) status_.recordingFailed = true;
             status_.error = true; status_.message = message;
-            previewProblem_ = false;
+            previewProblem_ = sourceWarning_ = false;
             if (reset) status_.state = State::Idle;
+        };
+        // Report (missing != 0) or retire an optional source left out of the layout.
+        auto reportOmission = [&](unsigned missing, const std::wstring& problem) {
+            if (!missing && !omissionShown) return;
+            std::wstring message;
+            if (missing) {
+                message = missing == 2u ? L"Camera unavailable; recording continues without it."
+                    : missing == 1u ? L"Display unavailable; recording continues without it."
+                    : L"Sources unavailable; recording continues without them.";
+                if (!problem.empty()) message += L" " + problem;
+                message += L" Switch the source away and back to retry.";
+            }
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (start_) return;
+            if (missing) {
+                // Never hide a recording, save or settings error behind it.
+                if (status_.error && !previewProblem_ && !sourceWarning_) return;
+                status_.error = true; status_.message.swap(message); sourceWarning_ = true; previewProblem_ = false;
+            } else if (sourceWarning_) {
+                sourceWarning_ = false; status_.error = false;
+                status_.message = paused ? L"Paused. Resume when you are ready." : recordingMessage(plan);
+            }
+            omissionShown = sourceWarning_;
         };
         auto publishPreviewError = [&](const std::wstring& message) {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -692,29 +752,28 @@ void Engine::run() {
             status_.preview.reset();
             // A preview can recover on its next refresh, but it must not
             // replace a recording or resource error that the user needs to see.
-            if (!status_.error || previewProblem_) {
+            if (!status_.error || previewProblem_ || sourceWarning_) {
                 status_.error = true;
                 status_.message = writing ? L"Preview unavailable: " + message : message;
-                previewProblem_ = true;
+                previewProblem_ = true; sourceWarning_ = false;
             }
         };
         auto finishSegment = [&](const std::wstring& reason, bool terminal) -> bool {
             if (session && session->segmentDurationSeconds > 0) {
-                const size_t count = session->separateFiles ? 2 : 1;
-                const std::array<bool, 2> opened{segmentWriting, cameraWriting};
-                const std::array<Encoder*, 2> writers{encoder ? &*encoder : nullptr, cameraEncoder ? &*cameraEncoder : nullptr};
-                const std::array<const std::wstring*, 2> temps{&temporary, &cameraTemporary}, finals{&finalPath, &cameraFinalPath};
-                const std::array<const std::wstring*, 2> tempIO{&temporaryIO, &cameraTemporaryIO}, finalIO{&finalPathIO, &cameraFinalPathIO};
-                std::array<std::wstring, 2> errors;
-                std::array<bool, 2> finalized{}, retained{};
-                std::array<uint64_t, 2> frames{}, totals = closedFrames;
+                const size_t count = plan.count;
+                const auto opened = partOpen;
+                std::array<Encoder*, MaxRecordingOutputs> writers{};
+                for (size_t i = 0; i < count; ++i) writers[i] = encoders[i] ? &*encoders[i] : nullptr;
+                std::array<std::wstring, MaxRecordingOutputs> errors;
+                std::array<bool, MaxRecordingOutputs> finalized{}, retained{};
+                std::array<uint64_t, MaxRecordingOutputs> frames{}, totals = closedFrames;
                 bool hasCurrent = false;
                 for (size_t i = 0; i < count; ++i) if (opened[i]) {
                     hasCurrent = true;
                     frames[i] = writers[i]->frames();
                     totals[i] = segmentFrameTotal(closedFrames[i], frames[i]);
                     finalized[i] = writers[i]->finishForPublication(errors[i]);
-                    const DWORD attrs = !finalized[i] ? GetFileAttributesW(tempIO[i]->c_str()) : INVALID_FILE_ATTRIBUTES;
+                    const DWORD attrs = !finalized[i] ? GetFileAttributesW(temporariesIO[i].c_str()) : INVALID_FILE_ATTRIBUTES;
                     retained[i] = attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
                 }
                 // Automatic saving consumes active time, while a terminal save
@@ -730,7 +789,7 @@ void Engine::run() {
                     for (const auto& path : status_.savedPaths) previousFiles += L" Latest saved: " + path + L".";
                 }
                 struct Report { std::wstring first, message; std::vector<std::wstring> paths; bool error = false; uint64_t completed = 0; };
-                std::array<Report, 4> reports;
+                std::array<Report, size_t(1) << MaxRecordingOutputs> reports;
                 const size_t masks = size_t(1) << count;
                 for (size_t mask = 0; mask < masks; ++mask) {
                     auto& report = reports[mask];
@@ -742,10 +801,10 @@ void Engine::run() {
                         complete &= finalized[i] && (mask & (size_t(1) << i)) != 0;
                         if (!opened[i]) continue;
                         if (!report.message.empty()) report.message += L" ";
-                        if (count == 2) report.message += i == 0 ? L"Desktop: " : L"Camera: ";
+                        if (count > 1) { report.message += outputLabel(plan.kinds[i]); report.message += L": "; }
                         if (finalized[i]) {
                             const bool renamed = (mask & (size_t(1) << i)) != 0;
-                            const auto& path = *(renamed ? finals[i] : temps[i]);
+                            const auto& path = renamed ? finals[i] : temporaries[i];
                             report.paths.push_back(path);
                             report.message += renamed ? L"Saved: " : L"Could not publish the final filename; finished video remains at: ";
                             report.message += path + L" (" + std::to_wstring(frames[i]) + L" frames).";
@@ -753,7 +812,7 @@ void Engine::run() {
                         } else if (frames[i] || retained[i]) {
                             report.error = true;
                             report.message += L"Could not finish video: " + errors[i];
-                            if (retained[i]) report.message += L" Partial file: " + *temps[i];
+                            if (retained[i]) report.message += L" Partial file: " + temporaries[i];
                         } else report.message += L"No frames saved in this part.";
                     }
                     if (complete && completedSegments == UINT64_MAX) throw std::overflow_error("Recording segment count exhausted");
@@ -770,57 +829,59 @@ void Engine::run() {
                 // not allocate, even when that later publication throws.
                 size_t published = 0;
                 for (size_t i = 0; i < count; ++i) if (finalized[i]) {
-                    try { if (writers[i]->publish(*finalIO[i]) == ERROR_SUCCESS) published |= size_t(1) << i; }
+                    try { if (writers[i]->publish(finalsIO[i]) == ERROR_SUCCESS) published |= size_t(1) << i; }
                     catch (const std::exception&) {}
                 }
                 auto& report = reports[published];
+                const uint64_t sessionTotal = count ? *std::min_element(totals.begin(), totals.begin() + count) : 0;
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
                     status_.elapsed = elapsed;
-                    status_.frames = count == 2 ? std::min(totals[0], totals[1]) : totals[0];
+                    status_.frames = sessionTotal;
                     status_.completedSegments = report.completed;
                     status_.error = status_.recordingFailed = report.error;
                     if (!report.paths.empty()) { status_.savedPath.swap(report.first); status_.savedPaths.swap(report.paths); }
                     status_.message.swap(report.message);
-                    previewProblem_ = false;
+                    previewProblem_ = sourceWarning_ = false;
                 }
                 closedFrames = totals; completedSegments = report.completed; segmentFailed = report.error;
                 for (size_t i = 0; i < count; ++i) if (writers[i]) writers[i]->releasePublication();
-                segmentWriting = cameraWriting = false;
+                partOpen = {};
                 return !segmentFailed;
             }
-            if (session && session->separateFiles) {
-                std::array<std::wstring, 2> errors;
-                const std::array<bool, 2> opened{writing, cameraWriting};
-                const std::array<Encoder*, 2> writers{encoder ? &*encoder : nullptr, cameraEncoder ? &*cameraEncoder : nullptr};
-                const std::array<const std::wstring*, 2> temporaryNames{&temporary, &cameraTemporary};
-                const std::array<const std::wstring*, 2> finalNames{&finalPath, &cameraFinalPath};
-                const std::array<const std::wstring*, 2> temporaryNamesIO{&temporaryIO, &cameraTemporaryIO};
-                const std::array<const std::wstring*, 2> finalNamesIO{&finalPathIO, &cameraFinalPathIO};
-                std::array<bool, 2> finalized{}, partial{};
-                std::array<uint64_t, 2> frameCounts{};
-                for (size_t i = 0; i < writers.size(); ++i) if (opened[i]) {
+            if (session && plan.count > 1) {
+                const size_t count = plan.count;
+                std::array<std::wstring, MaxRecordingOutputs> errors;
+                // The primary writer is open whenever the session writes;
+                // a companion may be absent after a failed paired open.
+                auto opened = partOpen; opened[0] = writing;
+                std::array<Encoder*, MaxRecordingOutputs> writers{};
+                for (size_t i = 0; i < count; ++i) writers[i] = encoders[i] ? &*encoders[i] : nullptr;
+                std::array<bool, MaxRecordingOutputs> finalized{}, partial{};
+                std::array<uint64_t, MaxRecordingOutputs> frameCounts{};
+                for (size_t i = 0; i < count; ++i) if (opened[i]) {
                     frameCounts[i] = writers[i]->frames();
                     finalized[i] = writers[i]->finishForPublication(errors[i]);
-                    const DWORD attributes = !finalized[i] && frameCounts[i] ? GetFileAttributesW(temporaryNamesIO[i]->c_str()) : INVALID_FILE_ATTRIBUTES;
+                    const DWORD attributes = !finalized[i] && frameCounts[i] ? GetFileAttributesW(temporariesIO[i].c_str()) : INVALID_FILE_ATTRIBUTES;
                     partial[i] = attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
                 }
                 struct Report { std::wstring first, message; std::vector<std::wstring> paths; bool error = false; };
-                std::array<Report, 4> reports;
+                std::array<Report, size_t(1) << MaxRecordingOutputs> reports;
                 // Prepare every possible publication result before the first
                 // rename. A later writer's allocation failure can then report
-                // the first saved movie and the second retained movie without
+                // the earlier saved movies and the retained ones without
                 // allocating or losing the identity-bound ownership guards.
-                for (size_t mask = 0; mask < reports.size(); ++mask) {
+                const size_t masks = size_t(1) << count;
+                for (size_t mask = 0; mask < masks; ++mask) {
                     auto& report = reports[mask];
                     report.error = !reason.empty();
                     report.message = reason.empty() && recordingLimitReached ? L"Recording time limit reached." : reason;
-                    for (size_t i = 0; i < writers.size(); ++i) {
+                    for (size_t i = 0; i < count; ++i) {
                         if (!report.message.empty()) report.message += L" ";
-                        report.message += i == 0 ? L"Desktop: " : L"Camera: ";
+                        report.message += outputLabel(plan.kinds[i]); report.message += L": ";
                         if (finalized[i]) {
                             const bool renamed = (mask & (size_t(1) << i)) != 0;
-                            const auto& path = *(renamed ? finalNames[i] : temporaryNames[i]);
+                            const auto& path = renamed ? finals[i] : temporaries[i];
                             report.paths.push_back(path);
                             report.message += renamed ? L"saved " : L"could not publish the final filename; finished video remains at ";
                             report.message += path + L" (" + std::to_wstring(frameCounts[i]) + L" frames).";
@@ -828,7 +889,7 @@ void Engine::run() {
                         } else if (frameCounts[i]) {
                             report.error = true;
                             report.message += L"could not finish video: " + errors[i];
-                            if (partial[i]) report.message += L" Partial file: " + *temporaryNames[i];
+                            if (partial[i]) report.message += L" Partial file: " + temporaries[i];
                         } else {
                             report.message += L"no frames saved.";
                             report.error |= writing && !reason.empty();
@@ -837,30 +898,33 @@ void Engine::run() {
                     if (!report.paths.empty()) report.first = report.paths.front();
                 }
                 size_t publicationMask = 0;
-                for (size_t i = 0; i < writers.size(); ++i) if (finalized[i]) {
+                for (size_t i = 0; i < count; ++i) if (finalized[i]) {
                     try {
-                        if (writers[i]->publish(*finalNamesIO[i]) == ERROR_SUCCESS) publicationMask |= size_t(1) << i;
+                        if (writers[i]->publish(finalsIO[i]) == ERROR_SUCCESS) publicationMask |= size_t(1) << i;
                     } catch (const std::exception&) {
                         // publish() allocates only before its native rename.
-                        // Both finalized files are still accurately described
+                        // Every finalized file is still accurately described
                         // by the precomputed retained-file result for this bit.
                     }
                 }
                 auto& report = reports[publicationMask];
+                const uint64_t frames = *std::min_element(frameCounts.begin(), frameCounts.begin() + count);
                 std::lock_guard<std::mutex> lock(mutex_);
                 stop_ = pauseRequested_ = pauseTarget_ = false;
                 status_.state = State::Idle; status_.elapsed = elapsed;
-                status_.frames = std::min(frameCounts[0], frameCounts[1]);
+                status_.frames = frames;
                 status_.error = status_.recordingFailed = report.error;
                 status_.savedPath.swap(report.first); status_.savedPaths.swap(report.paths); status_.message.swap(report.message);
-                if (encoder) encoder->releasePublication();
-                if (cameraEncoder) cameraEncoder->releasePublication();
-                writing = segmentWriting = cameraWriting = pending = paused = false; previewProblem_ = false;
+                for (auto& writer : encoders) if (writer) writer->releasePublication();
+                writing = pending = paused = false; partOpen = {}; previewProblem_ = sourceWarning_ = false;
                 recordingLimitReached = false;
-                desktop = {}; webcam = {}; composed = {}; cameraComposed = {};
+                releaseFrames(true);
                 power.update(false, false);
                 return !report.error;
             }
+            auto& encoder = encoders[0];
+            const auto& temporary = temporaries[0];
+            const auto& finalPath = finals[0];
             std::wstring error;
             const bool finalized = writing && encoder->finishForPublication(error);
             bool ok = !writing;
@@ -875,7 +939,7 @@ void Engine::run() {
                 savedPaths.push_back(finalPath);
                 message = reason.empty() ? (recordingLimitReached ? L"Recording time limit reached. Saved: " : L"Saved: ") + finalPath
                     : reason + L" Captured frames were saved.";
-                const DWORD renameError = encoder->publish(finalPathIO);
+                const DWORD renameError = encoder->publish(finalsIO[0]);
                 ok = renameError == ERROR_SUCCESS;
                 if (!ok) {
                     savedPath = temporary;
@@ -883,7 +947,7 @@ void Engine::run() {
                     message = failureContext + L"Video finished, but could not rename it. Finished video remains at: " + temporary + L". " + errorText(HRESULT_FROM_WIN32(renameError));
                 }
             } else if (writing) {
-                const DWORD attributes = encoder->frames() > 0 ? GetFileAttributesW(temporaryIO.c_str()) : INVALID_FILE_ATTRIBUTES;
+                const DWORD attributes = encoder->frames() > 0 ? GetFileAttributesW(temporariesIO[0].c_str()) : INVALID_FILE_ATTRIBUTES;
                 const bool retainedPartial = attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY);
                 message = failureContext + L"Could not finish video: " + error + (retainedPartial ? L" Partial file: " + temporary : L"");
             } else message = reason.empty() ? L"Recording cancelled." : reason;
@@ -898,9 +962,9 @@ void Engine::run() {
             if (finalized) { status_.savedPath.swap(savedPath); status_.savedPaths.swap(savedPaths); }
             status_.message.swap(message);
             if (encoder) encoder->releasePublication();
-            writing = segmentWriting = pending = paused = false; previewProblem_ = false;
+            writing = pending = paused = false; partOpen = {}; previewProblem_ = sourceWarning_ = false;
             recordingLimitReached = false;
-            desktop = {}; webcam = {}; composed = {};
+            releaseFrames(true);
             power.update(false, false);
             return !status_.error;
         };
@@ -927,8 +991,8 @@ void Engine::run() {
               // A recovery marker can fail after the writer accepted a sample.
               // Publish its count before reporting can allocate or retry; a
               // writerless new attempt must not reuse the prior encoder count.
-              if (!session || (!session->separateFiles && session->segmentDurationSeconds <= 0))
-                  status_.frames = writing && encoder ? encoder->frames() : 0;
+              if (!session || (plan.count < 2 && session->segmentDurationSeconds <= 0))
+                  status_.frames = writing && encoders[0] ? encoders[0]->frames() : 0;
               if (!segmentFailed) status_.message = L"Finishing MP4...";
               keepCamera = settings_.preview; }
             if (!keepCamera && cameraRunning) { clearCameraInput(); camera->stop(); cameraRunning = false; activeCamera.clear(); }
@@ -938,9 +1002,9 @@ void Engine::run() {
             if (!session || session->segmentDurationSeconds <= 0) return;
             { std::lock_guard<std::mutex> lock(mutex_);
               stop_ = pauseRequested_ = pauseTarget_ = false; status_.state = State::Idle; status_.elapsed = elapsed; }
-            writing = segmentWriting = cameraWriting = pending = paused = false;
+            writing = pending = paused = false; partOpen = {};
             recordingLimitReached = false;
-            desktop = {}; webcam = {}; composed = {}; cameraComposed = {};
+            releaseFrames(true);
             power.update(false, false);
         };
         auto endDelayedRequest = [&](const std::wstring& problem, bool failed) {
@@ -951,8 +1015,8 @@ void Engine::run() {
             if (writing && !sessionStarted) {
                 std::wstring cleanup;
                 bool discarded = true;
-                const std::array<Encoder*, 2> writers{segmentWriting && encoder ? &*encoder : nullptr,
-                    cameraWriting && cameraEncoder ? &*cameraEncoder : nullptr};
+                std::array<Encoder*, MaxRecordingOutputs> writers{};
+                for (size_t i = 0; i < plan.count; ++i) if (partOpen[i] && encoders[i]) writers[i] = &*encoders[i];
                 for (auto* writer : writers) if (writer) {
                     std::wstring error;
                     writer->finish(error);
@@ -964,14 +1028,14 @@ void Engine::run() {
                     writer->releasePublication();
                 }
                 if (!discarded) { failed = true; message += L" Empty output cleanup failed: " + cleanup; }
-                writing = segmentWriting = cameraWriting = false;
+                writing = false; partOpen = {};
             }
             if (pending || delayedOrigin) {
                 cancelNight(); nightMode = false;
                 cancelObservation(); skipping = observing = false; observationDesktop = {};
                 resetWatermark(); releaseDesktopCaptureCache();
                 pending = paused = false; sessionStarted = false; delayedLayersFrozen = false;
-                desktop = {}; webcam = {}; composed = {}; cameraComposed = {};
+                releaseFrames(true);
             }
             bool keepCamera;
             { std::lock_guard<std::mutex> lock(mutex_); keepCamera = settings_.preview; }
@@ -986,7 +1050,7 @@ void Engine::run() {
                 status_.state = State::Idle; status_.startDeadlineTick = 0;
                 status_.frames = 0; status_.elapsed = 0; status_.completedSegments = 0;
                 status_.nightEnabled = status_.nightWaiting = false; status_.timeSkip = {};
-                status_.error = status_.recordingFailed = failed; previewProblem_ = false;
+                status_.error = status_.recordingFailed = failed; previewProblem_ = sourceWarning_ = false;
                 status_.message.swap(message);
             }
         };
@@ -1062,7 +1126,7 @@ void Engine::run() {
                       delayedOrigin = delayedLayersFrozen = delayedStartPending_ = delayedCancel_ = false;
                       start_ = stop_ = pauseRequested_ = pauseTarget_ = false;
                       status_.state = State::Idle; status_.startDeadlineTick = 0;
-                      status_.error = status_.recordingFailed = previewProblem_ = false;
+                      status_.error = status_.recordingFailed = previewProblem_ = sourceWarning_ = false;
                       status_.nightEnabled = status_.nightWaiting = false;
                       status_.message.swap(delayedCancellationMessage_);
                       power.update(false, false);
@@ -1097,7 +1161,7 @@ void Engine::run() {
                 if (cancelledWaiting) {
                     if (!cancelledPreview) {
                         releaseDesktopCaptureCache(); resetWatermark();
-                        desktop = {}; webcam = {}; composed = {}; cameraComposed = {}; previewBuffer.reset();
+                        releaseFrames(true); previewBuffer.reset();
                         if (cameraRunning) { clearCameraInput(); camera->stop(); cameraRunning = false; activeCamera.clear(); }
                     }
                     continue;
@@ -1146,9 +1210,11 @@ void Engine::run() {
                 if (start) {
                     previewOnlyWork = false;
                     personFault = false; personFailure = {};
-                    session.emplace(cfg); pending = true; elapsed = 0;
+                    session.emplace(cfg); plan = outputPlan(cfg); pending = true; elapsed = 0;
+                    requiredSources = recordingSources(cfg);
+                    { std::lock_guard<std::mutex> lock(mutex_); sessionPlan_ = plan; }
                     resetWatermark(); incomingIntervalMs = cfg.intervalMs;
-                    segmentWriting = cameraWriting = sessionStarted = segmentFailed = false;
+                    partOpen = {}; sessionStarted = segmentFailed = false;
                     closedFrames = {}; segmentOrdinal = completedSegments = 0; sessionStem.clear();
                     activeDuration = Clock::duration::zero(); recordingLimitReached = false; terminalClockFrozen = false;
                     cancelNight(); nightMode = usesNightCamera(cfg);
@@ -1161,7 +1227,6 @@ void Engine::run() {
                     }
                     session->timeSkip = cfg.timeSkip;
                     resetSkipRequested = true; lastAdmission = Clock::time_point::min();
-                    if (cfg.separateFiles) { desktopLayers = preset(Mode::Desktop); cameraLayers = preset(Mode::Camera); }
                     nextFrame = now;
                     retryFrameAt = Clock::time_point::min();
                 }
@@ -1181,16 +1246,16 @@ void Engine::run() {
                     paused = pauseTarget;
                     if (paused) releaseDesktopCaptureCache();
                     resetSkipRequested = skipping;
-                    const bool desktopNeeded = (session && session->separateFiles) || std::any_of(cfg.layers.begin(), cfg.layers.end(),
-                        [](const Layer& layer) { return layer.source == Source::Desktop; });
+                    const bool desktopNeeded = (recordingSources(session ? *session : cfg) & 1u) != 0;
                     power.update(!paused, desktopNeeded);
                     if (!paused) { nextFrame = now; nightStartAt = now; retryFrameAt = Clock::time_point::min(); incomingIntervalMs = cfg.intervalMs; }
                     std::lock_guard<std::mutex> lock(mutex_);
                     status_.state = paused ? State::Paused : State::Recording;
                     status_.nightWaiting = nightMode && !paused;
                     status_.elapsed = elapsed;
+                    if (sourceWarning_) { sourceWarning_ = false; status_.error = false; }
                     if (!previewProblem_)
-                        status_.message = paused ? L"Paused. Resume when you are ready." : recordingMessage(session && session->separateFiles);
+                        status_.message = paused ? L"Paused. Resume when you are ready." : recordingMessage(plan);
                 }
                 bool captureDue = pending || (writing && !paused && now >= nextFrame);
                 // An overdue part still owns required work while applying the
@@ -1200,7 +1265,7 @@ void Engine::run() {
                 if (writing || pending) {
                     if (writing && cfg.intervalMs != session->intervalMs) {
                         std::wstring error;
-                        const int minimum = usesNightCamera(*session)
+                        const int minimum = session->night.enabled
                             ? std::max(NightMinDurationMs, session->night.durationMs) : MinCaptureIntervalMs;
                         // Invalid live requests leave the current recording intact.
                         if (cfg.intervalMs >= minimum && validateCaptureInterval(cfg.intervalMs, error)) {
@@ -1216,8 +1281,12 @@ void Engine::run() {
                     session->preview = cfg.preview;
                     cfg = *session;
                 }
-                bool needCamera = cfg.separateFiles, needDesktop = cfg.separateFiles;
-                for (auto& layer : cfg.layers) { needCamera |= layer.source == Source::Camera; needDesktop |= layer.source == Source::Desktop; }
+                // A session's frozen output plan keeps its companion sources
+                // even if live layout edits change what the collage shows.
+                unsigned sourcesNeeded = recordingSources(cfg);
+                if (writing || pending) for (size_t i = 0; i < plan.count; ++i)
+                    if (plan.kinds[i] != OutputKind::Layout) sourcesNeeded |= plan.kinds[i] == OutputKind::Desktop ? 1u : 2u;
+                const bool needDesktop = (sourcesNeeded & 1u) != 0, needCamera = (sourcesNeeded & 2u) != 0;
                 // cfg is the frozen recording snapshot while a session exists.
                 // Idle previews request detail only when the output needs it.
                 const auto cameraResolution = cameraResolutionForOutput(cfg.width, cfg.height);
@@ -1283,7 +1352,7 @@ void Engine::run() {
                 if (watermarkPrepared && (!cfg.watermark.enabled || (!writing && !pending && !active))) resetWatermark();
                 if (!cfg.preview) previewBuffer.reset();
                 if (!active || !needDesktop) releaseDesktopCaptureCache();
-                if (!active) { desktop = {}; webcam = {}; composed = {}; cameraComposed = {}; }
+                if (!active) releaseFrames(true);
                 else {
                     if (!needDesktop) desktop = {};
                     if (!needCamera) webcam = {};
@@ -1343,6 +1412,13 @@ void Engine::run() {
                     // The helper owns the integration window and intermediate
                     // pixels. Parent wakes only for commands, preview, the
                     // recording clock, or this bounded completion observation.
+                    // A person-only suspension starts no blend; a returning
+                    // person brings a complete window forward (returnToBase).
+                    if (skipping && skipDecision.suspended && !nightQueued && now >= nightStartAt) {
+                        const auto duration = std::chrono::milliseconds(nightWindowDuration(cfg, suggestedNightDurationMs));
+                        nightStartAt = Clock::now() + std::chrono::milliseconds(cfg.intervalMs);
+                        nextFrame = nightStartAt + duration;
+                    }
                     if (cameraRunning && !nightQueued && now >= nightStartAt && now >= retryFrameAt) {
                         previewOnlyWork = false;
                         nightDurationMs = nightWindowDuration(cfg, suggestedNightDurationMs);
@@ -1383,6 +1459,13 @@ void Engine::run() {
                     captureDue = nightCompleted;
                     if (!cameraRunning) { closeRecording(sourceError.empty() ? L"No camera available for night recording." : sourceError); continue; }
                 }
+                if (captureDue && skipping && skipDecision.suspended && writing && !paused && sessionStarted) {
+                    // Person-only recording admits nothing while nobody is
+                    // detected. Recheck at the base cadence; a detected person
+                    // brings the deadline forward immediately (returnToBase).
+                    captureDue = false;
+                    if (!nightMode) nextFrame = Clock::now() + std::chrono::milliseconds(cfg.intervalMs);
+                }
                 if (!captureDue && !previewDue) {
                     continue;
                 }
@@ -1394,6 +1477,13 @@ void Engine::run() {
                 if (refreshPreview) lastPreview = now;
                 std::wstring error;
                 bool ready = true, cameraWaiting = false;
+                // A source that only a live layout edit added after Record is
+                // optional: leave it out of the layout rather than stopping.
+                // Sources selected at Record keep their stop-and-save policy.
+                const unsigned optionalSources = writing || pending ? sourcesNeeded & ~requiredSources : 0u;
+                unsigned omitted = 0;
+                bool omissionFailed = false;
+                std::wstring omissionError;
                 if (needCamera && !(nightMode && nightFrameReady)) {
                     readingCameraInput = true;
                     ready = cameraRunning && camera->latest(webcam, error);
@@ -1415,15 +1505,51 @@ void Engine::run() {
                             returnToBase(); inspectSkipping();
                         }
                     }
+                    if (!ready && (optionalSources & 2u)) {
+                        // Warming is ordinary startup; only a failure is reported.
+                        omitted |= 2u; omissionFailed = !cameraWaiting; omissionError.swap(error); ready = true;
+                    }
                 }
                 const auto previewSize = previewDimensions(cfg.width, cfg.height);
                 const int width = captureDue ? cfg.width : previewSize.first, height = captureDue ? cfg.height : previewSize.second;
-                if (needDesktop && ready) ready = captureMonitor(cfg.monitorId, width, height, cfg.captureCursor, desktop, error);
-                if (ready && captureDue && cfg.separateFiles) {
-                    ready = compose(&desktop, nullptr, desktopLayers, width, height, composed, error) &&
-                        compose(nullptr, &webcam, cameraLayers, width, height, cameraComposed, error);
-                } else if (ready) ready = compose(needDesktop ? &desktop : nullptr, needCamera ? &webcam : nullptr, cfg.layers,
-                    width, height, captureDue ? composed : preparePreviewBuffer(), error);
+                if (needDesktop && ready && !captureMonitor(cfg.monitorId, width, height, cfg.captureCursor, desktop, error)) {
+                    if (optionalSources & 1u) { omitted |= 1u; omissionFailed = true; omissionError.swap(error); error.clear(); }
+                    else ready = false;
+                }
+                const std::vector<Layer>* layoutLayers = &cfg.layers;
+                if (ready && omitted) {
+                    visibleLayers.clear();
+                    for (const auto& layer : cfg.layers)
+                        if (!(omitted & (layer.source == Source::Desktop ? 1u : 2u))) visibleLayers.push_back(layer);
+                    layoutLayers = &visibleLayers;
+                    if (visibleLayers.empty()) {
+                        // Nothing in the layout can be drawn. A warming camera
+                        // retries promptly; a failed one skips this sample.
+                        if (!omissionFailed) { if (captureDue) retryFrameAt = Clock::now() + std::chrono::milliseconds(50); continue; }
+                        reportOmission(omitted, omissionError);
+                        if (captureDue && !nightMode) nextFrame = Clock::now() + std::chrono::milliseconds(cfg.intervalMs);
+                        continue;
+                    }
+                }
+                const Frame* layoutDesktop = needDesktop && !(omitted & 1u) ? &desktop : nullptr;
+                const Frame* layoutCamera = needCamera && !(omitted & 2u) ? &webcam : nullptr;
+                if (ready && captureDue) {
+                    // Each output composes the same captured sources once; the
+                    // layout follows live edits, companions stay full-frame.
+                    for (size_t i = 0; ready && i < plan.count; ++i) {
+                        const auto kind = plan.kinds[i];
+                        ready = kind == OutputKind::Desktop ? compose(&desktop, nullptr, desktopLayers, width, height, composed[i], error)
+                            : kind == OutputKind::Camera ? compose(nullptr, &webcam, cameraLayers, width, height, composed[i], error)
+                            : compose(layoutDesktop, layoutCamera, *layoutLayers, width, height, composed[i], error);
+                    }
+                } else if (ready) ready = compose(layoutDesktop, layoutCamera, *layoutLayers,
+                    width, height, preparePreviewBuffer(), error);
+                if (ready) {
+                    // Report a failed optional source, or retire that report once
+                    // every source the layout needs is drawn again.
+                    if (omissionFailed) reportOmission(omitted, omissionError);
+                    else if (!omitted) reportOmission(0, omissionError);
+                }
                 if (!ready) {
                     // Also allow warmup after resuming with preview disabled:
                     // that pause releases the camera and resume opens it again.
@@ -1484,8 +1610,8 @@ void Engine::run() {
                             if (sessionStarted) advanceElapsed(Clock::now());
                             if (limitExpired()) { recordingLimitReached = true; closeRecording(L""); admit = false; break; }
                             if (commandPending()) { admit = false; break; }
-                            if (cfg.stopOnLowDiskSpace && !space.enough(cfg.separateFiles)) {
-                                closeRecording(L"Cannot start recording: " + recordingSpaceProblem(space, cfg.separateFiles) + L" Save folder: " + recordingFolder); admit = false; break;
+                            if (cfg.stopOnLowDiskSpace && !space.enough(plan.count)) {
+                                closeRecording(L"Cannot start recording: " + recordingSpaceProblem(space, plan.count) + L" Save folder: " + recordingFolder); admit = false; break;
                             }
                             auto name = sessionStem;
                             if (cfg.segmentDurationSeconds > 0) {
@@ -1494,44 +1620,48 @@ void Engine::run() {
                                 name += part;
                             }
                             const auto base = (std::filesystem::path(recordingFolder) / name).wstring();
-                            const auto desktopBase = cfg.separateFiles ? base + L"-desktop" : base;
-                            temporary = desktopBase + L".recording.mp4"; finalPath = desktopBase + L".mp4";
                             const auto ioBase = recordingFolderIO + name;
-                            const auto desktopIOBase = cfg.separateFiles ? ioBase + L"-desktop" : ioBase;
-                            temporaryIO = desktopIOBase + L".recording.mp4"; finalPathIO = desktopIOBase + L".mp4";
-                            if (cfg.separateFiles) {
-                                cameraTemporary = base + L"-camera.recording.mp4"; cameraFinalPath = base + L"-camera.mp4";
-                                cameraTemporaryIO = ioBase + L"-camera.recording.mp4"; cameraFinalPathIO = ioBase + L"-camera.mp4";
+                            for (size_t i = 0; i < plan.count; ++i) {
+                                // A single layout keeps the plain session name.
+                                const std::wstring suffix = plan.count > 1 ? outputSuffix(plan.kinds[i]) : L"";
+                                temporaries[i] = base + suffix + L".recording.mp4"; finals[i] = base + suffix + L".mp4";
+                                temporariesIO[i] = ioBase + suffix + L".recording.mp4"; finalsIO[i] = ioBase + suffix + L".mp4";
                             }
-                            if (!encoder) encoder.emplace();
-                            if (!encoder->open(temporaryIO, cfg.width, cfg.height, cfg.outputFps, error, cfg.encodingQuality, cfg.encodingMode, cfg.recoveryMode)) {
-                                closeRecording((cfg.separateFiles ? L"Cannot start desktop recording: " : L"Cannot start recording: ") + error); admit = false; break;
+                            const auto openFailure = [&](size_t index) {
+                                return plan.count > 1 ? std::wstring(L"Cannot start ") + outputNoun(plan.kinds[index]) + L" recording: " + error
+                                    : L"Cannot start recording: " + error;
+                            };
+                            if (!encoders[0]) encoders[0].emplace();
+                            if (!encoders[0]->open(temporariesIO[0], cfg.width, cfg.height, cfg.outputFps, error, cfg.encodingQuality, cfg.encodingMode, cfg.recoveryMode)) {
+                                closeRecording(openFailure(0)); admit = false; break;
                             }
                             writing = segmentWriting = true;
-                            if (cfg.separateFiles) {
+                            bool opened = true;
+                            for (size_t i = 1; i < plan.count; ++i) {
                                 if (sessionStarted) advanceElapsed(Clock::now());
-                                if (limitExpired()) { recordingLimitReached = true; closeRecording(L""); admit = false; break; }
+                                if (limitExpired()) { recordingLimitReached = true; closeRecording(L""); opened = false; break; }
                                 if ((cfg.segmentDurationSeconds > 0 || (delayedOrigin && !sessionStarted)) && commandPending()) {
-                                    // Do not launch the second codec after a
+                                    // Do not launch another codec after a
                                     // queued command. Retire this owned empty
                                     // prospective part before Pause is serviced.
                                     if (delayedOrigin && !sessionStarted) endDelayedRequest(L"", false);
                                     else if (!finishSegment(L"", false)) closeRecording(L"");
-                                    admit = false; break;
+                                    opened = false; break;
                                 }
-                                if (!cameraEncoder) cameraEncoder.emplace();
-                                if (!cameraEncoder->open(cameraTemporaryIO, cfg.width, cfg.height, cfg.outputFps, error, cfg.encodingQuality, cfg.encodingMode, cfg.recoveryMode)) {
-                                    closeRecording(L"Cannot start camera recording: " + error); admit = false; break;
+                                if (!encoders[i]) encoders[i].emplace();
+                                if (!encoders[i]->open(temporariesIO[i], cfg.width, cfg.height, cfg.outputFps, error, cfg.encodingQuality, cfg.encodingMode, cfg.recoveryMode)) {
+                                    closeRecording(openFailure(i)); opened = false; break;
                                 }
-                                cameraWriting = true;
+                                partOpen[i] = true;
                             }
+                            if (!opened) { admit = false; break; }
                             pending = false;
                             if (!sessionStarted) { lastTick = Clock::now(); nextFrame = lastTick; }
                             power.update(true, !(delayedOrigin && !sessionStarted) && needDesktop);
                             { std::lock_guard<std::mutex> lock(mutex_);
                               status_.state = delayedOrigin ? State::Starting : State::Recording;
                               status_.error = false;
-                              status_.message = delayedOrigin ? L"Preparing recording..." : recordingMessage(cfg.separateFiles); }
+                              status_.message = delayedOrigin ? L"Preparing recording..." : recordingMessage(plan); }
                         }
                         if (sessionStarted) advanceElapsed(Clock::now());
                         if (limitExpired()) { recordingLimitReached = true; closeRecording(L""); admit = false; break; }
@@ -1544,8 +1674,8 @@ void Engine::run() {
                         } else advanceElapsed(Clock::now());
                         if (limitExpired()) { recordingLimitReached = true; closeRecording(L""); admit = false; break; }
                         if (commandPending()) { admit = false; break; }
-                        if (cfg.stopOnLowDiskSpace && !space.enough(cfg.separateFiles)) {
-                            closeRecording(L"Recording stopped: " + recordingSpaceProblem(space, cfg.separateFiles) + L" Save folder: " + recordingFolder); admit = false; break;
+                        if (cfg.stopOnLowDiskSpace && !space.enough(plan.count)) {
+                            closeRecording(L"Recording stopped: " + recordingSpaceProblem(space, plan.count) + L" Save folder: " + recordingFolder); admit = false; break;
                         }
                         // Expire existing evidence without new observation work
                         // after a slow automatic save/open. Both writes share
@@ -1560,24 +1690,23 @@ void Engine::run() {
                         break;
                     }
                     if (!admit) continue;
-                    if (cfg.segmentDurationSeconds > 0 && !encoder->frames()) {
+                    if (cfg.segmentDurationSeconds > 0 && !encoders[0]->frames()) {
                         nextSegmentBoundary = nextSegmentCut(activeDuration, cfg.segmentDurationSeconds);
                         ++segmentOrdinal;
                     }
                     if (!delayedOrigin) sessionStarted = true;
                     const auto admittedActiveMs = std::chrono::duration_cast<std::chrono::milliseconds>(activeDuration).count();
                     if (cfg.watermark.enabled) {
-                        // Both completed compositions share one admission context
-                        // and finish rendering before either writer accepts pixels.
+                        // Every completed composition shares one admission context
+                        // and finishes rendering before any writer accepts pixels.
                         WatermarkContext context;
                         context.activeMs = admittedActiveMs;
                         context.targetIntervalMs = incomingIntervalMs;
                         context.outputFps = cfg.outputFps;
                         GetLocalTime(&context.recordedLocal);
-                        if (!watermark.apply(composed, context, error) ||
-                            (cfg.separateFiles && !watermark.apply(cameraComposed, context, error))) {
-                            closeRecording(L"Watermark stopped recording: " + error); continue;
-                        }
+                        bool stamped = true;
+                        for (size_t i = 0; stamped && i < plan.count; ++i) stamped = watermark.apply(composed[i], context, error);
+                        if (!stamped) { closeRecording(L"Watermark stopped recording: " + error); continue; }
                         lastWatermarkContext = context; haveWatermarkContext = true;
                     }
                     if (delayedOrigin) {
@@ -1586,7 +1715,7 @@ void Engine::run() {
                         // then let cancellation and paired admission race only
                         // at this one allocation-free mutex commit.
                         if (commandPending()) continue;
-                        std::wstring recordingText = recordingMessage(cfg.separateFiles), wakeError;
+                        std::wstring recordingText = recordingMessage(plan), wakeError;
                         uint64_t epoch = 0;
                         const bool known = queryDelayedWakeEpoch(epoch, wakeError);
                         bool cancelled;
@@ -1604,12 +1733,13 @@ void Engine::run() {
                         }
                         power.update(true, needDesktop);
                     }
-                    if (!encoder->write(composed, error)) {
-                        closeRecording((cfg.separateFiles ? L"Desktop recording stopped: " : L"Recording stopped: ") + error); continue;
+                    bool written = true;
+                    for (size_t i = 0; i < plan.count; ++i) if (!encoders[i]->write(composed[i], error)) {
+                        closeRecording(plan.count > 1 ? std::wstring(outputLabel(plan.kinds[i])) + L" recording stopped: " + error
+                            : L"Recording stopped: " + error);
+                        written = false; break;
                     }
-                    if (cfg.separateFiles && !cameraEncoder->write(cameraComposed, error)) {
-                        closeRecording(L"Camera recording stopped: " + error); continue;
-                    }
+                    if (!written) continue;
                     lastAdmission = admittedAt;
                     const auto interval = std::chrono::milliseconds(skipping ? timeSkip.onFrame(admittedActiveMs) : cfg.intervalMs);
                     incomingIntervalMs = interval.count();
@@ -1631,8 +1761,7 @@ void Engine::run() {
                     }
                     if (skipping) inspectSkipping();
                     std::lock_guard<std::mutex> lock(mutex_);
-                    status_.frames = cfg.separateFiles ? std::min(segmentFrameTotal(closedFrames[0], encoder->frames()),
-                        segmentFrameTotal(closedFrames[1], cameraEncoder->frames())) : segmentFrameTotal(closedFrames[0], encoder->frames());
+                    status_.frames = sessionFrames();
                     status_.elapsed = elapsed;
                     if (nightMode) {
                         status_.night = completedNight.exposure;
@@ -1646,8 +1775,8 @@ void Engine::run() {
                     // the video frame is written, failures here are disposable
                     // preview failures and must not truncate that recording.
                     previewOnlyWork = true;
-                    if (captureDue && !compose(needDesktop ? &desktop : nullptr, needCamera ? &webcam : nullptr,
-                            cfg.layers, previewSize.first, previewSize.second, preparePreviewBuffer(), error)) {
+                    if (captureDue && !compose(layoutDesktop, layoutCamera,
+                            *layoutLayers, previewSize.first, previewSize.second, preparePreviewBuffer(), error)) {
                         publishPreviewError(error);
                         continue;
                     }
@@ -1677,7 +1806,7 @@ void Engine::run() {
                   if (previewProblem_) {
                       status_.error = false;
                       status_.message = writing
-                          ? paused ? L"Paused. Resume when you are ready." : recordingMessage(cfg.separateFiles)
+                          ? paused ? L"Paused. Resume when you are ready." : recordingMessage(plan)
                           : delayedRequest ? L"Waiting to start recording..." : L"Ready to record.";
                       previewProblem_ = false;
                   } }
@@ -1704,12 +1833,11 @@ void Engine::run() {
                     // Reporting or naming the completed recording may itself
                     // allocate. Still release the encoder and leave a retryable
                     // state; the .recording.mp4 file may contain saved frames.
-                    try { if (encoder) { std::wstring ignored; encoder->finish(ignored); } } catch (...) {}
-                    try { if (cameraEncoder) { std::wstring ignored; cameraEncoder->finish(ignored); } } catch (...) {}
+                    for (auto& writer : encoders) try { if (writer) { std::wstring ignored; writer->finish(ignored); } } catch (...) {}
                     std::lock_guard<std::mutex> lock(mutex_);
                     if (!start_) {
                         delayedSettings_.reset(); delayedStartPending_ = delayedCancel_ = false; status_.startDeadlineTick = 0;
-                        previewProblem_ = false;
+                        previewProblem_ = sourceWarning_ = false;
                         status_.state = State::Idle; status_.error = true;
                         if (terminalClockFrozen && (writing || pending)) status_.elapsed = elapsed;
                         status_.nightWaiting = false;
@@ -1724,12 +1852,12 @@ void Engine::run() {
                 cameraRunning = false;
                 nightMode = nightQueued = nightFrameReady = false;
                 cancelObservation(); skipping = observing = false; observationDesktop = {};
-                writing = segmentWriting = cameraWriting = pending = paused = false;
+                writing = pending = paused = false; partOpen = {};
                 delayedRequest.reset(); delayedDeadline = 0; delayedOrigin = false;
-                desktop = {}; webcam = {}; composed = {}; cameraComposed = {}; previewBuffer.reset();
+                releaseFrames(true); previewBuffer.reset();
                 power.update(false, false);
                 std::unique_lock<std::mutex> lock(mutex_);
-                previewProblem_ = false;
+                previewProblem_ = sourceWarning_ = false;
                 status_.preview.reset();
                 waitAfterFailure(lock);
             }

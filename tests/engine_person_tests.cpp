@@ -402,11 +402,30 @@ PersonPoll PersonClient::poll(PersonCheckResult& r)noexcept{
 }
 bool PersonClient::submit(const CameraPersonInput& input)noexcept{if(!impl_->active||impl_->pending)return false;++detectorSubmits;impl_->expected=input.source;impl_->pending=true;impl_->due=GetTickCount64()+static_cast<uint64_t>(inferenceDelay.load());return true;}
 }
+void personOnlyRecording(const std::filesystem::path& root) {
+    resetEvidence();verdict=2;
+    Engine e;auto s=configuration(root/L"person-only",TimeSkipMode::PersonOnly);s.timeSkip.quietAfterMs=1000;
+    e.configure(s);e.record();
+    const auto present=await(e,[](const auto& x){return x.timeSkip.reason==TimeSkipReason::PersonPresent&&x.frames>=5;});
+    require(!present.timeSkip.suspended&&present.timeSkip.intervalMs==100,"A detected person did not keep normal capture");
+    verdict=1;
+    const auto paused=await(e,[](const auto& x){return x.timeSkip.suspended&&x.timeSkip.reason==TimeSkipReason::NoPerson;},5000);
+    size_t before=0;{std::lock_guard<std::mutex> lock(evidenceMutex);before=writes.size();}
+    std::this_thread::sleep_for(900ms);
+    const auto still=e.status();size_t after=0;{std::lock_guard<std::mutex> lock(evidenceMutex);after=writes.size();}
+    require(still.state==State::Recording&&still.timeSkip.suspended&&after==before&&still.frames<=paused.frames+1,
+        "Person-only recording saved frames while nobody was detected");
+    verdict=2;
+    const auto returned=await(e,[](const auto& x){return !x.timeSkip.suspended&&x.timeSkip.reason==TimeSkipReason::PersonPresent;},2500);
+    await(e,[&](const auto& x){return x.frames>=returned.frames+3;},2500);
+    decode(finish(e));boundedCadence();require(detectorLive==0,"Finished person-only detector retained its resources");
+    std::cout<<"person-only recording pauses while nobody is detected and resumes promptly\n";
+}
 int main(){
     const HRESULT com=CoInitializeEx(nullptr,COINIT_MULTITHREADED);if(FAILED(com))return 1;if(FAILED(MFStartup(MF_VERSION))){CoUninitialize();return 1;}
     const auto root=std::filesystem::current_path()/(L"engine-person-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64()));int code=0;
     try{offAndNoCamera(root/L"isolation");accelerateAndActivity(root);ambiguousAbsenceAndUncertainty(root);pauseProvenance(root);malformedAndDuplicate(root);failuresLatch(root/L"failures");asynchronousDeadlines(root);scheduledNight(root);splitPresenceContinuity(root);
-        splitResumePerson(root,false);splitResumePerson(root,true);
+        splitResumePerson(root,false);splitResumePerson(root,true);personOnlyRecording(root);
         std::filesystem::remove_all(root);std::cout<<"All synthetic person engine contracts passed.\n";
     }catch(const std::exception& e){std::cerr<<e.what()<<'\n';std::wcerr<<L"Retained artifacts: "<<root.wstring()<<L'\n';code=1;}
     MFShutdown();CoUninitialize();return code;

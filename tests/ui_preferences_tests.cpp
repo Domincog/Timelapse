@@ -132,8 +132,12 @@ struct HiddenControls {
         app.nightEnabled=CreateWindowExW(0,L"BUTTON",L"Night",WS_CHILD|BS_AUTOCHECKBOX,0,0,200,30,app.window,nullptr,nullptr,nullptr);
         require(app.nightEnabled!=nullptr,"Cannot create owned night option.");
         app.nightDuration=combo(6);app.nightTarget=combo(3);choose(app.nightTarget,1);
+        for(HWND* target:{&app.alsoDesktop,&app.alsoCamera}){
+            *target=CreateWindowExW(0,L"BUTTON",L"Companion",WS_CHILD|BS_AUTOCHECKBOX,0,0,200,30,app.window,nullptr,nullptr,nullptr);
+            require(*target!=nullptr,"Cannot create owned companion option.");
+        }
     }
-    ~HiddenControls(){DestroyWindow(app.window);app.window=app.captureCursor=app.startDelay=nullptr;}
+    ~HiddenControls(){DestroyWindow(app.window);app.window=app.captureCursor=app.startDelay=app.alsoDesktop=app.alsoCamera=nullptr;}
 };
 struct PreferencesFixture {
     std::filesystem::path base=std::filesystem::current_path(), directory, settingsDirectory;
@@ -244,7 +248,7 @@ void newUnicodeFile(){
 }
 void existingUnicodeRewrite(){
     PreferencesFixture fixture;
-    const std::wstring initial=L"[Settings]\r\nFolder="+unicodeFolder+L"\r\nInterval=5\r\nQuality=1\r\nEncodingQuality=2\r\nEncodingMode=0\r\nRecordingLimit=0\r\nStopOnLowDiskSpace=1\r\nRecoveryMode=0\r\nShowDesktopCursor=1\r\nNightEnabled=0\r\nNightDurationMs=0\r\nNightTargetBrightness=96\r\nCaptureIntervalMs=5000\r\nVideoWidth=1280\r\nVideoHeight=720\r\nRecordingLimitSeconds=900\r\nSegmentDurationSeconds=0\r\nTimeSkipMode=0\r\nTimeSkipMultiplier=4\r\nTimeSkipQuietAfterMs=120000\r\nTimeSkipRampFrames=30\r\nTimeSkipRepeatSeconds=0\r\nTimeSkipRanges=\r\nTimeSkipQuietSensitivity=1\r\nTimeSkipUncertainAsAbsent=1\r\nWatermarkEnabled=0\r\nWatermarkShowTime=1\r\nWatermarkShowSpeed=1\r\nWatermarkTimeKind=0\r\nWatermarkX=10000\r\nWatermarkY=10000\r\nWatermarkTextSize=1\r\nStartDelaySeconds=0\r\nOutputFps=30\r\nPauseHotkey=0\r\nStopHotkey=0\r\n";
+    const std::wstring initial=L"[Settings]\r\nFolder="+unicodeFolder+L"\r\nInterval=5\r\nQuality=1\r\nEncodingQuality=2\r\nEncodingMode=0\r\nRecordingLimit=0\r\nStopOnLowDiskSpace=1\r\nRecoveryMode=0\r\nShowDesktopCursor=1\r\nNightEnabled=0\r\nNightDurationMs=0\r\nNightTargetBrightness=96\r\nCaptureIntervalMs=5000\r\nVideoWidth=1280\r\nVideoHeight=720\r\nRecordingLimitSeconds=900\r\nSegmentDurationSeconds=0\r\nTimeSkipMode=0\r\nTimeSkipMultiplier=4\r\nTimeSkipQuietAfterMs=120000\r\nTimeSkipRampFrames=30\r\nTimeSkipRepeatSeconds=0\r\nTimeSkipRanges=\r\nTimeSkipQuietSensitivity=1\r\nTimeSkipUncertainAsAbsent=1\r\nWatermarkEnabled=0\r\nWatermarkShowTime=1\r\nWatermarkShowSpeed=1\r\nWatermarkTimeKind=0\r\nWatermarkX=10000\r\nWatermarkY=10000\r\nWatermarkTextSize=1\r\nStartDelaySeconds=0\r\nOutputFps=30\r\nPauseHotkey=0\r\nStopHotkey=0\r\nAlsoSaveDesktop=0\r\nAlsoSaveCamera=0\r\n";
     fixture.seed(utf16(initial));reload();expectOptions(unicodeFolder,5,1,2);
     const auto initialBytes=fixture.bytes();
     const std::wstring changed=L"C:\\Synthetic videos\\\u65e5\u672c\u8a9e-\U0001f3a5";
@@ -348,6 +352,24 @@ void segmentOptions(){
     require(app.settings.segmentDurationSeconds==90,"Failed transaction lost the prior exact split setting.");
     expectUnknownContent(fixture);fixture.onlySettingsRemain();
     std::cout<<"PASS exact split presets/custom/max/off preferences, strict malformed fallback, preset normalization and atomic split-key failure\n";
+}
+void companionOptions(){
+    PreferencesFixture fixture;fixture.seed(legacy);reload();
+    require(!isChecked(app.alsoDesktop)&&!isChecked(app.alsoCamera),"Old preferences enabled companion files.");
+    for(bool desktop:{true,false})for(bool camera:{true,false}){
+        SendMessageW(app.alsoDesktop,BM_SETCHECK,desktop?BST_CHECKED:BST_UNCHECKED,0);
+        SendMessageW(app.alsoCamera,BM_SETCHECK,camera?BST_CHECKED:BST_UNCHECKED,0);preferences(true);
+        SendMessageW(app.alsoDesktop,BM_SETCHECK,desktop?BST_UNCHECKED:BST_CHECKED,0);
+        SendMessageW(app.alsoCamera,BM_SETCHECK,camera?BST_UNCHECKED:BST_CHECKED,0);reload();
+        require(isChecked(app.alsoDesktop)==desktop&&isChecked(app.alsoCamera)==camera&&choice(app.mode)==0,
+            "Companion choices lost their roundtrip or restored a collage at startup.");
+    }
+    for(const wchar_t* invalid:{L"",L"2",L"true",L"01",L"1junk"}){
+        for(const wchar_t* key:{L"AlsoSaveDesktop",L"AlsoSaveCamera"})
+            require(WritePrivateProfileStringW(L"Settings",key,invalid,app.preferences.c_str())!=FALSE,"Cannot seed invalid companion option.");
+        reload();require(!isChecked(app.alsoDesktop)&&!isChecked(app.alsoCamera),"Malformed companion option enabled extra files.");
+    }
+    fixture.onlySettingsRemain();std::cout<<"PASS companion file choices roundtrip; old and malformed settings keep them off\n";
 }
 void diskSafety(){
     PreferencesFixture fixture;fixture.seed(legacy);reload();
@@ -576,7 +598,7 @@ void timeCompressionPreferences(){
     require(WritePrivateProfileStringW(L"Settings",SkipKeys[5],oversized.c_str(),app.preferences.c_str())!=FALSE,"Cannot seed oversized range string.");reload();require(app.settings.timeSkip.mode==TimeSkipMode::Off,"Truncated saved schedule accepted.");
     restore();require(WritePrivateProfileStringW(L"Settings",SkipKeys[5],L"5:20;0:5;40:60",app.preferences.c_str())!=FALSE,"Cannot seed touching saved schedule.");reload();
     require(app.settings.timeSkip.rangeCount==2 && app.settings.timeSkip.ranges[0].startSeconds==0 && app.settings.timeSkip.ranges[0].endSeconds==20,"Loaded overlaps/touching ranges did not merge.");
-    for(auto mode:{TimeSkipMode::Off,TimeSkipMode::Quiet,TimeSkipMode::Manual,TimeSkipMode::QuietWithinSchedule,TimeSkipMode::NoPerson,TimeSkipMode::NoPersonWithinSchedule}){
+    for(auto mode:{TimeSkipMode::Off,TimeSkipMode::Quiet,TimeSkipMode::Manual,TimeSkipMode::QuietWithinSchedule,TimeSkipMode::NoPerson,TimeSkipMode::PersonOnly,TimeSkipMode::NoPersonWithinSchedule}){
         app.settings.timeSkip.mode=mode;preferences(true);reload();require(app.settings.timeSkip.mode==mode,"Saved compression mode changed.");}
     const unsigned inspections=lapse::uiPersonPackInspections;
     configure();require(choice(app.mode)==0 && app.settings.timeSkip.mode==TimeSkipMode::NoPersonWithinSchedule && lapse::uiPersonPackInspections==inspections,
@@ -588,7 +610,7 @@ void timeCompressionPreferences(){
     }
     require(WritePrivateProfileStringW(L"Settings",SkipKeys[7],nullptr,app.preferences.c_str()),"Cannot seed an old person policy without the uncertainty key.");reload();
     require(app.settings.timeSkip.mode==TimeSkipMode::NoPersonWithinSchedule && app.settings.timeSkip.quietAfterMs==expected.quietAfterMs && app.settings.timeSkip.uncertainAsAbsent,"Old person policy did not retain its mode and dwell with the enabled uncertainty default.");
-    require(WritePrivateProfileStringW(L"Settings",SkipKeys[0],L"6",app.preferences.c_str())!=FALSE,"Cannot seed future mode.");reload();
+    require(WritePrivateProfileStringW(L"Settings",SkipKeys[0],L"7",app.preferences.c_str())!=FALSE,"Cannot seed future mode.");reload();
     require(app.settings.timeSkip.mode==TimeSkipMode::Off,"Unknown numeric policy mode enabled a partial policy.");
     restore();reload();app.settings.timeSkip.mode=TimeSkipMode::NoPersonWithinSchedule;preferences(true);reload();
     const auto before=fixture.bytes();keyWrites=0;app.settings.timeSkip={};writeFault=WriteFault::DenyCompression;preferences(true);writeFault=WriteFault::None;
@@ -742,10 +764,10 @@ int main(){
     try{
         std::cout<<std::unitbuf;std::cout<<"ACP="<<GetACP()<<'\n';
         HiddenControls controls;
-        newUnicodeFile();existingUnicodeRewrite();playbackStagingRollback();migrateAnsi();encodingModes();recordingLimits();startDelayOptions();segmentOptions();diskSafety();recoveryOptions();cursorOptions();nightOptions();customOptions();readFailure();replacementFailure();
+        newUnicodeFile();existingUnicodeRewrite();playbackStagingRollback();migrateAnsi();encodingModes();recordingLimits();startDelayOptions();segmentOptions();diskSafety();companionOptions();recoveryOptions();cursorOptions();nightOptions();customOptions();readFailure();replacementFailure();
         preparationAllocationFailure();partialKeyWriteFailure();stagedExceptionCleanup();
         preferencePathBoundary(248);preferencePathBoundary(278);timeCompressionPreferences();watermarkPreferences();sizeCommandPreferences();checkpointBeforeRecording();
         require(!IsWindowVisible(app.window),"Fixture became visible.");
-        std::cout<<"All 24 preference cases passed; only owned hidden controls/settings were used.\n";return 0;
+        std::cout<<"All 25 preference cases passed; only owned hidden controls/settings were used.\n";return 0;
     }catch(const std::exception& error){std::cerr<<"PREFERENCES TEST FAILURE: "<<error.what()<<'\n';return 1;}
 }

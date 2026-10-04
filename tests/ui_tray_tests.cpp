@@ -326,11 +326,14 @@ void menuAndCommands(){Fixture f;f.state(State::Recording);f.close();
 }
 void inspectTrayActions(bool progress,State state){
     const int start=progress?2:0;
-    require(probe::menuItemCount==start+5 && probe::menuDefault==TrayShow,"Progress changed tray action count or the default Show command.");
+    // Recording or paused layouts (not separate files) add the Source submenu after Finish.
+    const int sources=(state==State::Recording || state==State::Paused) && !app.settings.separateFiles?1:0;
+    require(probe::menuItemCount==start+5+sources && probe::menuDefault==TrayShow,"Progress changed tray action count or the default Show command.");
+    if(sources)require(std::wstring(probe::menuItems[start+3].text)==L"S&ource","Live source submenu missing after Finish.");
     require(probe::menuItems[start].id==TrayShow && std::wstring(probe::menuItems[start].text)==L"&Show Timelapse" &&
         probe::menuItems[start+1].id==TrayPause && std::wstring(probe::menuItems[start+1].text)==(state==State::Paused?L"&Resume recording":L"&Pause recording") &&
         probe::menuItems[start+2].id==TrayFinish && std::wstring(probe::menuItems[start+2].text)==((state==State::Waiting || state==State::Starting)?L"Cancel s&tart":L"&Finish recording") &&
-        (probe::menuItems[start+3].type&MFT_SEPARATOR) && probe::menuItems[start+4].id==TrayExit && std::wstring(probe::menuItems[start+4].text)==L"E&xit Timelapse",
+        (probe::menuItems[start+3+sources].type&MFT_SEPARATOR) && probe::menuItems[start+4+sources].id==TrayExit && std::wstring(probe::menuItems[start+4+sources].text)==L"E&xit Timelapse",
         "Progress changed native tray action identities, order, labels or separator.");
     const bool pause=state==State::Recording || state==State::Paused;
     require(bool(probe::pauseFlags&MF_GRAYED)==!pause && bool(probe::finishFlags&MF_GRAYED)==!(pause || state==State::Starting || state==State::Waiting) && !(probe::exitFlags&MF_GRAYED),
@@ -605,10 +608,13 @@ void deferredVisuals(bool minimized){Fixture f;probe::current.state=State::Recor
     probe::resetWork();f.tick();require(probe::enables==0&&probe::textWrites==0&&probe::invalidated.empty(),"Restored status repeated its full refresh");
 }
 void unchangedTrayTip(){Fixture f;f.close();probe::resetWork();app.settings.separateFiles=true;
-    require(updateTray()&&app.trayStateValid&&app.traySeparate&&probe::notifications.empty(),"Equivalent idle tray text did not cache its new inputs");
+    require(updateTray()&&app.trayStateValid&&app.trayOutputs==2&&probe::notifications.empty(),"Equivalent idle tray text did not cache its new inputs");
     probe::current.state=State::Recording;f.tick();require(probe::tip.find(L"desktop + camera files")!=std::wstring::npos,"Active separate-file tray summary was not refreshed");
     probe::resetWork();app.status.recordingFailed=true;updateTray();
     require(app.trayFailure&&probe::notifications.empty(),"Equivalent active tray text did not cache its failure input");
+    // A collage with both companions summarizes its whole output set.
+    app.settings.separateFiles=false;app.settings.layers=preset(Mode::Overlay);app.settings.alsoSaveDesktop=app.settings.alsoSaveCamera=true;
+    require(updateTray()&&app.trayOutputs==3&&probe::tip.find(L" - 3 files")!=std::wstring::npos,"Collage companion tray summary did not count every file");
 }
 void nightResultDetails(){Fixture f;app.settings.layers=preset(Mode::Camera);app.advancedExpanded=true;
     SendMessageW(app.nightEnabled,BM_SETCHECK,BST_CHECKED,0);configure();updateControls();f.tick();
@@ -639,10 +645,22 @@ void compressionResultWork(){Fixture f;app.advancedExpanded=true;app.settings.ti
     require(probe::textWrites==0 && app.skipDetailCaption.find(L"paused")!=std::wstring::npos,"Paused compression facts polled visible ages or claimed checks.");
 }
 }
+void traySourceSwitch(){Fixture f;
+    app.settings.separateFiles=false;app.settings.layers=preset(Mode::Desktop);app.modeIndex=0;choose(app.mode,0);configure();
+    f.state(State::Recording);
+    probe::menuResult=TraySourceFirst+2;trayMenu();
+    require(app.modeIndex==2&&choice(app.mode)==2&&app.settings.layers.size()==2&&probe::configured.layers.size()==2,
+        "Tray Source did not switch the recording to Desktop + camera.");
+    probe::menuResult=TraySourceFirst+1;trayMenu();
+    require(app.modeIndex==1&&probe::configured.layers.size()==1&&probe::configured.layers[0].source==Source::Camera,"Tray Source did not switch to the camera.");
+    f.state(State::Idle);probe::menuResult=0;trayMenu();
+    f.command(TraySourceFirst);require(app.modeIndex==1,"An idle tray source command changed the layout.");
+    std::cout<<"PASS tray Source submenu switches a recording's live layout; commands after the session are ignored\n";
+}
 int main(){std::cout<<std::unitbuf;try{
     folderLifecycle();folderDeferrals();folderHiddenCompletion();folderFreshPendingPriority();folderOutcomePriority();
     hideAndShow();failedRegistration();restart(false);restart(true);legacyFallback();menuAndCommands();trayProgressSnapshots();trayProgressFailureControls();waitingSnapshots();waitingCommandsAndPower();exitOutcome(false);exitOutcome(true);backgroundFailure();modifierFailure();cleanupAndStartup();
-    unchangedWork();scopedPaint();idleStateBadge();deferredVisuals(false);deferredVisuals(true);unchangedTrayTip();nightResultDetails();compressionResultWork();
+    unchangedWork();scopedPaint();idleStateBadge();deferredVisuals(false);deferredVisuals(true);unchangedTrayTip();traySourceSwitch();nightResultDetails();compressionResultWork();
     for(int order=0;order<5;++order)failureOrdering(order);visibleFailure();obscuredFailure();for(int kind=0;kind<3;++kind)shownFailure(kind);nextFailedSession();previewOnlyError();
     for(bool duringShow:{false,true})for(bool finishing:{false,true})failureNoticeReentrancy(duringShow,finishing);trayLossWithFailure();failureInsideMenu();visibleFailureInsideMenu();failureMessageAllocation();
     std::cout<<"PASS 42 tray/status groups: owned hidden windows, synthetic engine, no tray icons, captures, input, or settings writes.\n";return 0;

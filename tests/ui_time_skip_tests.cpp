@@ -201,8 +201,8 @@ void personModesAndManagement(){
     skipScript=[](HWND window,DLGPROC,LPARAM parameter){
         auto& draft=*reinterpret_cast<SkipDraft*>(parameter);
         const auto visible=[](HWND child){return (GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0;};
-        require(SendMessageW(draft.mode,CB_GETCOUNT,0,0)==6 && lapse::uiPersonPackInspections==0 && !visible(draft.packManage) && !visible(draft.uncertain),
-            "Default editor inspected pack or lacks six explicit modes.");
+        require(SendMessageW(draft.mode,CB_GETCOUNT,0,0)==7 && lapse::uiPersonPackInspections==0 && !visible(draft.packManage) && !visible(draft.uncertain),
+            "Default editor inspected pack or lacks seven explicit modes.");
         mode(window,draft,TimeSkipMode::NoPerson);
         require(lapse::uiPersonPackInspections==1 && lapse::uiPersonPackDialogs==0 && visible(draft.packInfo) && visible(draft.packManage) && visible(draft.uncertain),
             "Person mode did not expose one inspected explicit management action.");
@@ -508,5 +508,27 @@ void nativePageWheelOwnership(){
     std::cout<<"PASS compression page/closed-combo wheel, native list ownership, nested range isolation, read-only scrolling and safe Ctrl/open-dropdown yield\n";
 }
 }
-int main(){try{transactionalRanges();boundsAndFreeze();modalLayoutAndInactiveDraft();strictPolicy();nativeCompressionInsertion();statusAndNestedClose();personModesAndManagement();personLayoutAndStatus();personUncertaintyChoice();nativeModalButtons();fineTuning();nativeScheduleMnemonicsAndReadOnlyEnter();nativePageWheelOwnership();std::cout<<"All thirteen time-compression UI groups passed using owned synthetic windows only.\n";return 0;}
+void personOnlyPolicy(){
+    HiddenFixture owned;setupSkip();
+    skipScript=[](HWND window,DLGPROC,LPARAM parameter){
+        auto& draft=*reinterpret_cast<SkipDraft*>(parameter);
+        const auto visible=[](HWND child){return (GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0;};
+        mode(window,draft,TimeSkipMode::PersonOnly);
+        require(!visible(draft.speed) && !visible(draft.fine) && !visible(draft.ramp) && visible(draft.quiet) && visible(draft.uncertain) &&
+            visible(draft.packManage) && !visible(draft.ranges),"Person-only mode showed speed or schedule controls, or hid its buffer.");
+        require(caption(draft.labels[3]).find(L"Keep recording after a person leaves")!=std::wstring::npos &&
+            caption(draft.help).find(L"only while a person is detected")!=std::wstring::npos,"Person-only wording missing.");
+        SetWindowTextW(draft.quiet,L"30");choose(draft.quietUnits,0);skipProc(window,WM_COMMAND,IDOK,0);require(outcome()==IDOK,"Valid person-only policy rejected.");
+    };
+    editSkip();
+    require(app.settings.timeSkip.mode==TimeSkipMode::PersonOnly && app.settings.timeSkip.quietAfterMs==30000 && IsWindowEnabled(app.record),
+        "Person-only policy lost its buffer or blocked recording.");
+    require(skipSummary(app.settings.timeSkip,app.settings.intervalMs).find(L"keeps recording 30 s after")!=std::wstring::npos,"Person-only summary missing its buffer.");
+    app.status.state=State::Recording;app.status.timeSkip.enabled=true;app.status.timeSkip.reason=TimeSkipReason::NoPerson;app.status.timeSkip.suspended=true;
+    app.advancedExpanded=true;updateSkipText(true);
+    require(app.skipDetailCaption.find(L"capture paused until someone appears")!=std::wstring::npos,"Paused person-only status was not explained.");
+    app.status={};app.settings.timeSkip={};app.advancedExpanded=false;
+    std::cout<<"PASS person-only policy: buffer without speed controls, exact commit, summary and paused status\n";
+}
+int main(){try{transactionalRanges();boundsAndFreeze();modalLayoutAndInactiveDraft();strictPolicy();nativeCompressionInsertion();statusAndNestedClose();personModesAndManagement();personOnlyPolicy();personLayoutAndStatus();personUncertaintyChoice();nativeModalButtons();fineTuning();nativeScheduleMnemonicsAndReadOnlyEnter();nativePageWheelOwnership();std::cout<<"All thirteen time-compression UI groups passed using owned synthetic windows only.\n";return 0;}
 catch(const std::exception& error){std::cerr<<"TIME COMPRESSION UI FAILURE: "<<error.what()<<'\n';return 1;}}
