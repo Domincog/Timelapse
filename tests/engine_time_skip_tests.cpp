@@ -63,9 +63,9 @@ class SkipEncoder {
     Encoder real_;
     bool secondary_=false;
 public:
-    bool open(const std::wstring& path,int width,int height,int fps,std::wstring& error,EncodingQuality quality,EncodingMode mode, bool recoveryMode) {
+    bool open(const std::wstring& path,int width,int height,int fps,std::wstring& error,EncodingQuality quality,EncodingMode mode, bool recoveryMode, const EncodingOptions& options = {}) {
         ++opens;secondary_=path.find(L"-camera.recording.mp4")!=std::wstring::npos;
-        return real_.open(path,width,height,fps,error,quality,mode, recoveryMode);
+        return real_.open(path,width,height,fps,error,quality,mode, recoveryMode, options);
     }
     bool write(const Frame& frame,std::wstring& error) {
         { std::lock_guard<std::mutex> lock(evidenceMutex); writes.push_back({GetTickCount64(),

@@ -69,7 +69,7 @@ BOOL WINAPI fixtureWriteProfile(LPCWSTR section,LPCWSTR key,LPCWSTR value,LPCWST
     if(section&&key){
         ++keyWrites;
         if(!result){++failedKeyWrites;keyWriteError=error;failedPreferenceKey=key;}
-        const int denyAt=writeFault==WriteFault::DenySecond?2:writeFault==WriteFault::DenyCompression?25:writeFault==WriteFault::DenySegment?11:writeFault==WriteFault::DenyWatermark?32:writeFault==WriteFault::DenyCursor?14:writeFault==WriteFault::DenyNightDuration?16:writeFault==WriteFault::DenyStartDelay?33:writeFault==WriteFault::DenyOutputFps?34:writeFault==WriteFault::DenyPauseHotkey?35:writeFault==WriteFault::DenyStopHotkey?36:0;
+        const int denyAt=writeFault==WriteFault::DenySecond?2:writeFault==WriteFault::DenyCompression?25:writeFault==WriteFault::DenySegment?11:writeFault==WriteFault::DenyWatermark?32:writeFault==WriteFault::DenyCursor?14:writeFault==WriteFault::DenyNightDuration?16:writeFault==WriteFault::DenyStartDelay?37:writeFault==WriteFault::DenyOutputFps?38:writeFault==WriteFault::DenyPauseHotkey?39:writeFault==WriteFault::DenyStopHotkey?40:0;
         if(denyAt && keyWrites==denyAt-1 && result){
             deniedWrite=CreateFileW(path,GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr);
             if(deniedWrite==INVALID_HANDLE_VALUE)throw std::runtime_error("Cannot deny the next owned staging write.");
@@ -121,7 +121,7 @@ struct HiddenControls {
             require(window!=nullptr,"Cannot create owned option control.");
             for(int i=0;i<count;++i)add(window,std::to_wstring(i));choose(window,0);return window;
         };
-        app.mode=combo(6);app.interval=combo(6);app.videoSize=combo(2);app.encodingQuality=combo(3);app.encodingMode=combo(static_cast<int>(std::size(EncodingModeLabels)));app.stopAfter=combo(6);
+        app.mode=combo(6);app.interval=combo(6);app.videoSize=combo(2);app.encodingQuality=combo(4);app.encodingMode=combo(static_cast<int>(std::size(EncodingModeLabels)));app.stopAfter=combo(6);
         app.splitEvery=combo(5);app.startDelay=combo(6);app.committedStartDelay=0;
         app.lowDisk=CreateWindowExW(0,L"BUTTON",L"Stop on low disk space",WS_CHILD|BS_AUTOCHECKBOX,0,0,200,30,app.window,nullptr,nullptr,nullptr);
         require(app.lowDisk!=nullptr,"Cannot create owned low disk option.");SendMessageW(app.lowDisk,BM_SETCHECK,BST_CHECKED,0);
@@ -222,12 +222,12 @@ const std::wstring unicodeFolder=L"C:\\Synthetic videos\\\u65e5\u672c\u8a9e-\U00
 std::string utf16(const std::wstring& text){const std::wstring value=L"\ufeff"+text;return {reinterpret_cast<const char*>(value.data()),value.size()*sizeof(wchar_t)};}
 void expectOptions(const std::wstring& folder,int interval,int size,int encoding){
     require(app.settings.folder==folder,"Unicode save folder changed on reload.");
-    require(choice(app.interval)==interval && choice(app.videoSize)==size && choice(app.encodingQuality)==encoding,
+    require(choice(app.interval)==interval && choice(app.videoSize)==size && choice(app.encodingQuality)==encodingQualityChoice(static_cast<EncodingQuality>(encoding)),
             "Persisted Interval/Quality/EncodingQuality changed.");
     require(choice(app.mode)==0,"Preferences load did not preserve Desktop startup mode.");
 }
 void reload(){
-    app.settings.folder=L"C:\\Default";choose(app.interval,0);choose(app.videoSize,0);choose(app.encodingQuality,1);choose(app.mode,4);
+    app.settings.folder=L"C:\\Default";choose(app.interval,0);choose(app.videoSize,0);choose(app.encodingQuality,encodingQualityChoice(static_cast<EncodingQuality>(1)));choose(app.mode,4);
     preferences(false);
 }
 void expectUtf16(const PreferencesFixture& fixture){const auto bytes=fixture.bytes();require(bytes.size()>=2 && static_cast<unsigned char>(bytes[0])==0xff && static_cast<unsigned char>(bytes[1])==0xfe,"Saved preferences lack the Unicode BOM.");}
@@ -242,18 +242,18 @@ void expectUnknownContent(const PreferencesFixture& fixture){
 }
 void newUnicodeFile(){
     PreferencesFixture fixture;
-    app.settings.folder=unicodeFolder;choose(app.interval,5);choose(app.videoSize,1);choose(app.encodingQuality,2);
+    app.settings.folder=unicodeFolder;choose(app.interval,5);choose(app.videoSize,1);choose(app.encodingQuality,encodingQualityChoice(static_cast<EncodingQuality>(2)));
     preferences(true);reload();expectOptions(unicodeFolder,5,1,2);expectUtf16(fixture);fixture.onlySettingsRemain();
     std::cout<<"PASS new Unicode folder and all numeric options roundtrip through real profile APIs\n";
 }
 void existingUnicodeRewrite(){
     PreferencesFixture fixture;
-    const std::wstring initial=L"[Settings]\r\nFolder="+unicodeFolder+L"\r\nInterval=5\r\nQuality=1\r\nEncodingQuality=2\r\nEncodingMode=0\r\nRecordingLimit=0\r\nStopOnLowDiskSpace=1\r\nRecoveryMode=0\r\nShowDesktopCursor=1\r\nNightEnabled=0\r\nNightDurationMs=0\r\nNightTargetBrightness=96\r\nCaptureIntervalMs=5000\r\nVideoWidth=1280\r\nVideoHeight=720\r\nRecordingLimitSeconds=900\r\nSegmentDurationSeconds=0\r\nTimeSkipMode=0\r\nTimeSkipMultiplier=4\r\nTimeSkipQuietAfterMs=120000\r\nTimeSkipRampFrames=30\r\nTimeSkipRepeatSeconds=0\r\nTimeSkipRanges=\r\nTimeSkipQuietSensitivity=1\r\nTimeSkipUncertainAsAbsent=1\r\nWatermarkEnabled=0\r\nWatermarkShowTime=1\r\nWatermarkShowSpeed=1\r\nWatermarkTimeKind=0\r\nWatermarkX=10000\r\nWatermarkY=10000\r\nWatermarkTextSize=1\r\nStartDelaySeconds=0\r\nOutputFps=30\r\nPauseHotkey=0\r\nStopHotkey=0\r\nAlsoSaveDesktop=0\r\nAlsoSaveCamera=0\r\nStatusHotkey=0\r\nStatusCorner=0\r\nStatusTextSize=1\r\nStatusStyle=0\r\nStatusLastKind=0\r\nStatusTimerSeconds=1500\r\nStatusBreakSeconds=300\r\nStatusRepeat=0\r\nStatusRecent1=\r\nStatusRecent2=\r\nStatusRecent3=\r\nStatusRecent4=\r\nStatusRecent5=\r\nStatusRecent6=\r\nStatusRecent7=\r\nStatusRecent8=\r\n";
+    const std::wstring initial=L"[Settings]\r\nFolder="+unicodeFolder+L"\r\nInterval=5\r\nQuality=1\r\nEncodingQuality=2\r\nAv1Preset=6\r\nEncodingRateControl=0\r\nAv1Crf=32\r\nEncodingBitrateKbps=4000\r\nEncodingMode=0\r\nRecordingLimit=0\r\nStopOnLowDiskSpace=1\r\nRecoveryMode=0\r\nShowDesktopCursor=1\r\nNightEnabled=0\r\nNightDurationMs=0\r\nNightTargetBrightness=96\r\nCaptureIntervalMs=5000\r\nVideoWidth=1280\r\nVideoHeight=720\r\nRecordingLimitSeconds=900\r\nSegmentDurationSeconds=0\r\nTimeSkipMode=0\r\nTimeSkipMultiplier=4\r\nTimeSkipQuietAfterMs=120000\r\nTimeSkipRampFrames=30\r\nTimeSkipRepeatSeconds=0\r\nTimeSkipRanges=\r\nTimeSkipQuietSensitivity=1\r\nTimeSkipUncertainAsAbsent=1\r\nWatermarkEnabled=0\r\nWatermarkShowTime=1\r\nWatermarkShowSpeed=1\r\nWatermarkTimeKind=0\r\nWatermarkX=10000\r\nWatermarkY=10000\r\nWatermarkTextSize=1\r\nStartDelaySeconds=0\r\nOutputFps=30\r\nPauseHotkey=0\r\nStopHotkey=0\r\nAlsoSaveDesktop=0\r\nAlsoSaveCamera=0\r\nStatusHotkey=0\r\nStatusCorner=0\r\nStatusTextSize=1\r\nStatusStyle=0\r\nStatusLastKind=0\r\nStatusTimerSeconds=1500\r\nStatusBreakSeconds=300\r\nStatusRepeat=0\r\nStatusRecent1=\r\nStatusRecent2=\r\nStatusRecent3=\r\nStatusRecent4=\r\nStatusRecent5=\r\nStatusRecent6=\r\nStatusRecent7=\r\nStatusRecent8=\r\n";
     fixture.seed(utf16(initial));reload();expectOptions(unicodeFolder,5,1,2);
     const auto initialBytes=fixture.bytes();
     const std::wstring changed=L"C:\\Synthetic videos\\\u65e5\u672c\u8a9e-\U0001f3a5";
     require(changed.size()==unicodeFolder.size(),"Rewrite must keep the same Unicode string length.");
-    app.settings.folder=changed;choose(app.interval,1);choose(app.videoSize,0);choose(app.encodingQuality,0);
+    app.settings.folder=changed;choose(app.interval,1);choose(app.videoSize,0);choose(app.encodingQuality,encodingQualityChoice(static_cast<EncodingQuality>(0)));
     preferences(true);reload();expectOptions(changed,1,0,0);expectUtf16(fixture);
     require(fixture.bytes().size()==initialBytes.size(),"Rewrite did not retain the same file size for the cache regression.");
     fixture.onlySettingsRemain();std::cout<<"PASS same-length existing UTF16 rewrite does not reload cached old settings\n";
@@ -311,7 +311,7 @@ void startDelayOptions(){
     reload();configure();require(!app.settings.startDelaySeconds,"Absent delay did not default to None.");
     choose(app.startDelay,3);configure();preferences(true);const auto previous=fixture.bytes();
     choose(app.startDelay,5);configure();keyWrites=failedKeyWrites=0;failedPreferenceKey.clear();writeFault=WriteFault::DenyStartDelay;preferences(true);writeFault=WriteFault::None;
-    require(keyWrites==33 && failedKeyWrites==1 && failedPreferenceKey==L"StartDelaySeconds" && fixture.bytes()==previous,"Failed final delay key published partial preferences.");
+    require(keyWrites==37 && failedKeyWrites==1 && failedPreferenceKey==L"StartDelaySeconds" && fixture.bytes()==previous,"Failed final delay key published partial preferences.");
     reload();configure();require(app.settings.startDelaySeconds==30 && lapse::recordCalls==records,"Preference loading armed a start or lost the prior delay after a failed save.");
     expectUnknownContent(fixture);fixture.onlySettingsRemain();
     std::cout<<"PASS self-timer exact presets/defaults/strict fallback, no armed-state persistence and final-key atomic failure\n";
@@ -324,7 +324,7 @@ void playbackStagingRollback(){
     for(int i=0;i<3;++i){
         app.settings.outputFps=60;app.pauseHotkey=static_cast<uint16_t>('P'|((HOTKEYF_CONTROL|HOTKEYF_ALT)<<8));app.stopHotkey=static_cast<uint16_t>('S'|((HOTKEYF_CONTROL|HOTKEYF_ALT)<<8));
         keyWrites=failedKeyWrites=0;failedPreferenceKey.clear();writeFault=faults[i];preferences(true);writeFault=WriteFault::None;
-        require(keyWrites==34+i && failedKeyWrites==1 && failedPreferenceKey==keys[i] && fixture.bytes()==previous,"Failed playback/shortcut staging key replaced prior preferences.");
+        require(keyWrites==38+i && failedKeyWrites==1 && failedPreferenceKey==keys[i] && fixture.bytes()==previous,"Failed playback/shortcut staging key replaced prior preferences.");
         reload();require(app.settings.outputFps==30 && !app.pauseHotkey && !app.stopHotkey,"Playback staging failure published partial new values.");
         fixture.onlySettingsRemain();
     }
@@ -508,13 +508,13 @@ struct OwnedFile {
 void replacementFailure(){
     PreferencesFixture fixture;fixture.seed(legacy);
     OwnedFile locked(CreateFileW(app.preferences.c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr));
-    app.settings.folder=unicodeFolder;choose(app.interval,0);choose(app.videoSize,0);choose(app.encodingQuality,2);
+    app.settings.folder=unicodeFolder;choose(app.interval,0);choose(app.videoSize,0);choose(app.encodingQuality,encodingQualityChoice(static_cast<EncodingQuality>(2)));
     preferences(true);locked.close();
     std::cout<<"locked replacement attempts="<<replacementAttempts<<" Windows error="<<replacementError<<'\n';
     require(replacementAttempts==1 && (replacementError==ERROR_SHARING_VIOLATION || replacementError==ERROR_ACCESS_DENIED),
             "Did not reach a real replacement sharing/access failure.");
     require(fixture.bytes()==legacy,"Failed replacement changed original bytes.");fixture.onlySettingsRemain();reload();expectOptions(L"C:\\Prior",4,1,0);
-    app.settings.folder=unicodeFolder;choose(app.interval,0);choose(app.videoSize,0);choose(app.encodingQuality,2);
+    app.settings.folder=unicodeFolder;choose(app.interval,0);choose(app.videoSize,0);choose(app.encodingQuality,encodingQualityChoice(static_cast<EncodingQuality>(2)));
     preferences(true);reload();expectOptions(unicodeFolder,0,0,2);fixture.onlySettingsRemain();
     require(replacementAttempts==2 && replacementError==ERROR_SUCCESS,"Unlocked retry did not recover normal publication.");
     std::cout<<"PASS real replacement lock preserves original bytes/settings, removes staged file, and permits retry\n";
@@ -529,7 +529,7 @@ void readFailure(){
     beforePreferenceReplace=[&]{UnlockFileEx(locked.value,0,MAXDWORD,MAXDWORD,&position);locked.close();};
     // Releasing before an erroneous publication makes this test distinguish a
     // snapshot read failure from merely being unable to replace a locked file.
-    app.settings.folder=unicodeFolder;choose(app.interval,0);choose(app.videoSize,0);choose(app.encodingQuality,2);
+    app.settings.folder=unicodeFolder;choose(app.interval,0);choose(app.videoSize,0);choose(app.encodingQuality,encodingQualityChoice(static_cast<EncodingQuality>(2)));
     preferences(true);beforePreferenceReplace=nullptr;
     if(locked.value!=INVALID_HANDLE_VALUE){UnlockFileEx(locked.value,0,MAXDWORD,MAXDWORD,&position);locked.close();}
     require(replacementAttempts==0,"Failed snapshot read reached publication.");
@@ -538,7 +538,7 @@ void readFailure(){
 }
 void preparationAllocationFailure(){
     PreferencesFixture fixture;fixture.seed(legacy);app.settings.folder=unicodeFolder;
-    choose(app.interval,0);choose(app.videoSize,0);choose(app.encodingQuality,2);
+    choose(app.interval,0);choose(app.videoSize,0);choose(app.encodingQuality,encodingQualityChoice(static_cast<EncodingQuality>(2)));
     const auto failures=preferenceAllocation::failures;preferenceAllocation::failNext=true;
     preferences(true);
     preferenceAllocation::failNext=false;
@@ -552,7 +552,7 @@ void preparationAllocationFailure(){
 }
 void partialKeyWriteFailure(){
     PreferencesFixture fixture;fixture.seed(legacy);app.settings.folder=unicodeFolder;
-    choose(app.interval,0);choose(app.videoSize,0);choose(app.encodingQuality,2);
+    choose(app.interval,0);choose(app.videoSize,0);choose(app.encodingQuality,encodingQualityChoice(static_cast<EncodingQuality>(2)));
     writeFault=WriteFault::DenySecond;preferences(true);writeFault=WriteFault::None;
     require(keyWrites==2&&failedKeyWrites==1&&(keyWriteError==ERROR_SHARING_VIOLATION||keyWriteError==ERROR_ACCESS_DENIED),
             "Expected exactly one real sharing-denied second key write.");
@@ -628,7 +628,7 @@ void preferencePathBoundary(size_t length){
         require(temporary.size()>=MAX_PATH,"Settings temporary suffix did not cross the path boundary.");
         fixture.seed(utf16(std::wstring(legacy.begin(),legacy.end())));
         reload();expectOptions(L"C:\\Prior",4,1,0);
-        app.settings.folder=unicodeFolder;choose(app.interval,5);choose(app.videoSize,0);choose(app.encodingQuality,2);
+        app.settings.folder=unicodeFolder;choose(app.interval,5);choose(app.videoSize,0);choose(app.encodingQuality,encodingQualityChoice(static_cast<EncodingQuality>(2)));
         preferences(true);reload();expectOptions(unicodeFolder,5,0,2);
         require(app.preferences==friendly,"File I/O normalization changed the logical preference location.");
         require(replacementAttempts==1&&replacementError==ERROR_SUCCESS&&saveDiagnostics==0,"Boundary save did not publish once.");
@@ -638,13 +638,13 @@ void preferencePathBoundary(size_t length){
         // temporary sibling, then permit an unlocked update at the same path.
         const auto before=fixture.bytes();
         OwnedFile locked(CreateFileW(fileIOPath(friendly).c_str(),GENERIC_READ,FILE_SHARE_READ,nullptr,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,nullptr));
-        app.settings.folder=L"C:\\Another selected folder";choose(app.interval,1);choose(app.videoSize,1);choose(app.encodingQuality,0);
+        app.settings.folder=L"C:\\Another selected folder";choose(app.interval,1);choose(app.videoSize,1);choose(app.encodingQuality,encodingQualityChoice(static_cast<EncodingQuality>(0)));
         preferences(true);locked.close();
         require(replacementAttempts==2&&(replacementError==ERROR_SHARING_VIOLATION||replacementError==ERROR_ACCESS_DENIED)&&saveDiagnostics==1,
                 "Long target did not reach the real replacement lock.");
         require(fixture.bytes()==before,"Failed long-path replacement changed original bytes.");
         reload();expectOptions(unicodeFolder,5,0,2);fixture.onlySettingsRemain();
-        app.settings.folder=L"C:\\Another selected folder";choose(app.interval,1);choose(app.videoSize,1);choose(app.encodingQuality,0);
+        app.settings.folder=L"C:\\Another selected folder";choose(app.interval,1);choose(app.videoSize,1);choose(app.encodingQuality,encodingQualityChoice(static_cast<EncodingQuality>(0)));
         preferences(true);reload();expectOptions(L"C:\\Another selected folder",1,1,0);
         require(replacementAttempts==3&&replacementError==ERROR_SUCCESS&&app.preferences==friendly,"Long-path unlocked retry failed.");
         expectUnknownContent(fixture);fixture.onlySettingsRemain();

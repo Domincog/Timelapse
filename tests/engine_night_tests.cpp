@@ -43,8 +43,8 @@ namespace lapse {
 class NightTestEncoder {
     Encoder real_;
 public:
-    bool open(const std::wstring& path,int width,int height,int fps,std::wstring& error,EncodingQuality q,EncodingMode mode, bool recoveryMode) {
-        ++opens;return real_.open(path,width,height,fps,error,q,mode, recoveryMode);
+    bool open(const std::wstring& path,int width,int height,int fps,std::wstring& error,EncodingQuality q,EncodingMode mode, bool recoveryMode, const EncodingOptions& options = {}) {
+        ++opens;return real_.open(path,width,height,fps,error,q,mode, recoveryMode, options);
     }
     bool write(const Frame& f,std::wstring& error) {
         std::this_thread::sleep_for(std::chrono::milliseconds(writeDelayMs.exchange(0)));

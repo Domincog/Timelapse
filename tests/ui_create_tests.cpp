@@ -65,7 +65,7 @@ LRESULT WINAPI fakeSend(HWND hwnd,UINT message,WPARAM value,LPARAM parameter){
     return 0;
 }
 DWORD WINAPI fakeProfileString(LPCWSTR section,LPCWSTR key,LPCWSTR fallback,LPWSTR output,DWORD count,LPCWSTR path){
-    if(std::wcscmp(key,L"SegmentDurationSeconds")==0 || std::wcsncmp(key,L"TimeSkip",8)==0 || std::wcsncmp(key,L"AlsoSave",8)==0 || std::wcsncmp(key,L"Watermark",9)==0 || std::wcscmp(key,L"StopOnLowDiskSpace")==0 || std::wcscmp(key,L"RecoveryMode")==0 || std::wcscmp(key,L"ShowDesktopCursor")==0 || std::wcscmp(key,L"NightEnabled")==0 || std::wcscmp(key,L"NightDurationMs")==0 || std::wcscmp(key,L"NightTargetBrightness")==0 || std::wcscmp(key,L"StartDelaySeconds")==0 || std::wcscmp(key,L"OutputFps")==0 || std::wcscmp(key,L"PauseHotkey")==0 || std::wcscmp(key,L"StopHotkey")==0 || std::wcsncmp(key,L"Status",6)==0){require(count>std::wcslen(fallback),"Option buffer too small");wcscpy_s(output,count,fallback);return static_cast<DWORD>(std::wcslen(fallback));}
+    if(std::wcsncmp(key,L"Av1",3)==0 || std::wcscmp(key,L"EncodingRateControl")==0 || std::wcscmp(key,L"EncodingBitrateKbps")==0 || std::wcscmp(key,L"SegmentDurationSeconds")==0 || std::wcsncmp(key,L"TimeSkip",8)==0 || std::wcsncmp(key,L"AlsoSave",8)==0 || std::wcsncmp(key,L"Watermark",9)==0 || std::wcscmp(key,L"StopOnLowDiskSpace")==0 || std::wcscmp(key,L"RecoveryMode")==0 || std::wcscmp(key,L"ShowDesktopCursor")==0 || std::wcscmp(key,L"NightEnabled")==0 || std::wcscmp(key,L"NightDurationMs")==0 || std::wcscmp(key,L"NightTargetBrightness")==0 || std::wcscmp(key,L"StartDelaySeconds")==0 || std::wcscmp(key,L"OutputFps")==0 || std::wcscmp(key,L"PauseHotkey")==0 || std::wcscmp(key,L"StopHotkey")==0 || std::wcsncmp(key,L"Status",6)==0){require(count>std::wcslen(fallback),"Option buffer too small");wcscpy_s(output,count,fallback);return static_cast<DWORD>(std::wcslen(fallback));}
     require(std::wcscmp(section,L"Settings")==0&&std::wcscmp(key,L"Folder")==0&&count>=1025&&path&&*path,"Unexpected profile read");
     ++profileReads;std::wmemset(output,L'x',1024);output[0]=L'C';output[1]=L':';output[2]=L'\\';output[1024]=0;
     if(fault==Fault::ProfileCopy)failNextAllocation=true;
@@ -184,7 +184,7 @@ void run(const wchar_t* name,Fault selectedFault){
     if(selectedFault==Fault::AfterEngine)require(failedAllocations==0&&syntheticThrows==1&&engineStarts==1,"Synthetic post-engine exception changed");
     if(selectedFault==Fault::Timer)require(failedAllocations==0&&syntheticThrows==0&&engineStarts==1&&engineStops==1,"Synthetic zero-timer cleanup changed");
     if(failed){require(!escaped&&created==-1,"WM_CREATE did not reject failed startup");require(resizeQueries==0&&resizeConfigures==0,"Failed startup processed resize configuration");require(keyWrites==0&&unchanged&&debugMessages==1&&timerStarts==(selectedFault==Fault::Timer?1:0),"Failed startup changed preferences or timer attempts");}
-    else {require(!escaped&&created==0&&failedAllocations==0&&engineStarts==1&&keyWrites==54&&!unchanged&&timerStarts==1&&debugMessages==0,"Healthy create/destroy changed");
+    else {require(!escaped&&created==0&&failedAllocations==0&&engineStarts==1&&keyWrites==58&&!unchanged&&timerStarts==1&&debugMessages==0,"Healthy create/destroy changed");
         require(!app.advancedExpanded&&app.advancedVisibility==0&&app.advancedLimitIndex==0,"Recreated controls inherited stale Advanced caption or expanded state");
         require(!app.settings.startDelaySeconds&&!app.committedStartDelay&&!app.advancedDelaySeconds&&app.waitingRemaining==UINT64_MAX&&app.waitingCaption.empty(),"Recreated controls inherited an armed self-timer or countdown cache");
         require(app.settings.outputFps==30 && !app.pauseHotkey && !app.stopHotkey && !app.pauseHotkeyId && !app.stopHotkeyId && app.hotkeyWarning.empty(),"Recreated controls inherited playback or shortcut policy");
@@ -237,7 +237,7 @@ void osCase(const wchar_t* className,const wchar_t* name,Fault selectedFault){
     require(routeEscapes==0&&routedCreates==1&&routedDestroys==1&&!app.engine&&timerStops==1&&quits==1,"Unexpected callback escape or missing OS cleanup");
     if(selectedFault==Fault::ProfileCopy)require(!created&&!acceptedAtReturn&&destroysAtReturn==1&&failedAllocations==1&&failedBytes>0&&keyWrites==0&&unchanged&&engineStarts==0&&engineStops==0&&timerStarts==0&&debugMessages==1,"OS failed-creation behavior changed");
     else if(selectedFault==Fault::Timer)require(!created&&!acceptedAtReturn&&!app.mode&&destroysAtReturn==1&&stopsAtReturn==1&&writesAtReturn==0&&failedAllocations==0&&syntheticThrows==0&&keyWrites==0&&unchanged&&engineStarts==1&&engineStops==1&&timerStarts==1&&debugMessages==1,"OS failed-timer cleanup or preference preservation changed");
-    else require(created&&acceptedAtReturn&&destroysAtReturn==0&&stopsAtReturn==0&&writesAtReturn==0&&failedAllocations==0&&keyWrites==54&&!unchanged&&engineStarts==1&&engineStops==1&&timerStarts==1&&debugMessages==0,"OS healthy-creation behavior changed");
+    else require(created&&acceptedAtReturn&&destroysAtReturn==0&&stopsAtReturn==0&&writesAtReturn==0&&failedAllocations==0&&keyWrites==58&&!unchanged&&engineStarts==1&&engineStops==1&&timerStarts==1&&debugMessages==0,"OS healthy-creation behavior changed");
     for(const auto& file:std::filesystem::directory_iterator(ownedCase))require(file.path()==path,"Owned settings stage remained");
 }
 }
@@ -261,7 +261,7 @@ void verifyChildCleanup(bool rejected){
     require(app.advancedCursorState!=99&&app.cameraListError.empty()&&app.statusTooltipCaption.empty(),"Window recreation retained a prior camera enumeration diagnostic/tooltip");
     require(!app.engine&&!app.startupComplete&&timerStops==1&&quits==1,"Destruction missed Engine/timer/quit cleanup");
     if(rejected)require(engineStarts==0&&engineStops==0&&engineConfigures==0&&timerStarts==0&&profileReads==0&&monitorEnumerations==0&&cameraEnumerations==0&&tooltipAttempts==0&&keyWrites==0&&debugMessages==1&&childUnchanged(),"Failed required child reached initialization or changed preferences");
-    else require(engineStarts==1&&engineStops==1&&timerStarts==1&&profileReads==1&&monitorEnumerations==1&&cameraEnumerations==1&&tooltipAttempts==1&&keyWrites==54*(recordCalls?2:1)&&debugMessages==0&&lastConfiguredInterval==5000&&!childUnchanged(),"Healthy initialization/persistence changed");
+    else require(engineStarts==1&&engineStops==1&&timerStarts==1&&profileReads==1&&monitorEnumerations==1&&cameraEnumerations==1&&tooltipAttempts==1&&keyWrites==58*(recordCalls?2:1)&&debugMessages==0&&lastConfiguredInterval==5000&&!childUnchanged(),"Healthy initialization/persistence changed");
     require(GetPrivateProfileIntW(L"Settings",L"Interval",99,currentIni.c_str())==2,"Owned interval preference changed");
     for(const auto& entry:std::filesystem::directory_iterator(ownedCase))require(entry.path()==currentIni,"Owned preference stage leaked");
 }

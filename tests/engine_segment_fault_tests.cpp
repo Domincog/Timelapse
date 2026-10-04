@@ -136,7 +136,7 @@ class SegmentFaultEncoder {
 public:
     ~SegmentFaultEncoder() { release(record_ && record_->frames == 0); }
     bool open(const std::wstring& path, int width, int height, int, std::wstring& error,
-              EncodingQuality, EncodingMode mode, bool recovery) {
+              EncodingQuality, EncodingMode mode, bool recovery, const EncodingOptions&  = {}) {
         error.clear();
         if (file_ != INVALID_HANDLE_VALUE || writing_) { error = L"Guard retained across reopen."; return false; }
         const int side = path.find(L"-camera.recording.mp4") == std::wstring::npos ? 0 : 1;

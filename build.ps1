@@ -1,4 +1,4 @@
-param([switch]$Test)
+param([switch]$Test, [string]$SvtAv1Archive = '', [string]$NasmArchive = '')
 $ErrorActionPreference = 'Stop'
 $projectRoot = $PSScriptRoot
 $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
@@ -7,7 +7,10 @@ $vsPath = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Comp
 if (-not $vsPath) { throw 'The Visual C++ build tools were not found.' }
 $vsVersion = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationVersion
 $generator = if ($vsVersion.StartsWith('16.')) { 'Visual Studio 16 2019' } else { 'Visual Studio 17 2022' }
-cmake -S $projectRoot -B (Join-Path $projectRoot 'build') -G $generator -A x64
+$dependencyArguments = @()
+if ($SvtAv1Archive) { $dependencyArguments += "-DTIMELAPSE_SVT_AV1_ARCHIVE=$([System.IO.Path]::GetFullPath($SvtAv1Archive))" }
+if ($NasmArchive) { $dependencyArguments += "-DTIMELAPSE_NASM_ARCHIVE=$([System.IO.Path]::GetFullPath($NasmArchive))" }
+cmake -S $projectRoot -B (Join-Path $projectRoot 'build') -G $generator -A x64 @dependencyArguments
 if ($LASTEXITCODE -ne 0) { throw 'CMake configuration failed.' }
 cmake --build (Join-Path $projectRoot 'build') --config Release --parallel
 if ($LASTEXITCODE -ne 0) { throw 'Build failed.' }

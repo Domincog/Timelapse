@@ -75,8 +75,8 @@ function New-Fixture([string]$Name) {
     Write-Text (Join-Path $root 'dist/updated/marker.txt') 'Unrelated nested staged milestone must survive.'
     $root
 }
-function Invoke-Build([string]$Root, [bool]$RunTests = $true) {
-    & (Join-Path $Root 'build.ps1') -Test:$RunTests | Out-Null
+function Invoke-Build([string]$Root, [bool]$RunTests = $true, [string]$SvtArchive = '', [string]$NasmArchive = '') {
+    & (Join-Path $Root 'build.ps1') -Test:$RunTests -SvtAv1Archive $SvtArchive -NasmArchive $NasmArchive | Out-Null
 }
 function Get-Inputs([string]$Root, [bool]$ExcludeExe = $false) {
     $map = @{}
@@ -177,6 +177,14 @@ $cases = @(
         Assert ($commandState.Calls.Count - $callStart -eq 3 -and $commandState.Calls[$callStart + 2].Command -eq 'test') 'Build -Test did not invoke CTest after build.'
         Assert ((File-Sha (Join-Path $root 'build/release/Timelapse.exe')) -eq (File-Sha (Join-Path $root 'dist/Timelapse.exe'))) 'New executable was not published.'
         Assert ((File-Sha (Join-Path $root 'README.md')) -eq (File-Sha (Join-Path $root 'dist/README.md'))) 'Current README was not published.'
+        $svtArchive = '.tmp/offline archives/SVT-AV1 ü.tar.gz'
+        $nasmArchive = '.tmp/offline archives/NASM ü.zip'
+        $callStart = $commandState.Calls.Count
+        Invoke-Build $root $false $svtArchive $nasmArchive; Assert-Distribution $root
+        $arguments = $commandState.Calls[$callStart].Arguments
+        Assert ($arguments.Count -eq 10 -and
+            "-DTIMELAPSE_SVT_AV1_ARCHIVE=$([IO.Path]::GetFullPath($svtArchive))" -cin $arguments -and
+            "-DTIMELAPSE_NASM_ARCHIVE=$([IO.Path]::GetFullPath($nasmArchive))" -cin $arguments) 'Offline archive paths were omitted, split, or not resolved.'
     } },
     @{ Name = 'early_command_failures'; Body = {
         param($root)

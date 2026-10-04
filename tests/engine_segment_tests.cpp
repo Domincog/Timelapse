@@ -12,7 +12,7 @@
 
 namespace {
 using namespace std::chrono_literals;
-struct Part { std::wstring temporary; std::vector<unsigned> grey; };
+struct Part { std::wstring temporary; std::vector<unsigned> grey; lapse::EncodingOptions options; };
 std::mutex journalMutex;
 std::vector<Part> journal;
 std::atomic<unsigned> desktopCalls{}, cameraCalls{}, openCalls{};
@@ -32,12 +32,12 @@ class SegmentEncoder {
     size_t index_ = 0;
 public:
     bool open(const std::wstring& path, int w, int h, int fps, std::wstring& error,
-              EncodingQuality quality, EncodingMode mode, bool recovery) {
+              EncodingQuality quality, EncodingMode mode, bool recovery, const EncodingOptions& options = {}) {
         const auto call = ++openCalls;
         if (call == delayedOpen) std::this_thread::sleep_for(std::chrono::milliseconds(openDelay.exchange(0)));
-        if (!real_.open(path, w, h, fps, error, quality, mode, recovery)) return false;
+        if (!real_.open(path, w, h, fps, error, quality, mode, recovery, options)) return false;
         std::lock_guard<std::mutex> lock(journalMutex);
-        index_ = journal.size(); journal.push_back({path, {}}); return true;
+        index_ = journal.size(); journal.push_back({path, {}, options}); return true;
     }
     bool write(const Frame& frame, std::wstring& error) {
         std::this_thread::sleep_for(std::chrono::milliseconds(writeDelay.exchange(0)));
@@ -121,6 +121,9 @@ void verify(const lapse::Settings& cfg, const lapse::Status& saved) {
     std::lock_guard<std::mutex> lock(journalMutex);
     size_t nonempty = 0;
     for (const auto& part : journal) {
+        require(part.options.av1Preset==cfg.encodingOptions.av1Preset && part.options.rateControl==cfg.encodingOptions.rateControl &&
+            part.options.av1Crf==cfg.encodingOptions.av1Crf && part.options.bitrateKbps==cfg.encodingOptions.bitrateKbps,
+            "Advanced encoder snapshot changed between outputs or segments");
         auto path = part.temporary;
         if (path.compare(0, 4, L"\\\\?\\") == 0) path.erase(0, 4); // MF's URL reader uses the ordinary local spelling.
         const auto extension = path.rfind(L".recording.mp4"); require(extension != std::wstring::npos, "Unexpected encoder pathname");
@@ -180,9 +183,10 @@ void exact(const std::filesystem::path& root) {
 void playbackParts(const std::filesystem::path& root, bool recovery) {
     auto cfg = settings(root,137,2); cfg.outputFps = recovery ? 59 : 24;
     cfg.separateFiles = true; cfg.recoveryMode = recovery;
+    cfg.encodingOptions.av1Preset=9;cfg.encodingOptions.rateControl=lapse::EncodingRateControl::TargetBitrate;cfg.encodingOptions.bitrateKbps=1600;
     lapse::Engine engine; engine.configure(cfg); engine.record();
     await(engine, [](const auto& s) { return s.frames >= 2; });
-    auto changed = cfg; changed.outputFps = 120; engine.configure(changed);
+    auto changed = cfg; changed.outputFps = 120;changed.encodingOptions={}; engine.configure(changed);
     const auto saved = await(engine, [](const auto& s) { return s.state == lapse::State::Idle; });
     verify(cfg,saved);
     require(saved.completedSegments == 2 && saved.frames >= 10, "Selected playback FPS changed split admission");

@@ -74,6 +74,7 @@ bool validateRecordingSettings(Settings& settings, std::wstring& error) {
         validateOutputFps(settings.outputFps, error) &&
         validateVideoSize(settings.width, settings.height, error) &&
         validateEncodingMode(settings.encodingMode, settings.recoveryMode, error) &&
+        validateEncodingOptions(settings.encodingMode, settings.encodingOptions, error) &&
         (!usesNightCamera(settings) || validateNightCapture(settings, error)) &&
         normalizeTimeSkipSettings(settings.timeSkip, error) && validateWatermarkSettings(settings.watermark, error) &&
         validateStatusFeedSettings(settings.statusFeed, error);
@@ -1710,7 +1711,7 @@ void Engine::run() {
                                     : L"Cannot start recording: " + error;
                             };
                             if (!encoders[0]) encoders[0].emplace();
-                            if (!encoders[0]->open(temporariesIO[0], cfg.width, cfg.height, cfg.outputFps, error, cfg.encodingQuality, cfg.encodingMode, cfg.recoveryMode)) {
+                            if (!encoders[0]->open(temporariesIO[0], cfg.width, cfg.height, cfg.outputFps, error, cfg.encodingQuality, cfg.encodingMode, cfg.recoveryMode, cfg.encodingOptions)) {
                                 closeRecording(openFailure(0)); admit = false; break;
                             }
                             writing = segmentWriting = true;
@@ -1728,7 +1729,7 @@ void Engine::run() {
                                     opened = false; break;
                                 }
                                 if (!encoders[i]) encoders[i].emplace();
-                                if (!encoders[i]->open(temporariesIO[i], cfg.width, cfg.height, cfg.outputFps, error, cfg.encodingQuality, cfg.encodingMode, cfg.recoveryMode)) {
+                                if (!encoders[i]->open(temporariesIO[i], cfg.width, cfg.height, cfg.outputFps, error, cfg.encodingQuality, cfg.encodingMode, cfg.recoveryMode, cfg.encodingOptions)) {
                                     closeRecording(openFailure(i)); opened = false; break;
                                 }
                                 partOpen[i] = true;

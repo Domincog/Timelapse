@@ -34,13 +34,13 @@ class LimitEncoder {
     Encoder real_;
     bool camera_ = false;
 public:
-    bool open(const std::wstring& path, int width, int height, int fps, std::wstring& error, EncodingQuality quality, EncodingMode mode, bool recoveryMode) {
+    bool open(const std::wstring& path, int width, int height, int fps, std::wstring& error, EncodingQuality quality, EncodingMode mode, bool recoveryMode, const EncodingOptions& options = {}) {
         camera_ = path.find(L"-camera.recording.mp4") != std::wstring::npos;
         if (camera_) {
             std::this_thread::sleep_for(std::chrono::milliseconds(cameraOpenDelayMs.exchange(0)));
             if (cameraOpenFailure.exchange(false)) { error = L"Injected initial camera writer failure."; return false; }
         }
-        return real_.open(path, width, height, fps, error, quality, mode, recoveryMode);
+        return real_.open(path, width, height, fps, error, quality, mode, recoveryMode, options);
     }
     bool write(const Frame& frame, std::wstring& error) {
         uint64_t empty = 0; firstAdmissionTick.compare_exchange_strong(empty, GetTickCount64());

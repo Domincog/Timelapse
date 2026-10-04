@@ -17,11 +17,12 @@ public:
     // Recovery mode uses fragmented H.264 with an end-of-segment marker per
     // accepted sample. Completed sections may survive process termination;
     // pending samples and uninitialized files are not guaranteed recoverable.
-    // SoftwareAV1 compresses with the bundled libaom encoder on the calling
-    // thread (plus its worker threads) and writes ordinary MP4 only.
+    // SoftwareAV1 uses the bundled SVT-AV1 encoder with asynchronous lookahead;
+    // finish() drains all accepted frames before finalizing ordinary MP4.
     bool open(const std::wstring& path, int width, int height, int fps, std::wstring& error,
               EncodingQuality quality = EncodingQuality::Balanced,
-              EncodingMode mode = EncodingMode::Compatible, bool recoveryMode = false);
+              EncodingMode mode = EncodingMode::Compatible, bool recoveryMode = false,
+              const EncodingOptions& options = {});
     bool write(const Frame& frame, std::wstring& error);
     bool finish(std::wstring& error);
     // Worker publication keeps the original object protected through status

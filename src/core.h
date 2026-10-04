@@ -24,9 +24,17 @@ struct Frame {
 struct Rect { double x = 0, y = 0, w = 1, h = 1; };
 enum class Source { Desktop, Camera };
 enum class Mode { Desktop, Camera, Overlay, SideBySide, Custom };
-enum class EncodingQuality { Compact, Balanced, Detail };
+// Values are saved in preferences; append new quality levels only.
+enum class EncodingQuality { Compact, Balanced, Detail, ExtraSmall };
 // Values are saved in preferences; append new modes only.
 enum class EncodingMode { Compatible, Efficient, HardwareH264, HardwareHEVC, QualityH264, SoftwareAV1 };
+enum class EncodingRateControl { Automatic, ConstantQuality, TargetBitrate };
+struct EncodingOptions {
+    int av1Preset = 6;
+    EncodingRateControl rateControl = EncodingRateControl::Automatic;
+    int av1Crf = 32;
+    int bitrateKbps = 4000;
+};
 struct Layer { Source source; Rect rect; };
 std::vector<Layer> preset(Mode mode);
 Rect constrain(Rect rect);

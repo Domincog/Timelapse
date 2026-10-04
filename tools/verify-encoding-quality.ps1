@@ -43,9 +43,11 @@ try {
     # Windows PowerShell represents successful native stderr as ErrorRecord;
     # capture its plain text while checking the process exit status explicitly.
     $ErrorActionPreference='Continue'
-    $LASTEXITCODE=$null
+    # Native commands set the global exit code. A script-local value would
+    # shadow it and make a successful verifier appear to have no exit status.
+    $global:LASTEXITCODE=$null
     $verificationOutput=& $verifierPath --raw $raw $Scene $Width $Height $Frames 2>&1
-    $verificationExit=$LASTEXITCODE
+    $verificationExit=$global:LASTEXITCODE
     $ErrorActionPreference='Stop'
     $lines=@($verificationOutput | ForEach-Object {$_.ToString()})
     $summaries=@($lines | Where-Object {$_ -like 'SUMMARY *'})

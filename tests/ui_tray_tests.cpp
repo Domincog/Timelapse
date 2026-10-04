@@ -70,7 +70,12 @@ BOOL WINAPI notify(DWORD operation,PNOTIFYICONDATAW data){
     if(data->uFlags&NIF_TIP)tip=data->szTip;
     return TRUE;
 }
-BOOL WINAPI show(HWND,int command){if(command==SW_HIDE)++hides;else {++shows;auto callback=std::move(onShow);if(callback)callback();}return TRUE;}
+BOOL WINAPI show(HWND window,int command){
+    // Dialog/control tests share this fixture. Keep real child visibility and
+    // tab order under the owned hidden parent; intercept only app/tray shows.
+    if(window && (GetWindowLongPtrW(window,GWL_STYLE)&WS_CHILD))return ShowWindow(window,command);
+    if(command==SW_HIDE)++hides;else {++shows;auto callback=std::move(onShow);if(callback)callback();}return TRUE;
+}
 BOOL WINAPI foreground(HWND){++foregrounds;return TRUE;}
 BOOL WINAPI destroy(HWND){++destroys;return TRUE;}
 int WINAPI dialog(HWND,LPCWSTR message,LPCWSTR,UINT flags){lastDialog=message;++dialogs;if((flags&MB_ICONMASK)==MB_ICONQUESTION){++confirmations;return confirmation;}auto callback=std::move(onWarning);if(callback)callback();return IDOK;}
@@ -196,7 +201,7 @@ struct Fixture {
         require(app.window&&!IsWindowVisible(app.window),"Owned hidden window creation failed");
         auto child=[&](const wchar_t* cls,DWORD style){auto w=CreateWindowExW(0,cls,L"",WS_CHILD|style,0,0,100,100,app.window,nullptr,nullptr,nullptr);require(w!=nullptr,"Child control creation failed");return w;};
         auto combo=[&](int count){auto w=child(L"COMBOBOX",CBS_DROPDOWNLIST);for(int i=0;i<count;++i)add(w,std::to_wstring(i));choose(w,0);return w;};
-        app.mode=combo(6);app.interval=combo(6);app.videoSize=combo(2);app.encodingQuality=combo(3);app.encodingMode=combo(static_cast<int>(std::size(EncodingModeLabels)));app.monitor=combo(1);app.camera=combo(1);
+        app.mode=combo(6);app.interval=combo(6);app.videoSize=combo(2);app.encodingQuality=combo(4);app.encodingMode=combo(static_cast<int>(std::size(EncodingModeLabels)));app.monitor=combo(1);app.camera=combo(1);
         app.stopAfter=combo(6);app.startDelay=combo(6);app.lowDisk=child(L"BUTTON",BS_AUTOCHECKBOX);SendMessageW(app.lowDisk,BM_SETCHECK,BST_CHECKED,0);
         app.nightEnabled=child(L"BUTTON",BS_AUTOCHECKBOX);app.nightDuration=combo(6);app.nightTarget=combo(3);choose(app.nightTarget,1);
         app.nightHint=child(L"STATIC",0);app.nightDetail=child(L"STATIC",0);

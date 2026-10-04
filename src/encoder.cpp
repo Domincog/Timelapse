@@ -101,6 +101,7 @@ struct Encoder::Impl {
     std::wstring path;
     // Retain the terminal outcome before allocating any diagnostic text.
     HRESULT finishResult = S_OK, finishCleanup = S_OK;
+    std::wstring finishError;
     bool finishEmpty = false;
     bool publicationAttempted = false;
     DWORD publicationResult = ERROR_INVALID_STATE;
@@ -115,7 +116,9 @@ struct Encoder::Impl {
     // A frame the encoder accepted but the file did not can be referenced by
     // later frames, so any AV1 write failure ends this output's writes.
     std::unique_ptr<Av1Encoder> av1;
-    std::vector<uint8_t> nv12, unit;
+    std::vector<uint8_t> nv12;
+    Av1Packet packet;
+    LONGLONG av1Written = 0;
     bool av1Stopped = false;
 
     ~Impl() {
@@ -134,7 +137,7 @@ struct Encoder::Impl {
         writing = false;
         av1.reset();
         std::vector<uint8_t>().swap(nv12);
-        std::vector<uint8_t>().swap(unit);
+        std::vector<uint8_t>().swap(packet.unit);
     }
 
     HRESULT releaseFile(bool discard) {
@@ -153,7 +156,19 @@ struct Encoder::Impl {
     void finalize(bool retainFile = false) {
         if (writer) {
             finishEmpty = frames == 0;
-            finishResult = writing ? writer->Finalize() : S_OK;
+            // Lookahead can retain an entire short clip. Flush it before the
+            // MP4 index is finalized, including on ordinary destruction.
+            if (writing && av1 && frames && !av1Stopped) {
+                try {
+                    std::wstring error;
+                    if (!av1->end(error) || !drainAv1(true, error)) rememberAv1Failure(error);
+                } catch (...) {
+                    av1Stopped = true;
+                    finishResult = E_OUTOFMEMORY;
+                }
+            }
+            const HRESULT finalized = writing ? writer->Finalize() : S_OK;
+            if (SUCCEEDED(finishResult)) finishResult = finalized;
             // Release MF before owned-file cleanup or handle publication.
             // Preserve terminal results before allocating diagnostics.
             release();
@@ -171,7 +186,8 @@ struct Encoder::Impl {
             return false;
         }
         if (FAILED(finishResult))
-            return fail(error, L"Cannot finalize the MP4 file", finishResult);
+            return finishError.empty() ? fail(error, L"Cannot finalize the MP4 file", finishResult) :
+                (error = finishError, false);
         return true;
     }
 
@@ -179,13 +195,63 @@ struct Encoder::Impl {
     LONGLONG timestamp(LONGLONG index) const {
         return (index / fps) * ticksPerSecond + (index % fps) * ticksPerSecond / fps;
     }
+
+    void rememberAv1Failure(const std::wstring& error) {
+        av1Stopped = true;
+        finishResult = E_FAIL;
+        finishError = error;
+    }
+
+    bool drainAv1(bool ending, std::wstring& error) {
+        for (;;) {
+            bool eos = false;
+            if (!av1->receive(packet, eos, error)) return false;
+            if (!packet.unit.empty()) {
+                if (packet.pts != av1Written || packet.pts >= frames ||
+                    packet.unit.size() > std::numeric_limits<DWORD>::max()) {
+                    error = L"The AV1 encoder produced an invalid video timestamp or sample.";
+                    return false;
+                }
+                ComPtr<IMFMediaBuffer> buffer;
+                const DWORD size = static_cast<DWORD>(packet.unit.size());
+                HRESULT hr = MFCreateMemoryBuffer(size, &buffer);
+                BYTE* destination = nullptr;
+                if (SUCCEEDED(hr)) hr = buffer->Lock(&destination, nullptr, nullptr);
+                if (SUCCEEDED(hr)) {
+                    std::memcpy(destination, packet.unit.data(), size);
+                    hr = buffer->Unlock();
+                }
+                if (SUCCEEDED(hr)) hr = buffer->SetCurrentLength(size);
+                ComPtr<IMFSample> sample;
+                if (SUCCEEDED(hr)) hr = MFCreateSample(&sample);
+                if (SUCCEEDED(hr)) hr = sample->AddBuffer(buffer.Get());
+                const LONGLONG time = timestamp(packet.pts);
+                if (SUCCEEDED(hr)) hr = sample->SetSampleTime(time);
+                if (SUCCEEDED(hr)) hr = sample->SetSampleDuration(timestamp(packet.pts + 1) - time);
+                // SVT folds hidden references into the displayed temporal
+                // unit, so DTS equals PTS even with random-access prediction.
+                if (SUCCEEDED(hr)) hr = sample->SetUINT32(MFSampleExtension_CleanPoint, packet.keyFrame ? TRUE : FALSE);
+                if (SUCCEEDED(hr)) hr = writer->WriteSample(stream, sample.Get());
+                if (FAILED(hr)) return fail(error, L"Cannot store the AV1 frame", hr);
+                ++av1Written;
+            }
+            if (eos) {
+                if (!ending || av1Written != frames) {
+                    error = L"The AV1 stream ended before every recorded frame was stored.";
+                    return false;
+                }
+                return true;
+            }
+            if (packet.unit.empty()) return !ending;
+        }
+    }
 };
 
 Encoder::Encoder() : impl_(std::make_unique<Impl>()) {}
 Encoder::~Encoder() { impl_->finalize(); }
 
 bool Encoder::open(const std::wstring& path, int width, int height, int fps, std::wstring& error,
-                   EncodingQuality quality, EncodingMode mode, bool recoveryMode) {
+                   EncodingQuality quality, EncodingMode mode, bool recoveryMode, const EncodingOptions& options) {
     error.clear();
     if (impl_->writer || impl_->file != INVALID_HANDLE_VALUE) {
         error = L"Finish the current recording before opening another output file.";
@@ -202,12 +268,14 @@ bool Encoder::open(const std::wstring& path, int width, int height, int fps, std
         return false;
     }
     if (!validateOutputFps(fps, error)) return false;
-    if (quality != EncodingQuality::Compact && quality != EncodingQuality::Balanced && quality != EncodingQuality::Detail) {
+    if (quality != EncodingQuality::Compact && quality != EncodingQuality::Balanced &&
+        quality != EncodingQuality::Detail && quality != EncodingQuality::ExtraSmall) {
         error = L"Choose a valid video quality.";
         return false;
     }
 
     if (!validateEncodingMode(mode, recoveryMode, error)) return false;
+    if (!validateEncodingOptions(mode, options, error)) return false;
     const bool hardware = mode == EncodingMode::HardwareH264 || mode == EncodingMode::HardwareHEVC;
     const bool hevc = mode == EncodingMode::HardwareHEVC;
     const bool compatible = mode == EncodingMode::Compatible;
@@ -227,7 +295,7 @@ bool Encoder::open(const std::wstring& path, int width, int height, int fps, std
         bool started = false;
         try {
             candidate->av1 = std::make_unique<Av1Encoder>();
-            started = candidate->av1->open(width, height, fps, quality, error);
+            started = candidate->av1->open(width, height, fps, quality, error, options);
             if (started) candidate->nv12.resize(candidate->bufferSize);
         } catch (const std::bad_alloc&) {
             error = L"Cannot start the AV1 encoder: not enough memory.";
@@ -291,12 +359,14 @@ bool Encoder::open(const std::wstring& path, int width, int height, int fps, std
     ComPtr<IMFMediaType> output;
     hr = MFCreateMediaType(&output);
     if (SUCCEEDED(hr)) hr = setVideoType(output.Get(), subtype, width, height, fps);
-    const int divisor = quality == EncodingQuality::Compact ? 10 : quality == EncodingQuality::Detail ? 4 : 7;
+    const int divisor = quality == EncodingQuality::ExtraSmall ? 16 : quality == EncodingQuality::Compact ? 10 :
+        quality == EncodingQuality::Detail ? 4 : 7;
     const int64_t nominal = int64_t(width) * height * fps;
     // Scale before the original bounds: very small and very large resolutions
     // retain the same 0.5–28 Mbps guardrails. Compatible arithmetic is unchanged.
-    const UINT32 bitrate = UINT32(std::clamp<int64_t>(efficient ? nominal * 3 / (divisor * 4) :
-        nominal / divisor, 500000, 28000000));
+    const bool customBitrate = options.rateControl == EncodingRateControl::TargetBitrate;
+    const UINT32 bitrate = customBitrate ? static_cast<UINT32>(options.bitrateKbps) * 1000 :
+        UINT32(std::clamp<int64_t>(efficient ? nominal * 3 / (divisor * 4) : nominal / divisor, 500000, 28000000));
     if (SUCCEEDED(hr)) hr = output->SetUINT32(MF_MT_AVG_BITRATE, bitrate);
     // Main profile enables more efficient entropy coding. Software B frames
     // are disabled below; hardware uses low-latency operation. Mode tests check
@@ -332,12 +402,14 @@ bool Encoder::open(const std::wstring& path, int width, int height, int fps, std
     // wholesale scene changes. This is a target, not a file-size cap. Quality H.264
     // and hardware modes retain detail using content-dependent file sizes.
     // Five playback seconds between keyframes improves static compression.
-    const bool constantQuality = hardware || qualitySoftware || (compatible && quality == EncodingQuality::Detail);
+    const bool constantQuality = !customBitrate &&
+        (hardware || qualitySoftware || (compatible && quality == EncodingQuality::Detail));
     const auto rateControl = constantQuality ? eAVEncCommonRateControlMode_Quality :
         eAVEncCommonRateControlMode_UnconstrainedVBR;
     if (SUCCEEDED(hr)) hr = encoding->SetUINT32(CODECAPI_AVEncCommonRateControlMode, rateControl);
     const UINT64 qp = compatible ? 18 :
-        (quality == EncodingQuality::Compact ? 28 : quality == EncodingQuality::Detail ? 20 : 24) + (hevc ? 2 : 0);
+        (quality == EncodingQuality::ExtraSmall ? 34 : quality == EncodingQuality::Compact ? 28 :
+            quality == EncodingQuality::Detail ? 20 : 24) + (hevc ? 2 : 0);
     if (SUCCEEDED(hr) && constantQuality) hr = encoding->SetUINT64(CODECAPI_AVEncVideoEncodeQP, qp);
     if (SUCCEEDED(hr)) hr = encoding->SetUINT32(CODECAPI_AVEncCommonQualityVsSpeed,
         efficient || qualitySoftware ? 66 : 100);
@@ -371,34 +443,30 @@ bool Encoder::write(const Frame& frame, std::wstring& error) {
         error = L"The AV1 recording stopped after an earlier error.";
         return false;
     }
-    ComPtr<IMFMediaBuffer> buffer;
-    HRESULT hr = S_OK;
-    bool keyFrame = false;
     if (impl_->av1) {
-        // Cleared only once the sample is stored; see Impl::av1Stopped.
-        impl_->av1Stopped = true;
+        // Accepted frames count immediately, even while lookahead has not
+        // emitted a sample. Finalization verifies that all are stored.
         toNv12(frame, impl_->nv12.data());
-        if (!impl_->av1->encode(impl_->nv12.data(), impl_->unit, keyFrame, error)) return false;
-        const auto bytes = static_cast<DWORD>(impl_->unit.size());
-        BYTE* destination = nullptr;
-        hr = MFCreateMemoryBuffer(bytes, &buffer);
-        if (SUCCEEDED(hr)) hr = buffer->Lock(&destination, nullptr, nullptr);
-        if (SUCCEEDED(hr)) {
-            std::memcpy(destination, impl_->unit.data(), bytes);
-            hr = buffer->Unlock();
+        if (!impl_->av1->encode(impl_->nv12.data(), error)) {
+            impl_->rememberAv1Failure(error);
+            return false;
         }
-        if (SUCCEEDED(hr)) hr = buffer->SetCurrentLength(bytes);
-        if (FAILED(hr)) return fail(error, L"Cannot store the AV1 frame", hr);
-    } else {
-        hr = MFCreateMemoryBuffer(impl_->bufferSize, &buffer);
-        if (FAILED(hr)) return fail(error, L"Cannot allocate a video frame", hr);
-        BYTE* destination = nullptr;
-        hr = buffer->Lock(&destination, nullptr, nullptr);
-        if (FAILED(hr)) return fail(error, L"Cannot access the video frame buffer", hr);
-        toNv12(frame, destination);
-        hr = buffer->Unlock();
-        if (SUCCEEDED(hr)) hr = buffer->SetCurrentLength(impl_->bufferSize);
+        ++impl_->frames;
+        if (!impl_->drainAv1(false, error)) {
+            impl_->rememberAv1Failure(error);
+            return false;
+        }
+        return true;
     }
+    ComPtr<IMFMediaBuffer> buffer;
+    HRESULT hr = MFCreateMemoryBuffer(impl_->bufferSize, &buffer);
+    if (FAILED(hr)) return fail(error, L"Cannot allocate a video frame", hr);
+    BYTE* destination = nullptr;
+    hr = buffer->Lock(&destination, nullptr, nullptr);
+    if (FAILED(hr)) return fail(error, L"Cannot access the video frame buffer", hr);
+    toNv12(frame, destination);
+    hr = buffer->Unlock();
+    if (SUCCEEDED(hr)) hr = buffer->SetCurrentLength(impl_->bufferSize);
     ComPtr<IMFSample> sample;
     if (SUCCEEDED(hr)) hr = MFCreateSample(&sample);
     if (SUCCEEDED(hr)) hr = sample->AddBuffer(buffer.Get());
@@ -406,12 +474,9 @@ bool Encoder::write(const Frame& frame, std::wstring& error) {
     const LONGLONG duration = impl_->timestamp(impl_->frames + 1) - timestamp;
     if (SUCCEEDED(hr)) hr = sample->SetSampleTime(timestamp);
     if (SUCCEEDED(hr)) hr = sample->SetSampleDuration(duration);
-    // Passthrough samples carry their own sync-sample flag for the MP4 index.
-    if (SUCCEEDED(hr) && impl_->av1) hr = sample->SetUINT32(MFSampleExtension_CleanPoint, keyFrame ? TRUE : FALSE);
     if (SUCCEEDED(hr)) hr = impl_->writer->WriteSample(impl_->stream, sample.Get());
     if (FAILED(hr)) return fail(error, L"Cannot encode the video frame", hr);
     ++impl_->frames;
-    impl_->av1Stopped = false;
     // Account for the accepted sample before a marker failure, so finalization
     // preserves it instead of treating this as an empty recording. The marker
     // closes a small fragment without changing keyframes or discarding samples.

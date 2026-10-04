@@ -81,8 +81,8 @@ namespace lapse {
 class DelayEncoder {
     Encoder real_;
 public:
-    bool open(const std::wstring& path, int width, int height, int fps, std::wstring& error, EncodingQuality quality, EncodingMode mode, bool recovery) {
-        const bool okay = real_.open(path, width, height, fps, error, quality, mode, recovery);
+    bool open(const std::wstring& path, int width, int height, int fps, std::wstring& error, EncodingQuality quality, EncodingMode mode, bool recovery, const EncodingOptions& options = {}) {
+        const bool okay = real_.open(path, width, height, fps, error, quality, mode, recovery, options);
         if (okay) {
             const auto number = ++delay_probe::opens;
             uint64_t empty = 0; delay_probe::firstOpen.compare_exchange_strong(empty, GetTickCount64());

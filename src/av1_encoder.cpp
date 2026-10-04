@@ -1,48 +1,28 @@
 #include "av1_encoder.h"
-#include <aom/aom_encoder.h>
-#include <aom/aomcx.h>
+#include "config.h"
+#include <EbSvtAv1Enc.h>
 #include <algorithm>
-#include <utility>
 #include <new>
 
 namespace lapse {
 namespace {
-// Settings measured on the synthetic encoding corpus; see DEVELOPMENT.md.
-// Speed 6 is the fastest good-quality preset (faster speeds are the same in
-// this usage). Four threads keep frame latency moderate without occupying a
-// whole machine. A 1080p desktop keyframe can outweigh minutes of unchanged
-// frames, so keyframes are ten playback seconds apart.
-constexpr int encoderSpeed = 6;
-constexpr unsigned maximumThreads = 4;
 constexpr unsigned keyframeSeconds = 10;
 constexpr int obuSequenceHeader = 1, obuTemporalDelimiter = 2, obuPadding = 15;
-
-// Constant-quality levels. Balanced matches or exceeds the H.264 Balanced
-// modes' measured detail on every corpus scene with much smaller files.
-unsigned quantizerLevel(EncodingQuality quality) {
-    return quality == EncodingQuality::Compact ? 32 : quality == EncodingQuality::Detail ? 16 : 24;
-}
-
-std::wstring widen(const char* text) {
-    std::wstring result;
-    for (; text && *text; ++text) result += static_cast<wchar_t>(static_cast<unsigned char>(*text));
-    return result;
-}
-
-bool fail(const aom_codec_ctx_t* codec, aom_codec_err_t result, const wchar_t* stage, std::wstring& error) {
-    error = stage;
-    if (result == AOM_CODEC_MEM_ERROR) {
-        error += L": not enough memory.";
-        return false;
+int qualityCrf(EncodingQuality quality) {
+    switch (quality) {
+    case EncodingQuality::ExtraSmall: return 44;
+    case EncodingQuality::Compact: return 36;
+    case EncodingQuality::Detail: return 24;
+    default: return 32;
     }
-    error += L": " + widen(aom_codec_err_to_string(result));
-    const char* detail = codec ? aom_codec_error_detail(codec) : nullptr;
-    if (detail && *detail) error += L" (" + widen(detail) + L")";
+}
+bool fail(EbErrorType result, const wchar_t* stage, std::wstring& error) {
+    error = stage;
+    if (result == EB_ErrorInsufficientResources) error += L": not enough memory.";
+    else if (result == EB_ErrorBadParameter) error += L": unsupported SVT-AV1 settings.";
+    else error += L" (SVT-AV1 error " + std::to_wstring(static_cast<uint32_t>(result)) + L").";
     return false;
 }
-
-// Measures one OBU at the start of data. libaom always writes size fields;
-// reject anything else rather than guess where a following OBU begins.
 bool nextObu(const uint8_t* data, size_t size, size_t& length, int& type) {
     if (!size || (data[0] & 0x80) || !(data[0] & 0x02)) return false;
     type = (data[0] >> 3) & 0x0f;
@@ -57,195 +37,222 @@ bool nextObu(const uint8_t* data, size_t size, size_t& length, int& type) {
     length = at + static_cast<size_t>(payload);
     return true;
 }
-
-// The first sequence header OBU in a temporal unit, or none.
-std::pair<const uint8_t*, size_t> sequenceHeaderIn(const std::vector<uint8_t>& unit) {
-    for (size_t at = 0, length = 0; at < unit.size(); at += length) {
-        int type = 0;
-        if (!nextObu(unit.data() + at, unit.size() - at, length, type)) break;
-        if (type == obuSequenceHeader) return {unit.data() + at, length};
-    }
-    return {nullptr, 0};
-}
-
-struct Codec {
-    aom_codec_ctx_t context{};
-    bool initialized = false;
-    Codec() = default;
-    Codec(const Codec&) = delete;
-    Codec& operator=(const Codec&) = delete;
-    ~Codec() { if (initialized) aom_codec_destroy(&context); }
+struct OutputBuffer {
+    EbBufferHeaderType* value = nullptr;
+    ~OutputBuffer() { if (value) svt_av1_enc_release_out_buffer(&value); }
 };
-
-bool start(Codec& codec, unsigned width, unsigned height, int fps, EncodingQuality quality, std::wstring& error) {
-    aom_codec_iface_t* const encoder = aom_codec_av1_cx();
-    aom_codec_enc_cfg_t config{};
-    aom_codec_err_t result = aom_codec_enc_config_default(encoder, &config, AOM_USAGE_GOOD_QUALITY);
-    if (result != AOM_CODEC_OK) return fail(nullptr, result, L"Cannot configure the AV1 encoder", error);
-    config.g_w = width;
-    config.g_h = height;
-    config.g_timebase = {1, fps};
-    config.g_threads = std::clamp<unsigned>(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS), 1, maximumThreads);
-    config.g_profile = 0;
-    config.g_bit_depth = AOM_BITS_8;
-    config.g_input_bit_depth = 8;
-    config.g_pass = AOM_RC_ONE_PASS;
-    // No lookahead: each frame is output by the call that accepts it.
-    config.g_lag_in_frames = 0;
-    config.rc_end_usage = AOM_Q;
-    config.kf_mode = AOM_KF_AUTO;
-    config.kf_min_dist = 0;
-    config.kf_max_dist = keyframeSeconds * static_cast<unsigned>(fps);
-    result = aom_codec_enc_init(&codec.context, encoder, &config, 0);
-    if (result != AOM_CODEC_OK) return fail(&codec.context, result, L"Cannot start the AV1 encoder", error);
-    codec.initialized = true;
-    aom_codec_ctx_t* const context = &codec.context;
-    result = aom_codec_control(context, AOME_SET_CPUUSED, encoderSpeed);
-    if (result == AOM_CODEC_OK) result = aom_codec_control(context, AOME_SET_CQ_LEVEL, quantizerLevel(quality));
-    if (result == AOM_CODEC_OK) result = aom_codec_control(context, AV1E_SET_ROW_MT, 1u);
-    // Detect anti-aliased desktop text for palette and intra block copy at
-    // keyframes. Camera-like content encodes identically either way.
-    if (result == AOM_CODEC_OK) result = aom_codec_control(context, AV1E_SET_SCREEN_CONTENT_DETECTION_MODE,
-                                                           static_cast<int>(AOM_SCREEN_DETECTION_ANTIALIASING_AWARE));
-    // Match the BT.709 limited-range NV12 conversion shared with H.264.
-    if (result == AOM_CODEC_OK) result = aom_codec_control(context, AV1E_SET_COLOR_PRIMARIES, static_cast<int>(AOM_CICP_CP_BT_709));
-    if (result == AOM_CODEC_OK) result = aom_codec_control(context, AV1E_SET_TRANSFER_CHARACTERISTICS, static_cast<int>(AOM_CICP_TC_BT_709));
-    if (result == AOM_CODEC_OK) result = aom_codec_control(context, AV1E_SET_MATRIX_COEFFICIENTS, static_cast<int>(AOM_CICP_MC_BT_709));
-    if (result == AOM_CODEC_OK) result = aom_codec_control(context, AV1E_SET_COLOR_RANGE, static_cast<int>(AOM_CR_STUDIO_RANGE));
-    if (result != AOM_CODEC_OK) return fail(context, result, L"Cannot configure the AV1 encoder", error);
-    return true;
 }
-
-// Encodes one frame into exactly one temporal unit, without temporal
-// delimiter or padding OBUs. Leaves unit empty on failure.
-bool encodeUnit(Codec& codec, unsigned width, unsigned height, aom_codec_pts_t pts, const uint8_t* nv12,
-                std::vector<uint8_t>& unit, bool& keyFrame, std::wstring& error) {
-    unit.clear();
-    keyFrame = false;
-    aom_image_t image{};
-    if (!aom_img_wrap(&image, AOM_IMG_FMT_NV12, width, height, 1, const_cast<uint8_t*>(nv12))) {
-        error = L"Cannot prepare the frame for AV1 encoding.";
-        return false;
-    }
-    const aom_codec_err_t result = aom_codec_encode(&codec.context, &image, pts, 1, 0);
-    if (result != AOM_CODEC_OK) return fail(&codec.context, result, L"Cannot encode the AV1 frame", error);
-    int frames = 0;
-    aom_codec_iter_t iterator = nullptr;
-    try {
-        while (const aom_codec_cx_pkt_t* packet = aom_codec_get_cx_data(&codec.context, &iterator)) {
-            if (packet->kind != AOM_CODEC_CX_FRAME_PKT) continue;
-            ++frames;
-            keyFrame = keyFrame || (packet->data.frame.flags & AOM_FRAME_IS_KEY) != 0;
-            const auto* data = static_cast<const uint8_t*>(packet->data.frame.buf);
-            for (size_t remaining = packet->data.frame.sz, length = 0; remaining; data += length, remaining -= length) {
-                int type = 0;
-                if (!data || !nextObu(data, remaining, length, type)) {
-                    error = L"The AV1 encoder produced an unsupported bitstream.";
-                    unit.clear();
-                    return false;
-                }
-                // The AV1 ISO base media file format binding excludes these from samples.
-                if (type != obuTemporalDelimiter && type != obuPadding) unit.insert(unit.end(), data, data + length);
-            }
-        }
-    } catch (const std::bad_alloc&) {
-        error = L"Cannot store the encoded AV1 frame: not enough memory.";
-        unit.clear();
-        return false;
-    }
-    if (frames != 1 || unit.empty()) {
-        error = L"The AV1 encoder did not produce exactly one video frame.";
-        unit.clear();
-        return false;
-    }
-    return true;
-}
-}
-
 struct Av1Encoder::Impl {
-    Codec codec;
-    // Any failure may leave libaom holding a reference frame the caller never
-    // stored, so later frames could depend on missing data. Refuse them.
-    bool failed = false;
+    EbComponentType* codec = nullptr;
+    bool initialized = false, failed = false, ending = false, eos = false, priming = false;
     unsigned width = 0, height = 0;
-    aom_codec_pts_t pts = 0;
-    std::vector<uint8_t> sequence;
+    int64_t submitted = 0, received = 0;
+    std::vector<uint8_t> sequence, chroma;
+    ~Impl() {
+        if (initialized) svt_av1_enc_deinit(codec);
+        if (codec) svt_av1_enc_deinit_handle(codec);
+    }
 };
-
 Av1Encoder::Av1Encoder() = default;
 Av1Encoder::~Av1Encoder() = default;
 
-bool Av1Encoder::open(int width, int height, int fps, EncodingQuality quality, std::wstring& error) {
+bool Av1Encoder::open(int width, int height, int fps, EncodingQuality quality, std::wstring& error,
+                      const EncodingOptions& options) {
     error.clear();
-    if (impl_) {
-        error = L"The AV1 encoder is already open.";
+    if (impl_) { error = L"The AV1 encoder is already open."; return false; }
+    if (!validateVideoSize(width, height, error) || !validateOutputFps(fps, error) ||
+        !validateEncodingOptions(EncodingMode::SoftwareAV1, options, error)) return false;
+    if (quality != EncodingQuality::Compact && quality != EncodingQuality::Balanced &&
+        quality != EncodingQuality::Detail && quality != EncodingQuality::ExtraSmall) {
+        error = L"Choose a valid video quality."; return false;
+    }
+    // SVT disables adaptive quantization below 64 pixels, and its VBR
+    // implementation requires it. Preserve tiny quality-based recordings,
+    // but reject this unsupported combination before creating an output file.
+    if (options.rateControl == EncodingRateControl::TargetBitrate && (width < 64 || height < 64)) {
+        error = L"SVT-AV1 target bitrate needs video dimensions of at least 64 x 64. "
+            L"Choose a larger video size or use automatic quality / CRF.";
         return false;
     }
-    if (width <= 0 || height <= 0 || (width & 1) || (height & 1) || fps <= 0) {
-        error = L"The AV1 encoder needs even video dimensions and a positive frame rate.";
-        return false;
-    }
-    if (quality != EncodingQuality::Compact && quality != EncodingQuality::Balanced && quality != EncodingQuality::Detail) {
-        error = L"Choose a valid video quality.";
-        return false;
-    }
-    auto candidate = std::make_unique<Impl>();
-    candidate->width = static_cast<unsigned>(width);
-    candidate->height = static_cast<unsigned>(height);
-    // libaom finalizes some sequence-level tools from speed, size and thread
-    // settings while encoding its first frame, so its init-time global header
-    // can disagree with the bitstream. Take the final header from a separate
-    // short-lived instance with identical settings, before the real one starts.
-    {
-        Codec primer;
-        if (!start(primer, candidate->width, candidate->height, fps, quality, error)) return false;
-        std::vector<uint8_t> flat(size_t(width) * height * 3 / 2, 128), unit;
-        bool keyFrame = false;
-        if (!encodeUnit(primer, candidate->width, candidate->height, 0, flat.data(), unit, keyFrame, error)) return false;
-        const auto header = sequenceHeaderIn(unit);
-        if (!keyFrame || !header.first) {
-            error = L"Cannot read the AV1 sequence header.";
-            return false;
+    auto start = [&](std::unique_ptr<Impl>& candidate) {
+        candidate = std::make_unique<Impl>();
+        candidate->width = static_cast<unsigned>(width);
+        candidate->height = static_cast<unsigned>(height);
+        candidate->chroma.resize(size_t(width) * height / 2);
+        EbSvtAv1EncConfiguration config{};
+        EbErrorType result = svt_av1_enc_init_handle(&candidate->codec, &config);
+        if (result != EB_ErrorNone) return fail(result, L"Cannot create the AV1 encoder", error);
+        config.source_width = candidate->width;
+        config.source_height = candidate->height;
+        config.frame_rate_numerator = static_cast<unsigned>(fps);
+        config.frame_rate_denominator = 1;
+        config.encoder_bit_depth = 8;
+        config.encoder_color_format = EB_YUV420;
+        config.profile = MAIN_PROFILE;
+        config.enc_mode = static_cast<int8_t>(options.av1Preset);
+        // SVT 4.2 supports random access in its single-worker mode. Retain
+        // lookahead and temporal tools while bounding frame/worker pools for
+        // the recorder, including simultaneous source outputs.
+        config.level_of_parallelism = 1;
+        // A 16-frame random-access mini-GOP retains bidirectional prediction,
+        // TPL and temporal filtering while keeping 1080p lookahead pools
+        // suitable for a recorder. The upstream 32-frame default exceeds the
+        // app's memory budget even in its single-worker mode.
+        config.hierarchical_levels = 4;
+        config.intra_period_length = static_cast<int32_t>(keyframeSeconds * fps - 1);
+        config.intra_refresh_type = SVT_AV1_KF_REFRESH;
+        config.color_primaries = EB_CICP_CP_BT_709;
+        config.transfer_characteristics = EB_CICP_TC_BT_709;
+        config.matrix_coefficients = EB_CICP_MC_BT_709;
+        config.color_range = EB_CR_STUDIO_RANGE;
+        // SVT implements CRF 64..70 as base QP plus extended offset. Use its
+        // parameter parser instead of incorrectly assigning these to config.qp.
+        const int crf = options.rateControl == EncodingRateControl::ConstantQuality ? options.av1Crf : qualityCrf(quality);
+        result = svt_av1_enc_parse_parameter(&config, "crf", std::to_string(crf).c_str());
+        if (options.rateControl == EncodingRateControl::TargetBitrate) {
+            config.rate_control_mode = SVT_AV1_RC_MODE_VBR;
+            config.target_bit_rate = static_cast<uint32_t>(options.bitrateKbps) * 1000;
         }
-        candidate->sequence.assign(header.first, header.first + header.second);
+        if (result == EB_ErrorNone) result = svt_av1_enc_set_parameter(candidate->codec, &config);
+        if (result != EB_ErrorNone) return fail(result, L"Cannot configure the AV1 encoder", error);
+        result = svt_av1_enc_init(candidate->codec);
+        if (result != EB_ErrorNone) return fail(result, L"Cannot start the AV1 encoder", error);
+        candidate->initialized = true;
+        EbBufferHeaderType* header = nullptr;
+        result = svt_av1_enc_stream_header(candidate->codec, &header);
+        struct HeaderRelease {
+            EbBufferHeaderType* value;
+            ~HeaderRelease() { if (value) svt_av1_enc_stream_header_release(value); }
+        } release{header};
+        if (result != EB_ErrorNone) return fail(result, L"Cannot read the AV1 sequence header", error);
+        if (header && header->p_buffer) {
+            for (size_t at = 0, length = 0; at < header->n_filled_len; at += length) {
+                int type = 0;
+                if (!nextObu(header->p_buffer + at, header->n_filled_len - at, length, type)) break;
+                if (type == obuSequenceHeader) {
+                    candidate->sequence.assign(header->p_buffer + at, header->p_buffer + at + length); break;
+                }
+            }
+        }
+        if (candidate->sequence.empty()) { error = L"Cannot read the AV1 sequence header."; return false; }
+        return true;
+    };
+    // SVT derives some sequence-level tools on its first frame, after the
+    // init-time stream_header API. Obtain the exact final header with one
+    // identical short-lived encoder. Finish and destroy it before starting
+    // the recording instance so the large lookahead pools never overlap.
+    std::vector<uint8_t> sequence;
+    {
+        Av1Encoder primer;
+        if (!start(primer.impl_)) return false;
+        primer.impl_->priming = true;
+        std::vector<uint8_t> flat(size_t(width) * height * 3 / 2, 128);
+        if (!primer.encode(flat.data(), error) || !primer.end(error)) return false;
+        Av1Packet packet;
+        bool eos = false;
+        int received = 0;
+        do {
+            if (!primer.receive(packet, eos, error)) return false;
+            if (!packet.unit.empty()) {
+                if (!packet.keyFrame || packet.pts != 0 || ++received != 1) {
+                    error = L"Cannot read the final AV1 sequence header."; return false;
+                }
+            }
+        } while (!eos);
+        if (received != 1) { error = L"Cannot read the final AV1 sequence header."; return false; }
+        sequence = primer.sequenceHeader();
     }
-    if (!start(candidate->codec, candidate->width, candidate->height, fps, quality, error)) return false;
+    std::unique_ptr<Impl> candidate;
+    if (!start(candidate)) return false;
+    candidate->sequence = std::move(sequence);
     impl_ = std::move(candidate);
     return true;
 }
-
 const std::vector<uint8_t>& Av1Encoder::sequenceHeader() const noexcept {
     static const std::vector<uint8_t> none;
     return impl_ ? impl_->sequence : none;
 }
-
-bool Av1Encoder::encode(const uint8_t* nv12, std::vector<uint8_t>& unit, bool& keyFrame, std::wstring& error) {
+bool Av1Encoder::encode(const uint8_t* nv12, std::wstring& error) {
     error.clear();
-    unit.clear();
-    keyFrame = false;
-    if (!impl_ || !nv12) {
-        error = L"The AV1 encoder is not open.";
-        return false;
-    }
-    if (impl_->failed) {
-        error = L"The AV1 encoder stopped after an earlier error.";
-        return false;
-    }
+    if (!impl_ || !nv12) { error = L"The AV1 encoder is not open."; return false; }
+    if (impl_->failed || impl_->ending) { error = L"The AV1 encoder has stopped."; return false; }
     impl_->failed = true;
-    if (!encodeUnit(impl_->codec, impl_->width, impl_->height, impl_->pts, nv12, unit, keyFrame, error)) return false;
-    if (keyFrame) {
-        // av1C promises this exact header; never write a stream contradicting it.
-        const auto header = sequenceHeaderIn(unit);
-        if (!header.first || !std::equal(header.first, header.first + header.second,
-                                         impl_->sequence.begin(), impl_->sequence.end())) {
-            error = L"The AV1 sequence header changed unexpectedly.";
-            unit.clear();
-            keyFrame = false;
-            return false;
-        }
+    const size_t luma = size_t(impl_->width) * impl_->height, plane = luma / 4;
+    // SVT copies planar input during send_picture(), so both caller NV12
+    // storage and this chroma scratch buffer can be reused immediately.
+    for (size_t i = 0; i < plane; ++i) {
+        impl_->chroma[i] = nv12[luma + 2 * i];
+        impl_->chroma[plane + i] = nv12[luma + 2 * i + 1];
     }
-    ++impl_->pts;
-    impl_->failed = false;
+    EbSvtIOFormat image{};
+    image.luma = const_cast<uint8_t*>(nv12);
+    image.cb = impl_->chroma.data(); image.cr = impl_->chroma.data() + plane;
+    image.y_stride = impl_->width; image.cb_stride = image.cr_stride = impl_->width / 2;
+    EbBufferHeaderType input{};
+    input.size = sizeof(input); input.p_buffer = reinterpret_cast<uint8_t*>(&image);
+    input.n_filled_len = static_cast<uint32_t>(luma * 3 / 2);
+    input.pts = impl_->submitted; input.pic_type = EB_AV1_INVALID_PICTURE;
+    const EbErrorType result = svt_av1_enc_send_picture(impl_->codec, &input);
+    if (result != EB_ErrorNone) return fail(result, L"Cannot submit the AV1 frame", error);
+    ++impl_->submitted; impl_->failed = false;
+    return true;
+}
+bool Av1Encoder::end(std::wstring& error) {
+    error.clear();
+    if (!impl_) { error = L"The AV1 encoder is not open."; return false; }
+    if (impl_->failed) { error = L"The AV1 encoder stopped after an earlier error."; return false; }
+    if (impl_->ending) return true;
+    impl_->failed = true;
+    EbBufferHeaderType input{};
+    input.size = sizeof(input); input.flags = EB_BUFFERFLAG_EOS;
+    const EbErrorType result = svt_av1_enc_send_picture(impl_->codec, &input);
+    if (result != EB_ErrorNone) return fail(result, L"Cannot finish the AV1 stream", error);
+    impl_->ending = true; impl_->failed = false;
+    return true;
+}
+bool Av1Encoder::receive(Av1Packet& packet, bool& eos, std::wstring& error) {
+    error.clear(); packet.unit.clear(); packet.pts = 0; packet.keyFrame = false; eos = false;
+    if (!impl_) { error = L"The AV1 encoder is not open."; return false; }
+    if (impl_->failed) { error = L"The AV1 encoder stopped after an earlier error."; return false; }
+    if (impl_->eos) { eos = true; return true; }
+    impl_->failed = true;
+    OutputBuffer output;
+    const EbErrorType result = svt_av1_enc_get_packet(impl_->codec, &output.value, impl_->ending ? 1 : 0);
+    if (result == EB_NoErrorEmptyQueue && !impl_->ending) { impl_->failed = false; return true; }
+    if (result != EB_ErrorNone) return fail(result, L"Cannot receive the AV1 frame", error);
+    if (!output.value) { error = L"The AV1 encoder produced no packet."; return false; }
+    eos = (output.value->flags & EB_BUFFERFLAG_EOS) != 0;
+    packet.pts = output.value->pts; packet.keyFrame = output.value->pic_type == EB_AV1_KEY_PICTURE;
+    bool sequenceFound = false;
+    try {
+        for (size_t at = 0, length = 0; at < output.value->n_filled_len; at += length) {
+            int type = 0;
+            const uint8_t* data = output.value->p_buffer + at;
+            if (!nextObu(data, output.value->n_filled_len - at, length, type)) {
+                error = L"The AV1 encoder produced an unsupported bitstream."; packet.unit.clear(); return false;
+            }
+            if (type == obuSequenceHeader) {
+                sequenceFound = true;
+                if (impl_->priming && impl_->received == 0) impl_->sequence.assign(data, data + length);
+                else if (length != impl_->sequence.size() || !std::equal(data, data + length, impl_->sequence.begin())) {
+                    error = L"The AV1 sequence header changed unexpectedly."; packet.unit.clear(); return false;
+                }
+            }
+            if (type != obuTemporalDelimiter && type != obuPadding) packet.unit.insert(packet.unit.end(), data, data + length);
+        }
+    } catch (const std::bad_alloc&) {
+        error = L"Cannot store the encoded AV1 frame: not enough memory."; packet.unit.clear(); return false;
+    }
+    if (!packet.unit.empty()) {
+        if (packet.pts != impl_->received || (packet.keyFrame && !sequenceFound)) {
+            error = L"The AV1 encoder produced an unexpected frame order or keyframe."; packet.unit.clear(); return false;
+        }
+        ++impl_->received;
+    } else if (!eos) { error = L"The AV1 encoder produced an empty video frame."; return false; }
+    if (eos && (!impl_->ending || impl_->received != impl_->submitted)) {
+        error = L"The AV1 encoder did not finish every submitted frame."; packet.unit.clear(); return false;
+    }
+    impl_->eos = eos; impl_->failed = false;
     return true;
 }
 }

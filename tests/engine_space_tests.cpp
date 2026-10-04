@@ -86,10 +86,10 @@ class SpaceEncoder {
     bool secondary_ = false;
 public:
     bool open(const std::wstring& path, int width, int height, int fps, std::wstring& error,
-              EncodingQuality quality, EncodingMode mode, bool recoveryMode) {
+              EncodingQuality quality, EncodingMode mode, bool recoveryMode, const EncodingOptions& options = {}) {
         secondary_ = path.find(L"-camera.recording.mp4") != std::wstring::npos;
         if (expectQueries && !queryCalls) orderingFailed = true;
-        const bool result = real_.open(path, width, height, fps, error, quality, mode, recoveryMode);
+        const bool result = real_.open(path, width, height, fps, error, quality, mode, recoveryMode, options);
         if (result) {
             ++openedWriters;
             if (!paired || secondary_) openGate.enter();

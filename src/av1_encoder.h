@@ -1,13 +1,19 @@
-#pragma once
+﻿#pragma once
 #include "core.h"
 
 namespace lapse {
-// Software AV1 encoding with the pinned libaom encoder for one fixed-size,
-// 8-bit 4:2:0 BT.709 limited-range stream. There is no lookahead: every
-// accepted frame immediately yields exactly one shown temporal unit, so
-// written samples and frame counts stay one-to-one as in the H.264 modes.
-// Use from one thread. After any failed encode() the stream is unusable and
-// later frames are refused, because libaom may already reference that frame.
+// A complete shown temporal unit in display order, including any hidden
+// reference pictures. SVT-AV1 outputs DTS=PTS. Delimiter/padding OBUs are
+// removed to conform to the AV1 MP4 binding.
+struct Av1Packet {
+    std::vector<uint8_t> unit;
+    int64_t pts = 0;
+    bool keyFrame = false;
+};
+// Bundled SVT-AV1, fixed-size 8-bit 4:2:0 BT.709 limited range. Use from one
+// thread. encode() copies input into SVT's lookahead queue. Drain receive()
+// after submitting frames; call end() and receive() through EOS at stop.
+// Any failed operation permanently stops the stream.
 class Av1Encoder {
 public:
     Av1Encoder();
@@ -15,14 +21,16 @@ public:
     Av1Encoder(const Av1Encoder&) = delete;
     Av1Encoder& operator=(const Av1Encoder&) = delete;
 
-    // Width and height must be even and valid for recording.
-    bool open(int width, int height, int fps, EncodingQuality quality, std::wstring& error);
+    bool open(int width, int height, int fps, EncodingQuality quality, std::wstring& error,
+              const EncodingOptions& options = {});
     // The sequence header OBU for the MP4 av1C box; available after open().
     const std::vector<uint8_t>& sequenceHeader() const noexcept;
-    // nv12 is tightly packed: width x height luma, then interleaved chroma.
-    // On success, unit holds one complete temporal unit without temporal
-    // delimiter or padding OBUs, as stored in MP4 samples.
-    bool encode(const uint8_t* nv12, std::vector<uint8_t>& unit, bool& keyFrame, std::wstring& error);
+    // Tightly packed NV12: width x height luma, then interleaved chroma.
+    bool encode(const uint8_t* nv12, std::wstring& error);
+    bool end(std::wstring& error);
+    // Nonblocking before end(), blocking after it. Empty unit means no packet
+    // is ready. EOS can accompany the final nonempty unit.
+    bool receive(Av1Packet& packet, bool& eos, std::wstring& error);
 
 private:
     struct Impl;

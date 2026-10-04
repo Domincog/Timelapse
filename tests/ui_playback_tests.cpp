@@ -158,9 +158,83 @@ void persistedSettingsAndTiming(){
     app.settings.outputFps=24;require(trayProgressText(status,progress) && std::wstring(progress).find(L"00:00:01 video")!=std::wstring::npos,"Editing next-recording fps changed previous recording duration.");
     std::cout<<"PASS exact preference roundtrip, malformed/default recovery, saved-shortcut conflicts and stable recorded-fps timing\n";
 }
+void advancedEncoderDialog(){
+    PlaybackFixture fixture;
+    app.encoderConfigure=CreateWindowExW(0,L"BUTTON",L"Encoder settings...",WS_CHILD|WS_TABSTOP,0,0,202,30,app.window,nullptr,nullptr,nullptr);
+    require(app.encoderConfigure!=nullptr,"Cannot create owned encoder entry.");
+    choose(app.encodingMode,static_cast<int>(EncodingMode::SoftwareAV1));configure();
+    playbackProbe::dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<EncoderDraft*>(parameter);
+        require(draft.options.av1Preset==6 && encoderDraftRate(draft)==EncodingRateControl::Automatic && SendMessageW(draft.preset,CB_GETCOUNT,0,0)==12,
+            "AV1 default preset/rate or full preset range changed.");
+        require((GetWindowLongPtrW(draft.preset,GWL_STYLE)&WS_VISIBLE) && !(GetWindowLongPtrW(draft.value,GWL_STYLE)&WS_VISIBLE),"Automatic exposed a custom field or hid AV1 preset.");
+        choose(draft.preset,9);choose(draft.rate,1);encoderSettingsProc(window,WM_COMMAND,MAKEWPARAM(EncoderRate,CBN_SELCHANGE),reinterpret_cast<LPARAM>(draft.rate));
+        require(encoderDraftRate(draft)==EncodingRateControl::ConstantQuality && (GetWindowLongPtrW(draft.value,GWL_STYLE)&WS_VISIBLE) && playbackText(draft.help).find(L"overrides Video quality")!=std::wstring::npos,
+            "Custom CRF field or explanation did not follow rate selection.");
+        SetWindowTextW(draft.value,L"48");encoderSettingsProc(window,WM_CLOSE,0,0);};
+    editEncoderSettings();require(app.settings.encodingOptions.av1Preset==6 && app.settings.encodingOptions.rateControl==EncodingRateControl::Automatic,"Cancelled encoder draft committed values.");
+    playbackProbe::dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<EncoderDraft*>(parameter);
+        choose(draft.preset,8);choose(draft.rate,1);encoderSettingsProc(window,WM_COMMAND,MAKEWPARAM(EncoderRate,CBN_SELCHANGE),0);
+        SetWindowTextW(draft.value,L"45");choose(draft.rate,2);encoderSettingsProc(window,WM_COMMAND,MAKEWPARAM(EncoderRate,CBN_SELCHANGE),0);
+        SetWindowTextW(draft.value,L"2800");choose(draft.rate,1);encoderSettingsProc(window,WM_COMMAND,MAKEWPARAM(EncoderRate,CBN_SELCHANGE),0);
+        require(playbackText(draft.value)==L"45" && draft.options.bitrateKbps==2800,"Rate switching discarded a valid custom draft.");
+        for(const wchar_t* invalid:{L"",L"0",L"71",L"32.0",L"32junk",L"-1",L"999999999999999999999999999999"}){
+            SetWindowTextW(draft.value,invalid);encoderSettingsProc(window,WM_COMMAND,IDOK,0);
+            require(!playbackProbe::dialogOutcome && !playbackText(draft.error).empty(),"Invalid custom CRF was accepted.");}
+        SetWindowTextW(draft.value,L" 40 ");encoderSettingsProc(window,WM_COMMAND,IDOK,0);require(playbackProbe::dialogOutcome==IDOK,"Valid custom CRF failed to commit.");};
+    editEncoderSettings();require(app.settings.encodingOptions.av1Preset==8 && app.settings.encodingOptions.rateControl==EncodingRateControl::ConstantQuality &&
+        app.settings.encodingOptions.av1Crf==40 && probe::configured.encodingOptions.av1Crf==40,"Advanced AV1 settings did not reach the engine.");
+    choose(app.encodingMode,static_cast<int>(EncodingMode::Compatible));configure();updateControls();
+    require(!app.encodingValidation.empty() && !IsWindowEnabled(app.record) && app.advancedCaption.find(L"check encoding")!=std::wstring::npos && app.advancedTooltip.find(L"SVT-AV1 preset")==std::wstring::npos,
+        "Switching encoders silently retained unsupported custom CRF or mislabeled its warning.");
+    playbackProbe::dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<EncoderDraft*>(parameter);
+        require(SendMessageW(draft.rate,CB_GETCOUNT,0,0)==2 && !(GetWindowLongPtrW(draft.preset,GWL_STYLE)&WS_VISIBLE),"H.264 exposed AV1-only controls.");
+        choose(draft.rate,1);encoderSettingsProc(window,WM_COMMAND,MAKEWPARAM(EncoderRate,CBN_SELCHANGE),0);SetWindowTextW(draft.value,L"100001");encoderSettingsProc(window,WM_COMMAND,IDOK,0);
+        require(!playbackProbe::dialogOutcome,"Bitrate above supported bounds was accepted.");SetWindowTextW(draft.value,L"2000");encoderSettingsProc(window,WM_COMMAND,IDOK,0);};
+    editEncoderSettings();require(app.settings.encodingOptions.rateControl==EncodingRateControl::TargetBitrate && app.settings.encodingOptions.bitrateKbps==2000 && app.encodingValidation.empty(),"Target bitrate did not repair unsupported mode choice.");
+    for(auto state:{State::Waiting,State::Starting,State::Recording,State::Paused,State::Finishing}){
+        fixture.owned.state(state);playbackProbe::dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<EncoderDraft*>(parameter);
+            require(draft.readOnly && !IsWindowEnabled(draft.preset) && !IsWindowEnabled(draft.rate) && !IsWindowEnabled(draft.value) && !IsWindowEnabled(draft.defaults) && !IsWindowEnabled(draft.okay),"Active encoder settings were editable.");
+            SetWindowTextW(draft.value,L"9000");encoderSettingsProc(window,WM_COMMAND,IDOK,0);};editEncoderSettings();require(app.settings.encodingOptions.bitrateKbps==2000,"Forged active OK changed frozen encoder settings.");}
+    fixture.owned.state(State::Idle);choose(app.encodingMode,static_cast<int>(EncodingMode::SoftwareAV1));configure();
+    playbackProbe::dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<EncoderDraft*>(parameter);
+        for(int dpi:{96,144,192}){draft.dpi=dpi;customFont(window,draft);SetWindowPos(window,nullptr,0,0,draft.scale(460),draft.scale(440),SWP_NOZORDER|SWP_NOACTIVATE);encoderSettingsLayout(window,draft);
+            RECT preset{},rate{},value{},help{},error{},okay{};GetWindowRect(draft.preset,&preset);GetWindowRect(draft.rate,&rate);GetWindowRect(draft.value,&value);GetWindowRect(draft.help,&help);GetWindowRect(draft.error,&error);GetWindowRect(draft.okay,&okay);
+            require(preset.bottom<rate.top && rate.bottom<value.top && value.bottom<help.top && help.bottom<error.top && error.bottom<okay.top,"Encoder controls overlap at supported DPI.");
+            SetWindowPos(window,nullptr,0,0,draft.scale(280),draft.scale(160),SWP_NOZORDER|SWP_NOACTIVATE);encoderSettingsLayout(window,draft);encoderSettingsReveal(window,draft,draft.cancel);
+            RECT bounds{},client{};GetWindowRect(draft.cancel,&bounds);MapWindowPoints(nullptr,window,reinterpret_cast<POINT*>(&bounds),2);GetClientRect(window,&client);
+            require(bounds.left>=0 && bounds.top>=0 && bounds.right<=client.right && bounds.bottom<=client.bottom,"Small encoder viewport cannot reveal Cancel.");}
+        encoderSettingsProc(window,WM_COMMAND,EncoderDefaults,0);require(choice(draft.preset)==6 && encoderDraftRate(draft)==EncodingRateControl::Automatic,"Use defaults did not restore preset 6 and automatic quality.");
+        encoderSettingsProc(window,WM_COMMAND,IDOK,0);};editEncoderSettings();require(app.settings.encodingOptions.av1Preset==6 && app.settings.encodingOptions.rateControl==EncodingRateControl::Automatic,"Encoder defaults did not commit.");
+    app.dpi=96;app.advancedExpanded=false;app.advancedVisibility=-1;updateAdvanced();require(!(GetWindowLongPtrW(app.encoderConfigure,GWL_STYLE)&WS_VISIBLE),"Encoder entry leaked into collapsed Advanced.");
+    app.encoderConfigure=nullptr;
+    std::cout<<"PASS encoder native drafts, AV1-only preset/CRF, all-mode bitrate, strict validation, frozen sessions and DPI/scroll geometry\n";
+}
+void encoderPreferenceRoundtrip(){
+    PlaybackFixture fixture;OwnedPreferences preferencesFile;
+    for(EncodingQuality quality:{EncodingQuality::Compact,EncodingQuality::Balanced,EncodingQuality::Detail,EncodingQuality::ExtraSmall}){
+        choose(app.encodingQuality,encodingQualityChoice(quality));choose(app.encodingMode,static_cast<int>(EncodingMode::SoftwareAV1));configure();
+        app.settings.encodingOptions.av1Preset=11;app.settings.encodingOptions.rateControl=EncodingRateControl::ConstantQuality;app.settings.encodingOptions.av1Crf=45;app.settings.encodingOptions.bitrateKbps=2300;
+        require(savePreferences(),"Cannot save owned AV1 preferences.");app.settings.encodingOptions={};preferences(false);configure();
+        require(app.settings.encodingQuality==quality && app.settings.encodingOptions.av1Preset==11 && app.settings.encodingOptions.rateControl==EncodingRateControl::ConstantQuality &&
+            app.settings.encodingOptions.av1Crf==45 && app.settings.encodingOptions.bitrateKbps==2300,"Quality mapping or advanced encoding roundtrip changed values.");
+    }
+    struct Setting {const wchar_t* key;const wchar_t* valid;const wchar_t* invalid;int expected;};
+    for(const Setting& item:{Setting{L"Av1Preset",L"11",L"12",6},Setting{L"Av1Crf",L"70",L"0",32},Setting{L"EncodingBitrateKbps",L"100000",L"100001",4000}}){
+        preferencesFile.write(item.key,item.valid);preferences(false);
+        for(const wchar_t* invalid:{item.invalid,L"",L"-1",L"1.0",L"01",L"1junk",L"999999999999999999999999999999"}){
+            preferencesFile.write(item.key,invalid);preferences(false);const int value=std::wcscmp(item.key,L"Av1Preset")==0?app.settings.encodingOptions.av1Preset:
+                std::wcscmp(item.key,L"Av1Crf")==0?app.settings.encodingOptions.av1Crf:app.settings.encodingOptions.bitrateKbps;
+            require(value==item.expected,"Malformed advanced preference enabled a numeric prefix or retained prior settings.");}
+    }
+    preferencesFile.write(L"Av1Preset",L"13");preferences(false);require(app.settings.encodingOptions.av1Preset==6,"Clamped preset 13 was exposed through preferences.");
+    for(const wchar_t* invalid:{L"3",L"-1",L"1junk",L"01"}){preferencesFile.write(L"EncodingRateControl",invalid);preferences(false);require(app.settings.encodingOptions.rateControl==EncodingRateControl::Automatic,"Malformed persisted rate control was accepted.");}
+    preferencesFile.write(L"EncodingMode",L"0");preferencesFile.write(L"EncodingRateControl",L"1");preferences(false);configure();
+    require(app.settings.encodingOptions.rateControl==EncodingRateControl::Automatic && app.encodingValidation.empty(),"Saved AV1-only CRF enabled unsupported H.264 settings.");
+    std::cout<<"PASS exact four-quality/advanced preference mapping and malformed or unsupported encoder fallback\n";
+}
 }
 int main(){
     std::cout<<std::unitbuf;INITCOMMONCONTROLSEX controls{sizeof(controls),ICC_STANDARD_CLASSES|ICC_HOTKEY_CLASS};InitCommonControlsEx(&controls);
-    try{cancellationAndValidation();conflictsSwapsAndCleanup();shortcutLifecycle();dialogStateAndGeometry();persistedSettingsAndTiming();std::cout<<"All playback UI cases passed with owned controls and synthetic registrations.\n";return 0;}
+    try{cancellationAndValidation();conflictsSwapsAndCleanup();shortcutLifecycle();dialogStateAndGeometry();persistedSettingsAndTiming();advancedEncoderDialog();encoderPreferenceRoundtrip();std::cout<<"All playback and encoder UI cases passed with owned controls and synthetic registrations.\n";return 0;}
     catch(const std::exception& error){std::cerr<<"FAIL: "<<error.what()<<'\n';return 1;}
 }

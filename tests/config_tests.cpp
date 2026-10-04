@@ -163,9 +163,35 @@ void sourceSizeSuggestions() {
                   "source aspect is preserved within even-pixel rounding");
         }
 }
+void encoderSettings() {
+    using namespace lapse;
+    std::wstring error;
+    EncodingOptions options;
+    check(options.av1Preset==6 && options.rateControl==EncodingRateControl::Automatic && options.av1Crf==32 && options.bitrateKbps==4000,
+          "advanced encoder defaults remain automatic with preset six");
+    for(auto mode:{EncodingMode::Compatible,EncodingMode::Efficient,EncodingMode::HardwareH264,EncodingMode::HardwareHEVC,EncodingMode::QualityH264,EncodingMode::SoftwareAV1}){
+        check(validateEncodingOptions(mode,options,error) && error.empty(),"automatic defaults supported by every encoder");
+        auto bitrate=options;bitrate.rateControl=EncodingRateControl::TargetBitrate;
+        for(int value:{1,4000,100000}){bitrate.bitrateKbps=value;check(validateEncodingOptions(mode,bitrate,error),"bitrate bounds supported by every encoder");}
+        auto crf=options;crf.rateControl=EncodingRateControl::ConstantQuality;
+        check(validateEncodingOptions(mode,crf,error)==(mode==EncodingMode::SoftwareAV1),"custom CRF restricted to AV1 without fallback");
+    }
+    for(int preset:{0,6,11}){options.av1Preset=preset;check(validateEncodingOptions(EncodingMode::SoftwareAV1,options,error),"SVT preset inclusive bounds");}
+    for(int preset:{-1,12,13,INT_MAX}){options.av1Preset=preset;check(!validateEncodingOptions(EncodingMode::SoftwareAV1,options,error),"invalid or clamped preset rejected even in automatic mode");}
+    options={};options.rateControl=EncodingRateControl::ConstantQuality;
+    for(int crf:{1,32,70}){options.av1Crf=crf;check(validateEncodingOptions(EncodingMode::SoftwareAV1,options,error),"SVT CRF inclusive bounds");}
+    for(int crf:{0,71,INT_MAX}){options.av1Crf=crf;check(!validateEncodingOptions(EncodingMode::SoftwareAV1,options,error),"invalid CRF rejected");}
+    options={};options.rateControl=static_cast<EncodingRateControl>(77);check(!validateEncodingOptions(EncodingMode::SoftwareAV1,options,error),"unknown rate control rejected");
+    options={};for(int bitrate:{0,-1,100001,INT_MAX}){options.bitrateKbps=bitrate;check(!validateEncodingOptions(EncodingMode::SoftwareAV1,options,error),"invalid hidden bitrate rejected");}
+    int parsed=999;
+    for(const wchar_t* invalid:{L"",L" ",L"-1",L"+1",L"1.0",L"1e2",L"70 CRF",L"1 0",L"9999999999999999"})
+        check(!parseEncodingInteger(invalid,1,70,parsed,error) && parsed==999 && !error.empty(),"invalid encoder numeric drafts cannot commit");
+    check(parseEncodingInteger(L" \t70\r\n",1,70,parsed,error) && parsed==70 && error.empty(),"encoder whole-number parser accepts surrounding whitespace");
+    check(parseEncodingInteger(L"0",0,11,parsed,error) && parsed==0,"preset zero is supported");
+}
 }
 int main() {
-    durationParsing(); formatsAndBounds(); previewGeometry(); recordingFormats(); playbackRates(); sourceSizeSuggestions();
+    durationParsing(); formatsAndBounds(); previewGeometry(); recordingFormats(); playbackRates(); sourceSizeSuggestions(); encoderSettings();
     if (failures) return 1;
     std::cout << "Exact custom settings and bounded geometry checks passed\n";
     return 0;

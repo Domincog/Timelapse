@@ -52,9 +52,9 @@ class CustomEncoder {
     Encoder real_;
     bool secondary_ = false;
 public:
-    bool open(const std::wstring& path, int width, int height, int fps, std::wstring& error, EncodingQuality q, EncodingMode mode, bool recoveryMode) {
+    bool open(const std::wstring& path, int width, int height, int fps, std::wstring& error, EncodingQuality q, EncodingMode mode, bool recoveryMode, const EncodingOptions& options = {}) {
         ++opens; secondary_ = path.find(L"-camera.recording.mp4") != std::wstring::npos;
-        return real_.open(path, width, height, fps, error, q, mode, recoveryMode);
+        return real_.open(path, width, height, fps, error, q, mode, recoveryMode, options);
     }
     bool write(const Frame& frame, std::wstring& error) {
         { std::lock_guard<std::mutex> lock(observationsMutex); writes.push_back({GetTickCount64(), frame.width, frame.height, secondary_}); }
@@ -178,6 +178,11 @@ void invalidAdmission(const std::filesystem::path& root) {
         auto value = settings(L""); value.intervalMs = 999; value.night.enabled = true; value.night.durationMs = duration; cases.push_back(value);
     }
     auto tooLong = settings(L""); tooLong.intervalMs = 1499; tooLong.night.enabled = true; tooLong.night.durationMs = 1500; cases.push_back(tooLong);
+    for(int preset:{-1,12,13}){auto value=settings(L"");value.encodingOptions.av1Preset=preset;cases.push_back(value);}
+    for(int crf:{0,71}){auto value=settings(L"");value.encodingOptions.av1Crf=crf;cases.push_back(value);}
+    for(int bitrate:{0,100001}){auto value=settings(L"");value.encodingOptions.bitrateKbps=bitrate;cases.push_back(value);}
+    auto invalidRate=settings(L"");invalidRate.encodingOptions.rateControl=static_cast<EncodingRateControl>(77);cases.push_back(invalidRate);
+    auto unsupportedCrf=settings(L"");unsupportedCrf.encodingOptions.rateControl=EncodingRateControl::ConstantQuality;cases.push_back(unsupportedCrf);
     unsigned index = 0;
     for (auto value : cases) {
         reset(); value.folder = (root / (L"invalid-" + std::to_wstring(index++))).wstring(); value.separateFiles = true;

@@ -201,6 +201,42 @@ bool validateEncodingMode(EncodingMode mode, bool recoveryMode, std::wstring& er
     }
     return true;
 }
+bool parseEncodingInteger(std::wstring_view text, int minimum, int maximum, int& result, std::wstring& error) {
+    error.clear(); text = trimmed(text);
+    const auto invalid = [&] {
+        error = L"Enter a whole number from " + std::to_wstring(minimum) + L" to " + std::to_wstring(maximum) + L".";
+        return false;
+    };
+    if (minimum < 0 || maximum < minimum || text.empty() || text.size() > 16) return invalid();
+    int64_t value = 0;
+    for (wchar_t c : text) {
+        if (c < L'0' || c > L'9') return invalid();
+        value = value * 10 + (c - L'0');
+        if (value > maximum) return invalid();
+    }
+    if (value < minimum) return invalid();
+    result = static_cast<int>(value); return true;
+}
+bool validateEncodingOptions(EncodingMode mode, const EncodingOptions& options, std::wstring& error) {
+    error.clear();
+    if (options.av1Preset < 0 || options.av1Preset > MaxAv1Preset) {
+        error = L"SVT-AV1 preset must be from 0 to 11. Preset 6 is the default."; return false;
+    }
+    if (options.rateControl != EncodingRateControl::Automatic && options.rateControl != EncodingRateControl::ConstantQuality &&
+        options.rateControl != EncodingRateControl::TargetBitrate) {
+        error = L"Choose a valid encoder rate control."; return false;
+    }
+    if (options.av1Crf < 1 || options.av1Crf > 70) {
+        error = L"SVT-AV1 CRF must be a whole number from 1 to 70."; return false;
+    }
+    if (options.bitrateKbps < 1 || options.bitrateKbps > 100000) {
+        error = L"Target bitrate must be from 1 to 100,000 kbps."; return false;
+    }
+    if (options.rateControl == EncodingRateControl::ConstantQuality && mode != EncodingMode::SoftwareAV1) {
+        error = L"Custom CRF requires SVT-AV1. Choose Automatic or Target bitrate for this encoder."; return false;
+    }
+    return true;
+}
 std::wstring formatDuration(int64_t milliseconds, bool compact) {
     if (milliseconds < 0) return L"Invalid duration";
     struct Unit { int64_t ms; const wchar_t* shortName; const wchar_t* singular; const wchar_t* plural; };

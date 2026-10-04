@@ -102,10 +102,10 @@ class ObservedEncoder {
     bool camera_ = false;
 public:
     bool open(const std::wstring& path, int width, int height, int fps, std::wstring& error,
-              EncodingQuality quality, EncodingMode mode, bool recovery) {
+              EncodingQuality quality, EncodingMode mode, bool recovery, const EncodingOptions& options = {}) {
         ++opens; camera_ = path.find(L"-camera.recording.mp4") != std::wstring::npos;
         add({Kind::Open, {}, {}, 0, 0, camera_});
-        return real_.open(path, width, height, fps, error, quality, mode, recovery);
+        return real_.open(path, width, height, fps, error, quality, mode, recovery, options);
     }
     bool write(const Frame& frame, std::wstring& error) {
         add({Kind::Write, {}, {}, 0, pixelsHash(frame), camera_});

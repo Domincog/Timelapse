@@ -35,9 +35,10 @@ uint64_t privateBytes() {
 }
 }
 int wmain(int argc, wchar_t** argv) {
-    if (argc != 8) {
+    if (argc != 8 && argc != 11) {
         std::cerr << "Usage: encoding_benchmark <compatible|efficient|quality-h264|hardware-h264|hardware-hevc|av1> "
-            "<compact|balanced|detail> <scene:0-3> <width> <height> <frames> <unused-output.mp4>\n"
+            "<extra-small|compact|balanced|detail> <scene:0-3> <width> <height> <frames> <unused-output.mp4> "
+            "[<av1-preset:0-11> <auto|crf|bitrate> <crf-or-kbps>]\n"
             "Example: encoding_benchmark efficient balanced 0 1920 1080 180 screen.mp4\n"
             "Pre-renders all source frames (180 x 1080p uses about 1.4 GiB) outside encoding measurements.\n"
             "Run encoding_quality_verifier or verify-encoding-quality.ps1 on every output for fidelity/timing QA.\n";
@@ -55,10 +56,23 @@ int wmain(int argc, wchar_t** argv) {
         else if (modeName == L"av1") mode = lapse::EncodingMode::SoftwareAV1;
         else throw std::runtime_error("Invalid encoding mode");
         lapse::EncodingQuality quality;
-        if (qualityName == L"compact") quality = lapse::EncodingQuality::Compact;
+        if (qualityName == L"extra-small") quality = lapse::EncodingQuality::ExtraSmall;
+        else if (qualityName == L"compact") quality = lapse::EncodingQuality::Compact;
         else if (qualityName == L"balanced") quality = lapse::EncodingQuality::Balanced;
         else if (qualityName == L"detail") quality = lapse::EncodingQuality::Detail;
         else throw std::runtime_error("Invalid encoding quality");
+        lapse::EncodingOptions options;
+        if (argc == 11) {
+            options.av1Preset = integer(argv[8]);
+            const std::wstring control = argv[9];
+            if (control == L"crf") {
+                options.rateControl = lapse::EncodingRateControl::ConstantQuality;
+                options.av1Crf = integer(argv[10]);
+            } else if (control == L"bitrate") {
+                options.rateControl = lapse::EncodingRateControl::TargetBitrate;
+                options.bitrateKbps = integer(argv[10]);
+            } else require(control == L"auto", "Invalid rate control");
+        }
         const int scene = integer(argv[3]), width = integer(argv[4]), height = integer(argv[5]), count = integer(argv[6]);
         require(scene < corpus::sceneCount && width >= 640 && height >= 360 && width <= 4096 && height <= 4096 &&
             !(width & 1) && !(height & 1) && count > 0 && count <= 1000, "Invalid scene, dimensions or frame count");
@@ -73,7 +87,7 @@ int wmain(int argc, wchar_t** argv) {
         lapse::Encoder encoder; std::wstring error;
         const auto initialPrivate = privateBytes(); auto peakPrivate = initialPrivate;
         const auto cpuStart = processCpu(); const auto start = std::chrono::steady_clock::now();
-        encoded(encoder.open(argv[7], width, height, corpus::fps, error, quality, mode), error);
+        encoded(encoder.open(argv[7], width, height, corpus::fps, error, quality, mode, false, options), error);
         const auto cpuOpened = processCpu(); peakPrivate = std::max(peakPrivate, privateBytes());
         for (const auto& frame : frames) {
             encoded(encoder.write(frame, error), error); peakPrivate = std::max(peakPrivate, privateBytes());

@@ -26,7 +26,8 @@ $personSources = @('person-pack/README.md', 'person-pack/CMakeLists.txt', 'perso
     'person-pack/model.cpp', 'person-pack/model.h', 'person-pack/model.rc.in', 'person-pack/resources.h', 'person-pack/worker.cpp',
     'person-pack/tests/model_fixture.cpp', 'person-pack/tests/model_tests.cpp', 'person-pack/tests/worker_tests.cpp',
     'person-pack/NOTICE.txt', 'person-pack/NanoDet-LICENSE.txt', 'person-pack/ncnn-LICENSE.txt', 'third-party/ncnn-LICENSE.txt')
-$av1Sources = @('third-party/libaom.cmake', 'third-party/libaom-LICENSE.txt', 'third-party/libaom-PATENTS.txt')
+$av1Sources = @('third-party/svt-av1.cmake', 'third-party/svt-av1-LICENSE.txt', 'third-party/svt-av1-PATENTS.txt',
+    'third-party/svt-av1-BSD2-LICENSE.txt', 'third-party/svt-av1-fastfeat-LICENSE.txt', 'third-party/svt-av1-safestringlib-LICENSE.txt')
 
 function Assert([bool]$Condition, [string]$Message) { if (-not $Condition) { throw $Message } }
 function Write-Text([string]$Path, [string]$Text) { [System.IO.File]::WriteAllText($Path, $Text, $utf8) }

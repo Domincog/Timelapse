@@ -210,7 +210,7 @@ struct HiddenFixture {
             auto handle=child(L"COMBOBOX",CBS_DROPDOWNLIST);
             for(int i=0;i<count;++i)add(handle,std::to_wstring(i)); choose(handle,0); return handle;
         };
-        app.mode=combo(6); app.interval=combo(6); app.videoSize=combo(2); app.encodingQuality=combo(3); app.encodingMode=combo(static_cast<int>(std::size(EncodingModeLabels)));app.stopAfter=combo(6);
+        app.mode=combo(6); app.interval=combo(6); app.videoSize=combo(2); app.encodingQuality=combo(4); app.encodingMode=combo(static_cast<int>(std::size(EncodingModeLabels)));app.stopAfter=combo(6);
         app.splitEvery=combo(5);app.segmentLabel=child(L"STATIC",0);app.hasCustomSegment=false;app.committedSegment=0;app.customSegmentSeconds=900;app.advancedSegmentSeconds=-1;
         app.lowDisk=child(L"BUTTON",BS_AUTOCHECKBOX);SendMessageW(app.lowDisk,BM_SETCHECK,BST_CHECKED,0);
         app.recoveryMode=child(L"BUTTON",BS_AUTOCHECKBOX);
@@ -563,8 +563,9 @@ void missingPathsReachStartup(){
 
 void indexLoads() {
     struct Input { UINT interval,size,quality; int seconds,width; EncodingQuality expected; };
-    const Input cases[]={{5,1,2,60,1920,EncodingQuality::Detail},{999,999,999,60,1920,EncodingQuality::Detail},
-        {static_cast<UINT>(-1),static_cast<UINT>(-1),static_cast<UINT>(-1),1,1280,EncodingQuality::Compact}};
+    const Input cases[]={{5,1,2,60,1920,EncodingQuality::Detail},{5,1,3,60,1920,EncodingQuality::ExtraSmall},
+        {999,999,999,60,1920,EncodingQuality::Balanced},
+        {static_cast<UINT>(-1),static_cast<UINT>(-1),static_cast<UINT>(-1),1,1280,EncodingQuality::Balanced}};
     seed(false);
     overrideIndexes=false; preferences(false); configure();
     require(app.settings.intervalMs==5000&&app.settings.width==1280&&app.settings.encodingQuality==EncodingQuality::Balanced&&choice(app.mode)==0,

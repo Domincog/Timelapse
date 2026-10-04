@@ -28,6 +28,8 @@ struct Settings {
     int outputFps = DefaultOutputFps;
     EncodingQuality encodingQuality = EncodingQuality::Balanced;
     EncodingMode encodingMode = EncodingMode::Compatible;
+    // Advanced settings freeze with every output and segment at Record.
+    EncodingOptions encodingOptions;
     std::wstring folder;
     bool preview = true;
     // Capture both selected sources on one schedule into independent videos.

@@ -13,7 +13,7 @@ HRESULT WINAPI modeTestCreateWriter(LPCWSTR, IMFByteStream*, IMFAttributes*, IMF
 HRESULT WINAPI modeTestCreateSample(IMFSample**);
 // Make a real sink writer select software for one explicit hardware request.
 // This exercises fallback rejection even on a CI machine with no GPU encoder.
-// The sample hook fails one AV1 frame after the codec has already accepted it.
+// The sample hook fails the AV1 drain after the codec has accepted input.
 #define MFCreateSinkWriterFromURL modeTestCreateWriter
 #define MFCreateSample modeTestCreateSample
 #include "../src/encoder.cpp"
@@ -121,8 +121,9 @@ void verifyAv1(const std::filesystem::path& path, int count, const std::vector<i
     const std::vector<uint8_t> file((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     size_t at = 0, bytes = 0;
     require(findBox(file, 0, file.size(), "av1C", at, bytes) && bytes > 4, "AV1 MP4 lacks av1C");
-    require(file[at] == 0x81 && file[at + 1] >> 5 == 0 && (file[at + 2] & 0x7c) == 0x0c && file[at + 3] == 0,
-        "av1C does not describe 8-bit 4:2:0 Main profile without presentation delay");
+    require(file[at] == 0x81 && file[at + 1] >> 5 == 0 && (file[at + 2] & 0x7c) == 0x0c &&
+        (file[at + 3] & 0xe0) == 0 && ((file[at + 3] & 0x10) || !(file[at + 3] & 0x0f)),
+        "av1C does not describe 8-bit 4:2:0 Main profile with a valid presentation delay");
     const std::vector<uint8_t> sequence(file.begin() + at + 4, file.begin() + at + bytes);
     const auto config = obus(sequence.data(), sequence.size());
     require(config.size() == 1 && config[0].type == 1, "av1C configOBUs must be exactly one sequence header");
@@ -155,7 +156,7 @@ lapse::Frame pattern(int frameIndex) {
     }
     return f;
 }
-void verify(const std::filesystem::path& path, int count, lapse::EncodingMode mode, int playbackFps = fps) {
+void verify(const std::filesystem::path& path, int count, lapse::EncodingMode mode, int playbackFps = fps, bool checkPattern = true) {
     ComPtr<IMFSourceReader> reader;
     check(MFCreateSourceReaderFromURL(path.c_str(), nullptr, &reader), "Open encoded mode output");
     ComPtr<IMFMediaType> native; check(reader->GetNativeMediaType(video, 0, &native), "Read native type");
@@ -164,7 +165,7 @@ void verify(const std::filesystem::path& path, int count, lapse::EncodingMode mo
     // Compressed HEVC samples are readable even when the optional Windows HEVC
     // decoder is absent. Local independent FFmpeg QA covers decoded HEVC pixels.
     // AV1 pixels are checked whenever the optional Windows AV1 decoder exists.
-    const bool decode = mode != lapse::EncodingMode::HardwareHEVC &&
+    const bool decode = checkPattern && mode != lapse::EncodingMode::HardwareHEVC &&
         (mode != lapse::EncodingMode::SoftwareAV1 || av1Decoder());
     UINT32 w = 0, h = 0; check(MFGetAttributeSize(native.Get(), MF_MT_FRAME_SIZE, &w, &h), "Read size");
     if (w != width || h != height) {
@@ -228,7 +229,8 @@ void exercise(const std::filesystem::path& directory, lapse::EncodingMode mode) 
         std::cout << "Hardware mode " << int(mode) << " absent (independent MFT enumeration); skipped.\n"; return;
     }
     lapse::Encoder encoder; std::wstring error;
-    for (auto quality : {lapse::EncodingQuality::Compact, lapse::EncodingQuality::Balanced, lapse::EncodingQuality::Detail}) {
+    for (auto quality : {lapse::EncodingQuality::ExtraSmall, lapse::EncodingQuality::Compact,
+                         lapse::EncodingQuality::Balanced, lapse::EncodingQuality::Detail}) {
         for (int count : {0, 1, 2, 31}) {
             const auto name = std::to_wstring(int(mode)) + L"-" + std::to_wstring(int(quality)) + L"-" + std::to_wstring(count);
             const auto path = directory / (name + L".recording.mp4"), published = directory / (name + L".mp4");
@@ -314,29 +316,106 @@ void av1Specifics(const std::filesystem::path& directory) {
     }
     for (size_t i = 0; i < runs[0].size(); ++i)
         require(runs[0][i].bytes == runs[1][i].bytes && runs[0][i].cleanPoint == runs[1][i].cleanPoint, "AV1 output is not repeatable");
-    // A frame the codec accepted but the file did not store ends the output;
-    // every stored frame remains decodable.
+    // Buffered input must surface a mux error at Finish, retain the failure,
+    // and prevent publication. This also catches ignoring EOS drain failures.
     const auto stopped = directory / L"av1-stopped.mp4";
     encoded(encoder.open(stopped.wstring(), width, height, fps, error, balanced, av1), error);
     encoded(encoder.write(pattern(0), error), error);
-    failSample = true; const bool stored = encoder.write(pattern(1), error); failSample = false;
-    require(!stored && encoder.frames() == 1, "Injected AV1 sample failure was accepted");
-    require(!encoder.write(pattern(2), error) && error.find(L"earlier error") != std::wstring::npos && encoder.frames() == 1,
-        "AV1 recording continued after a frame the file did not store");
-    encoded(encoder.finish(error), error); verify(stopped, 1, av1); verifyAv1(stopped, 1, {0});
+    encoded(encoder.write(pattern(1), error), error);
+    failSample = true; const bool finished = encoder.finishForPublication(error); failSample = false;
+    require(!finished && !error.empty(), "Injected AV1 drain failure was ignored");
+    const auto terminal = error;
+    require(!encoder.finish(error) && error == terminal, "AV1 drain failure was not retained");
+    require(!encoder.write(pattern(2), error), "AV1 recording continued after finalization failed");
+    require(encoder.publish((directory / L"failed-published.mp4").wstring()) != ERROR_SUCCESS,
+        "Failed AV1 output was published");
     // Direct encoder guards.
-    lapse::Av1Encoder direct; std::vector<uint8_t> nv12(size_t(width) * height * 3 / 2, 128), unit; bool key = true;
-    require(!direct.encode(nv12.data(), unit, key, error) && unit.empty() && !key && direct.sequenceHeader().empty(),
+    lapse::Av1Encoder direct; std::vector<uint8_t> nv12(size_t(width) * height * 3 / 2, 128);
+    require(!direct.encode(nv12.data(), error) && direct.sequenceHeader().empty(),
         "Unopened AV1 encoder accepted a frame");
     require(!direct.open(width + 1, height, fps, balanced, error) && !direct.open(width, height, 0, balanced, error) &&
         !direct.open(width, height, fps, static_cast<lapse::EncodingQuality>(9), error), "AV1 encoder accepted invalid settings");
     encoded(direct.open(width, height, fps, balanced, error), error);
     require(!direct.open(width, height, fps, balanced, error) && !direct.sequenceHeader().empty(), "AV1 encoder reopened");
-    encoded(direct.encode(nv12.data(), unit, key, error), error);
-    require(key && !unit.empty() && obus(unit.data(), unit.size()).front().type == 1, "First AV1 unit lacks a keyframe sequence header");
-    encoded(direct.encode(nv12.data(), unit, key, error), error);
-    require(!key && !unit.empty(), "Second AV1 unit was not an inter frame");
+    encoded(direct.encode(nv12.data(), error), error);
+    encoded(direct.encode(nv12.data(), error), error);
+    encoded(direct.end(error), error);
+    encoded(direct.end(error), error);
+    bool eos = false; int packets = 0;
+    while (!eos) {
+        lapse::Av1Packet packet;
+        encoded(direct.receive(packet, eos, error), error);
+        if (packet.unit.empty()) continue;
+        require(packet.pts == packets, "Direct AV1 packet lost presentation order");
+        require(packet.keyFrame == (packets == 0), "Direct AV1 keyframe changed");
+        if (packets == 0)
+            require(obus(packet.unit.data(), packet.unit.size()).front().type == 1,
+                "First AV1 unit lacks a sequence header");
+        ++packets;
+    }
+    require(packets == 2 && !direct.encode(nv12.data(), error), "AV1 EOS lost frames or accepted more input");
     std::cout << "AV1: keyframe spacing, av1C/colr/OBU layout, repeatable output, stop after failure and encoder guards passed.\n";
+}
+void advancedSettings(const std::filesystem::path& directory) {
+    using namespace lapse;
+    std::wstring error;
+    const auto rejected = directory / L"invalid-options.mp4";
+    for (int field = 0; field < 4; ++field) {
+        EncodingOptions options;
+        if (field == 0) options.av1Preset = 12;
+        if (field == 1) { options.rateControl = EncodingRateControl::ConstantQuality; options.av1Crf = 71; }
+        if (field == 2) { options.rateControl = EncodingRateControl::TargetBitrate; options.bitrateKbps = 0; }
+        if (field == 3) options.rateControl = static_cast<EncodingRateControl>(99);
+        Encoder encoder;
+        require(!encoder.open(rejected.wstring(), width, height, fps, error, EncodingQuality::Balanced,
+                EncodingMode::SoftwareAV1, false, options) && !std::filesystem::exists(rejected),
+            "Invalid advanced settings created an output file");
+    }
+    EncodingOptions crf;
+    crf.rateControl = EncodingRateControl::ConstantQuality;
+    Encoder invalid;
+    require(!invalid.open(rejected.wstring(), width, height, fps, error, EncodingQuality::Balanced,
+            EncodingMode::Compatible, false, crf) && !std::filesystem::exists(rejected),
+        "H.264 silently accepted AV1 CRF settings");
+    std::vector<std::vector<Av1Sample>> crfRuns;
+    for (int value : {18, 58}) {
+        crf.av1Crf = value;
+        Encoder encoder;
+        const auto path = directory / (L"custom-crf-" + std::to_wstring(value) + L".mp4");
+        encoded(encoder.open(path.wstring(), width, height, fps, error, EncodingQuality::Balanced,
+            EncodingMode::SoftwareAV1, false, crf), error);
+        for (int i = 0; i < 31; ++i) encoded(encoder.write(texture(i), error), error);
+        encoded(encoder.finish(error), error);
+        verify(path, 31, EncodingMode::SoftwareAV1, fps, false); verifyAv1(path, 31, {0});
+        crfRuns.push_back(compressedSamples(path));
+    }
+    uint64_t sizes[2]{};
+    for (int run = 0; run < 2; ++run) for (const auto& sample : crfRuns[run]) sizes[run] += sample.bytes.size();
+    require(sizes[0] > sizes[1], "Custom AV1 CRF did not change compression");
+    EncodingOptions fast = crf;
+    fast.av1Crf = 18;
+    fast.av1Preset = 11;
+    Encoder preset;
+    const auto fastPath = directory / L"av1-preset-11.mp4";
+    encoded(preset.open(fastPath.wstring(), width, height, fps, error, EncodingQuality::ExtraSmall,
+        EncodingMode::SoftwareAV1, false, fast), error);
+    for (int i = 0; i < 31; ++i) encoded(preset.write(texture(i), error), error);
+    encoded(preset.finish(error), error); verify(fastPath, 31, EncodingMode::SoftwareAV1, fps, false);
+    const auto fastSamples = compressedSamples(fastPath);
+    bool different = false;
+    for (size_t i = 0; i < fastSamples.size(); ++i) different = different || fastSamples[i].bytes != crfRuns[0][i].bytes;
+    require(different, "Selected SVT-AV1 preset did not change the compressed output");
+    EncodingOptions bitrate;
+    bitrate.rateControl = EncodingRateControl::TargetBitrate; bitrate.bitrateKbps = 300;
+    for (auto mode : {EncodingMode::Compatible, EncodingMode::Efficient, EncodingMode::QualityH264,
+                      EncodingMode::SoftwareAV1}) {
+        Encoder encoder;
+        const auto path = directory / (L"custom-bitrate-" + std::to_wstring(int(mode)) + L".mp4");
+        encoded(encoder.open(path.wstring(), width, height, fps, error, EncodingQuality::Balanced, mode, false, bitrate), error);
+        for (int i = 0; i < 31; ++i) encoded(encoder.write(pattern(i), error), error);
+        encoded(encoder.finish(error), error); verify(path, 31, mode);
+    }
+    std::cout << "Advanced: invalid settings rejected before storage, custom CRF changes compression, preset 11 and target bitrate outputs preserve frames.\n";
 }
 }
 int main() {
@@ -352,6 +431,7 @@ int main() {
             lapse::EncodingMode::HardwareH264, lapse::EncodingMode::HardwareHEVC, lapse::EncodingMode::QualityH264,
             lapse::EncodingMode::SoftwareAV1}) exercise(directory, mode);
         av1Specifics(directory);
+        advancedSettings(directory);
         std::filesystem::remove_all(directory);
     } catch (const std::exception& error) { std::cerr << error.what() << "\nArtifacts kept at " << directory.string() << '\n'; result = 1; }
     MFShutdown(); CoUninitialize(); return result;

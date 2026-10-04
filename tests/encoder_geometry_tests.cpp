@@ -83,6 +83,7 @@ bool checkAperture(IMFMediaType* type,REFGUID key,int width,int height) {
         "Visible display crop changed");
     return true;
 }
+bool av1Decoder();
 void verify(const std::filesystem::path& path,int width,int height,int expected,REFGUID codec) {
     ComPtr<IMFSourceReader> reader;
     check(MFCreateSourceReaderFromURL(path.c_str(),nullptr,&reader),"Open geometry video");
@@ -107,6 +108,23 @@ void verify(const std::filesystem::path& path,int width,int height,int expected,
     const bool durationOkay=duration.vt==VT_UI8&&std::llabs(static_cast<LONGLONG>(duration.uhVal.QuadPart)-
         int64_t(expected)*10000000/fps)<=10000000/(fps*1000)+2;
     PropVariantClear(&duration);require(durationOkay,"Geometry duration mismatch");
+    if(codec==MFVideoFormat_AV1&&!av1Decoder()) {
+        int count=0;bool ended=false;
+        for(int attempt=0;attempt<expected+100;++attempt) {
+            DWORD flags=0;LONGLONG timestamp=0;ComPtr<IMFSample> sample;
+            check(reader->ReadSample(video,0,nullptr,&flags,&timestamp,&sample),"Read compressed geometry frame");
+            require(!(flags&MF_SOURCE_READERF_ERROR),"Compressed geometry reader error");
+            if(sample) {
+                require(count<expected&&std::llabs(timestamp-int64_t(count)*10000000/fps)<=1,
+                    "Compressed geometry frame count or timestamp mismatch");
+                ++count;
+            }
+            if(flags&MF_SOURCE_READERF_ENDOFSTREAM){ended=true;break;}
+        }
+        require(ended&&count==expected,"Compressed geometry lost final frames");
+        std::cout<<"AV1 compressed geometry verified; pixel QA requires the optional Windows decoder or independent FFmpeg.\n";
+        return;
+    }
     ComPtr<IMFMediaType> requested;check(MFCreateMediaType(&requested),"Create decode type");
     check(requested->SetGUID(MF_MT_MAJOR_TYPE,MFMediaType_Video),"Set major type");
     check(requested->SetGUID(MF_MT_SUBTYPE,MFVideoFormat_NV12),"Set NV12");
@@ -198,11 +216,12 @@ int main() {
         exercise(directory,638,478,lapse::EncodingMode::Efficient,1);
         exercise(directory,48,48,lapse::EncodingMode::Compatible,0);
         exercise(directory,48,48,lapse::EncodingMode::SoftwareAV1,0);
-        if(av1Decoder()) {
-            for(auto size:{std::pair<int,int>{48,48},{638,478},{478,638},{4096,2160},{2160,3840}})
-                exercise(directory,size.first,size.second,lapse::EncodingMode::SoftwareAV1);
-        } else std::cout<<"SKIP AV1 geometry pixels: the optional Windows AV1 decoder is not installed\n";
-        std::filesystem::remove_all(directory);
+        for(auto size:{std::pair<int,int>{48,48},{638,478},{478,638},{4096,2160},{2160,3840}})
+            exercise(directory,size.first,size.second,lapse::EncodingMode::SoftwareAV1);
+        wchar_t keep[2]{};
+        if(GetEnvironmentVariableW(L"TIMELAPSE_KEEP_ENCODER_GEOMETRY",keep,2))
+            std::wcout<<L"Artifacts kept at "<<directory.wstring()<<L'\n';
+        else std::filesystem::remove_all(directory);
         std::cout<<"All synthetic encoder geometry contracts passed.\n";
     } catch(const std::exception& error) {std::cerr<<error.what()<<'\n';result=1;}
     MFShutdown();CoUninitialize();return result;

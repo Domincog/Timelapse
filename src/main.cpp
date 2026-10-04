@@ -44,7 +44,7 @@ constexpr int StageMinHeight = HeaderTop + HeaderHeight + PreviewGap + PreviewMi
 // Horizontal space the Advanced disclosure reserves beside its caption text:
 // left inset, chevron, the gap before it and the right inset.
 constexpr int DisclosureChrome = 46;
-enum Id { ModeBox = 100, IntervalBox, SizeBox, EncodingQualityBox, MonitorBox, CameraBox, Refresh, Record, Pause, Finish, Folder, OpenFolder, Reset, Forward, Preview, EncodingModeBox, AdvancedToggle, StopAfterBox, LowDiskBox, NightBox, NightDurationBox, NightTargetBox, NightHint, NightDetail, SkipConfigure, SkipSummary, SkipDetail, RecoveryBox, SegmentBox, WatermarkConfigure, WatermarkSummary, StatusDetails, CursorBox, StartDelayBox, PlaybackConfigure, AlsoDesktopBox, AlsoCameraBox, SetStatusButton, ClearStatusButton, StatusSummaryLine };
+enum Id { ModeBox = 100, IntervalBox, SizeBox, EncodingQualityBox, MonitorBox, CameraBox, Refresh, Record, Pause, Finish, Folder, OpenFolder, Reset, Forward, Preview, EncodingModeBox, AdvancedToggle, StopAfterBox, LowDiskBox, NightBox, NightDurationBox, NightTargetBox, NightHint, NightDetail, SkipConfigure, SkipSummary, SkipDetail, RecoveryBox, SegmentBox, WatermarkConfigure, WatermarkSummary, StatusDetails, CursorBox, StartDelayBox, PlaybackConfigure, AlsoDesktopBox, AlsoCameraBox, SetStatusButton, ClearStatusButton, StatusSummaryLine, EncoderConfigure };
 constexpr int StartDelays[] = {0,5,10,30,60,300};
 constexpr const wchar_t* StartDelayLabels[] = {L"None",L"5 seconds",L"10 seconds",L"30 seconds",L"1 minute",L"5 minutes"};
 constexpr int RecordingLimits[] = {0,900,3600,14400,28800,86400};
@@ -57,9 +57,19 @@ constexpr wchar_t SegmentHelp[] = L"Split by active recording time, not video le
 constexpr int NightDurations[] = {0,1000,2000,5000,10000,30000};
 constexpr const wchar_t* NightDurationLabels[] = {L"Auto",L"1 second",L"2 seconds",L"5 seconds",L"10 seconds",L"30 seconds"};
 constexpr int NightTargets[] = {64,96,128};
-constexpr const wchar_t* EncodingModeLabels[] = {L"Compatible H.264 (default)",L"Efficient H.264 (bitrate target)",L"Hardware H.264 (CPU offload)",L"Hardware HEVC (HEVC player)",L"Quality H.264 (detail)",L"AV1 (smallest files)"};
+constexpr const wchar_t* EncodingModeLabels[] = {L"Compatible H.264 (default)",L"Efficient H.264 (bitrate target)",L"Hardware H.264 (CPU offload)",L"Hardware HEVC (HEVC player)",L"Quality H.264 (detail)",L"SVT-AV1 (smallest files)"};
 // Selection index is the saved EncodingMode value; one label per mode.
 static_assert(std::size(EncodingModeLabels)==static_cast<size_t>(EncodingMode::SoftwareAV1)+1);
+// UI order is independent of the enum values kept in existing preferences.
+constexpr EncodingQuality EncodingQualities[] = {EncodingQuality::ExtraSmall,EncodingQuality::Compact,EncodingQuality::Balanced,EncodingQuality::Detail};
+constexpr const wchar_t* EncodingQualityLabels[] = {L"Extra small file",L"Smaller file",L"Balanced",L"More detail"};
+EncodingQuality encodingQualityAt(int selection) noexcept {
+    return selection >= 0 && selection < static_cast<int>(std::size(EncodingQualities)) ? EncodingQualities[selection] : EncodingQuality::Balanced;
+}
+int encodingQualityChoice(EncodingQuality quality) noexcept {
+    for(size_t i=0;i<std::size(EncodingQualities);++i)if(EncodingQualities[i]==quality)return static_cast<int>(i);
+    return 2;
+}
 constexpr const wchar_t* SkipModeLabels[] = {L"Off",L"Scene is quiet",L"Inside scheduled ranges",L"Quiet scene + schedule",L"No person detected (camera)",L"No person + schedule (camera)",L"No person detected: pause capture (camera)"};
 // Selection index is the saved TimeSkipMode value; one label per mode.
 static_assert(std::size(SkipModeLabels)==static_cast<size_t>(TimeSkipMode::PersonOnly)+1);
@@ -100,7 +110,7 @@ struct App {
     HWND window{}, preview{}, statusText{}, statusDetails{}, tooltip{};
     HWND customDialog{};
     HWND skipConfigure{},skipSummary{},skipDetail{};
-    HWND watermarkConfigure{},watermarkSummary{},playbackConfigure{};
+    HWND watermarkConfigure{},watermarkSummary{},playbackConfigure{},encoderConfigure{};
     uint16_t pauseHotkey=0,stopHotkey=0,statusHotkey=0;
     int pauseHotkeyId=0,stopHotkeyId=0,statusHotkeyId=0,recordedOutputFps=DefaultOutputFps;
     // The live status line the engine burns into the video corner. Its look
@@ -140,7 +150,7 @@ struct App {
     State controlsState = State::Idle;
     bool advancedExpanded = false;
     int advancedLimitIndex = -1, advancedVisibility = -1, advancedNightState = -1, advancedRecoveryState = -1, nightVisibility = -1;
-    int advancedSegmentSeconds = -1,advancedOutputFps=-1;
+    int advancedSegmentSeconds = -1,advancedOutputFps=-1,advancedEncodingMode=-1;
     int advancedCursorState = -1, cursorVisibility = -1, advancedDelaySeconds = -1, committedStartDelay = 0;
     uint64_t waitingRemaining = UINT64_MAX;
     std::wstring waitingCaption;
@@ -886,10 +896,12 @@ void updateAdvanced() {
     const int selection=selectedLimit(),segment=selectedSegment(),delay=selectedStartDelay();
     const int night=app.settings.night.enabled?(app.nightValidation.empty()?1:2):0;
     const int recovery=app.encodingValidation.empty()?(app.settings.recoveryMode?1:0):2;
+    std::wstring advancedEncoderError;
+    const bool encoderWarning=recovery==2 && !validateEncodingOptions(app.settings.encodingMode,app.settings.encodingOptions,advancedEncoderError);
     const int cursor=app.settings.captureCursor?0:hasSource(Source::Desktop)?1:2;
-    if(app.advancedOutputFps!=app.settings.outputFps || delay!=app.advancedDelaySeconds || selection!=app.advancedLimitIndex || segment!=app.advancedSegmentSeconds || night!=app.advancedNightState || recovery!=app.advancedRecoveryState || cursor!=app.advancedCursorState || app.advancedSkipRevision!=app.skipRevision || app.advancedWatermarkRevision!=app.watermarkRevision){
+    if(app.advancedEncodingMode!=static_cast<int>(app.settings.encodingMode) || app.advancedOutputFps!=app.settings.outputFps || delay!=app.advancedDelaySeconds || selection!=app.advancedLimitIndex || segment!=app.advancedSegmentSeconds || night!=app.advancedNightState || recovery!=app.advancedRecoveryState || cursor!=app.advancedCursorState || app.advancedSkipRevision!=app.skipRevision || app.advancedWatermarkRevision!=app.watermarkRevision){
         std::wstring caption=L"&Advanced";
-        if(recovery==2)caption+=L" · check MP4";
+        if(recovery==2)caption+=encoderWarning?L" · check encoding":L" · check MP4";
         else if(night==2)caption+=L" · check blend";
         else if(!app.watermarkValidation.empty())caption+=L" · check watermark";
         else if(night){caption+=L" · night";if(selection)caption+=L", "+(choice(app.stopAfter)<6?std::wstring(RecordingLimitShortLabels[std::clamp(choice(app.stopAfter),0,5)]):formatDuration(int64_t(selection)*1000,true));}
@@ -917,6 +929,12 @@ void updateAdvanced() {
         app.advancedWarning=warning;
         app.advancedTooltip=L"Show or hide advanced options. Recording options can be changed before recording. Night mode applies only to camera content. Show desktop cursor applies only to desktop content.";
         app.advancedTooltip+=L" Playback: "+std::to_wstring(app.settings.outputFps)+L" fps. Global shortcuts can be configured in Playback & shortcuts.";
+        app.advancedTooltip+=L" Encoder settings: ";
+        if(app.settings.encodingMode==EncodingMode::SoftwareAV1)app.advancedTooltip+=L"SVT-AV1 preset "+std::to_wstring(app.settings.encodingOptions.av1Preset)+L"; ";
+        app.advancedTooltip+=
+            (app.settings.encodingOptions.rateControl==EncodingRateControl::Automatic?L"automatic Video quality":
+             app.settings.encodingOptions.rateControl==EncodingRateControl::ConstantQuality?L"custom CRF "+std::to_wstring(app.settings.encodingOptions.av1Crf):
+             L"target bitrate "+std::to_wstring(app.settings.encodingOptions.bitrateKbps)+L" kbps")+L".";
         if(!app.hotkeyWarning.empty())app.advancedTooltip+=L" "+app.hotkeyWarning;
         if(delay)app.advancedTooltip+=L" After Record, wait "+formatDuration(int64_t(delay)*1000)+L" before preparation. Visible preview continues; Stop after counts active recording time. Sleep cancels the pending start.";
         if(cursor)app.advancedTooltip+=L" The added system cursor is hidden in desktop preview and recordings; pointers drawn into application pixels are unchanged.";
@@ -938,6 +956,7 @@ void updateAdvanced() {
         app.advancedWatermarkRevision=app.watermarkRevision;
         app.advancedCursorState=cursor;app.advancedDelaySeconds=delay;
         app.advancedOutputFps=app.settings.outputFps;
+        app.advancedEncodingMode=static_cast<int>(app.settings.encodingMode);
         app.advancedLimitIndex=selection;app.advancedSegmentSeconds=segment;app.advancedNightState=night;app.advancedRecoveryState=recovery;app.advancedSkipRevision=app.skipRevision;
     }
     const int visibleNight=app.advancedExpanded?nightRow():0;
@@ -952,7 +971,7 @@ void updateAdvanced() {
     const auto visible=[](HWND child,bool show){
         if(child && ((GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0)!=show)ShowWindow(child,show?SW_SHOWNA:SW_HIDE);
     };
-    for(HWND child:{app.labels[6],app.encodingMode,app.labels[7],app.stopAfter,app.lowDisk,app.recoveryMode,app.segmentLabel,app.splitEvery,app.startDelayLabel,app.startDelay,app.startDelayHint,app.watermarkConfigure,app.watermarkSummary,app.playbackConfigure})visible(child,app.advancedExpanded);
+    for(HWND child:{app.labels[6],app.encodingMode,app.encoderConfigure,app.labels[7],app.stopAfter,app.lowDisk,app.recoveryMode,app.segmentLabel,app.splitEvery,app.startDelayLabel,app.startDelay,app.startDelayHint,app.watermarkConfigure,app.watermarkSummary,app.playbackConfigure})visible(child,app.advancedExpanded);
     if(!visibleCursor && GetFocus()==app.captureCursor)SetFocus(app.advanced);
     visible(app.captureCursor,visibleCursor);
     for(HWND child:{app.skipConfigure,app.skipSummary})visible(child,visibleSkip!=0);
@@ -1002,10 +1021,11 @@ void configure() {
     app.committedInterval=std::clamp(choice(app.interval),0,app.hasCustomInterval?6:5);
     app.committedSize=std::clamp(sizeSelection,0,app.hasCustomSize?2:1);
     app.committedLimit=std::clamp(choice(app.stopAfter),0,app.hasCustomLimit?6:5);
-    app.settings.encodingQuality = static_cast<EncodingQuality>(std::clamp(choice(app.encodingQuality),0,2));
+    app.settings.encodingQuality = encodingQualityAt(choice(app.encodingQuality));
     app.settings.encodingMode = static_cast<EncodingMode>(std::clamp(choice(app.encodingMode),0,static_cast<int>(std::size(EncodingModeLabels))-1));
     app.settings.recoveryMode = app.recoveryMode && SendMessageW(app.recoveryMode,BM_GETCHECK,0,0)==BST_CHECKED;
-    validateEncodingMode(app.settings.encodingMode,app.settings.recoveryMode,app.encodingValidation);
+    if(validateEncodingMode(app.settings.encodingMode,app.settings.recoveryMode,app.encodingValidation))
+        validateEncodingOptions(app.settings.encodingMode,app.settings.encodingOptions,app.encodingValidation);
     app.settings.recordingLimitSeconds = selectedLimit();
     if(!app.active())app.committedStartDelay=std::clamp(choice(app.startDelay),0,5);
     app.settings.startDelaySeconds=app.startDelay?StartDelays[app.committedStartDelay]:0;
@@ -1341,7 +1361,7 @@ void showControl(HWND child,bool show) {
 bool panelControl(HWND child) {
     if(!child)return false;
     for(HWND member:{app.labels[0],app.mode,app.labels[4],app.monitor,app.labels[5],app.camera,app.alsoLabel,app.alsoDesktop,app.alsoCamera,app.refresh,app.labels[1],app.interval,app.labels[2],app.videoSize,
-        app.labels[3],app.encodingQuality,app.folder,app.openFolder,app.advanced,app.labels[6],app.encodingMode,app.recoveryMode,app.labels[7],app.stopAfter,
+        app.labels[3],app.encodingQuality,app.folder,app.openFolder,app.advanced,app.labels[6],app.encodingMode,app.encoderConfigure,app.recoveryMode,app.labels[7],app.stopAfter,
         app.segmentLabel,app.splitEvery,app.startDelayLabel,app.startDelay,app.startDelayHint,app.lowDisk,app.captureCursor,app.skipConfigure,app.skipSummary,
         app.skipDetail,app.watermarkConfigure,app.watermarkSummary,app.playbackConfigure,app.nightEnabled,app.labels[8],app.nightDuration,app.labels[9],
         app.nightTarget,app.nightHint,app.nightDetail,app.liveStatusSet,app.liveStatusClear,app.liveStatusSummary})if(member==child)return true;
@@ -1418,6 +1438,7 @@ int placePanel(bool place,int left,int offset) {
     const int collapsedBottom=y;
     y+=app.scale(14);
     combo(app.labels[6],app.encodingMode,190);
+    put(app.encoderConfigure,y,button);y+=button+app.scale(14);
     put(app.recoveryMode,y-app.scale(4),check);y+=check+app.scale(14);
     combo(app.labels[7],app.stopAfter,210);
     combo(app.segmentLabel,app.splitEvery,210);
@@ -1583,7 +1604,7 @@ void revealFocusedControl() {
 }
 void toggleAdvanced() {
     const HWND focused=GetFocus();
-    if(app.advancedExpanded)for(HWND child:{app.encodingMode,app.stopAfter,app.splitEvery,app.lowDisk,app.recoveryMode,app.captureCursor,app.startDelay,app.skipConfigure,app.watermarkConfigure,app.playbackConfigure,app.nightEnabled,app.nightDuration,app.nightTarget})
+    if(app.advancedExpanded)for(HWND child:{app.encodingMode,app.encoderConfigure,app.stopAfter,app.splitEvery,app.lowDisk,app.recoveryMode,app.captureCursor,app.startDelay,app.skipConfigure,app.watermarkConfigure,app.playbackConfigure,app.nightEnabled,app.nightDuration,app.nightTarget})
         if(child && (focused==child || (focused && IsChild(child,focused)))){SetFocus(app.advanced);break;}
     app.advancedExpanded=!app.advancedExpanded;
     updateAdvanced();layout();
@@ -2816,6 +2837,167 @@ void editPlayback() {
     if(!app.closeWhenDone && !app.hiddenToTray){SetFocus(app.playbackConfigure);revealFocusedControl();}
 }
 
+enum EncoderSettingsId { EncoderPreset=5601,EncoderRate,EncoderValue,EncoderDefaults };
+struct EncoderDraft : CustomDraft {
+    EncodingMode mode=EncodingMode::Compatible;
+    EncodingOptions options;
+    EncodingRateControl visibleRate=EncodingRateControl::Automatic;
+    HWND presetLabel{},preset{},rateLabel{},rate{},valueLabel{},value{},defaults{};
+    int naturalHeight=0;
+    bool readOnly=false;
+};
+EncodingRateControl encoderDraftRate(const EncoderDraft& draft) noexcept {
+    const int selection=choice(draft.rate);
+    if(draft.mode==EncodingMode::SoftwareAV1)return static_cast<EncodingRateControl>(selection);
+    return selection==0?EncodingRateControl::Automatic:selection==1?EncodingRateControl::TargetBitrate:static_cast<EncodingRateControl>(-1);
+}
+void encoderSettingsLayout(HWND window,EncoderDraft& draft) {
+    if(draft.layingOut)return;draft.layingOut=true;
+    const bool av1=draft.mode==EncodingMode::SoftwareAV1;
+    const auto rate=encoderDraftRate(draft);const bool custom=rate!=EncodingRateControl::Automatic;
+    for(HWND child:{draft.presetLabel,draft.preset})showControl(child,av1);
+    for(HWND child:{draft.valueLabel,draft.value})showControl(child,custom);
+    SetWindowTextW(draft.valueLabel,rate==EncodingRateControl::ConstantQuality?L"Custom &CRF (1-70)":L"Target &bitrate (kbps)");
+    const auto help=draft.readOnly?L"Encoder settings are fixed for this recording.":rate==EncodingRateControl::ConstantQuality?
+        L"Custom CRF overrides Video quality. Lower CRF keeps more detail and makes larger files. SVT-AV1 supports 1-70.":rate==EncodingRateControl::TargetBitrate?
+        L"Target bitrate overrides Video quality. Choose 1-100,000 kbps; achieved size varies with the scene and encoder. This is a target, not a file size limit.":
+        L"Automatic uses Video quality. Extra small file saves space with less detail; Balanced is the default.";
+    std::wstring copy=help;
+    if(av1)copy+=L" SVT-AV1 preset 6 is the default. Lower presets encode more slowly for better compression; higher presets encode faster.";
+    if(av1 && rate==EncodingRateControl::TargetBitrate)copy+=L" AV1 target bitrate needs both video dimensions to be at least 64 pixels.";
+    SetWindowTextW(draft.help,copy.c_str());
+    RECT client{};GetClientRect(window,&client);const auto style=GetWindowLongPtrW(window,GWL_STYLE);
+    const int bw=GetSystemMetricsForDpi(SM_CXVSCROLL,draft.dpi),bh=GetSystemMetricsForDpi(SM_CYHSCROLL,draft.dpi);
+    const int availableW=client.right+((style&WS_VSCROLL)?bw:0),availableH=client.bottom+((style&WS_HSCROLL)?bh:0),pad=draft.scale(18);
+    const auto wrap=[&](HWND child,int width,int minimum){
+        wchar_t value[1024]{};GetWindowTextW(child,value,1024);RECT bounds{0,0,std::max(1,width),0};HDC dc=GetDC(window);
+        if(!dc)return minimum;const auto previous=SelectObject(dc,draft.font?draft.font:GetStockObject(DEFAULT_GUI_FONT));
+        DrawTextW(dc,value,-1,&bounds,DT_CALCRECT|DT_WORDBREAK|DT_NOPREFIX);SelectObject(dc,previous);ReleaseDC(window,dc);return std::max(minimum,int(bounds.bottom));
+    };
+    int rateTop=0,valueTop=0,helpTop=0,helpHeight=0,errorTop=0,errorHeight=0,buttonTop=0;
+    const auto measure=[&](int width){
+        rateTop=av1?draft.scale(80):draft.scale(16);valueTop=rateTop+draft.scale(64);
+        helpTop=(custom?valueTop:rateTop)+draft.scale(64);helpHeight=wrap(draft.help,width-2*pad,draft.scale(66));
+        errorTop=helpTop+helpHeight+draft.scale(10);errorHeight=wrap(draft.error,width-2*pad,draft.scale(36));
+        buttonTop=errorTop+errorHeight+draft.scale(10);draft.naturalHeight=buttonTop+draft.scale(46);
+    };
+    bool horizontal=false,vertical=false;
+    for(int i=0;i<3;++i){horizontal=availableW-(vertical?bw:0)<draft.scale(360);measure(std::max(draft.scale(360),availableW-(vertical?bw:0)));vertical=availableH-(horizontal?bh:0)<draft.naturalHeight;}
+    ShowScrollBar(window,SB_HORZ,horizontal);ShowScrollBar(window,SB_VERT,vertical);GetClientRect(window,&client);
+    const int width=std::max(draft.scale(360),int(client.right));measure(width);const int height=std::max(draft.naturalHeight,int(client.bottom));
+    if(width<=client.right)draft.wheelX=0;if(height<=client.bottom)draft.wheelY=0;
+    draft.scrollX=std::clamp(draft.scrollX,0,width-int(std::max(1L,client.right)));draft.scrollY=std::clamp(draft.scrollY,0,height-int(std::max(1L,client.bottom)));
+    SCROLLINFO info{sizeof(info),SIF_RANGE|SIF_PAGE|SIF_POS};info.nMax=width-1;info.nPage=std::max(1L,client.right);info.nPos=draft.scrollX;SetScrollInfo(window,SB_HORZ,&info,TRUE);
+    info.nMax=height-1;info.nPage=std::max(1L,client.bottom);info.nPos=draft.scrollY;SetScrollInfo(window,SB_VERT,&info,TRUE);
+    const auto move=[&](HWND child,int x,int y,int w,int h){MoveWindow(child,x-draft.scrollX,y-draft.scrollY,w,h,TRUE);};
+    move(draft.presetLabel,pad,draft.scale(16),width-2*pad,draft.scale(20));move(draft.preset,pad,draft.scale(38),width-2*pad,draft.scale(260));
+    move(draft.rateLabel,pad,rateTop,width-2*pad,draft.scale(20));move(draft.rate,pad,rateTop+draft.scale(22),width-2*pad,draft.scale(180));
+    move(draft.valueLabel,pad,valueTop,width-2*pad,draft.scale(20));move(draft.value,pad,valueTop+draft.scale(22),width-2*pad,draft.scale(28));
+    move(draft.help,pad,helpTop,width-2*pad,helpHeight);move(draft.error,pad,errorTop,width-2*pad,errorHeight);
+    move(draft.defaults,pad,buttonTop,draft.scale(124),draft.scale(28));move(draft.okay,width-pad-draft.scale(174),buttonTop,draft.scale(80),draft.scale(28));
+    move(draft.cancel,width-pad-draft.scale(80),buttonTop,draft.scale(80),draft.scale(28));draft.layingOut=false;
+}
+void encoderSettingsReveal(HWND window,EncoderDraft& draft,HWND child) {
+    if(!child || !IsChild(window,child))return;RECT bounds{},client{};GetWindowRect(child,&bounds);MapWindowPoints(nullptr,window,reinterpret_cast<POINT*>(&bounds),2);GetClientRect(window,&client);
+    if(bounds.left<0)draft.scrollX+=bounds.left;else if(bounds.right>client.right)draft.scrollX+=bounds.right-client.right;
+    if(bounds.top<0)draft.scrollY+=bounds.top;else if(bounds.bottom>client.bottom)draft.scrollY+=bounds.bottom-client.bottom;encoderSettingsLayout(window,draft);
+}
+void encoderSettingsFitHeight(HWND window,EncoderDraft& draft) {
+    RECT bounds{},client{};GetWindowRect(window,&bounds);GetClientRect(window,&client);bounds.bottom+=draft.naturalHeight-client.bottom;
+    bounds=fitWindow(bounds,workArea(MonitorFromWindow(window,MONITOR_DEFAULTTONEAREST)));
+    SetWindowPos(window,nullptr,bounds.left,bounds.top,bounds.right-bounds.left,bounds.bottom-bounds.top,SWP_NOZORDER|SWP_NOACTIVATE);encoderSettingsLayout(window,draft);
+}
+bool validateEncoderDraft(EncoderDraft& draft,std::wstring& error,HWND& invalid) {
+    auto options=draft.options;options.rateControl=encoderDraftRate(draft);invalid=draft.preset;
+    if(draft.mode==EncodingMode::SoftwareAV1){options.av1Preset=choice(draft.preset);if(options.av1Preset<0 || options.av1Preset>MaxAv1Preset){error=L"Choose an SVT-AV1 preset from 0 to 11.";return false;}}
+    if(options.rateControl==EncodingRateControl::ConstantQuality || options.rateControl==EncodingRateControl::TargetBitrate){
+        invalid=draft.value;wchar_t value[48]{};
+        if(GetWindowTextLengthW(draft.value)>=48){error=L"Enter a shorter whole number.";return false;}
+        GetWindowTextW(draft.value,value,48);
+        const bool crf=options.rateControl==EncodingRateControl::ConstantQuality;int parsed=0;
+        if(!parseEncodingInteger(value,1,crf?70:100000,parsed,error))return false;
+        (crf?options.av1Crf:options.bitrateKbps)=parsed;
+    }
+    invalid=draft.rate;if(!validateEncodingOptions(draft.mode,options,error))return false;
+    draft.options=options;return true;
+}
+INT_PTR CALLBACK encoderSettingsProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
+    auto* draft=reinterpret_cast<EncoderDraft*>(GetWindowLongPtrW(window,DWLP_USER));
+    try {
+        if(message==WM_INITDIALOG){
+            draft=reinterpret_cast<EncoderDraft*>(lp);SetWindowLongPtrW(window,DWLP_USER,lp);draft->previousDialog=app.customDialog;app.customDialog=window;
+            draft->dpi=static_cast<int>(GetDpiForWindow(window));if(draft->dpi<=0)draft->dpi=app.dpi;SetWindowTextW(window,L"Encoder settings");
+            const auto child=[&](const wchar_t* cls,const wchar_t* caption,DWORD style,int id){return CreateWindowExW(std::wcscmp(cls,L"EDIT")==0?WS_EX_CLIENTEDGE:0,cls,caption,
+                WS_CHILD|WS_VISIBLE|style,0,0,1,1,window,reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),GetModuleHandleW(nullptr),nullptr);};
+            draft->presetLabel=child(L"STATIC",L"SVT-AV1 &preset",0,0);draft->preset=child(L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL,EncoderPreset);
+            for(int preset=0;preset<=MaxAv1Preset;++preset)add(draft->preset,std::to_wstring(preset)+(preset==6?L" (default)":preset==0?L" (slowest)":preset==MaxAv1Preset?L" (fastest)":L""));choose(draft->preset,draft->options.av1Preset);
+            draft->rateLabel=child(L"STATIC",L"&Rate control",0,0);draft->rate=child(L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL,EncoderRate);
+            add(draft->rate,L"Automatic (Video quality)");if(draft->mode==EncodingMode::SoftwareAV1)add(draft->rate,L"Custom CRF");add(draft->rate,L"Target bitrate");
+            choose(draft->rate,draft->mode==EncodingMode::SoftwareAV1?static_cast<int>(draft->options.rateControl):draft->options.rateControl==EncodingRateControl::TargetBitrate?1:0);
+            draft->visibleRate=encoderDraftRate(*draft);
+            draft->valueLabel=child(L"STATIC",L"",0,0);draft->value=child(L"EDIT",L"",WS_TABSTOP|ES_AUTOHSCROLL,EncoderValue);SendMessageW(draft->value,EM_LIMITTEXT,48,0);
+            SetWindowTextW(draft->value,std::to_wstring(draft->options.rateControl==EncodingRateControl::ConstantQuality?draft->options.av1Crf:draft->options.bitrateKbps).c_str());
+            draft->help=child(L"STATIC",L"",SS_NOPREFIX,CustomHelp);draft->error=child(L"STATIC",L"",SS_NOPREFIX,CustomError);
+            draft->defaults=child(L"BUTTON",L"Use &defaults",WS_TABSTOP|BS_PUSHBUTTON|BS_NOTIFY,EncoderDefaults);
+            draft->okay=child(L"BUTTON",L"OK",WS_TABSTOP|BS_DEFPUSHBUTTON|BS_NOTIFY,IDOK);draft->cancel=child(L"BUTTON",draft->readOnly?L"Close":L"Cancel",WS_TABSTOP|BS_PUSHBUTTON|BS_NOTIFY,IDCANCEL);
+            for(HWND field:{draft->presetLabel,draft->preset,draft->rateLabel,draft->rate,draft->valueLabel,draft->value,draft->help,draft->error,draft->defaults,draft->okay,draft->cancel})
+                if(!field){EndDialog(window,-1);return TRUE;}
+            if(!dialogWheelCombos({draft->preset,draft->rate}) || !SetWindowSubclass(draft->value,playbackFocusProc,2,0)){EndDialog(window,-1);return TRUE;}
+            if(draft->readOnly)for(HWND field:{draft->preset,draft->rate,draft->value,draft->defaults,draft->okay})EnableWindow(field,FALSE);
+            customFont(window,*draft);RECT bounds{0,0,draft->scale(460),draft->scale(400)};
+            AdjustWindowRectExForDpi(&bounds,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_STYLE)),FALSE,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_EXSTYLE)),draft->dpi);
+            RECT owner{};GetWindowRect(app.window,&owner);OffsetRect(&bounds,(owner.left+owner.right-(bounds.right-bounds.left))/2-bounds.left,(owner.top+owner.bottom-(bounds.bottom-bounds.top))/2-bounds.top);
+            bounds=fitWindow(bounds,workArea(MonitorFromWindow(app.window,MONITOR_DEFAULTTONEAREST)));SetWindowPos(window,nullptr,bounds.left,bounds.top,bounds.right-bounds.left,bounds.bottom-bounds.top,SWP_NOZORDER|SWP_NOACTIVATE);
+            encoderSettingsLayout(window,*draft);encoderSettingsFitHeight(window,*draft);SetFocus(draft->readOnly?draft->cancel:draft->mode==EncodingMode::SoftwareAV1?draft->preset:draft->rate);return FALSE;
+        }
+        if(!draft)return FALSE;
+        switch(message){
+        case WM_SIZE:encoderSettingsLayout(window,*draft);return TRUE;
+        case WM_MOUSEWHEEL:case WM_MOUSEHWHEEL:{const auto result=dialogWheel(window,*draft,message,wp);if(result==DialogWheel::Scrolled)encoderSettingsLayout(window,*draft);if(result!=DialogWheel::Pass)return TRUE;break;}
+        case WM_DPICHANGED:{draft->dpi=HIWORD(wp);customFont(window,*draft);RECT bounds=fitWindow(*reinterpret_cast<RECT*>(lp),workArea(MonitorFromRect(reinterpret_cast<RECT*>(lp),MONITOR_DEFAULTTONEAREST)));
+            SetWindowPos(window,nullptr,bounds.left,bounds.top,bounds.right-bounds.left,bounds.bottom-bounds.top,SWP_NOZORDER|SWP_NOACTIVATE);encoderSettingsLayout(window,*draft);encoderSettingsReveal(window,*draft,GetFocus());return TRUE;}
+        case WM_HSCROLL:case WM_VSCROLL:{const int bar=message==WM_HSCROLL?SB_HORZ:SB_VERT;SCROLLINFO info{sizeof(info),SIF_ALL};GetScrollInfo(window,bar,&info);int position=info.nPos;
+            switch(LOWORD(wp)){case SB_LINEUP:position-=draft->scale(24);break;case SB_LINEDOWN:position+=draft->scale(24);break;case SB_PAGEUP:position-=info.nPage;break;case SB_PAGEDOWN:position+=info.nPage;break;case SB_THUMBPOSITION:case SB_THUMBTRACK:position=info.nTrackPos;break;case SB_TOP:position=0;break;case SB_BOTTOM:position=info.nMax;break;default:return TRUE;}
+            (bar==SB_HORZ?draft->scrollX:draft->scrollY)=position;encoderSettingsLayout(window,*draft);return TRUE;}
+        case WM_COMMAND:{const int id=LOWORD(wp),code=HIWORD(wp);
+            if(code==BN_SETFOCUS || code==CBN_SETFOCUS || code==EN_SETFOCUS){encoderSettingsReveal(window,*draft,reinterpret_cast<HWND>(lp));return TRUE;}
+            if(id==IDCANCEL && code==BN_CLICKED){EndDialog(window,IDCANCEL);return TRUE;}
+            if(id==IDOK && code==BN_CLICKED){if(draft->readOnly || app.active()){EndDialog(window,IDCANCEL);return TRUE;}
+                std::wstring error;HWND invalid{};if(validateEncoderDraft(*draft,error,invalid)){EndDialog(window,IDOK);return TRUE;}
+                SetWindowTextW(draft->error,error.c_str());encoderSettingsLayout(window,*draft);encoderSettingsFitHeight(window,*draft);SetFocus(invalid);encoderSettingsReveal(window,*draft,invalid);return TRUE;}
+            if(id==EncoderRate && code==CBN_SELCHANGE){
+                if(draft->readOnly || app.active())return TRUE;
+                // Retain valid drafts when visiting another rate-control choice.
+                // Invalid text remains uncommitted and cannot affect recording.
+                if(draft->visibleRate!=EncodingRateControl::Automatic){wchar_t value[48]{};GetWindowTextW(draft->value,value,48);int parsed=0;std::wstring error;
+                    const bool crf=draft->visibleRate==EncodingRateControl::ConstantQuality;
+                    if(GetWindowTextLengthW(draft->value)<48 && parseEncodingInteger(value,1,crf?70:100000,parsed,error))
+                        (crf?draft->options.av1Crf:draft->options.bitrateKbps)=parsed;}
+                draft->visibleRate=encoderDraftRate(*draft);
+                SetWindowTextW(draft->error,L"");SetWindowTextW(draft->value,std::to_wstring(encoderDraftRate(*draft)==EncodingRateControl::ConstantQuality?draft->options.av1Crf:draft->options.bitrateKbps).c_str());
+                encoderSettingsLayout(window,*draft);encoderSettingsFitHeight(window,*draft);return TRUE;}
+            if(id==EncoderDefaults && code==BN_CLICKED && !draft->readOnly && !app.active()){
+                draft->options={};draft->visibleRate=EncodingRateControl::Automatic;choose(draft->preset,6);choose(draft->rate,0);SetWindowTextW(draft->error,L"");SetWindowTextW(draft->value,L"4000");
+                encoderSettingsLayout(window,*draft);encoderSettingsFitHeight(window,*draft);return TRUE;}
+            return FALSE;}
+        case WM_CTLCOLORSTATIC:if(reinterpret_cast<HWND>(lp)==draft->error){SetTextColor(reinterpret_cast<HDC>(wp),RGB(164,40,40));SetBkColor(reinterpret_cast<HDC>(wp),GetSysColor(COLOR_BTNFACE));return reinterpret_cast<INT_PTR>(GetSysColorBrush(COLOR_BTNFACE));}break;
+        case WM_CLOSE:EndDialog(window,IDCANCEL);return TRUE;
+        case WM_DESTROY:if(draft->font){DeleteObject(draft->font);draft->font=nullptr;}if(app.customDialog==window)app.customDialog=IsWindow(draft->previousDialog)?draft->previousDialog:nullptr;return TRUE;
+        }
+    } catch(...){EndDialog(window,-1);return TRUE;}return FALSE;
+}
+void editEncoderSettings() {
+    if(app.customDialog)return;EncoderDraft draft;draft.mode=app.settings.encodingMode;draft.options=app.settings.encodingOptions;draft.readOnly=app.active();CustomTemplate resource;
+    const auto outcome=DialogBoxIndirectParamW(GetModuleHandleW(nullptr),&resource.dialog,app.window,encoderSettingsProc,reinterpret_cast<LPARAM>(&draft));
+    if(!IsWindow(app.window))return;
+    if(outcome==IDOK && !draft.readOnly && !app.active()){
+        app.settings.encodingOptions=draft.options;app.advancedOutputFps=-1;configure();updateControls();layout();InvalidateRect(app.window,nullptr,FALSE);
+        if(app.startupComplete && !savePreferences())MessageBoxW(app.window,L"Your settings apply for this session, but could not be saved. Check that the settings folder is writable.",L"Timelapse",MB_OK|MB_ICONWARNING);
+    }
+    if(outcome==-1)MessageBoxW(app.window,L"Encoder settings could not be opened. Try again.",L"Timelapse",MB_OK|MB_ICONERROR);
+    if(!app.closeWhenDone && !app.hiddenToTray){SetFocus(app.encoderConfigure);revealFocusedControl();}
+}
+
 // Live status line: what the user is doing, burned into the video corner by
 // the engine. Changing it strikes the old line through and fades it out.
 constexpr const wchar_t* StatusKindLabels[]={L"Text only",L"Stopwatch (counts up)",L"Timer (counts down)"};
@@ -3241,8 +3423,11 @@ bool savePreferences() {
         const auto temporary=preferencesPath+L"."+std::to_wstring(GetCurrentProcessId())+L"."+std::to_wstring(GetTickCount64())+L".tmp";
         const int sizeChoice=choice(app.videoSize);
         const auto interval=std::to_wstring(choice(app.interval)), quality=std::to_wstring(sizeChoice>=0 && sizeChoice<=(app.hasCustomSize?2:1)?sizeChoice:app.committedSize);
-        const auto encodingQuality=std::to_wstring(choice(app.encodingQuality));
+        const auto encodingQuality=std::to_wstring(static_cast<int>(encodingQualityAt(choice(app.encodingQuality))));
         const auto encodingMode=std::to_wstring(choice(app.encodingMode));
+        const std::wstring encoderValues[]={std::to_wstring(app.settings.encodingOptions.av1Preset),
+            std::to_wstring(static_cast<int>(app.settings.encodingOptions.rateControl)),std::to_wstring(app.settings.encodingOptions.av1Crf),std::to_wstring(app.settings.encodingOptions.bitrateKbps)};
+        constexpr const wchar_t* encoderKeys[]={L"Av1Preset",L"EncodingRateControl",L"Av1Crf",L"EncodingBitrateKbps"};
         const auto recordingLimit=std::to_wstring(std::clamp(choice(app.stopAfter),0,app.hasCustomLimit?6:5));
         const auto customInterval=std::to_wstring(app.customIntervalMs), customWidth=std::to_wstring(app.customWidth),customHeight=std::to_wstring(app.customHeight);
         const auto customLimit=std::to_wstring(app.customLimitSeconds);
@@ -3250,6 +3435,7 @@ bool savePreferences() {
         const auto startDelay=std::to_wstring(selectedStartDelay());
         const auto outputFps=std::to_wstring(app.settings.outputFps),pauseHotkey=std::to_wstring(app.pauseHotkey),stopHotkey=std::to_wstring(app.stopHotkey);
         std::wstring playbackError;if(!validateOutputFps(app.settings.outputFps,playbackError) || !validateHotkeys(app.pauseHotkey,app.stopHotkey,app.statusHotkey,playbackError))return false;
+        if(!validateEncodingOptions(static_cast<EncodingMode>(choice(app.encodingMode)),app.settings.encodingOptions,playbackError))return false;
         if(!validateStatusFeedSettings(app.settings.statusFeed,playbackError))return false;
         const std::wstring statusValues[]={std::to_wstring(app.statusHotkey),std::to_wstring(static_cast<int>(app.settings.statusFeed.corner)),
             std::to_wstring(static_cast<int>(app.settings.statusFeed.textSize)),std::to_wstring(static_cast<int>(app.settings.statusFeed.style)),
@@ -3296,6 +3482,7 @@ bool savePreferences() {
             WritePrivateProfileStringW(L"Settings",L"NightTargetBrightness",nightTarget.c_str(),pending.path);
         for(size_t i=0;saved && i<skip.size();++i)saved=WritePrivateProfileStringW(L"Settings",SkipKeys[i],skip[i].c_str(),pending.path)!=FALSE;
         for(size_t i=0;saved && i<watermark.size();++i)saved=WritePrivateProfileStringW(L"Settings",WatermarkKeys[i],watermark[i].c_str(),pending.path)!=FALSE;
+        for(size_t i=0;saved && i<std::size(encoderKeys);++i)saved=WritePrivateProfileStringW(L"Settings",encoderKeys[i],encoderValues[i].c_str(),pending.path)!=FALSE;
         if(saved)saved=WritePrivateProfileStringW(L"Settings",L"StartDelaySeconds",startDelay.c_str(),pending.path)!=FALSE;
         if(saved)saved=WritePrivateProfileStringW(L"Settings",L"OutputFps",outputFps.c_str(),pending.path) &&
             WritePrivateProfileStringW(L"Settings",L"PauseHotkey",pauseHotkey.c_str(),pending.path) &&
@@ -3330,7 +3517,8 @@ void preferences(bool save) {
         const int videoSize=static_cast<int>(GetPrivateProfileIntW(L"Settings",L"Quality",0,path));
         choose(app.interval,std::clamp(interval,0,5));
         choose(app.videoSize,std::clamp(videoSize,0,1));
-        choose(app.encodingQuality,std::clamp(static_cast<int>(GetPrivateProfileIntW(L"Settings",L"EncodingQuality",1,path)),0,2));
+        const UINT encodingQuality=GetPrivateProfileIntW(L"Settings",L"EncodingQuality",1,path);
+        choose(app.encodingQuality,encodingQualityChoice(encodingQuality<=static_cast<UINT>(EncodingQuality::ExtraSmall)?static_cast<EncodingQuality>(encodingQuality):EncodingQuality::Balanced));
         const UINT encodingMode=GetPrivateProfileIntW(L"Settings",L"EncodingMode",0,path);
         choose(app.encodingMode,encodingMode<std::size(EncodingModeLabels)?static_cast<int>(encodingMode):0);
         const UINT recordingLimit=GetPrivateProfileIntW(L"Settings",L"RecordingLimit",0,path);
@@ -3342,6 +3530,16 @@ void preferences(bool save) {
                std::to_wstring(parsed/1000)!=value)return false;
             output=static_cast<int>(parsed/1000);return true;
         };
+        app.settings.encodingOptions={};
+        exactInteger(L"Av1Preset",0,MaxAv1Preset,app.settings.encodingOptions.av1Preset);
+        exactInteger(L"Av1Crf",1,70,app.settings.encodingOptions.av1Crf);
+        exactInteger(L"EncodingBitrateKbps",1,100000,app.settings.encodingOptions.bitrateKbps);
+        int encoderRate=0;exactInteger(L"EncodingRateControl",0,2,encoderRate);
+        app.settings.encodingOptions.rateControl=static_cast<EncodingRateControl>(encoderRate);
+        // A preference copied from another encoder must not silently request
+        // unsupported CRF. Use its normal automatic quality policy instead.
+        if(app.settings.encodingOptions.rateControl==EncodingRateControl::ConstantQuality && choice(app.encodingMode)!=static_cast<int>(EncodingMode::SoftwareAV1))
+            app.settings.encodingOptions.rateControl=EncodingRateControl::Automatic;
         app.hasCustomInterval=app.hasCustomSize=app.hasCustomLimit=false;
         app.customIntervalMs=5000;app.customWidth=1280;app.customHeight=720;app.customLimitSeconds=900;
         app.customSegmentSeconds=900;app.committedSegment=0;app.hasCustomSegment=false;
@@ -3720,7 +3918,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
     case WM_CREATE: {
         cancelOpenFolder();app.shellBusyObserved=shellOperationBusy.load(std::memory_order_acquire);app.openFolderBusyShown=false;
         app.startupComplete=false;app.advancedExpanded=false;app.advancedLimitIndex=app.advancedVisibility=-1;
-        app.advancedSegmentSeconds=-1;
+        app.advancedSegmentSeconds=app.advancedEncodingMode=-1;app.settings.encodingOptions={};
         app.advancedCursorState=app.cursorVisibility=app.advancedDelaySeconds=-1;app.committedStartDelay=0;
         app.waitingRemaining=UINT64_MAX;app.waitingCaption.clear();
         app.failureNotice=FailureNotice::None;
@@ -3774,13 +3972,14 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         app.alsoCamera=requiredControl(L"BUTTON",L"Camera",WS_TABSTOP|BS_AUTOCHECKBOX,AlsoCameraBox);
         app.interval=combo(1,L"Capture &every",IntervalBox);for(auto s:{L"1 second",L"2 seconds",L"5 seconds",L"10 seconds",L"30 seconds",L"60 seconds"})add(app.interval,s);
         app.videoSize=combo(2,L"Video si&ze",SizeBox);add(app.videoSize,L"720p");add(app.videoSize,L"1080p");
-        app.encodingQuality=combo(3,L"Video &quality",EncodingQualityBox);for(auto s:{L"Smaller file",L"Balanced",L"More detail"})add(app.encodingQuality,s);
+        app.encodingQuality=combo(3,L"Video &quality",EncodingQualityBox);for(auto s:EncodingQualityLabels)add(app.encodingQuality,s);
         app.folder=button(L"C&hange...",Folder);app.openFolder=button(L"&Open folder",OpenFolder);
         app.liveStatusSummary=requiredControl(L"STATIC",L"",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX,StatusSummaryLine);
         app.liveStatusSet=button(L"Set stat&us...",SetStatusButton);app.liveStatusClear=button(L"Clear",ClearStatusButton);
         app.advanced=requiredControl(L"BUTTON",L"&Advanced",WS_TABSTOP|BS_AUTOCHECKBOX|BS_PUSHLIKE,AdvancedToggle);
         app.encodingMode=combo(6,L"Encodin&g",EncodingModeBox);
         for(auto label:EncodingModeLabels)add(app.encodingMode,label);
+        app.encoderConfigure=button(L"Encoder settings...",EncoderConfigure);
         app.recoveryMode=requiredControl(L"BUTTON",L"MP4 recover&y mode (H.264)",WS_TABSTOP|BS_AUTOCHECKBOX,RecoveryBox);
         app.stopAfter=combo(7,L"S&top after",StopAfterBox);for(auto label:RecordingLimitLabels)add(app.stopAfter,label);
         app.segmentLabel=requiredControl(L"STATIC",L"Split files e&very",0,211);
@@ -3813,7 +4012,10 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         TOOLINFOW tip{sizeof(tip)};tip.uFlags=TTF_IDISHWND|TTF_SUBCLASS;tip.hwnd=w;tip.uId=reinterpret_cast<UINT_PTR>(app.statusText);tip.lpszText=LPSTR_TEXTCALLBACKW;
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));SendMessageW(app.tooltip,TTM_SETMAXTIPWIDTH,0,app.scale(520));
         tip.uId=reinterpret_cast<UINT_PTR>(app.encodingMode);
-        tip.lpszText=const_cast<LPWSTR>(L"Compatible keeps the original software H.264 settings. Efficient uses a bitrate target at every quality level. Quality H.264, AV1 and hardware modes use fixed quantization; detailed or changing scenes can make much larger files. Hardware modes require a supported encoder and do not switch to software if unavailable. HEVC playback needs a compatible player or decoder. AV1 uses more processor time to make much smaller files; playback needs a player or decoder with AV1 support. File size and image quality depend on the scene and encoder.");
+        tip.lpszText=const_cast<LPWSTR>(L"Compatible keeps the original software H.264 settings. Efficient uses a bitrate target at every quality level. SVT-AV1 uses constant quality by default and preset 6. Quality H.264 and hardware modes use fixed quantization; detailed or changing scenes can make larger files. Encoder settings can override Video quality with a custom AV1 CRF or target bitrate. Hardware modes require a supported encoder and do not switch to software if unavailable. HEVC and AV1 playback need a compatible player or decoder. File size and image quality depend on the scene and encoder.");
+        SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
+        tip.uId=reinterpret_cast<UINT_PTR>(app.encoderConfigure);
+        tip.lpszText=const_cast<LPWSTR>(L"Advanced encoding choices: SVT-AV1 speed preset (default 6), custom AV1 CRF, or target bitrate. Automatic uses Video quality. These choices apply to every file and split, and stay fixed while recording.");
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
         tip.uId=reinterpret_cast<UINT_PTR>(app.mode);
         tip.lpszText=const_cast<LPWSTR>(L"Separate files records full-frame desktop and camera videos together. The side-by-side preview is only for monitoring; each source has its own MP4. A collage can also save separate desktop and camera files at the same time.");
@@ -3959,7 +4161,8 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
            reinterpret_cast<HWND>(lp)==app.nightDetail || reinterpret_cast<HWND>(lp)==app.skipSummary || reinterpret_cast<HWND>(lp)==app.skipDetail))return 0;
         if(id==SizeBox && code==CBN_DROPDOWN){refreshSizeSuggestions();return 0;}
         if(code==CBN_SELCHANGE){
-            if(app.active() && (id==EncodingModeBox || id==NightDurationBox || id==NightTargetBox || (id==IntervalBox && !intervalEditable()) || id==SizeBox || id==StopAfterBox || id==SegmentBox || id==StartDelayBox)){
+            if(app.active() && (id==EncodingQualityBox || id==EncodingModeBox || id==NightDurationBox || id==NightTargetBox || (id==IntervalBox && !intervalEditable()) || id==SizeBox || id==StopAfterBox || id==SegmentBox || id==StartDelayBox)){
+                if(id==EncodingQualityBox)choose(app.encodingQuality,encodingQualityChoice(app.settings.encodingQuality));
                 if(id==EncodingModeBox)choose(app.encodingMode,static_cast<int>(app.settings.encodingMode));
                 if(id==IntervalBox)choose(app.interval,app.committedInterval);
                 if(id==SizeBox)choose(app.videoSize,app.committedSize);
@@ -4025,6 +4228,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         case SkipConfigure:editSkip();break;
         case WatermarkConfigure:if(code==BN_CLICKED)editWatermark();break;
         case PlaybackConfigure:if(code==BN_CLICKED)editPlayback();break;
+        case EncoderConfigure:if(code==BN_CLICKED)editEncoderSettings();break;
         case LowDiskBox:if(!app.active())configure();break;
         case AlsoDesktopBox:case AlsoCameraBox:
             if(code!=BN_CLICKED)break;

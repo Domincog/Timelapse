@@ -6,11 +6,14 @@
 
 namespace lapse {
 enum class EncodingMode;
+struct EncodingOptions;
 inline constexpr int MinCaptureIntervalMs = 100;
 inline constexpr int MaxCaptureIntervalMs = 86400000;
 inline constexpr int MinOutputFps = 1;
 inline constexpr int MaxOutputFps = 120;
 inline constexpr int DefaultOutputFps = 30;
+// SVT-AV1 random-access mode clamps presets above 11; expose real choices only.
+inline constexpr int MaxAv1Preset = 11;
 inline constexpr int MinVideoDimension = 48;
 inline constexpr int MaxVideoDimension = 4096;
 inline constexpr int64_t MaxVideoPixels = int64_t(4096) * 2160;
@@ -36,6 +39,10 @@ bool validateVideoSize(int width, int height, std::wstring& error);
 std::pair<int, int> sourceVideoDimensions(int64_t width, int64_t height) noexcept;
 // Recovery mode uses the native fragmented sink and is supported for H.264 only.
 bool validateEncodingMode(EncodingMode mode, bool recoveryMode, std::wstring& error);
+// Advanced encoder values are validated before opening any output file.
+bool validateEncodingOptions(EncodingMode mode, const EncodingOptions& options, std::wstring& error);
+// Strict whole-number drafts; optional surrounding ASCII whitespace.
+bool parseEncodingInteger(std::wstring_view text, int minimum, int maximum, int& result, std::wstring& error);
 // Largest exact single unit requiring at most three fractional digits.
 std::wstring formatDuration(int64_t milliseconds, bool compact = false);
 // Disposable preview fits 640x360, uses even dimensions and no large allocation.

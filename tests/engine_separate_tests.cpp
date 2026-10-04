@@ -41,11 +41,11 @@ class SeparateEncoder {
     Encoder real_;
     bool camera_ = false;
 public:
-    bool open(const std::wstring& path, int width, int height, int fps, std::wstring& error, EncodingQuality quality, EncodingMode mode, bool recoveryMode) {
+    bool open(const std::wstring& path, int width, int height, int fps, std::wstring& error, EncodingQuality quality, EncodingMode mode, bool recoveryMode, const EncodingOptions& options = {}) {
         if (recoveryMode) ++recoveryOpens;
         camera_ = path.find(L"-camera.recording.mp4") != std::wstring::npos;
         if (fault == (camera_ ? Fault::OpenCamera : Fault::OpenDesktop)) { error = L"Injected open failure."; return false; }
-        return real_.open(path, width, height, fps, error, quality, mode, recoveryMode);
+        return real_.open(path, width, height, fps, error, quality, mode, recoveryMode, options);
     }
     bool write(const Frame& frame, std::wstring& error) {
         if (fault == (camera_ ? Fault::WriteCamera : Fault::WriteDesktop)) { error = L"Injected write failure."; return false; }

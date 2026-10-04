@@ -28,12 +28,12 @@ class CompanionEncoder {
     Encoder real_;
     enum class Kind { Layout, Desktop, Camera } kind_ = Kind::Layout;
 public:
-    bool open(const std::wstring& path, int width, int height, int fps, std::wstring& error, EncodingQuality quality, EncodingMode mode, bool recoveryMode) {
+    bool open(const std::wstring& path, int width, int height, int fps, std::wstring& error, EncodingQuality quality, EncodingMode mode, bool recoveryMode, const EncodingOptions& options = {}) {
         kind_ = path.find(L"-camera.recording.mp4") != std::wstring::npos ? Kind::Camera
             : path.find(L"-desktop.recording.mp4") != std::wstring::npos ? Kind::Desktop : Kind::Layout;
         ++opens;
         if (kind_ == Kind::Camera && fault == Fault::OpenCamera) { error = L"Injected open failure."; return false; }
-        return real_.open(path, width, height, fps, error, quality, mode, recoveryMode);
+        return real_.open(path, width, height, fps, error, quality, mode, recoveryMode, options);
     }
     bool write(const Frame& frame, std::wstring& error) {
         if ((kind_ == Kind::Camera && fault == Fault::WriteCamera) || (kind_ == Kind::Desktop && fault == Fault::WriteDesktop)) {

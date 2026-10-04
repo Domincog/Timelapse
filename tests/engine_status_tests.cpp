@@ -76,9 +76,9 @@ class ObservedEncoder {
     bool camera_ = false;
 public:
     bool open(const std::wstring& path, int width, int height, int fps, std::wstring& error,
-              EncodingQuality quality, EncodingMode mode, bool recovery) {
+              EncodingQuality quality, EncodingMode mode, bool recovery, const EncodingOptions& options = {}) {
         camera_ = path.find(L"-camera.recording.mp4") != std::wstring::npos;
-        return real_.open(path, width, height, fps, error, quality, mode, recovery);
+        return real_.open(path, width, height, fps, error, quality, mode, recovery, options);
     }
     bool write(const Frame& frame, std::wstring& error) {
         { std::lock_guard<std::mutex> lock(journalMutex); writtenFrames.push_back({pixelsHash(frame), camera_}); }
