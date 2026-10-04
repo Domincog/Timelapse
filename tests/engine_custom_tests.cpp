@@ -189,21 +189,22 @@ void invalidAdmission(const std::filesystem::path& root) {
     }
     std::cout << "PASS invalid custom interval/geometry/Night settings fail before source and output work.\n";
 }
-void fractionalFrozen(const std::filesystem::path& root) {
+void fractionalLive(const std::filesystem::path& root) {
     reset(); auto config = settings(root / L"fractional-portrait"); config.intervalMs = 137;
     config.width = 240; config.height = 320; config.preview = true;
     Engine engine; engine.configure(config); engine.record();
     await(engine, [](const auto& value) { return value.frames >= 1 && value.preview; });
-    config.intervalMs = 1000; config.width = 384; config.height = 384; engine.configure(config);
+    config.intervalMs = 239; config.width = 384; config.height = 384; engine.configure(config);
     const auto running = await(engine, [](const auto& value) { return value.frames >= 5 && value.preview; }, 1800);
     require(running.preview->width == 270 && running.preview->height == 360 && running.preview->pixels.capacity() <= 640 * 360 * 4,
         "Active portrait preview did not retain its bounded frozen aspect");
     const auto saved = finish(engine); const auto observed = observations();
-    require(observed.size() >= 5 && observed[4].tick - observed[0].tick >= 450 && observed[4].tick - observed[0].tick < 1400,
-        "Exact 137ms interval was rounded, changed live, or burst ahead");
+    require(observed.size() >= 5 && observed[4].tick - observed[0].tick >= 850 && observed[4].tick - observed[0].tick < 1600,
+        "Live fractional interval did not update promptly or burst ahead");
+    for(size_t i=2;i<observed.size();++i)require(observed[i].tick-observed[i-1].tick>=225,"Live 239ms interval retained the old shorter cadence");
     for (const auto& write : observed) require(write.width == 240 && write.height == 320, "Active output dimensions changed live");
     decode(saved, 240, 320, 1);
-    std::cout << "PASS exact fractional cadence, frozen interval/portrait size and bounded matching preview.\n";
+    std::cout << "PASS live fractional cadence retains frozen portrait size and bounded matching preview.\n";
 }
 void boundaryGeometry(const std::filesystem::path& root) {
     for (const bool separate : {false, true}) {
@@ -367,7 +368,7 @@ int main() {
     const auto root = std::filesystem::current_path() / (L"engine-custom-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
     int result = 0;
     try {
-        invalidAdmission(root); fractionalFrozen(root); boundaryGeometry(root); playbackRates(root); slowWork(root); liveNightValidation(root);
+        invalidAdmission(root); fractionalLive(root); boundaryGeometry(root); playbackRates(root); slowWork(root); liveNightValidation(root);
         previewCadence(root); longInterval(root); idleAspectRetirement(); playbackAcceptance(root);
         std::filesystem::remove_all(root); std::cout << "All synthetic custom settings engine contracts passed.\n";
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; std::wcerr << L"Artifacts retained at " << root.wstring() << L'\n'; result = 1; }

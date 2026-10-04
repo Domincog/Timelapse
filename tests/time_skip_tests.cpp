@@ -303,6 +303,22 @@ void playbackRampDurations() {
 }
 int main() {
     try { normalization(); manualProfiles(); scheduleBoundaries(); quietAndSources(); descriptorNoise(); quietSensitivity(); delaysAndAllocation(); playbackRampDurations();
+        TimeSkipSettings settings;settings.mode=TimeSkipMode::Quiet;settings.quietAfterMs=1000;
+        TimeSkipController controller;require(controller.reset(settings,100,1),"Live rebase fixture failed");
+        const auto image=flat();controller.observe(0,image,1,1,0);controller.observe(0,image,1,2,1000);
+        const auto before=controller.onFrame(1000);const auto count=allocations.load();
+        require(controller.rebase(200) && controller.inspect(1000).reason==TimeSkipReason::Quiet &&
+            std::abs(controller.inspect(1000).intervalMs-before*2)<=1,"Live rebase lost qualified observations or ramp phase");
+        require(!controller.rebase(99) && !controller.rebase(MaxCaptureIntervalMs+1LL) &&
+            std::abs(controller.inspect(1000).intervalMs-before*2)<=1,"Invalid rebase changed cadence");
+        require(controller.rebase(MaxCaptureIntervalMs) && controller.inspect(1000).intervalMs>=MaxCaptureIntervalMs &&
+            allocations.load()==count,"Maximum live interval overflowed or allocated");
+        settings.mode=TimeSkipMode::NoPerson;require(controller.reset(settings,100,2),"Live person rebase fixture failed");
+        controller.observePerson({PersonPresence::QualifiedAbsent,1,1,0});
+        controller.observePerson({PersonPresence::QualifiedAbsent,1,2,1000});
+        const auto personInterval=controller.onFrame(1000);
+        require(controller.rebase(200) && controller.inspect(1000).reason==TimeSkipReason::NoPerson &&
+            std::abs(controller.inspect(1000).intervalMs-personInterval*2)<=1,"Live rebase lost person qualification");
         std::cout << "All time-compression policy contracts passed. Controller bytes: " << sizeof(TimeSkipController) << '\n'; return 0;
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
 }

@@ -921,6 +921,20 @@ void updateAdvanced() {
     updateSkipText(true);
 }
 
+bool intervalEditable() {
+    return !app.closeWhenDone && (app.status.state==State::Idle || app.status.state==State::Recording || app.status.state==State::Paused);
+}
+bool validateLiveInterval(int milliseconds,std::wstring& error) {
+    if(!validateCaptureInterval(milliseconds,error))return false;
+    if(app.active() && app.settings.night.enabled &&
+       milliseconds<std::max(NightMinDurationMs,app.settings.night.durationMs)) {
+        error=app.settings.night.durationMs>0
+            ? L"Capture every must be at least the current Night blend duration. Choose a longer interval."
+            : L"Night camera needs a capture interval of at least 1 second.";
+        return false;
+    }
+    return true;
+}
 void configure() {
     const int previousInterval=app.settings.intervalMs;
     app.settings.intervalMs = selectedInterval();
@@ -995,6 +1009,7 @@ void refreshSources() {
 void updateControls() {
     const bool idle = !app.active();
     for (auto control : {app.mode,app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.splitEvery,app.startDelay,app.lowDisk,app.recoveryMode,app.nightEnabled,app.nightDuration,app.nightTarget,app.refresh,app.folder}) EnableWindow(control,idle);
+    EnableWindow(app.interval,intervalEditable());
     EnableWindow(app.monitor,idle && hasSource(Source::Desktop));
     EnableWindow(app.captureCursor,idle && hasSource(Source::Desktop));
     EnableWindow(app.camera,idle && hasSource(Source::Camera) && !app.cameras.empty());
@@ -1963,6 +1978,7 @@ bool validateCustom(CustomDraft& draft,std::wstring& message,HWND& invalid) {
     if(!parseDuration(first,unit,night?NightMinDurationMs:interval?MinCaptureIntervalMs:1000,
                       night?int64_t(NightMaxDurationMs):interval?int64_t(MaxCaptureIntervalMs):int64_t(INT_MAX)*1000,
                       (interval || night)?1:1000,duration,message))return false;
+    if(interval && !validateLiveInterval(static_cast<int>(duration),message))return false;
     draft.durationMs=duration;return true;
 }
 INT_PTR CALLBACK customProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
@@ -2021,7 +2037,7 @@ INT_PTR CALLBACK customProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             }
             if(LOWORD(wp)==IDCANCEL && HIWORD(wp)==BN_CLICKED){EndDialog(window,IDCANCEL);return TRUE;}
             if(LOWORD(wp)==IDOK && HIWORD(wp)==BN_CLICKED){
-                if(app.active()){EndDialog(window,IDCANCEL);return TRUE;}
+                if(app.active() && (draft->kind!=CustomKind::Interval || !intervalEditable())){EndDialog(window,IDCANCEL);return TRUE;}
                 std::wstring error;HWND invalid{};
                 if(validateCustom(*draft,error,invalid)){EndDialog(window,IDOK);return TRUE;}
                 SetWindowTextW(draft->error,error.c_str());SetFocus(invalid);SendMessageW(invalid,EM_SETSEL,0,-1);customReveal(window,*draft,invalid);return TRUE;
@@ -2046,7 +2062,7 @@ void commitCustom(const CustomDraft& draft) {
     normalizeCustomSelections();customItems();configure();updateControls();layout();InvalidateRect(app.preview,nullptr,FALSE);InvalidateRect(app.window,nullptr,FALSE);
 }
 void editCustom(CustomKind kind) {
-    if(app.active() || app.customDialog)return;
+    if((app.active() && (kind!=CustomKind::Interval || !intervalEditable())) || app.customDialog)return;
     HWND box=kind==CustomKind::Interval?app.interval:kind==CustomKind::Size?app.videoSize:kind==CustomKind::Segment?app.splitEvery:kind==CustomKind::Night?app.nightDuration:app.stopAfter;
     choose(box,kind==CustomKind::Interval?app.committedInterval:kind==CustomKind::Size?app.committedSize:kind==CustomKind::Segment?app.committedSegment:kind==CustomKind::Night?app.committedNightDuration:app.committedLimit);
     const int duration=kind==CustomKind::Segment?app.settings.segmentDurationSeconds:app.settings.recordingLimitSeconds;
@@ -2055,7 +2071,7 @@ void editCustom(CustomKind kind) {
     draft.width=app.settings.width;draft.height=app.settings.height;CustomTemplate resource;
     const auto outcome=DialogBoxIndirectParamW(GetModuleHandleW(nullptr),&resource.dialog,app.window,customProc,reinterpret_cast<LPARAM>(&draft));
     if(!IsWindow(app.window))return;
-    if(outcome==IDOK && !app.active())commitCustom(draft);
+    if(outcome==IDOK && (!app.active() || (kind==CustomKind::Interval && intervalEditable())))commitCustom(draft);
     else if(outcome==-1)MessageBoxW(app.window,L"The custom settings dialog could not be opened. Try again.",L"Timelapse",MB_OK|MB_ICONERROR);
     if(!app.closeWhenDone && !app.hiddenToTray){SetFocus(box);revealFocusedControl();}
 }
@@ -3333,6 +3349,9 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         tip.uId=reinterpret_cast<UINT_PTR>(app.mode);
         tip.lpszText=const_cast<LPWSTR>(L"Separate files records full-frame desktop and camera videos together. The side-by-side preview is only for monitoring; each source has its own MP4.");
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
+        tip.uId=reinterpret_cast<UINT_PTR>(app.interval);
+        tip.lpszText=const_cast<LPWSTR>(L"Change capture timing before or during recording, including while paused. Longer intervals make that part of the video shorter. Captures already underway finish first. Playback FPS stays fixed. Night camera requires an interval at least as long as its blend duration.");
+        SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
         tip.uId=reinterpret_cast<UINT_PTR>(app.videoSize);tip.lpszText=LPSTR_TEXTCALLBACKW;
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
         tip.uId=reinterpret_cast<UINT_PTR>(app.advanced);
@@ -3460,7 +3479,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
            reinterpret_cast<HWND>(lp)==app.nightDetail || reinterpret_cast<HWND>(lp)==app.skipSummary || reinterpret_cast<HWND>(lp)==app.skipDetail))return 0;
         if(id==SizeBox && code==CBN_DROPDOWN){refreshSizeSuggestions();return 0;}
         if(code==CBN_SELCHANGE){
-            if(app.active() && (id==EncodingModeBox || id==NightDurationBox || id==NightTargetBox || id==IntervalBox || id==SizeBox || id==StopAfterBox || id==SegmentBox || id==StartDelayBox)){
+            if(app.active() && (id==EncodingModeBox || id==NightDurationBox || id==NightTargetBox || (id==IntervalBox && !intervalEditable()) || id==SizeBox || id==StopAfterBox || id==SegmentBox || id==StartDelayBox)){
                 if(id==EncodingModeBox)choose(app.encodingMode,static_cast<int>(app.settings.encodingMode));
                 if(id==IntervalBox)choose(app.interval,app.committedInterval);
                 if(id==SizeBox)choose(app.videoSize,app.committedSize);
@@ -3483,6 +3502,14 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
             }
             if(id==ModeBox)changeLayout(false);
             else {
+                if(id==IntervalBox && app.active()) {
+                    std::wstring error;
+                    if(!validateLiveInterval(selectedInterval(),error)) {
+                        choose(app.interval,app.committedInterval);
+                        MessageBoxW(w,error.c_str(),L"Capture interval",MB_OK|MB_ICONINFORMATION);
+                        return 0;
+                    }
+                }
                 if(id==MonitorBox || id==CameraBox) {
                     const HWND box=id==MonitorBox ? app.monitor : app.camera;
                     const int count=static_cast<int>(id==MonitorBox ? app.monitors.size() : app.cameras.size());

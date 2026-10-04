@@ -216,6 +216,7 @@ void pausedSession(const std::filesystem::path& root) {
     const auto last = events(Kind::ApplyFull).back(); const auto count = events(Kind::ApplyFull).size();
     settings.watermark.x = 0; settings.watermark.timeKind = WatermarkTimeKind::RecordedLocal; settings.watermark.showSpeed = false;
     settings.outputFps = 120;
+    settings.intervalMs = 350;
     engine.configure(settings);
     await(engine, [&](const Status&) { const auto previews = events(Kind::ApplyPreview); return !previews.empty() && sameContext(previews.back().context, last.context); });
     std::this_thread::sleep_for(350ms);
@@ -228,11 +229,11 @@ void pausedSession(const std::filesystem::path& root) {
     require(watermarkResets == resets, "Hidden pause discarded its prepared recording renderer");
     engine.setPaused(false); await(engine, [&](const Status&) { return events(Kind::ApplyFull).size() > count; });
     const auto resumed = events(Kind::ApplyFull)[count];
-    require(resumed.before != resumed.after && resumed.context.targetIntervalMs == 200 && resumed.context.outputFps == 59 &&
+    require(resumed.before != resumed.after && resumed.context.targetIntervalMs == 350 && resumed.context.outputFps == 59 &&
         resumed.context.activeMs - last.context.activeMs < 300,
         "Resume target or active time includes pause");
     require(!finish(engine).error, "Pause/resume recording failed");
-    std::cout << "PASS settings and paused context freeze; resume uses base target.\n";
+    std::cout << "PASS paused context stays fixed; resume stamps the edited interval at frozen playback FPS.\n";
 }
 void manualRate(const std::filesystem::path& root) {
     reset(); auto settings = config(root / L"manual"); settings.intervalMs = 100;

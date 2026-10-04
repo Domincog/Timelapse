@@ -177,7 +177,7 @@ void offAndManual(const std::filesystem::path& root) {
     Engine engine;engine.configure(settings);engine.record();
     const auto accelerated=await(engine,[](const auto& s){return s.timeSkip.intervalMs>=350;});
     require(accelerated.timeSkip.reason==TimeSkipReason::Manual&&checks==0&&observerCaptures==0,"Manual mode scanned activity");
-    settings.timeSkip.mode=TimeSkipMode::Off;settings.intervalMs=1000;engine.configure(settings);
+    settings.timeSkip.mode=TimeSkipMode::Off;engine.configure(settings);
     const auto count=accelerated.frames;await(engine,[&](const auto& s){return s.frames>=count+2;});
     require(engine.status().timeSkip.intervalMs>=350,"Live settings changed frozen cadence policy");
     settings.layers.front().rect={0.1,0.1,0.8,0.8};engine.configure(settings);
@@ -187,6 +187,70 @@ void offAndManual(const std::filesystem::path& root) {
     engine.setPaused(false);await(engine,[&](const auto& s){return s.frames>paused.frames;});
     const auto saved=finish(engine);spacing(submitted());decode(saved,160,120,1);
     std::cout<<"PASS Off/manual zero observation work, smooth growth, frozen policy and pause/resume.\n";
+}
+void liveIntervals(const std::filesystem::path& root,bool paired) {
+    reset();auto settings=config(root/(paired?L"live-paired":L"live-single"),TimeSkipMode::Off);
+    settings.separateFiles=paired;
+    Engine engine;engine.configure(settings);engine.record();
+    await(engine,[](const auto& s){return s.frames>=2;});
+    settings.intervalMs=MaxCaptureIntervalMs;engine.configure(settings);
+    std::this_thread::sleep_for(150ms);const auto slow=engine.status().frames;
+    std::this_thread::sleep_for(250ms);
+    require(engine.status().frames==slow,"Longer live interval retained the old capture deadline");
+    settings.intervalMs=100;engine.configure(settings);
+    await(engine,[&](const auto& s){return s.frames>=slow+2;},1200);
+    engine.setPaused(true);const auto paused=await(engine,[](const auto& s){return s.state==State::Paused;});
+    settings.intervalMs=150;settings.width=320;settings.outputFps=60;engine.configure(settings);
+    std::this_thread::sleep_for(250ms);require(engine.status().frames==paused.frames,"Live paused edit admitted a frame");
+    engine.setPaused(false);await(engine,[&](const auto& s){return s.frames>=paused.frames+3;},1200);
+    auto values=submitted();std::vector<Write> primary;for(const auto& value:values)if(!value.secondary)primary.push_back(value);
+    require(primary.back().microseconds-primary[primary.size()-2].microseconds>=145000,"Resume lost the edited interval");
+    settings.intervalMs=MaxCaptureIntervalMs;engine.configure(settings);std::this_thread::sleep_for(150ms);
+    const auto held=engine.status().frames;
+    settings.intervalMs=99;engine.configure(settings);std::this_thread::sleep_for(250ms);
+    require(engine.status().state==State::Recording && engine.status().frames==held,"Invalid live interval changed or stopped recording");
+    settings.intervalMs=100;engine.configure(settings);await(engine,[&](const auto& s){return s.frames>held;},1200);
+    const auto saved=finish(engine);decode(saved,160,120,paired?2:1);spacing(submitted());
+    require(opens==(paired?2u:1u),"Interval edit reopened the recording outputs");
+    std::cout<<"PASS live long/short cadence, hidden worker wake, paused edits, invalid requests and frozen outputs, paired="<<paired<<".\n";
+}
+void liveInFlight(const std::filesystem::path& root) {
+    reset();auto settings=config(root/L"live-in-flight",TimeSkipMode::Off);
+    Engine engine;engine.configure(settings);engine.record();await(engine,[](const auto& s){return s.frames>=1;});
+    ScopedWriteGateRelease guard;gateNextWrite=true;
+    await(engine,[](const auto&){return writeGateEntered.load();});
+    const auto gated=submitted().size()-1;
+    settings.intervalMs=MaxCaptureIntervalMs;engine.configure(settings);
+    settings.intervalMs=200;engine.configure(settings);releaseWriteGate();
+    await(engine,[&](const auto& s){return s.frames>=gated+3;},1600);
+    const auto values=submitted();
+    // Nominal deadlines can absorb capture jitter. Two following intervals
+    // distinguish 200ms from stale 100ms timing without a 5ms wall-clock margin.
+    require(values[gated+2].microseconds-values[gated].microseconds>=350000,"In-flight edit lost the latest requested cadence");
+    decode(finish(engine),160,120,1);
+    reset();settings=config(root/L"live-manual",TimeSkipMode::Manual);
+    Engine compressed;compressed.configure(settings);compressed.record();
+    await(compressed,[](const auto& s){return s.timeSkip.intervalMs==400;});
+    settings.intervalMs=200;compressed.configure(settings);
+    await(compressed,[](const auto& s){return s.timeSkip.intervalMs==800 && s.timeSkip.reason==TimeSkipReason::Manual;},500);
+    settings.intervalMs=100;compressed.configure(settings);
+    await(compressed,[](const auto& s){return s.timeSkip.intervalMs==400;},500);
+    require(checks==0,"Live manual compression added source observations");decode(finish(compressed),160,120,1);
+    std::cout<<"PASS edits during encoding retain the latest request and compressed ramp phase.\n";
+}
+void liveNightInterval(const std::filesystem::path& root) {
+    reset();auto settings=config(root/L"live-night",TimeSkipMode::Off);settings.intervalMs=1000;settings.night.enabled=true;
+    Engine engine;engine.configure(settings);engine.record();
+    await(engine,[](const auto& s){return s.frames>=1 && begun().size()>=2;});
+    const auto accepted=begun();const auto cancellations=nightCancels.load();
+    settings.intervalMs=2000;engine.configure(settings);
+    const auto count=engine.status().frames;await(engine,[&](const auto& s){return s.frames>count;},1800);
+    require(nightCancels==cancellations && begun().size()==accepted.size(),"Live interval truncated or replaced a queued Night blend");
+    settings.intervalMs=500;engine.configure(settings);
+    await(engine,[&](const auto& s){return s.frames>=count+2;},3500);
+    const auto values=submitted();require(values.back().tick-values[values.size()-2].tick>=1950,"Night update ignored its new spacing or accepted a subsecond interval");
+    decode(finish(engine),160,120,1);
+    std::cout<<"PASS queued Night windows finish fully and invalid Night cadence leaves recording intact.\n";
 }
 void pairedActivity(const std::filesystem::path& root) {
     reset();auto settings=config(root/L"paired");settings.separateFiles=true;settings.captureCursor=false;
@@ -399,7 +463,7 @@ int main(){
     if(FAILED(MFStartup(MF_VERSION))){CoUninitialize();return 1;}
     const auto root=std::filesystem::current_path()/(L"engine-time-skip-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64()));
     int result=0;
-    try{validation(root);offAndManual(root);pairedActivity(root);unavailableAndPause(root);resetReceipt(root);scheduleAndLimit(root);optionalSlowQueryLimit(root);splitPolicyContinuity(root);
+    try{validation(root);offAndManual(root);liveIntervals(root,false);liveIntervals(root,true);liveInFlight(root);liveNightInterval(root);pairedActivity(root);unavailableAndPause(root);resetReceipt(root);scheduleAndLimit(root);optionalSlowQueryLimit(root);splitPolicyContinuity(root);
         splitResumeObservation(root,false);splitResumeObservation(root,true);splitResumeObservation(root,true,true);
         combinedAndSourceReset(root);nightWindows(root);nightSourceTransition(root);
         std::filesystem::remove_all(root);std::cout<<"All synthetic time-skipping engine contracts passed.\n";

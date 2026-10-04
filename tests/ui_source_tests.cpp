@@ -465,10 +465,11 @@ void activeControls() {
     seed(true);
     for(auto state:{State::Starting,State::Recording,State::Paused,State::Finishing}) {
         app.status.state=state; updateControls();
-        for(auto control:{app.refresh,app.mode,app.monitor,app.camera,app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.splitEvery,app.lowDisk,app.nightEnabled,app.nightDuration,app.nightTarget,app.folder,app.record})
+        for(auto control:{app.refresh,app.mode,app.monitor,app.camera,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.splitEvery,app.lowDisk,app.nightEnabled,app.nightDuration,app.nightTarget,app.folder,app.record})
             require(!IsWindowEnabled(control),"An active-session source/settings control remained enabled.");
+        require((IsWindowEnabled(app.interval)!=FALSE)==(state==State::Recording || state==State::Paused),"Live interval availability did not follow session state");
     }
-    std::cout<<"PASS Refresh/source/settings controls disabled in Starting, Recording, Paused and Finishing.\n";
+    std::cout<<"PASS capture interval editable in Recording/Paused; other source/settings controls remain locked.\n";
 }
 void resetKnownFolders(){
     require(knownFolderBuffers.empty(),"A previous known-folder lookup leaked its returned buffer.");
@@ -712,4 +713,3 @@ int main() {
         return 0;
     }catch(const std::exception& error){std::cerr<<"PROBE FAILURE: "<<error.what()<<'\n';return 1;}
 }
-

@@ -56,6 +56,8 @@ public:
     // input returns false and leaves a safe disabled controller. No allocation.
     bool reset(const TimeSkipSettings&, int64_t baseIntervalMs, unsigned sourceMask,
                int outputFps = DefaultOutputFps) noexcept;
+    // Change capture cadence without losing observation history or ramp phase.
+    bool rebase(int64_t baseIntervalMs) noexcept;
     // Only distinct, trusted source observations count. Active time excludes
     // pauses. The engine owns wall-clock freshness and marks stale input unavailable.
     bool observe(unsigned sourceIndex, const TimeSkipDescriptor&, uint64_t epoch,
@@ -95,6 +97,7 @@ private:
     int64_t baseMs_ = 1000, lastInspectMs_ = -1, lastFrameMs_ = -1, windowStartMs_ = -1, windowEndMs_ = 0;
     unsigned sourceMask_ = 0, phase_ = 0;
     bool valid_ = false, descending_ = false, finished_ = false, returnPending_ = false;
+    void buildIntervals() noexcept;
     void baseReturn() noexcept;
     TimeSkipDecision evaluate(int64_t activeMs) noexcept;
 };

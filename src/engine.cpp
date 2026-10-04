@@ -1110,6 +1110,7 @@ void Engine::run() {
                 if (quit) { if (writing || pending) { previewOnlyWork = false; closeRecording(L""); } break; }
                 Settings& cfg = *snapshot;
                 bool resetSkipRequested = false;
+                bool intervalChanged = false;
                 if (start && requestDeadline) {
                     delayedRequest.emplace(std::move(cfg)); delayedDeadline = requestDeadline; delayedEpoch = requestEpoch;
                     delayedOrigin = true; sessionStarted = false; start = false;
@@ -1197,6 +1198,17 @@ void Engine::run() {
                 // do not discard their reset intent as a disposable preview.
                 previewOnlyWork = !captureDue && !segmentExpired();
                 if (writing || pending) {
+                    if (writing && cfg.intervalMs != session->intervalMs) {
+                        std::wstring error;
+                        const int minimum = usesNightCamera(*session)
+                            ? std::max(NightMinDurationMs, session->night.durationMs) : MinCaptureIntervalMs;
+                        // Invalid live requests leave the current recording intact.
+                        if (cfg.intervalMs >= minimum && validateCaptureInterval(cfg.intervalMs, error)) {
+                            session->intervalMs = cfg.intervalMs;
+                            intervalChanged = true;
+                            if (skipping) timeSkip.rebase(cfg.intervalMs);
+                        }
+                    }
                     if (!session->separateFiles && !delayedLayersFrozen) {
                         if (skipping && !sameLayers(session->layers, cfg.layers)) resetSkipRequested = true;
                         session->layers = cfg.layers;
@@ -1230,6 +1242,25 @@ void Engine::run() {
                         }
                     }
                     std::lock_guard<std::mutex> lock(mutex_); status_.timeSkip = skipStatus;
+                }
+                if (intervalChanged) {
+                    const auto target = skipping ? timeSkip.inspect(activeMilliseconds()).intervalMs : cfg.intervalMs;
+                    // A queued Night blend keeps both its duration and incoming
+                    // watermark target. Its following window uses the new cadence.
+                    if (!nightQueued) {
+                        incomingIntervalMs = target;
+                        if (!paused && lastAdmission != Clock::time_point::min()) {
+                            nextFrame = std::max(lastAdmission + std::chrono::milliseconds(target), Clock::now());
+                            if (nightMode) {
+                                const auto duration = std::chrono::milliseconds(nightWindowDuration(cfg, suggestedNightDurationMs));
+                                nextFrame = std::max(nextFrame, Clock::now() + duration);
+                                nightStartAt = nextFrame - duration;
+                            }
+                            retryFrameAt = Clock::time_point::min();
+                        }
+                    }
+                    captureDue = pending || (writing && !paused && Clock::now() >= nextFrame);
+                    previewOnlyWork = !captureDue && !segmentExpired();
                 }
                 if (segmentExpired()) {
                     previewOnlyWork = false;

@@ -173,6 +173,17 @@ bool TimeSkipController::reset(const TimeSkipSettings& settings, int64_t base, u
     // output frame (at least one). The persisted values stay compatible with
     // older preferences; only this owned runtime snapshot is scaled.
     settings_.rampFrames = std::max(1, (settings_.rampFrames * fps + DefaultOutputFps / 2) / DefaultOutputFps);
+    buildIntervals();
+    valid_ = true; return true;
+}
+bool TimeSkipController::rebase(int64_t base) noexcept {
+    if (!valid_ || base < MinCaptureIntervalMs || base > MaxCaptureIntervalMs) return false;
+    baseMs_ = base;
+    buildIntervals();
+    return true;
+}
+void TimeSkipController::buildIntervals() noexcept {
+    returnSpans_.fill(0);
     for (int i = 0; i <= settings_.rampFrames; ++i) {
         const double x = double(i) / settings_.rampFrames;
         const double eased = x * x * x * (10 + x * (-15 + 6 * x));
@@ -180,7 +191,6 @@ bool TimeSkipController::reset(const TimeSkipSettings& settings, int64_t base, u
         returnSpans_[i] = i ? returnSpans_[i - 1] + intervals_[i - 1] : 0;
     }
     intervals_[0] = baseMs_; intervals_[settings_.rampFrames] = baseMs_ * settings_.multiplier;
-    valid_ = true; return true;
 }
 void TimeSkipController::baseReturn() noexcept {
     if (phase_) returnPending_ = true;

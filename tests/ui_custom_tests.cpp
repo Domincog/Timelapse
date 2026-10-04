@@ -136,7 +136,8 @@ void activeAndNight(){
     HiddenFixture owned;setupCustom();
     for(auto state:{State::Starting,State::Recording,State::Paused,State::Finishing}){
         app.status.state=state;const int calls=lapse::configurationCalls;
-        for(auto kind:{CustomKind::Interval,CustomKind::Size,CustomKind::Limit,CustomKind::Segment,CustomKind::Night})invoke(kind);
+        for(auto kind:{CustomKind::Size,CustomKind::Limit,CustomKind::Segment,CustomKind::Night})invoke(kind);
+        if(state==State::Starting || state==State::Finishing)invoke(CustomKind::Interval);
         require(!dialogCalls && lapse::configurationCalls==calls && app.settings.intervalMs==5000 && app.settings.width==1280 && app.settings.recordingLimitSeconds==0 && app.settings.segmentDurationSeconds==0 && choice(app.splitEvery)==0 && selectedNightDuration()==0,
             "Active session accepted a forged custom command.");
     }
@@ -199,6 +200,31 @@ void customNightDuration(){
     choose(app.nightDuration,0);windowProc(app.window,WM_COMMAND,MAKEWPARAM(NightDurationBox,CBN_SELCHANGE),0);
     require(app.settings.night.durationMs==0 && selectedNightDuration()==0,"Auto selection retained the last manual Night duration.");
     std::cout<<"PASS custom Night exact milliseconds/native entry, bounds, committed cancellation/failure/active guards, interval validation and preset/Auto normalization\n";
+}
+void liveIntervalControls(){
+    HiddenFixture owned;setupCustom();
+    for(auto state:{State::Waiting,State::Starting,State::Recording,State::Paused,State::Finishing}){
+        app.status.state=state;updateControls();const bool live=state==State::Recording || state==State::Paused;
+        require((IsWindowEnabled(app.interval)!=FALSE)==live,"Interval enabled outside editable session states");
+        if(!live)continue;
+        choose(app.interval,5);windowProc(app.window,WM_COMMAND,MAKEWPARAM(IntervalBox,CBN_SELCHANGE),0);
+        require(app.settings.intervalMs==60000 && lapse::configured.intervalMs==60000,"Live preset was not configured");
+        dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<CustomDraft*>(parameter);SetWindowTextW(draft.first,L"0.125");accept(window);};
+        invoke(CustomKind::Interval);require(app.settings.intervalMs==125 && caption(app.interval)==L"0.125 seconds","Live custom interval was not committed");
+        dialogScript=[](HWND window,LPARAM){customProc(window,WM_COMMAND,IDCANCEL,0);};
+        invoke(CustomKind::Interval);require(app.settings.intervalMs==125,"Cancel changed live cadence");
+    }
+    app.status={};sourceMode(Mode::Camera);SendMessageW(app.nightEnabled,BM_SETCHECK,BST_CHECKED,0);choose(app.interval,2);choose(app.nightDuration,2);configure();
+    app.status.state=State::Recording;
+    dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<CustomDraft*>(parameter);
+        SetWindowTextW(draft.first,L"1");accept(window);require(!dialogOutcome && !caption(draft.error).empty(),"Live custom interval shorter than Night was accepted");
+        SetWindowTextW(draft.first,L"3");accept(window);};
+    invoke(CustomKind::Interval);require(app.settings.intervalMs==3000 && app.settings.night.durationMs==2000,"Valid live Night cadence changed the blend policy");
+    choose(app.interval,0);windowProc(app.window,WM_COMMAND,MAKEWPARAM(IntervalBox,CBN_SELCHANGE),0);
+    require(app.settings.intervalMs==3000 && selectedInterval()==3000,"Invalid Night preset changed live cadence");
+    dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<CustomDraft*>(parameter);SetWindowTextW(draft.first,L"10");app.status.state=State::Finishing;accept(window);};
+    invoke(CustomKind::Interval);require(app.settings.intervalMs==3000,"Saving accepted a stale live interval draft");
+    std::cout<<"PASS live interval presets/custom values, cancellation, Night limits and saving guards\n";
 }
 void segmentDurations(){
     HiddenFixture owned;setupCustom();
@@ -455,7 +481,7 @@ void sourceSizeSnapshots(){
 }
 }
 int main(){
-    try{intervalAndCancellation();dimensionsAndLimit();activeAndNight();customNightDuration();segmentDurations();nativeNumericInsertion();nativeButtonNavigation();dialogDpiAndLifecycle();canceledDialogFocus();nativeDialogWheel();sourceSizeSnapshots();
+    try{intervalAndCancellation();dimensionsAndLimit();activeAndNight();liveIntervalControls();customNightDuration();segmentDurations();nativeNumericInsertion();nativeButtonNavigation();dialogDpiAndLifecycle();canceledDialogFocus();nativeDialogWheel();sourceSizeSnapshots();
         std::cout<<"All custom UI cases passed with owned controls and synthetic engine.\n";return 0;
     }catch(const std::exception& error){std::cerr<<error.what()<<'\n';return 1;}
 }
