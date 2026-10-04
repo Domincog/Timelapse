@@ -139,7 +139,7 @@ namespace lapse {
 class FixtureEngine {
 public:
     void configure(const Settings&){++fixture::configured;}
-    void refreshSources(){} void record(){} void pause(){} void setPaused(bool){} void finish(){++fixture::finishes;} void cancelDelayedStart() noexcept {}
+    void refreshSources(){} void record(){} void pause(){} void setPaused(bool){} void finish(){++fixture::finishes;} void cancelDelayedStart() noexcept {} void setStatus(const StatusItem&) {}
     Status status(){return {};}
 };
 std::vector<Monitor> enumerateMonitors(){fixture::forbidden();return {};}

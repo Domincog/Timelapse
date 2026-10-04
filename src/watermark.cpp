@@ -1,5 +1,6 @@
 #include "watermark.h"
 #include "config.h"
+#include "overlay.h"
 #include <algorithm>
 #include <cwchar>
 #include <cstring>
@@ -7,7 +8,6 @@
 
 namespace lapse {
 namespace {
-constexpr size_t MaxTileBytes = 4 * 1024 * 1024;
 bool fail(std::wstring& error, const wchar_t* message) { error = message; return false; }
 bool validSettings(const WatermarkSettings& settings) noexcept {
     return settings.timeKind >= WatermarkTimeKind::ActiveElapsed && settings.timeKind <= WatermarkTimeKind::RecordedLocal &&
@@ -22,7 +22,6 @@ bool validDate(const SYSTEMTIME& value) noexcept {
     const bool leap = value.wYear % 4 == 0 && (value.wYear % 100 != 0 || value.wYear % 400 == 0);
     return value.wDay >= 1 && value.wDay <= days[value.wMonth - 1] + (value.wMonth == 2 && leap ? 1u : 0u);
 }
-bool selected(HGDIOBJ object) noexcept { return object && object != HGDI_ERROR; }
 }
 bool validateWatermarkSettings(const WatermarkSettings& settings, std::wstring& error) {
     error.clear();
@@ -82,57 +81,41 @@ bool formatWatermarkText(const WatermarkSettings& settings, const WatermarkConte
 
 struct WatermarkRenderer::Impl {
     WatermarkSettings settings;
-    int outputWidth = 0, outputHeight = 0, fontHeight = 0, lineHeight = 0, padding = 0, gap = 0, margin = 0;
-    int tileWidth = 0, tileHeight = 0, drawnWidth = 0, drawnHeight = 0;
-    HDC dc = nullptr;
-    HFONT font = nullptr;
-    HBITMAP bitmap = nullptr;
-    HGDIOBJ oldFont = nullptr, oldBitmap = nullptr;
-    uint8_t* pixels = nullptr;
+    int outputWidth = 0, outputHeight = 0, margin = 0, gap = 0, tileWidth = 0, tileHeight = 0;
+    // The first line uses the larger semibold face; a second line is smaller.
+    OverlayFont fonts[2];
+    OverlayCanvas canvas;
+    OverlayHalo halo;
     std::array<wchar_t, WatermarkTextCapacity> text{};
     bool rasterized = false;
-    ~Impl() {
-        if (dc && oldFont) SelectObject(dc, oldFont);
-        if (dc && oldBitmap) SelectObject(dc, oldBitmap);
-        if (font) DeleteObject(font);
-        if (bitmap) DeleteObject(bitmap);
-        if (dc) DeleteDC(dc);
-    }
     bool raster(const std::array<wchar_t, WatermarkTextCapacity>& next, std::wstring& error) {
         if (rasterized && text == next) return true;
         rasterized = false;
         const wchar_t* lines[] = {next.data(), nullptr};
-        int lengths[] = {0, 0}, count = 1, maximum = 0;
+        int lengths[] = {0, 0}, widths[] = {0, 0}, count = 1;
         const auto split = std::wcschr(next.data(), L'\n');
         if (split) { lengths[0] = static_cast<int>(split - next.data()); lines[1] = split + 1; count = 2; }
         else lengths[0] = static_cast<int>(std::wcslen(next.data()));
         if (count == 2) lengths[1] = static_cast<int>(std::wcslen(lines[1]));
+        int widest = 0, height = halo.pad * 2;
         for (int i = 0; i < count; ++i) {
-            SIZE extent{};
-            if (!GetTextExtentPoint32W(dc, lines[i], lengths[i], &extent) || extent.cx <= 0 || extent.cy > lineHeight)
-                return fail(error, L"Windows could not measure the watermark text.");
-            maximum = std::max(maximum, static_cast<int>(extent.cx));
+            if (!fonts[i].raster(lines[i], lengths[i], fonts[i].maxWidth(), widths[i]) || widths[i] <= 0)
+                return fail(error, L"Windows could not draw the watermark text.");
+            widest = std::max(widest, widths[i]); height += fonts[i].lineHeight() + (i ? gap : 0);
         }
-        const int width = maximum + padding * 2, height = count * lineHeight + (count - 1) * gap + padding * 2;
-        if (width > tileWidth || height > tileHeight) return fail(error, L"The watermark text exceeds its prepared bounds.");
-        // Previous successful rasterization was flushed before any CPU access.
-        // Fill only the bounded tile; the recording frame is still untouched.
-        for (size_t i = 0; i < size_t(tileWidth) * tileHeight; ++i) {
-            pixels[i * 4] = pixels[i * 4 + 1] = pixels[i * 4 + 2] = 20; pixels[i * 4 + 3] = 255;
+        const int width = widest + halo.pad * 2;
+        if (!canvas.begin(width, height)) return fail(error, L"The watermark text exceeds its prepared bounds.");
+        // Align lines toward the nearer horizontal edge so a corner placement
+        // reads cleanly without any backing box.
+        const int align = settings.x <= 3333 ? 0 : settings.x >= 6667 ? 2 : 1;
+        int y = halo.pad;
+        for (int i = 0; i < count; ++i) {
+            const int x = halo.pad + (align == 0 ? 0 : align == 2 ? widest - widths[i] : (widest - widths[i]) / 2);
+            fonts[i].blit(canvas, x, y, i ? OverlayColor{232, 236, 242} : OverlayColor{246, 248, 250}, i ? 225 : 255);
+            y += fonts[i].lineHeight() + gap;
         }
-        bool drawn = true;
-        for (int i = 0; i < count; ++i)
-            if (!TextOutW(dc, padding, padding + i * (lineHeight + gap), lines[i], lengths[i])) drawn = false;
-        const bool flushed = GdiFlush() != FALSE;
-        if (!drawn || !flushed) return fail(error, L"Windows could not draw the watermark text.");
-        for (int y = 0; y < height; ++y) for (int x = 0; x < width; ++x) {
-            auto* p = pixels + (size_t(y) * tileWidth + x) * 4;
-            // Explicit grayscale and alpha avoid ClearType/color fringes or
-            // undefined GDI alpha leaking into the video frame.
-            const auto gray = static_cast<uint8_t>((unsigned(p[0]) + p[1] + p[2] + 1) / 3);
-            p[0] = p[1] = p[2] = gray; p[3] = 255;
-        }
-        text = next; drawnWidth = width; drawnHeight = height; rasterized = true; return true;
+        canvas.halo(halo.outline, halo.outlineAlpha, halo.blur, halo.shadowAlpha, halo.offset);
+        text = next; tileWidth = width; tileHeight = height; rasterized = true; return true;
     }
 };
 WatermarkRenderer::WatermarkRenderer() noexcept = default;
@@ -148,10 +131,10 @@ bool WatermarkRenderer::prepare(const WatermarkSettings& settings, int width, in
         reset(); return fail(error, L"Choose a supported video size before enabling the watermark.");
     }
     if (impl_ && impl_->outputWidth == width && impl_->outputHeight == height && sameWatermarkSettings(impl_->settings, settings)) return true;
-    // A position-only change reuses all measured/rasterized GDI state.
+    // A position-only change reuses fonts and the canvas; only alignment redraws.
     if (impl_ && impl_->outputWidth == width && impl_->outputHeight == height) {
         auto previous = impl_->settings; previous.x = settings.x; previous.y = settings.y;
-        if (sameWatermarkSettings(previous, settings)) { impl_->settings = settings; lastBounds_ = {}; return true; }
+        if (sameWatermarkSettings(previous, settings)) { impl_->settings = settings; impl_->rasterized = false; lastBounds_ = {}; return true; }
     }
     reset();
     try {
@@ -160,52 +143,37 @@ bool WatermarkRenderer::prepare(const WatermarkSettings& settings, int width, in
         const int edge = std::min(width, height);
         const int scale = settings.textSize == WatermarkTextSize::Small ? 48 : settings.textSize == WatermarkTextSize::Medium ? 36 : 28;
         const int minimum = settings.textSize == WatermarkTextSize::Small ? 12 : settings.textSize == WatermarkTextSize::Medium ? 16 : 20;
-        prepared->fontHeight = std::max(minimum, edge / scale);
-        prepared->padding = std::max(2, prepared->fontHeight / 5); prepared->gap = std::max(1, prepared->fontHeight / 6);
-        prepared->margin = std::max(2, edge / 100);
-        prepared->dc = CreateCompatibleDC(nullptr);
-        if (!prepared->dc) return fail(error, L"Windows could not create the watermark drawing context.");
-        prepared->font = CreateFontW(-prepared->fontHeight, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE, ANSI_CHARSET,
-            OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, FIXED_PITCH | FF_MODERN, L"Consolas");
-        if (!prepared->font) return fail(error, L"Windows could not create the watermark font.");
-        const auto oldFont = SelectObject(prepared->dc, prepared->font);
-        if (!selected(oldFont)) return fail(error, L"Windows could not select the watermark font.");
-        prepared->oldFont = oldFont;
-        TEXTMETRICW metrics{};
-        if (!GetTextMetricsW(prepared->dc, &metrics) || metrics.tmHeight <= 0 || metrics.tmHeight > 512 ||
-            metrics.tmMaxCharWidth <= 0 || metrics.tmMaxCharWidth > 512 || metrics.tmOverhang < 0 || metrics.tmOverhang > 512)
-            return fail(error, L"Windows returned unsupported watermark font metrics.");
-        prepared->lineHeight = metrics.tmHeight;
-        // tmMaxCharWidth can include wide non-ASCII glyphs in the selected
-        // font. All formatted labels are ASCII: bound their actual advances,
-        // without rejecting small canvases because of unrelated glyphs.
-        std::array<int, 95> widths{};
-        if (!GetCharWidth32W(prepared->dc, 32, 126, widths.data()))
-            return fail(error, L"Windows could not measure the watermark alphabet.");
-        const int characterWidth = *std::max_element(widths.begin(), widths.end());
-        if (characterWidth <= 0 || characterWidth > 512)
-            return fail(error, L"Windows returned unsupported watermark character widths.");
-        const int longestTime = settings.timeKind == WatermarkTimeKind::RecordedLocal ? 28 : 24;
-        const int longest = std::max(settings.showTime ? longestTime : 0, settings.showSpeed ? 21 : 0);
-        prepared->tileWidth = longest * characterWidth + metrics.tmOverhang + prepared->padding * 2;
-        const int lines = int(settings.showTime) + int(settings.showSpeed);
-        prepared->tileHeight = lines * prepared->lineHeight + (lines - 1) * prepared->gap + prepared->padding * 2;
-        if (prepared->tileWidth > width - prepared->margin * 2 || prepared->tileHeight > height - prepared->margin * 2 ||
-            size_t(prepared->tileWidth) * prepared->tileHeight * 4 > MaxTileBytes)
+        const int primary = std::max(minimum, edge / scale), secondary = std::max(minimum * 3 / 4, primary * 3 / 4);
+        prepared->halo = overlayHalo(primary);
+        prepared->margin = std::max(2, edge / 60); prepared->gap = std::max(0, primary / 12);
+        const int count = int(settings.showTime) + int(settings.showSpeed);
+        for (int i = 0; i < count; ++i)
+            if (!prepared->fonts[i].prepare(i ? L"Segoe UI" : L"Segoe UI Semibold", i ? secondary : primary, width, error)) return false;
+        // Preflight the widest text each line can show: every digit position
+        // holds this font's widest digit.
+        const auto longest = [&](OverlayFont& font, const wchar_t* pattern, int& result) {
+            wchar_t widestDigit = L'0'; int best = -1;
+            for (wchar_t digit = L'0'; digit <= L'9'; ++digit) {
+                int advance = 0; if (!font.measure(&digit, 1, advance)) return false;
+                if (advance > best) { best = advance; widestDigit = digit; }
+            }
+            wchar_t sample[48]{}; size_t n = 0;
+            for (; pattern[n] && n + 1 < std::size(sample); ++n) sample[n] = pattern[n] == L'#' ? widestDigit : pattern[n];
+            return font.measure(sample, static_cast<int>(n), result);
+        };
+        int widest = 0, lines = 0, tall = prepared->halo.pad * 2;
+        const wchar_t* time = settings.timeKind == WatermarkTimeKind::RecordedLocal ? L"Recorded ####-##-## ##:##:##" : L"Elapsed ######d ##:##:##";
+        for (const wchar_t* pattern : {settings.showTime ? time : nullptr, settings.showSpeed ? L"Target #########.###x" : nullptr}) {
+            if (!pattern) continue;
+            int measured = 0;
+            if (!longest(prepared->fonts[lines], pattern, measured)) return fail(error, L"Windows could not measure the watermark text.");
+            widest = std::max(widest, measured); tall += prepared->fonts[lines].lineHeight() + (lines ? prepared->gap : 0); ++lines;
+        }
+        if (widest > width - prepared->margin * 2 || tall - prepared->halo.pad * 2 > height - prepared->margin * 2)
             return fail(error, L"The watermark does not fit this video size. Choose smaller text, fewer fields, or a larger video size.");
-        BITMAPINFO info{}; info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-        info.bmiHeader.biWidth = prepared->tileWidth; info.bmiHeader.biHeight = -prepared->tileHeight;
-        info.bmiHeader.biPlanes = 1; info.bmiHeader.biBitCount = 32; info.bmiHeader.biCompression = BI_RGB;
-        void* pixels = nullptr;
-        prepared->bitmap = CreateDIBSection(prepared->dc, &info, DIB_RGB_COLORS, &pixels, nullptr, 0);
-        if (!prepared->bitmap || !pixels) return fail(error, L"Windows could not allocate the watermark text tile.");
-        prepared->pixels = static_cast<uint8_t*>(pixels);
-        const auto oldBitmap = SelectObject(prepared->dc, prepared->bitmap);
-        if (!selected(oldBitmap)) return fail(error, L"Windows could not select the watermark text tile.");
-        prepared->oldBitmap = oldBitmap;
-        if (!SetBkMode(prepared->dc, TRANSPARENT) || SetTextColor(prepared->dc, RGB(255,255,255)) == CLR_INVALID ||
-            SetTextAlign(prepared->dc, TA_LEFT | TA_TOP | TA_NOUPDATECP) == GDI_ERROR)
-            return fail(error, L"Windows could not configure watermark text drawing.");
+        for (int i = 0; i < lines; ++i)
+            if (!prepared->fonts[i].prepare(i ? L"Segoe UI" : L"Segoe UI Semibold", i ? secondary : primary, widest + 2, error)) return false;
+        if (!prepared->canvas.reserve(widest + prepared->halo.pad * 2 + 2, tall, error)) return false;
         impl_ = std::move(prepared); return true;
     } catch (const std::bad_alloc&) { return fail(error, L"There is not enough memory to prepare the watermark."); }
 }
@@ -217,31 +185,14 @@ bool WatermarkRenderer::apply(Frame& frame, const WatermarkContext& context, std
         return fail(error, L"The watermark output frame is invalid.");
     std::array<wchar_t, WatermarkTextCapacity> text{};
     if (!formatWatermarkText(impl_->settings, context, text, error) || !impl_->raster(text, error)) return false;
-    const auto& state = *impl_;
-    const int left = state.margin + static_cast<int>(int64_t(state.outputWidth - state.margin * 2 - state.drawnWidth) * state.settings.x / 10000);
-    const int top = state.margin + static_cast<int>(int64_t(state.outputHeight - state.margin * 2 - state.drawnHeight) * state.settings.y / 10000);
-    const RECT bounds{static_cast<LONG>(int64_t(left) * frame.width / state.outputWidth),
-        static_cast<LONG>(int64_t(top) * frame.height / state.outputHeight),
-        static_cast<LONG>((int64_t(left + state.drawnWidth) * frame.width + state.outputWidth - 1) / state.outputWidth),
-        static_cast<LONG>((int64_t(top + state.drawnHeight) * frame.height + state.outputHeight - 1) / state.outputHeight)};
-    const int drawnWidth = bounds.right - bounds.left, drawnHeight = bounds.bottom - bounds.top;
-    if (bounds.left < 0 || bounds.top < 0 || bounds.right > frame.width || bounds.bottom > frame.height || drawnWidth <= 0 || drawnHeight <= 0)
+    auto& state = *impl_;
+    // Place the visible text (inside the halo padding) within the margins.
+    const int pad = state.halo.pad, innerWidth = state.tileWidth - pad * 2, innerHeight = state.tileHeight - pad * 2;
+    const int left = state.margin - pad + static_cast<int>(int64_t(state.outputWidth - state.margin * 2 - innerWidth) * state.settings.x / 10000);
+    const int top = state.margin - pad + static_cast<int>(int64_t(state.outputHeight - state.margin * 2 - innerHeight) * state.settings.y / 10000);
+    RECT bounds{};
+    if (!state.canvas.composite(frame, left, top, state.outputWidth, state.outputHeight, bounds))
         return fail(error, L"The watermark placement is outside the video frame.");
-    // All fallible work is complete. Only the exact bounded destination tile
-    // is touched, using center-sampled scaling for disposable previews.
-    for (int y = 0; y < drawnHeight; ++y) {
-        const int sy = static_cast<int>((int64_t(y) * 2 + 1) * state.drawnHeight / (int64_t(drawnHeight) * 2));
-        auto* target = frame.pixels.data() + (size_t(bounds.top + y) * frame.width + bounds.left) * 4;
-        const auto* source = state.pixels + size_t(sy) * state.tileWidth * 4;
-        if (drawnWidth == state.drawnWidth && drawnHeight == state.drawnHeight) {
-            std::memcpy(target, source, size_t(drawnWidth) * 4); continue;
-        }
-        for (int x = 0; x < drawnWidth; ++x) {
-            const int sx = static_cast<int>((int64_t(x) * 2 + 1) * state.drawnWidth / (int64_t(drawnWidth) * 2));
-            target[x * 4] = source[sx * 4]; target[x * 4 + 1] = source[sx * 4 + 1];
-            target[x * 4 + 2] = source[sx * 4 + 2]; target[x * 4 + 3] = 255;
-        }
-    }
     lastBounds_ = bounds; return true;
 }
 }

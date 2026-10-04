@@ -4,6 +4,7 @@
 #include "night.h"
 #include "time_skip.h"
 #include "watermark.h"
+#include "status_feed.h"
 #include <array>
 #include <mutex>
 #include <thread>
@@ -52,6 +53,9 @@ struct Settings {
     TimeSkipSettings timeSkip;
     // Final-frame overlay; raw source analysis is unaffected. Frozen at Record.
     WatermarkSettings watermark;
+    // Where and how the live status line is drawn. Frozen at Record; the
+    // status itself changes at any time through Engine::setStatus.
+    StatusFeedSettings statusFeed;
     // Optional fragmented H.264 MP4; ordinary MP4 remains the default.
     bool recoveryMode = false;
     // Include the native cursor in desktop video and preview. Frozen with the
@@ -152,6 +156,9 @@ public:
     // Cancel a delayed request through its first admission boundary. Called
     // synchronously for suspend/resume; cleanup remains on the worker thread.
     void cancelDelayedStart() noexcept;
+    // The user's current status line, shown on the next admitted frame and in
+    // the preview. Kind None clears it. Invalid items are ignored.
+    void setStatus(const StatusItem& item);
     Status status();
 private:
     void run();
@@ -178,6 +185,7 @@ private:
     bool sourceWarning_ = false;
     // The active session's frozen files, for status text set outside the worker.
     OutputPlan sessionPlan_{};
+    StatusItem statusItem_{};
     bool quit_ = false, start_ = false, stop_ = false, pauseRequested_ = false, pauseTarget_ = false, retrySources_ = false;
     std::thread worker_;
 };

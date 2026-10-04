@@ -75,7 +75,8 @@ bool validateRecordingSettings(Settings& settings, std::wstring& error) {
         validateVideoSize(settings.width, settings.height, error) &&
         validateEncodingMode(settings.encodingMode, settings.recoveryMode, error) &&
         (!usesNightCamera(settings) || validateNightCapture(settings, error)) &&
-        normalizeTimeSkipSettings(settings.timeSkip, error) && validateWatermarkSettings(settings.watermark, error);
+        normalizeTimeSkipSettings(settings.timeSkip, error) && validateWatermarkSettings(settings.watermark, error) &&
+        validateStatusFeedSettings(settings.statusFeed, error);
 }
 bool queryDelayedWakeEpoch(uint64_t& epoch, std::wstring& error) {
     // No binding or query on the default immediate path. Own the system-only
@@ -169,7 +170,7 @@ void Engine::configure(const Settings& s) {
       const int mask = sources(s);
       const bool cameraTierChanged = status_.state == State::Idle && (mask & 2) &&
           cameraResolutionForOutput(s.width, s.height) != cameraResolutionForOutput(settings_.width, settings_.height);
-      if (!sameWatermarkSettings(s.watermark, settings_.watermark) ||
+      if (!sameWatermarkSettings(s.watermark, settings_.watermark) || !sameStatusFeedSettings(s.statusFeed, settings_.statusFeed) ||
           (status_.state == State::Idle && s.watermark.enabled && s.watermark.showSpeed && s.outputFps != settings_.outputFps) ||
           (status_.state == State::Idle && (mask & 1) && s.captureCursor != settings_.captureCursor)) retirePreview(true);
       if (mask != sources(settings_) || s.cameraId != settings_.cameraId || !s.preview || cameraTierChanged) retireCameraInput();
@@ -179,6 +180,12 @@ void Engine::configure(const Settings& s) {
               !EqualRect(&s.monitor, &settings_.monitor)))) retirePreview();
       settings_ = s;
       ++settingsRevision_; }
+    wake_.notify_one();
+}
+void Engine::setStatus(const StatusItem& item) {
+    std::wstring error;
+    if (!validateStatusItem(item, error)) return;
+    { std::lock_guard<std::mutex> lock(mutex_); statusItem_ = item; }
     wake_.notify_one();
 }
 void Engine::retireCameraInput() noexcept {
@@ -305,8 +312,76 @@ void Engine::run() {
         bool watermarkPrepared = false, haveWatermarkContext = false;
         WatermarkContext lastWatermarkContext;
         int64_t incomingIntervalMs = 5000;
+        // The live status line is drawn after the watermark. Its history
+        // belongs to one recording and advances once per admitted frame.
+        StatusFeedRenderer statusRenderer;
+        StatusFeedSettings preparedStatus;
+        int statusWidth = 0, statusHeight = 0;
+        StatusFeed statusFeed;
+        uint64_t statusFrame = 0;
         auto resetWatermark = [&]() noexcept {
             watermark.reset(); watermarkPrepared = haveWatermarkContext = false;
+            statusRenderer.reset();
+        };
+        auto prepareStatus = [&](const Settings& cfg, std::wstring& error) {
+            if (statusRenderer.prepared() && statusWidth == cfg.width && statusHeight == cfg.height &&
+                sameStatusFeedSettings(preparedStatus, cfg.statusFeed)) return true;
+            if (!statusRenderer.prepare(cfg.statusFeed, cfg.width, cfg.height, error)) return false;
+            preparedStatus = cfg.statusFeed; statusWidth = cfg.width; statusHeight = cfg.height;
+            return true;
+        };
+        auto currentStatus = [&]() { std::lock_guard<std::mutex> lock(mutex_); return statusItem_; };
+        // Each saved part gets a small text log of when each status appeared,
+        // in saved-video time, ready to paste as video chapters. Best effort:
+        // it never changes the recording or its result.
+        struct StatusLogEntry { uint64_t frame = 0; StatusView view; };
+        std::vector<StatusLogEntry> statusLog;
+        std::wstring statusLogBase;
+        uint64_t loggedSequence = 0, loggedPhase = 0;
+        bool loggedVisible = false;
+        auto logStatus = [&](uint64_t partFrame) noexcept {
+            StatusView shown;
+            const bool visible = statusFeed.current(shown);
+            if (visible == loggedVisible && (!visible || (shown.sequence == loggedSequence && shown.phase == loggedPhase))) return;
+            loggedVisible = visible; loggedSequence = shown.sequence; loggedPhase = shown.phase;
+            if (!visible && statusLog.empty()) return;
+            try { statusLog.push_back({partFrame, shown}); } catch (const std::bad_alloc&) {}
+        };
+        auto writeStatusLog = [&](int fps) noexcept {
+            if (!statusLog.empty() && !statusLogBase.empty()) try {
+                const auto clock = [&](uint64_t frame) {
+                    const uint64_t seconds = frame / uint64_t(std::clamp(fps, MinOutputFps, MaxOutputFps));
+                    wchar_t value[32]{};
+                    if (seconds >= 3600) swprintf_s(value, L"%llu:%02llu:%02llu", seconds / 3600, seconds / 60 % 60, seconds % 60);
+                    else swprintf_s(value, L"%llu:%02llu", seconds / 60, seconds % 60);
+                    return std::wstring(value);
+                };
+                std::wstring text = L"Status changes in this Timelapse video. Times are positions in the saved video; "
+                    L"paste the list into a video description to add chapters.\r\n\r\n";
+                if (statusLog.front().frame > 0) text += L"0:00 Start\r\n";
+                for (const auto& entry : statusLog) {
+                    text += clock(entry.frame) + L" ";
+                    if (!entry.view.visible) { text += L"(no status)\r\n"; continue; }
+                    text += entry.view.label.data();
+                    switch (entry.view.icon) {
+                    case StatusIcon::Stopwatch: text += L" (stopwatch)"; break;
+                    case StatusIcon::Timer: case StatusIcon::Overtime: text += L" (timer)"; break;
+                    default: break;
+                    }
+                    text += L"\r\n";
+                }
+                const int bytes = WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+                if (bytes > 0) {
+                    std::string utf8("\xEF\xBB\xBF");
+                    utf8.resize(3 + size_t(bytes));
+                    WideCharToMultiByte(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), utf8.data() + 3, bytes, nullptr, nullptr);
+                    const HANDLE file = CreateFileW((statusLogBase + L"-status.txt").c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                    if (file != INVALID_HANDLE_VALUE) {
+                        DWORD written = 0; WriteFile(file, utf8.data(), static_cast<DWORD>(utf8.size()), &written, nullptr); CloseHandle(file);
+                    }
+                }
+            } catch (...) {}
+            statusLog.clear(); loggedVisible = false;
         };
         auto prepareWatermark = [&](const Settings& cfg, std::wstring& error) {
             if (!cfg.watermark.enabled) {
@@ -759,6 +834,7 @@ void Engine::run() {
             }
         };
         auto finishSegment = [&](const std::wstring& reason, bool terminal) -> bool {
+            writeStatusLog(session ? session->outputFps : DefaultOutputFps);
             if (session && session->segmentDurationSeconds > 0) {
                 const size_t count = plan.count;
                 const auto opened = partOpen;
@@ -1214,6 +1290,7 @@ void Engine::run() {
                     requiredSources = recordingSources(cfg);
                     { std::lock_guard<std::mutex> lock(mutex_); sessionPlan_ = plan; }
                     resetWatermark(); incomingIntervalMs = cfg.intervalMs;
+                    statusFeed.reset(cfg.outputFps); statusFrame = 0;
                     partOpen = {}; sessionStarted = segmentFailed = false;
                     closedFrames = {}; segmentOrdinal = completedSegments = 0; sessionStem.clear();
                     activeDuration = Clock::duration::zero(); recordingLimitReached = false; terminalClockFrozen = false;
@@ -1350,6 +1427,7 @@ void Engine::run() {
                 // Keep paused session resources and its last context intact:
                 // a hidden resume must still stamp before its first write.
                 if (watermarkPrepared && (!cfg.watermark.enabled || (!writing && !pending && !active))) resetWatermark();
+                if (statusRenderer.prepared() && !writing && !pending && !active) statusRenderer.reset();
                 if (!cfg.preview) previewBuffer.reset();
                 if (!active || !needDesktop) releaseDesktopCaptureCache();
                 if (!active) releaseFrames(true);
@@ -1636,6 +1714,7 @@ void Engine::run() {
                                 closeRecording(openFailure(0)); admit = false; break;
                             }
                             writing = segmentWriting = true;
+                            statusLogBase = ioBase; statusLog.clear(); loggedVisible = false;
                             bool opened = true;
                             for (size_t i = 1; i < plan.count; ++i) {
                                 if (sessionStarted) advanceElapsed(Clock::now());
@@ -1708,6 +1787,18 @@ void Engine::run() {
                         for (size_t i = 0; stamped && i < plan.count; ++i) stamped = watermark.apply(composed[i], context, error);
                         if (!stamped) { closeRecording(L"Watermark stopped recording: " + error); continue; }
                         lastWatermarkContext = context; haveWatermarkContext = true;
+                    }
+                    {
+                        // Status changes take effect on the next admitted frame;
+                        // animation is timed in these frames, values in real time.
+                        statusFeed.advance(currentStatus(), GetTickCount64(), statusFrame);
+                        logStatus(encoders[0] ? encoders[0]->frames() : 0);
+                        if (!statusFeed.empty()) {
+                            bool stamped = prepareStatus(cfg, error);
+                            for (size_t i = 0; stamped && i < plan.count; ++i) stamped = statusRenderer.apply(composed[i], statusFeed, statusFrame, error);
+                            if (!stamped) { closeRecording(L"Status overlay stopped recording: " + error); continue; }
+                        }
+                        ++statusFrame;
                     }
                     if (delayedOrigin) {
                         // Source, codec and both overlays remain preparation.
@@ -1789,6 +1880,20 @@ void Engine::run() {
                             GetLocalTime(&context.recordedLocal);
                         }
                         if (!watermark.apply(*previewBuffer, context, error)) { publishPreviewError(error); continue; }
+                    }
+                    {
+                        // Show a status change at once, as the next saved frame
+                        // will look when its entrance has finished.
+                        StatusFeed previewFeed = statusFeed;
+                        uint64_t index = statusFrame;
+                        if (!(writing || pending)) { previewFeed.reset(cfg.outputFps); index = 0; }
+                        previewFeed.advance(currentStatus(), GetTickCount64(), index);
+                        if (!previewFeed.empty()) {
+                            if (!prepareStatus(cfg, error) ||
+                                !statusRenderer.apply(*previewBuffer, previewFeed, index + previewFeed.transitionFrames(), error)) {
+                                publishPreviewError(error); continue;
+                            }
+                        }
                     }
                 }
                 // A successful video admission is not evidence that a failed

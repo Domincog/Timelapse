@@ -25,7 +25,7 @@ public:
     void record() {}
     void pause() {}
     void setPaused(bool) {}
-    void finish() {} void cancelDelayedStart() noexcept {}
+    void finish() {} void cancelDelayedStart() noexcept {} void setStatus(const StatusItem&) {}
     Status status() { return {}; }
 };
 std::vector<Monitor> enumerateMonitors() { throw std::runtime_error("Unexpected monitor enumeration."); }
@@ -275,7 +275,7 @@ void paintCheck(){
     // Inspect the complete canvas even when the real dirty viewport culls
     // off-screen stage text. Scoped WM_PAINT invalidation is covered in tray tests.
     paintWindow(paintDC,RECT{-app.scrollX,-app.scrollY,app.contentWidth-app.scrollX,app.contentHeight-app.scrollY});
-    require(drawnText.size()==8,"Unexpected parent painted-text count.");
+    require(drawnText.size()==9,"Unexpected parent painted-text count.");
     for(const auto& draw:drawnText){RECT expected=draw.logical;OffsetRect(&expected,-app.scrollX,-app.scrollY);require(equal(expected,draw.device),"Parent paint origin does not follow scrolling.");}
     require(drawnText.back().logical.top==app.savePathRect.top-app.panelScroll,"Painted save path uses viewport height.");
     require(drawnText.back().device.bottom+app.scale(6)==bounds(app.folder).top,"Painted save path detached from Change button.");

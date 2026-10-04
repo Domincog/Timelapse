@@ -38,7 +38,7 @@ int confirmations=0,confirmation=IDOK,menus=0,menuX=0,menuY=0;
 int endedMenus=0;UINT menuResult=0;
 UINT pauseFlags=0,finishFlags=0,exitFlags=0;
 struct MenuItem {UINT id=0,type=0,state=0;wchar_t text[200]{};};
-MenuItem menuItems[8]{};int menuItemCount=0;UINT menuDefault=0;
+MenuItem menuItems[10]{};int menuItemCount=0;UINT menuDefault=0;
 bool failProgressAppend=false,failProgressSeparator=false;int progressAppendFailures=0,progressSeparatorFailures=0;
 bool failAdd=false,failModify=false,failVersion=false;
 bool iconic=false;
@@ -84,7 +84,7 @@ BOOL WINAPI appendMenu(HMENU menu,UINT flags,UINT_PTR id,LPCWSTR label){
 }
 BOOL WINAPI menu(HMENU value,UINT flags,int x,int y,int,HWND,const RECT*){
     require((flags&TPM_RETURNCMD)!=0,"Menu must not dispatch commands asynchronously");++menus;menuX=x;menuY=y;
-    menuItemCount=GetMenuItemCount(value);require(menuItemCount>=0 && menuItemCount<=8,"Unexpected tray menu inventory.");
+    menuItemCount=GetMenuItemCount(value);require(menuItemCount>=0 && menuItemCount<=10,"Unexpected tray menu inventory.");
     menuDefault=GetMenuDefaultItem(value,FALSE,0);
     for(int i=0;i<menuItemCount;++i){
         auto& item=menuItems[i];item={};MENUITEMINFOW info{sizeof(info)};
@@ -110,6 +110,7 @@ public:
     void cancelDelayedStart() noexcept {++probe::delayedCancels;if(probe::delayedOrigin &&
         (probe::current.state==State::Waiting || probe::current.state==State::Starting)){
         probe::current.state=State::Idle;probe::current.startDeadlineTick=0;probe::delayedOrigin=false;}}
+    void setStatus(const StatusItem&) {}
     Status status(){++probe::statusQueries;Status value=probe::current;if(probe::failAfterStatus){probe::failAfterStatus=false;noticeAllocation::failNext=true;}return value;}
 };
 std::vector<Monitor> enumerateMonitors(){throw std::runtime_error("Unexpected display enumeration");}
@@ -328,12 +329,13 @@ void inspectTrayActions(bool progress,State state){
     const int start=progress?2:0;
     // Recording or paused layouts (not separate files) add the Source submenu after Finish.
     const int sources=(state==State::Recording || state==State::Paused) && !app.settings.separateFiles?1:0;
-    require(probe::menuItemCount==start+5+sources && probe::menuDefault==TrayShow,"Progress changed tray action count or the default Show command.");
+    require(probe::menuItemCount==start+6+sources && probe::menuDefault==TrayShow,"Progress changed tray action count or the default Show command.");
     if(sources)require(std::wstring(probe::menuItems[start+3].text)==L"S&ource","Live source submenu missing after Finish.");
     require(probe::menuItems[start].id==TrayShow && std::wstring(probe::menuItems[start].text)==L"&Show Timelapse" &&
         probe::menuItems[start+1].id==TrayPause && std::wstring(probe::menuItems[start+1].text)==(state==State::Paused?L"&Resume recording":L"&Pause recording") &&
         probe::menuItems[start+2].id==TrayFinish && std::wstring(probe::menuItems[start+2].text)==((state==State::Waiting || state==State::Starting)?L"Cancel s&tart":L"&Finish recording") &&
-        (probe::menuItems[start+3+sources].type&MFT_SEPARATOR) && probe::menuItems[start+4+sources].id==TrayExit && std::wstring(probe::menuItems[start+4+sources].text)==L"E&xit Timelapse",
+        probe::menuItems[start+3+sources].id==TraySetStatus && std::wstring(probe::menuItems[start+3+sources].text)==L"Set stat&us..." &&
+        (probe::menuItems[start+4+sources].type&MFT_SEPARATOR) && probe::menuItems[start+5+sources].id==TrayExit && std::wstring(probe::menuItems[start+5+sources].text)==L"E&xit Timelapse",
         "Progress changed native tray action identities, order, labels or separator.");
     const bool pause=state==State::Recording || state==State::Paused;
     require(bool(probe::pauseFlags&MF_GRAYED)==!pause && bool(probe::finishFlags&MF_GRAYED)==!(pause || state==State::Starting || state==State::Waiting) && !(probe::exitFlags&MF_GRAYED),

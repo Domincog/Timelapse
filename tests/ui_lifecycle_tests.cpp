@@ -111,7 +111,7 @@ class LifecycleEngine {
 public:
     LifecycleEngine(){++engines;engineAlive=true;}
     ~LifecycleEngine(){observeFolderCleanup();++engineStops;engineAlive=false;log('e');}
-    void configure(const Settings&){}void refreshSources(){}void record(){++recordRequests;}void pause(){}void setPaused(bool){}void finish(){} void cancelDelayedStart() noexcept {}
+    void configure(const Settings&){}void refreshSources(){}void record(){++recordRequests;}void pause(){}void setPaused(bool){}void finish(){} void cancelDelayedStart() noexcept {} void setStatus(const StatusItem&) {}
     Status status(){return {};}
 };
 std::vector<Monitor> enumerateMonitors(){throw std::runtime_error("Unexpected display enumeration");}

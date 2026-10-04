@@ -47,7 +47,7 @@ public:
     void record() {if(beforeRecording)beforeRecording();recordedSettings=configuredSettings;++recordCalls;fixtureStatus.state=configuredSettings.startDelaySeconds?State::Waiting:State::Starting;}
     void pause() {}
     void setPaused(bool) {}
-    void finish() {} void cancelDelayedStart() noexcept {}
+    void finish() {} void cancelDelayedStart() noexcept {} void setStatus(const StatusItem&) {}
     Status status(){return fixtureStatus;}
 };
 std::vector<Monitor> enumerateMonitors(){throw std::runtime_error("Unexpected device enumeration.");}
@@ -248,7 +248,7 @@ void newUnicodeFile(){
 }
 void existingUnicodeRewrite(){
     PreferencesFixture fixture;
-    const std::wstring initial=L"[Settings]\r\nFolder="+unicodeFolder+L"\r\nInterval=5\r\nQuality=1\r\nEncodingQuality=2\r\nEncodingMode=0\r\nRecordingLimit=0\r\nStopOnLowDiskSpace=1\r\nRecoveryMode=0\r\nShowDesktopCursor=1\r\nNightEnabled=0\r\nNightDurationMs=0\r\nNightTargetBrightness=96\r\nCaptureIntervalMs=5000\r\nVideoWidth=1280\r\nVideoHeight=720\r\nRecordingLimitSeconds=900\r\nSegmentDurationSeconds=0\r\nTimeSkipMode=0\r\nTimeSkipMultiplier=4\r\nTimeSkipQuietAfterMs=120000\r\nTimeSkipRampFrames=30\r\nTimeSkipRepeatSeconds=0\r\nTimeSkipRanges=\r\nTimeSkipQuietSensitivity=1\r\nTimeSkipUncertainAsAbsent=1\r\nWatermarkEnabled=0\r\nWatermarkShowTime=1\r\nWatermarkShowSpeed=1\r\nWatermarkTimeKind=0\r\nWatermarkX=10000\r\nWatermarkY=10000\r\nWatermarkTextSize=1\r\nStartDelaySeconds=0\r\nOutputFps=30\r\nPauseHotkey=0\r\nStopHotkey=0\r\nAlsoSaveDesktop=0\r\nAlsoSaveCamera=0\r\n";
+    const std::wstring initial=L"[Settings]\r\nFolder="+unicodeFolder+L"\r\nInterval=5\r\nQuality=1\r\nEncodingQuality=2\r\nEncodingMode=0\r\nRecordingLimit=0\r\nStopOnLowDiskSpace=1\r\nRecoveryMode=0\r\nShowDesktopCursor=1\r\nNightEnabled=0\r\nNightDurationMs=0\r\nNightTargetBrightness=96\r\nCaptureIntervalMs=5000\r\nVideoWidth=1280\r\nVideoHeight=720\r\nRecordingLimitSeconds=900\r\nSegmentDurationSeconds=0\r\nTimeSkipMode=0\r\nTimeSkipMultiplier=4\r\nTimeSkipQuietAfterMs=120000\r\nTimeSkipRampFrames=30\r\nTimeSkipRepeatSeconds=0\r\nTimeSkipRanges=\r\nTimeSkipQuietSensitivity=1\r\nTimeSkipUncertainAsAbsent=1\r\nWatermarkEnabled=0\r\nWatermarkShowTime=1\r\nWatermarkShowSpeed=1\r\nWatermarkTimeKind=0\r\nWatermarkX=10000\r\nWatermarkY=10000\r\nWatermarkTextSize=1\r\nStartDelaySeconds=0\r\nOutputFps=30\r\nPauseHotkey=0\r\nStopHotkey=0\r\nAlsoSaveDesktop=0\r\nAlsoSaveCamera=0\r\nStatusHotkey=0\r\nStatusCorner=0\r\nStatusTextSize=1\r\nStatusStyle=0\r\nStatusLastKind=0\r\nStatusTimerSeconds=1500\r\nStatusBreakSeconds=300\r\nStatusRepeat=0\r\nStatusRecent1=\r\nStatusRecent2=\r\nStatusRecent3=\r\nStatusRecent4=\r\nStatusRecent5=\r\nStatusRecent6=\r\nStatusRecent7=\r\nStatusRecent8=\r\n";
     fixture.seed(utf16(initial));reload();expectOptions(unicodeFolder,5,1,2);
     const auto initialBytes=fixture.bytes();
     const std::wstring changed=L"C:\\Synthetic videos\\\u65e5\u672c\u8a9e-\U0001f3a5";
@@ -760,14 +760,40 @@ void checkpointBeforeRecording(){
 }
 }
 
+void statusPreferences(){
+    PreferencesFixture fixture;fixture.seed(legacy);reload();
+    require(sameStatusFeedSettings(app.settings.statusFeed,StatusFeedSettings{}) && app.recentStatuses.empty() && !app.statusHotkey && app.statusDraftKind==0 &&
+        app.statusDraftTimerMs==25*60000 && app.statusDraftBreakMs==5*60000 && !app.statusDraftRepeat,"Old settings changed status defaults.");
+    const StatusFeedSettings look{StatusCorner::BottomRight,StatusTextSize::Large,StatusStyle::EdgeFade};
+    const std::vector<std::wstring> recent={L"Work on Essay",L"Caf\u00e9 \u2615 \u65e5\u672c\u8a9e",L"Shower"};
+    const auto key=static_cast<uint16_t>(MAKEWORD('U',HOTKEYF_CONTROL|HOTKEYF_ALT));
+    app.settings.statusFeed=look;app.recentStatuses=recent;app.statusDraftKind=2;app.statusDraftTimerMs=90000;app.statusDraftBreakMs=450000;app.statusDraftRepeat=true;app.statusHotkey=key;
+    preferences(true);
+    app.settings.statusFeed={};app.recentStatuses.clear();app.statusDraftKind=0;app.statusDraftTimerMs=app.statusDraftBreakMs=0;app.statusDraftRepeat=false;app.statusHotkey=0;
+    reload();
+    require(sameStatusFeedSettings(look,app.settings.statusFeed) && app.recentStatuses==recent && app.statusDraftKind==2 && app.statusDraftTimerMs==90000 &&
+        app.statusDraftBreakMs==450000 && app.statusDraftRepeat && app.statusHotkey==key,"Status look, recents, last choices or shortcut lost the real roundtrip.");
+    // Each malformed key falls back alone; recents are folded, trimmed and deduplicated.
+    const auto put=[&](const wchar_t* name,const wchar_t* value){require(WritePrivateProfileStringW(L"Settings",name,value,app.preferences.c_str())!=FALSE,"Cannot seed status key.");};
+    put(L"StatusCorner",L"9");put(L"StatusTextSize",L"1junk");put(L"StatusTimerSeconds",L"0");put(L"StatusLastKind",L"-1");
+    put(L"StatusRecent2",L"   spaced out   ");put(L"StatusRecent3",L"Work on Essay");put(L"StatusHotkey",std::to_wstring(MAKEWORD('U',HOTKEYF_ALT)).c_str());
+    reload();
+    require(app.settings.statusFeed.corner==StatusCorner::TopLeft && app.settings.statusFeed.textSize==StatusTextSize::Medium && app.settings.statusFeed.style==StatusStyle::EdgeFade &&
+        app.statusDraftTimerMs==25*60000 && app.statusDraftKind==0 && app.statusDraftBreakMs==450000 && !app.statusHotkey,"Malformed status keys were coerced or reset their neighbours.");
+    require(app.recentStatuses==std::vector<std::wstring>{L"Work on Essay",L"spaced out"},"Recent statuses were not trimmed and deduplicated.");
+    unregisterRecordingHotkeys();app.statusHotkey=0;app.settings.statusFeed={};app.recentStatuses.clear();app.statusDraftKind=0;
+    app.statusDraftTimerMs=25*60000;app.statusDraftBreakMs=5*60000;app.statusDraftRepeat=false;
+    expectUnknownContent(fixture);fixture.onlySettingsRemain();
+    std::cout<<"PASS status look, Unicode recents, last timer choices and shortcut roundtrip; malformed keys fall back individually\n";
+}
 int main(){
     try{
         std::cout<<std::unitbuf;std::cout<<"ACP="<<GetACP()<<'\n';
         HiddenControls controls;
         newUnicodeFile();existingUnicodeRewrite();playbackStagingRollback();migrateAnsi();encodingModes();recordingLimits();startDelayOptions();segmentOptions();diskSafety();companionOptions();recoveryOptions();cursorOptions();nightOptions();customOptions();readFailure();replacementFailure();
         preparationAllocationFailure();partialKeyWriteFailure();stagedExceptionCleanup();
-        preferencePathBoundary(248);preferencePathBoundary(278);timeCompressionPreferences();watermarkPreferences();sizeCommandPreferences();checkpointBeforeRecording();
+        preferencePathBoundary(248);preferencePathBoundary(278);timeCompressionPreferences();watermarkPreferences();statusPreferences();sizeCommandPreferences();checkpointBeforeRecording();
         require(!IsWindowVisible(app.window),"Fixture became visible.");
-        std::cout<<"All 25 preference cases passed; only owned hidden controls/settings were used.\n";return 0;
+        std::cout<<"All 26 preference cases passed; only owned hidden controls/settings were used.\n";return 0;
     }catch(const std::exception& error){std::cerr<<"PREFERENCES TEST FAILURE: "<<error.what()<<'\n';return 1;}
 }

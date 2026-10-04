@@ -14,11 +14,11 @@
 
 namespace {
 void require(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
-enum class Fault { None, DC, Font, FontSelection, Metrics, BadMetrics, Widths, Bitmap, BitmapSelection, Configure, Measure, Draw, Flush };
+enum class Fault { None, DC, Font, FontSelection, Metrics, BadMetrics, Bitmap, BitmapSelection, Configure, Measure, Draw, Flush };
 struct Owned { HGDIOBJ handle = nullptr; size_t bytes = 0; };
 struct Probe {
     Fault fault = Fault::None;
-    std::array<Owned, 8> owned{};
+    std::array<Owned, 16> owned{};
     int dcCount = 0, objectCount = 0, createdDC = 0, createdObjects = 0, draws = 0, measures = 0, flushes = 0;
     size_t bytes = 0, peakBytes = 0;
     bool cleanupFailed = false;
@@ -41,8 +41,16 @@ void* operator new(std::size_t bytes) {
     if (void* result = std::malloc(bytes ? bytes : 1)) return result;
     throw std::bad_alloc();
 }
+void* operator new[](std::size_t bytes) {
+    if (forbidAllocation) throw std::bad_alloc();
+    ++allocations;
+    if (void* result = std::malloc(bytes ? bytes : 1)) return result;
+    throw std::bad_alloc();
+}
 void operator delete(void* value) noexcept { std::free(value); }
 void operator delete(void* value, std::size_t) noexcept { std::free(value); }
+void operator delete[](void* value) noexcept { std::free(value); }
+void operator delete[](void* value, std::size_t) noexcept { std::free(value); }
 
 HDC WINAPI stampCreateDC(HDC source) {
     require(!source, "Watermark requested a source/screen DC");
@@ -53,7 +61,8 @@ HDC WINAPI stampCreateDC(HDC source) {
 }
 HFONT WINAPI stampCreateFont(int h, int w, int escape, int orientation, int weight, DWORD italic,
     DWORD underline, DWORD strike, DWORD charset, DWORD precision, DWORD clip, DWORD quality, DWORD pitch, LPCWSTR face) {
-    require(charset == ANSI_CHARSET && quality == ANTIALIASED_QUALITY, "Unexpected font charset or ClearType rendering");
+    require(charset == DEFAULT_CHARSET && quality == ANTIALIASED_QUALITY, "Unexpected font charset or ClearType rendering");
+    require(face && std::wcsncmp(face, L"Segoe UI", 8) == 0, "Watermark did not use the Segoe UI family");
     if (probe.hit(Fault::Font)) return nullptr;
     auto font = CreateFontW(h,w,escape,orientation,weight,italic,underline,strike,charset,precision,clip,quality,pitch,face);
     probe.track(font, 0); return font;
@@ -67,11 +76,8 @@ HGDIOBJ WINAPI stampSelect(HDC dc, HGDIOBJ object) {
 BOOL WINAPI stampMetrics(HDC dc, LPTEXTMETRICW metrics) {
     if (probe.hit(Fault::Metrics)) return FALSE;
     const auto result = GetTextMetricsW(dc, metrics);
-    if (probe.hit(Fault::BadMetrics)) metrics->tmMaxCharWidth = 100000;
+    if (probe.hit(Fault::BadMetrics)) metrics->tmHeight = 100000;
     return result;
-}
-BOOL WINAPI stampWidths(HDC dc, UINT first, UINT last, LPINT widths) {
-    return probe.hit(Fault::Widths) ? FALSE : GetCharWidth32W(dc, first, last, widths);
 }
 HBITMAP WINAPI stampDib(HDC dc, const BITMAPINFO* info, UINT colors, void** pixels, HANDLE section, DWORD offset) {
     require(!section && !offset && info->bmiHeader.biHeight < 0 && info->bmiHeader.biBitCount == 32, "Unexpected watermark DIB format");
@@ -80,13 +86,11 @@ HBITMAP WINAPI stampDib(HDC dc, const BITMAPINFO* info, UINT colors, void** pixe
     probe.track(bitmap, size_t(info->bmiHeader.biWidth) * size_t(-info->bmiHeader.biHeight) * 4); return bitmap;
 }
 int WINAPI stampBkMode(HDC dc, int mode) { return probe.hit(Fault::Configure) ? 0 : SetBkMode(dc, mode); }
-BOOL WINAPI stampMeasure(HDC dc, LPCWSTR text, int length, LPSIZE extent) {
-    ++probe.measures;
-    return probe.hit(Fault::Measure) ? FALSE : GetTextExtentPoint32W(dc, text, length, extent);
-}
-BOOL WINAPI stampDraw(HDC dc, int x, int y, LPCWSTR text, int length) {
-    ++probe.draws;
-    return probe.hit(Fault::Draw) ? FALSE : TextOutW(dc, x, y, text, length);
+int WINAPI stampDrawText(HDC dc, LPWSTR text, int length, LPRECT rect, UINT format) {
+    require(format & DT_NOPREFIX, "Overlay text must not interpret ampersands");
+    if (format & DT_CALCRECT) { ++probe.measures; if (probe.hit(Fault::Measure)) return 0; }
+    else { ++probe.draws; if (probe.hit(Fault::Draw)) return 0; }
+    return DrawTextW(dc, text, length, rect, format);
 }
 BOOL WINAPI stampFlush() {
     ++probe.flushes;
@@ -112,24 +116,21 @@ BOOL WINAPI stampDeleteDC(HDC dc) noexcept {
 #define CreateFontW stampCreateFont
 #define SelectObject stampSelect
 #define GetTextMetricsW stampMetrics
-#define GetCharWidth32W stampWidths
 #define CreateDIBSection stampDib
 #define SetBkMode stampBkMode
-#define GetTextExtentPoint32W stampMeasure
-#define TextOutW stampDraw
+#define DrawTextW stampDrawText
 #define GdiFlush stampFlush
 #define DeleteObject stampDelete
 #define DeleteDC stampDeleteDC
+#include "../src/overlay.cpp"
 #include "../src/watermark.cpp"
 #undef CreateCompatibleDC
 #undef CreateFontW
 #undef SelectObject
 #undef GetTextMetricsW
-#undef GetCharWidth32W
 #undef CreateDIBSection
 #undef SetBkMode
-#undef GetTextExtentPoint32W
-#undef TextOutW
+#undef DrawTextW
 #undef GdiFlush
 #undef DeleteObject
 #undef DeleteDC
@@ -212,18 +213,23 @@ void offAndCold() {
       require(renderer.apply(value,ctx,error), "Off renderer failed"); renderer.reset(); renderer.reset(); }
     require(before == value.pixels && probe.createdDC == dcs && probe.createdObjects == objects, "Disabled renderer allocated resources or changed pixels"); clean();
 }
+// Text without a box: inside the bounds there must be bright glyph pixels,
+// a darker halo around them and untouched background between strokes.
 void pixels(const Frame& value, const RECT& bounds) {
     require(bounds.right > bounds.left && bounds.bottom > bounds.top && bounds.left >= 0 && bounds.top >= 0 && bounds.right <= value.width && bounds.bottom <= value.height,
         "Stamp bounds are invalid");
-    size_t bright = 0, dark = 0;
+    size_t bright = 0, dark = 0, untouched = 0;
     for (int y = 0; y < value.height; ++y) for (int x = 0; x < value.width; ++x) {
         const auto* p = value.pixels.data() + (size_t(y)*value.width+x)*4;
+        const bool original = p[0] == 71 && p[1] == 112 && p[2] == 153 && p[3] == 29;
         if (x >= bounds.left && x < bounds.right && y >= bounds.top && y < bounds.bottom) {
-            require(p[0] == p[1] && p[1] == p[2] && p[3] == 255, "Stamp is not grayscale opaque BGRA");
-            bright += p[0] >= 180; dark += p[0] == 20;
-        } else require(p[0] == 71 && p[1] == 112 && p[2] == 153 && p[3] == 29, "Watermark modified pixels outside its bounds");
+            if (original) { ++untouched; continue; }
+            require(p[3] == 255, "Stamped pixel is not opaque BGRA");
+            bright += p[0] >= 200 && p[1] >= 200 && p[2] >= 200;
+            dark += p[0] < 50 && p[1] < 80 && p[2] < 110;
+        } else require(original, "Watermark modified pixels outside its bounds");
     }
-    require(bright > 3 && dark > bright, "Rendered text or dark backing is missing");
+    require(bright > 3 && dark > 3 && untouched > 0, "Rendered text, halo or see-through background is missing");
 }
 void geometry() {
     auto settings = enabled(); std::wstring error;
@@ -233,21 +239,23 @@ void geometry() {
             // Deliberately thin output cannot hold two large lines; preflight must reject.
             WatermarkRenderer renderer;
             const bool ready = renderer.prepare(settings,dimensions.first,dimensions.second,error);
-            if (dimensions.second == 48 && size == WatermarkTextSize::Large) { require(!ready, "Thin output unexpectedly passed full longest-text preflight"); continue; }
-            if (dimensions.second == 48 && size == WatermarkTextSize::Medium && !ready) {
-                require(error.find(L"does not fit") != std::wstring::npos, "Unexpected thin-output error"); continue;
+            if (dimensions.second == 48) {
+                if (!ready) { require(error.find(L"does not fit") != std::wstring::npos, "Unexpected thin-output error"); clean(); continue; }
+                require(size != WatermarkTextSize::Large, "Thin output unexpectedly passed full longest-text preflight");
             }
             if (!ready) std::wcerr << L"Rejected geometry " << dimensions.first << L'x' << dimensions.second << L" size " << int(size) << L": " << error << L'\n';
             require(ready, "Common output geometry rejected");
+            const int edge = std::min(dimensions.first, dimensions.second), margin = std::max(2, edge / 60);
             for (const auto pos : {std::pair<int,int>{0,0},{10000,0},{0,10000},{10000,10000},{3721,6284}}) {
                 settings.x = pos.first; settings.y = pos.second;
                 const int creations = probe.createdObjects;
                 require(renderer.prepare(settings,dimensions.first,dimensions.second,error) && creations == probe.createdObjects, "Position update rebuilt resources");
                 auto value = frame(dimensions.first,dimensions.second);
                 require(renderer.apply(value,context(),error), "Geometry stamping failed"); const auto bounds = renderer.lastBounds(); pixels(value,bounds);
-                if (!pos.first) require(bounds.left >= 2 && bounds.left <= 21, "Left margin mismatch");
-                if (!pos.second) require(bounds.top >= 2 && bounds.top <= 21, "Top margin mismatch");
-                if (pos.first == 10000) require(value.width - bounds.right >= 2 && value.width - bounds.right <= 21, "Right margin mismatch");
+                if (!pos.first) require(bounds.left <= margin, "Left margin mismatch");
+                if (!pos.second) require(bounds.top <= margin, "Top margin mismatch");
+                if (pos.first == 10000) require(value.width - bounds.right <= margin, "Right margin mismatch");
+                if (pos.second == 10000) require(value.height - bounds.bottom <= margin, "Bottom margin mismatch");
             }
             renderer.reset(); clean();
         }
@@ -255,6 +263,29 @@ void geometry() {
     settings = enabled();
     for (const auto dimensions : {std::pair<int,int>{48,48},{48,4096},{1279,720},{0,720},{4096,4096}}) {
         WatermarkRenderer renderer; require(!renderer.prepare(settings,dimensions.first,dimensions.second,error) && !error.empty(), "Invalid or too-small watermark output accepted"); clean();
+    }
+}
+void alignment() {
+    // Lines align toward the nearer edge: a right placement keeps both lines'
+    // right ends together, a left placement their left ends.
+    std::wstring error; auto ctx = context();
+    for (int x : {0, 10000}) {
+        auto settings = enabled(); settings.x = x; settings.y = 0;
+        WatermarkRenderer renderer; require(renderer.prepare(settings,1280,720,error), "Alignment preparation failed");
+        auto value = frame(1280,720); require(renderer.apply(value,ctx,error), "Alignment render failed");
+        const auto bounds = renderer.lastBounds();
+        int extent[2][2] = {{INT_MAX, -1}, {INT_MAX, -1}};
+        const int middle = (bounds.top + bounds.bottom) / 2;
+        for (int y = bounds.top; y < bounds.bottom; ++y) for (int px = bounds.left; px < bounds.right; ++px) {
+            const auto* p = value.pixels.data() + (size_t(y) * value.width + px) * 4;
+            if (p[0] < 200 || p[1] < 200 || p[2] < 200) continue;
+            auto& line = extent[y < middle ? 0 : 1];
+            line[0] = std::min(line[0], px); line[1] = std::max(line[1], px);
+        }
+        require(extent[0][1] >= 0 && extent[1][1] >= 0, "Both watermark lines must draw");
+        if (!x) require(std::abs(extent[0][0] - extent[1][0]) <= 3, "Left-placed lines are not left aligned");
+        else require(std::abs(extent[0][1] - extent[1][1]) <= 3, "Right-placed lines are not right aligned");
+        renderer.reset(); clean();
     }
 }
 void scalingAndReuse() {
@@ -270,7 +301,7 @@ void scalingAndReuse() {
     { NoAllocation noAllocation;
       for (int i=0;i<100;++i) { ctx.activeMs += 1000; ctx.targetIntervalMs = 5000+i; require(renderer.apply(full,ctx,error), "Warmed changing render failed"); }
       require(renderer.prepare(settings,1280,720,error), "Identical warm preparation failed"); }
-    require(allocations == before && probe.createdObjects == creationCalls && probe.dcCount == 1 && probe.objectCount == 2, "Warmed renderer allocated or exceeded resource bound");
+    require(allocations == before && probe.createdObjects == creationCalls && probe.dcCount == 2 && probe.objectCount == 4, "Warmed renderer allocated or exceeded resource bound");
     renderer.reset(); clean();
 }
 void longestText() {
@@ -281,17 +312,16 @@ void longestText() {
         require(renderer.prepare(settings,1280,720,error), "Longest-text preflight failed");
         auto value = frame(1280,720); require(renderer.apply(value,ctx,error), "Preflight did not reserve the actual longest supported text"); pixels(value,renderer.lastBounds());
     }
-    // Largest even shorter edge under the public 4K-area budget. Recorded
-    // local text + Large exercises this machine's maximum retained tile.
+    // Largest even shorter edge under the public 4K-area budget.
     settings.textSize = WatermarkTextSize::Large;
     require(renderer.prepare(settings,2974,2974,error), "Maximum shorter-edge preflight failed");
     auto largest = frame(2974,2974); require(renderer.apply(largest,ctx,error), "Maximum text tile render failed"); pixels(largest,renderer.lastBounds());
-    require(probe.bytes <= 4*1024*1024, "Prepared tile exceeded its byte bound");
+    require(probe.bytes <= 8*1024*1024, "Retained text rasters exceeded their byte bound");
     renderer.reset(); clean();
 }
 void faults() {
-    std::wstring error;
-    for (auto fault : {Fault::DC,Fault::Font,Fault::FontSelection,Fault::Metrics,Fault::BadMetrics,Fault::Widths,Fault::Bitmap,Fault::BitmapSelection,Fault::Configure}) {
+    std::wstring error; error.reserve(256);
+    for (auto fault : {Fault::DC,Fault::Font,Fault::FontSelection,Fault::Metrics,Fault::BadMetrics,Fault::Bitmap,Fault::BitmapSelection,Fault::Configure,Fault::Measure}) {
         WatermarkRenderer renderer; probe.fault = fault;
         require(!renderer.prepare(enabled(),1280,720,error) && !error.empty() && probe.fault == Fault::None, "Injected preparation failure was ignored");
         clean(); require(renderer.prepare(enabled(),1280,720,error), "Renderer did not recover after preparation failure"); renderer.reset(); clean();
@@ -311,7 +341,6 @@ void faults() {
     const auto unchanged = renderer.lastBounds();
     require(std::memcmp(&previous,&unchanged,sizeof(RECT)) == 0, "Failed render changed last successful bounds");
     renderer.reset(); clean();
-    error.reserve(256);
     { NoAllocation noAllocation; require(!renderer.prepare(enabled(),1280,720,error) && !error.empty(), "Allocation failure escaped prepare"); }
     clean();
 }
@@ -345,7 +374,7 @@ void benchmark() {
         const auto renderAllocations=allocations-beforeAllocation;
         if (comma) std::cout << ",\n"; comma=true;
         std::cout << "{\"width\":"<<value.width<<",\"height\":"<<value.height<<",\"changing\":"<<(changing?"true":"false")
-            <<",\"iterations\":"<<iterations<<",\"wallMs\":"<<elapsed<<",\"cpuMs\":"<<cpuMs<<",\"tileBytes\":"<<bytes
+            <<",\"iterations\":"<<iterations<<",\"wallMs\":"<<elapsed<<",\"cpuMs\":"<<cpuMs<<",\"rasterBytes\":"<<bytes
             <<",\"ownedGdiObjects\":"<<probe.objectCount+probe.dcCount<<",\"cppAllocations\":"<<renderAllocations<<"}";
         renderer.reset(); clean();
     }
@@ -358,11 +387,12 @@ int main(int argc, char** argv) {
         formatting(); std::cout << "PASS formatting\n";
         invalidFormatting(); std::cout << "PASS invalid contexts and settings\n";
         offAndCold(); std::cout << "PASS cold/off zero resources and mutation\n";
-        geometry(); std::cout << "PASS geometry, positions and exact mutation bounds\n";
+        geometry(); std::cout << "PASS geometry, positions, boxless halo and exact mutation bounds\n";
+        alignment(); std::cout << "PASS edge-aligned lines\n";
         scalingAndReuse(); std::cout << "PASS preview mapping, reuse and zero warmed C++ allocations\n";
         longestText(); std::cout << "PASS longest supported text\n";
         faults(); std::cout << "PASS allocation/GDI failures and recovery\n";
         independentThreads(); std::cout << "PASS independent thread ownership\n";
-        clean(); std::cout << "PASS retained-tile peak bytes " << probe.peakBytes << "\n"; return 0;
+        clean(); std::cout << "PASS retained raster peak bytes " << probe.peakBytes << "\n"; return 0;
     } catch (const std::exception& error) { forbidAllocation=false; std::cerr << "FAIL: " << error.what() << '\n'; return 1; }
 }

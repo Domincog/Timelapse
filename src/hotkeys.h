@@ -43,4 +43,17 @@ inline bool validateHotkeys(uint16_t pause, uint16_t stop, std::wstring& error) 
     }
     return true;
 }
+// The third global action opens the status window from anywhere.
+inline bool validateHotkeys(uint16_t pause, uint16_t stop, uint16_t status, std::wstring& error) {
+    if (!validateHotkeys(pause, stop, error)) return false;
+    if (!validHotkey(status)) {
+        error = L"Use Ctrl or Alt with a letter, number, function or navigation key. Add Ctrl to Alt+letter combinations to keep interface access keys available. F12 and Ctrl+Alt+Delete are reserved. Clear the field to disable a shortcut.";
+        return false;
+    }
+    if (status && ((pause && hotkeyIdentity(status) == hotkeyIdentity(pause)) || (stop && hotkeyIdentity(status) == hotkeyIdentity(stop)))) {
+        error = L"Choose a Set status shortcut that differs from Pause / resume and Stop and save.";
+        return false;
+    }
+    return true;
+}
 }

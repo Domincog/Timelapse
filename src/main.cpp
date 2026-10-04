@@ -44,7 +44,7 @@ constexpr int StageMinHeight = HeaderTop + HeaderHeight + PreviewGap + PreviewMi
 // Horizontal space the Advanced disclosure reserves beside its caption text:
 // left inset, chevron, the gap before it and the right inset.
 constexpr int DisclosureChrome = 46;
-enum Id { ModeBox = 100, IntervalBox, SizeBox, EncodingQualityBox, MonitorBox, CameraBox, Refresh, Record, Pause, Finish, Folder, OpenFolder, Reset, Forward, Preview, EncodingModeBox, AdvancedToggle, StopAfterBox, LowDiskBox, NightBox, NightDurationBox, NightTargetBox, NightHint, NightDetail, SkipConfigure, SkipSummary, SkipDetail, RecoveryBox, SegmentBox, WatermarkConfigure, WatermarkSummary, StatusDetails, CursorBox, StartDelayBox, PlaybackConfigure, AlsoDesktopBox, AlsoCameraBox };
+enum Id { ModeBox = 100, IntervalBox, SizeBox, EncodingQualityBox, MonitorBox, CameraBox, Refresh, Record, Pause, Finish, Folder, OpenFolder, Reset, Forward, Preview, EncodingModeBox, AdvancedToggle, StopAfterBox, LowDiskBox, NightBox, NightDurationBox, NightTargetBox, NightHint, NightDetail, SkipConfigure, SkipSummary, SkipDetail, RecoveryBox, SegmentBox, WatermarkConfigure, WatermarkSummary, StatusDetails, CursorBox, StartDelayBox, PlaybackConfigure, AlsoDesktopBox, AlsoCameraBox, SetStatusButton, ClearStatusButton, StatusSummaryLine };
 constexpr int StartDelays[] = {0,5,10,30,60,300};
 constexpr const wchar_t* StartDelayLabels[] = {L"None",L"5 seconds",L"10 seconds",L"30 seconds",L"1 minute",L"5 minutes"};
 constexpr int RecordingLimits[] = {0,900,3600,14400,28800,86400};
@@ -68,11 +68,11 @@ constexpr int SeparateFilesMode = 5;
 constexpr wchar_t SeparateFilesLabel[] = L"Desktop + camera (2 files)";
 constexpr UINT TrayMessage = WM_APP + 1, ShowExistingMessage = WM_APP + 2;
 constexpr UINT CancelOwnedWorkMessage = WM_APP + 3;
-constexpr UINT TrayShow = 4001, TrayPause = 4002, TrayFinish = 4003, TrayExit = 4004, TrayProgress = 4005;
+constexpr UINT TrayShow = 4001, TrayPause = 4002, TrayFinish = 4003, TrayExit = 4004, TrayProgress = 4005, TraySetStatus = 4006, TrayClearStatus = 4007;
 // Tray Source submenu: one command per live layout mode (Desktop..Custom collage).
 constexpr UINT TraySourceFirst = 4010, TraySourceCount = 5;
 constexpr UINT ExitSystemCommand = 0x1000;
-constexpr int FirstRecordingHotkeyId = 4401, LastRecordingHotkeyId = 4404;
+constexpr int FirstRecordingHotkeyId = 4401, LastRecordingHotkeyId = 4406;
 constexpr wchar_t InstanceMutexName[] = L"Local\\Timelapse.Application.{DC32D155-1B8D-4880-9902-CE6245D34923}";
 constexpr wchar_t SetupMutexName[] = L"Local\\Timelapse.Setup.{DC32D155-1B8D-4880-9902-CE6245D34923}";
 enum class FailureNotice { None, Pending, Presenting, Presented };
@@ -101,8 +101,20 @@ struct App {
     HWND customDialog{};
     HWND skipConfigure{},skipSummary{},skipDetail{};
     HWND watermarkConfigure{},watermarkSummary{},playbackConfigure{};
-    uint16_t pauseHotkey=0,stopHotkey=0;
-    int pauseHotkeyId=0,stopHotkeyId=0,recordedOutputFps=DefaultOutputFps;
+    uint16_t pauseHotkey=0,stopHotkey=0,statusHotkey=0;
+    int pauseHotkeyId=0,stopHotkeyId=0,statusHotkeyId=0,recordedOutputFps=DefaultOutputFps;
+    // The live status line the engine burns into the video corner. Its look
+    // is app.settings.statusFeed; the text, timer and history live here.
+    HWND liveStatusSet{},liveStatusClear{},liveStatusSummary{};
+    StatusItem liveStatus{};
+    uint64_t liveStatusSequence=0,statusNoticeSequence=0,statusNoticePhase=0;
+    StatusIcon statusNoticeIcon=StatusIcon::None;
+    std::array<wchar_t,160> liveStatusCaption{};
+    std::vector<std::wstring> recentStatuses;
+    // The Set status window reopens with the last choices.
+    int statusDraftKind=0;
+    int64_t statusDraftTimerMs=25*60000,statusDraftBreakMs=5*60000;
+    bool statusDraftRepeat=false;
     // Frozen at Record: the number of output files.
     size_t recordedOutputs=1;
     std::wstring hotkeyWarning;
@@ -172,7 +184,7 @@ struct App {
     // Painted geometry in logical canvas coordinates, refreshed by layout().
     // Panel-relative rows are stored unscrolled; paint subtracts panelScroll.
     RECT panelRect{}, headerRect{}, previewRect{}, transportRect{}, statsRect{}, statusRect{}, savePathRect{};
-    int sectionTops[3]{}, panelRules[6]{}, panelRuleCount = 0;
+    int sectionTops[4]{}, panelRules[6]{}, panelRuleCount = 0;
     POINT dragStart{};
     Rect dragRect{};
     RECT videoRect{};
@@ -194,35 +206,44 @@ void removeTray();
 void unregisterRecordingHotkeys() noexcept {
     if(app.pauseHotkeyId)UnregisterHotKey(app.window,app.pauseHotkeyId);
     if(app.stopHotkeyId)UnregisterHotKey(app.window,app.stopHotkeyId);
-    app.pauseHotkeyId=app.stopHotkeyId=0;
+    if(app.statusHotkeyId)UnregisterHotKey(app.window,app.statusHotkeyId);
+    app.pauseHotkeyId=app.stopHotkeyId=app.statusHotkeyId=0;
 }
-bool setRecordingHotkeys(uint16_t pause,uint16_t stop,std::wstring& error) {
-    if(!validateHotkeys(pause,stop,error))return false;
+bool setRecordingHotkeys(uint16_t pause,uint16_t stop,uint16_t status,std::wstring& error) {
+    if(!validateHotkeys(pause,stop,status,error))return false;
     struct Binding {uint16_t value;int id;};
-    const Binding previous[]={{app.pauseHotkey,app.pauseHotkeyId},{app.stopHotkey,app.stopHotkeyId}};
-    Binding next[]={{pause,0},{stop,0}};
-    bool created[2]{};
-    // Reuse retained combinations, including a swap of the two actions. New
+    const Binding previous[]={{app.pauseHotkey,app.pauseHotkeyId},{app.stopHotkey,app.stopHotkeyId},{app.statusHotkey,app.statusHotkeyId}};
+    Binding next[]={{pause,0},{stop,0},{status,0}};
+    bool created[3]{};
+    static constexpr const wchar_t* Names[]={L"Pause / resume",L"Stop and save",L"Set status"};
+    // Reuse retained combinations, including swaps between actions. New
     // combinations use spare ids until the whole draft succeeds, so a conflict
     // never silently disables a user's previous working shortcut.
-    for(int action=0;action<2;++action){
+    for(int action=0;action<3;++action){
         if(!next[action].value)continue;
         for(const auto& old:previous)if(old.id && hotkeyIdentity(old.value)==hotkeyIdentity(next[action].value)){next[action].id=old.id;break;}
         if(next[action].id)continue;
         for(int id=FirstRecordingHotkeyId;id<=LastRecordingHotkeyId;++id){
-            if(id==previous[0].id || id==previous[1].id || id==next[0].id || id==next[1].id)continue;
+            bool used=false;
+            for(const auto& binding:previous)used=used || binding.id==id;
+            for(const auto& binding:next)used=used || binding.id==id;
+            if(used)continue;
             next[action].id=id;break;
         }
         if(!next[action].id || !RegisterHotKey(app.window,next[action].id,hotkeyRegistrationModifiers(next[action].value),LOBYTE(next[action].value))){
-            for(int i=0;i<2;++i)if(created[i])UnregisterHotKey(app.window,next[i].id);
-            error=std::wstring(action==0?L"Pause / resume":L"Stop and save")+L" shortcut is unavailable. Windows or another app may be using it. Choose another combination.";
+            for(int i=0;i<3;++i)if(created[i])UnregisterHotKey(app.window,next[i].id);
+            error=std::wstring(Names[action])+L" shortcut is unavailable. Windows or another app may be using it. Choose another combination.";
             return false;
         }
         created[action]=true;
     }
-    for(const auto& old:previous)if(old.id && old.id!=next[0].id && old.id!=next[1].id)UnregisterHotKey(app.window,old.id);
-    app.pauseHotkey=pause;app.stopHotkey=stop;app.pauseHotkeyId=next[0].id;app.stopHotkeyId=next[1].id;
+    for(const auto& old:previous)if(old.id && old.id!=next[0].id && old.id!=next[1].id && old.id!=next[2].id)UnregisterHotKey(app.window,old.id);
+    app.pauseHotkey=pause;app.stopHotkey=stop;app.statusHotkey=status;
+    app.pauseHotkeyId=next[0].id;app.stopHotkeyId=next[1].id;app.statusHotkeyId=next[2].id;
     app.hotkeyWarning.clear();error.clear();return true;
+}
+bool setRecordingHotkeys(uint16_t pause,uint16_t stop,std::wstring& error) {
+    return setRecordingHotkeys(pause,stop,app.statusHotkey,error);
 }
 void cancelOpenFolder() noexcept;
 void refreshOpenFolderControl();
@@ -552,6 +573,7 @@ const wchar_t* videoSizeTooltip() noexcept {
     } catch (...) { return VideoSizeHelp; }
 }
 void layout();
+void updateLiveStatus(bool force=false);
 bool skipEnabled() { return app.settings.timeSkip.mode!=TimeSkipMode::Off; }
 bool skipScheduled(TimeSkipMode mode) { return mode==TimeSkipMode::Manual || mode==TimeSkipMode::QuietWithinSchedule || mode==TimeSkipMode::NoPersonWithinSchedule; }
 bool skipAutomatic(TimeSkipMode mode) { return mode==TimeSkipMode::Quiet || mode==TimeSkipMode::QuietWithinSchedule; }
@@ -1068,6 +1090,7 @@ void updateControls() {
     EnableWindow(app.reset,collage); EnableWindow(app.forward,collage && app.selected>=0);
     updateAdvanced();
     updateNightText(!app.controlsUpdated);updateSkipText(!app.controlsUpdated);updateStatusText(!app.controlsUpdated);
+    updateLiveStatus(!app.controlsUpdated);
     refreshOpenFolderControl();
     app.controlsState=app.status.state;app.controlsUpdated=true;
 }
@@ -1286,6 +1309,8 @@ void trayMenu(POINT at={},bool usePoint=false) {
             if(!AppendMenuW(menu,MF_POPUP,reinterpret_cast<UINT_PTR>(sources),L"S&ource"))DestroyMenu(sources);
         }
     }
+    AppendMenuW(menu,MF_STRING|(app.closeWhenDone?MF_GRAYED:MF_ENABLED),TraySetStatus,L"Set stat&us...");
+    if(app.liveStatus.kind!=StatusKind::None)AppendMenuW(menu,MF_STRING|(app.closeWhenDone?MF_GRAYED:MF_ENABLED),TrayClearStatus,L"C&lear status");
     AppendMenuW(menu,MF_SEPARATOR,0,nullptr);AppendMenuW(menu,MF_STRING|(app.closeWhenDone?MF_GRAYED:MF_ENABLED),TrayExit,L"E&xit Timelapse");
     SetMenuDefaultItem(menu,TrayShow,FALSE);if(!usePoint)GetCursorPos(&at);SetForegroundWindow(app.window);
     app.trayMenuOpen=true;app.trayMenuCanceled=false;
@@ -1319,7 +1344,7 @@ bool panelControl(HWND child) {
         app.labels[3],app.encodingQuality,app.folder,app.openFolder,app.advanced,app.labels[6],app.encodingMode,app.recoveryMode,app.labels[7],app.stopAfter,
         app.segmentLabel,app.splitEvery,app.startDelayLabel,app.startDelay,app.startDelayHint,app.lowDisk,app.captureCursor,app.skipConfigure,app.skipSummary,
         app.skipDetail,app.watermarkConfigure,app.watermarkSummary,app.playbackConfigure,app.nightEnabled,app.labels[8],app.nightDuration,app.labels[9],
-        app.nightTarget,app.nightHint,app.nightDetail})if(member==child)return true;
+        app.nightTarget,app.nightHint,app.nightDetail,app.liveStatusSet,app.liveStatusClear,app.liveStatusSummary})if(member==child)return true;
     return false;
 }
 // Device rows appear only for sources the layout uses, and collage tools only
@@ -1380,6 +1405,11 @@ int placePanel(bool place,int left,int offset) {
     y+=app.scale(26);
     const int changeW=app.scale(104),buttonGap=app.scale(8);
     put(app.folder,y,button,0,changeW);put(app.openFolder,y,button,changeW+buttonGap,width-changeW-buttonGap);
+    y+=button;rule();section(3);
+    // What you're doing, shown in the video corner; usable while recording.
+    put(app.liveStatusSummary,y,labelH);y+=labelH+app.scale(8);
+    const int clearW=app.scale(88);
+    put(app.liveStatusSet,y,button,0,width-clearW-buttonGap);put(app.liveStatusClear,y,button,width-clearW,clearW);
     y+=button;rule();
     if(place)app.advancedTop=y;
     put(app.advanced,y,app.scale(38));y+=app.scale(38);
@@ -1611,7 +1641,7 @@ void fonts() {
     app.font=make(14,FW_NORMAL);app.titleFont=make(24,FW_SEMIBOLD);app.smallFont=make(12,FW_NORMAL);
     app.strongFont=make(14,FW_SEMIBOLD);app.headerFont=make(12,FW_SEMIBOLD);
     EnumChildWindows(app.window,[](HWND w,LPARAM p)->BOOL { SendMessageW(w,WM_SETFONT,p,TRUE); return TRUE; },reinterpret_cast<LPARAM>(app.font));
-    for(HWND child:{app.statusText,app.statusDetails,app.startDelayHint,app.nightHint,app.nightDetail,app.skipSummary,app.skipDetail,app.watermarkSummary})
+    for(HWND child:{app.statusText,app.statusDetails,app.startDelayHint,app.nightHint,app.nightDetail,app.skipSummary,app.skipDetail,app.watermarkSummary,app.liveStatusSummary})
         if(child)SendMessageW(child,WM_SETFONT,reinterpret_cast<WPARAM>(app.smallFont),TRUE);
 }
 
@@ -2544,17 +2574,35 @@ void watermarkIllustration(WatermarkDraft& draft) {
     }
     SetWindowTextW(draft.error,error.c_str());InvalidateRect(draft.preview,nullptr,FALSE);
 }
-void watermarkPaint(const DRAWITEMSTRUCT& draw,const WatermarkDraft& draft) {
-    FillRect(draw.hDC,&draw.rcItem,GetSysColorBrush(COLOR_3DDKSHADOW));const auto& frame=draft.illustration;
+// Draws a frame (or only its source rectangle) centred and scaled to fit.
+void paintIllustration(const DRAWITEMSTRUCT& draw,const Frame& frame,const RECT* source=nullptr) {
+    FillRect(draw.hDC,&draw.rcItem,GetSysColorBrush(COLOR_3DDKSHADOW));
     if(frame.width<=0 || frame.height<=0 || frame.pixels.empty())return;
+    RECT part{0,0,frame.width,frame.height};
+    if(source && source->right>source->left && source->bottom>source->top && source->left>=0 && source->top>=0 && source->right<=frame.width && source->bottom<=frame.height)part=*source;
+    const int partWidth=part.right-part.left,partHeight=part.bottom-part.top;
     const int width=draw.rcItem.right-draw.rcItem.left,height=draw.rcItem.bottom-draw.rcItem.top;
-    const double scale=std::min(double(width)/frame.width,double(height)/frame.height);
-    const int w=std::max(1,int(frame.width*scale)),h=std::max(1,int(frame.height*scale));
+    const double scale=std::min(double(width)/partWidth,double(height)/partHeight);
+    const int w=std::max(1,int(partWidth*scale)),h=std::max(1,int(partHeight*scale));
     BITMAPINFO info{};info.bmiHeader.biSize=sizeof(BITMAPINFOHEADER);info.bmiHeader.biWidth=frame.width;info.bmiHeader.biHeight=-frame.height;
     info.bmiHeader.biPlanes=1;info.bmiHeader.biBitCount=32;info.bmiHeader.biCompression=BI_RGB;
     const int old=SetStretchBltMode(draw.hDC,HALFTONE);POINT origin{};SetBrushOrgEx(draw.hDC,0,0,&origin);
-    StretchDIBits(draw.hDC,draw.rcItem.left+(width-w)/2,draw.rcItem.top+(height-h)/2,w,h,0,0,frame.width,frame.height,frame.pixels.data(),&info,DIB_RGB_COLORS,SRCCOPY);
+    // StretchDIBits measures the source row from the bottom, even for this top-down DIB.
+    StretchDIBits(draw.hDC,draw.rcItem.left+(width-w)/2,draw.rcItem.top+(height-h)/2,w,h,part.left,frame.height-part.bottom,partWidth,partHeight,frame.pixels.data(),&info,DIB_RGB_COLORS,SRCCOPY);
     SetBrushOrgEx(draw.hDC,origin.x,origin.y,nullptr);SetStretchBltMode(draw.hDC,old);
+}
+void watermarkPaint(const DRAWITEMSTRUCT& draw,const WatermarkDraft& draft) { paintIllustration(draw,draft.illustration); }
+// A desktop-like backdrop with light and dark areas, so overlay legibility
+// can be judged before recording.
+void illustrationBackdrop(Frame& frame) {
+    const auto dimensions=previewDimensions(app.settings.width,app.settings.height);
+    frame.width=dimensions.first;frame.height=dimensions.second;frame.pixels.resize(size_t(dimensions.first)*dimensions.second*4);
+    for(int y=0;y<frame.height;++y)for(int x=0;x<frame.width;++x){auto* p=frame.pixels.data()+(size_t(y)*frame.width+x)*4;
+        const bool page=x<frame.width*52/100 && y>frame.height/40 && y<frame.height*85/100;
+        if(page){const bool line=(y/std::max(1,frame.height/30))%2==0 && x>frame.width/16 && x<frame.width*45/100 && y>frame.height/6;
+            p[0]=p[1]=p[2]=line?uint8_t(190):uint8_t(250);}
+        else {p[0]=uint8_t(70+60*x/frame.width);p[1]=uint8_t(75+50*y/frame.height);p[2]=uint8_t(35+35*x/frame.width);}
+        p[3]=255;}
 }
 INT_PTR CALLBACK watermarkProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
     auto* draft=reinterpret_cast<WatermarkDraft*>(GetWindowLongPtrW(window,DWLP_USER));
@@ -2582,7 +2630,7 @@ INT_PTR CALLBACK watermarkProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             for(HWND child:draft->labels)if(!child){EndDialog(window,-1);return TRUE;}
             if(!dialogWheelCombos({draft->timeKind,draft->position,draft->size})){EndDialog(window,-1);return TRUE;}
             std::wstring help=draft->readOnly?L"Options are frozen for this recording. ":L"";
-            help+=L"Target speed is total planned playback acceleration, not extra compression or achieved speed. Recorded time is the local clock when a frame is accepted for saving; it may differ from camera exposure time. Clock/time-zone changes can affect it.\n\nBoth files use the same watermark. X/Y place the whole box inside the video; 0% is left/top, 100% right/bottom. Text scales with video size and may increase file size.";
+            help+=L"Target speed is total planned playback acceleration, not extra compression or achieved speed. Recorded time is the local clock when a frame is accepted for saving; it may differ from camera exposure time. Clock/time-zone changes can affect it.\n\nEvery saved file uses the same watermark. It is drawn as text with a soft shadow, without a background box, and lines align toward the nearer side. X/Y place the text inside the video; 0% is left/top, 100% right/bottom. Text scales with video size and may increase file size.";
             SetWindowTextW(draft->help,help.c_str());if(draft->readOnly){ShowWindow(draft->okay,SW_HIDE);SendMessageW(window,DM_SETDEFID,IDCANCEL,0);}
             customFont(window,*draft);draft->ready=true;watermarkIllustration(*draft);
             RECT rect{0,0,draft->scale(540),draft->scale(540)};AdjustWindowRectExForDpi(&rect,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_STYLE)),FALSE,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_EXSTYLE)),draft->dpi);
@@ -2631,11 +2679,11 @@ void editWatermark() {
     if(!app.closeWhenDone && !app.hiddenToTray){SetFocus(app.watermarkConfigure);revealFocusedControl();}
 }
 
-enum PlaybackId { PlaybackFps=5501,PlaybackPause,PlaybackStop,PlaybackClearPause,PlaybackClearStop };
+enum PlaybackId { PlaybackFps=5501,PlaybackPause,PlaybackStop,PlaybackClearPause,PlaybackClearStop,PlaybackStatus,PlaybackClearStatus };
 struct PlaybackDraft : CustomDraft {
     int fps=DefaultOutputFps,naturalHeight=0;
-    uint16_t pauseHotkey=0,stopHotkey=0;
-    HWND fpsHint{},pauseLabel{},stopLabel{},stop{},clearPause{},clearStop{};
+    uint16_t pauseHotkey=0,stopHotkey=0,statusHotkey=0;
+    HWND fpsHint{},pauseLabel{},stopLabel{},stop{},clearPause{},clearStop{},statusLabel{},status{},clearStatus{};
     bool readOnly=false;
 };
 LRESULT CALLBACK playbackFocusProc(HWND window,UINT message,WPARAM wp,LPARAM lp,UINT_PTR id,DWORD_PTR) {
@@ -2654,10 +2702,10 @@ void playbackLayout(HWND window,PlaybackDraft& draft) {
         if(!dc)return minimum;const auto previous=SelectObject(dc,draft.font?draft.font:GetStockObject(DEFAULT_GUI_FONT));
         DrawTextW(dc,value,-1,&bounds,DT_CALCRECT|DT_WORDBREAK|DT_NOPREFIX);SelectObject(dc,previous);ReleaseDC(window,dc);return std::max(minimum,int(bounds.bottom));
     };
-    int fpsHintHeight=0,pauseTop=0,stopTop=0,helpTop=0,helpHeight=0,errorTop=0,errorHeight=0,buttonTop=0;
+    int fpsHintHeight=0,pauseTop=0,stopTop=0,statusTop=0,helpTop=0,helpHeight=0,errorTop=0,errorHeight=0,buttonTop=0;
     const auto measure=[&](int width){
         fpsHintHeight=wrap(draft.fpsHint,width-2*pad,draft.scale(36));pauseTop=draft.scale(80)+fpsHintHeight+draft.scale(14);stopTop=pauseTop+draft.scale(66);
-        helpTop=stopTop+draft.scale(66);helpHeight=wrap(draft.help,width-2*pad,draft.scale(56));errorTop=helpTop+helpHeight+draft.scale(8);
+        statusTop=stopTop+draft.scale(66);helpTop=statusTop+draft.scale(66);helpHeight=wrap(draft.help,width-2*pad,draft.scale(56));errorTop=helpTop+helpHeight+draft.scale(8);
         errorHeight=wrap(draft.error,width-2*pad,draft.scale(36));buttonTop=errorTop+errorHeight+draft.scale(10);draft.naturalHeight=buttonTop+draft.scale(44);
     };
     bool horizontal=false,vertical=false;
@@ -2674,6 +2722,7 @@ void playbackLayout(HWND window,PlaybackDraft& draft) {
     move(draft.fpsHint,pad,draft.scale(80),width-2*pad,fpsHintHeight);
     move(draft.pauseLabel,pad,pauseTop,width-2*pad,draft.scale(20));move(draft.second,pad,pauseTop+draft.scale(22),fieldWidth,draft.scale(28));move(draft.clearPause,width-pad-clearWidth,pauseTop+draft.scale(22),clearWidth,draft.scale(28));
     move(draft.stopLabel,pad,stopTop,width-2*pad,draft.scale(20));move(draft.stop,pad,stopTop+draft.scale(22),fieldWidth,draft.scale(28));move(draft.clearStop,width-pad-clearWidth,stopTop+draft.scale(22),clearWidth,draft.scale(28));
+    move(draft.statusLabel,pad,statusTop,width-2*pad,draft.scale(20));move(draft.status,pad,statusTop+draft.scale(22),fieldWidth,draft.scale(28));move(draft.clearStatus,width-pad-clearWidth,statusTop+draft.scale(22),clearWidth,draft.scale(28));
     move(draft.help,pad,helpTop,width-2*pad,helpHeight);move(draft.error,pad,errorTop,width-2*pad,errorHeight);
     move(draft.okay,width-pad-draft.scale(174),buttonTop,draft.scale(80),draft.scale(28));move(draft.cancel,width-pad-draft.scale(80),buttonTop,draft.scale(80),draft.scale(28));draft.layingOut=false;
 }
@@ -2693,10 +2742,11 @@ bool validatePlaybackDraft(PlaybackDraft& draft,std::wstring& error,HWND& invali
     GetWindowTextW(draft.first,fps,96);int parsed=DefaultOutputFps;
     if(!parseOutputFps(fps,parsed,error))return false;
     const auto pause=static_cast<uint16_t>(SendMessageW(draft.second,HKM_GETHOTKEY,0,0)),stop=static_cast<uint16_t>(SendMessageW(draft.stop,HKM_GETHOTKEY,0,0));
-    invalid=!validHotkey(pause)?draft.second:draft.stop;
-    if(!validateHotkeys(pause,stop,error))return false;
-    if(!setRecordingHotkeys(pause,stop,error)){invalid=error.find(L"Pause / resume")==0?draft.second:draft.stop;return false;}
-    draft.fps=parsed;draft.pauseHotkey=pause;draft.stopHotkey=stop;return true;
+    const auto status=static_cast<uint16_t>(SendMessageW(draft.status,HKM_GETHOTKEY,0,0));
+    invalid=!validHotkey(pause)?draft.second:!validHotkey(stop) || (pause && hotkeyIdentity(pause)==hotkeyIdentity(stop))?draft.stop:draft.status;
+    if(!validateHotkeys(pause,stop,status,error))return false;
+    if(!setRecordingHotkeys(pause,stop,status,error)){invalid=error.find(L"Pause / resume")==0?draft.second:error.find(L"Stop and save")==0?draft.stop:draft.status;return false;}
+    draft.fps=parsed;draft.pauseHotkey=pause;draft.stopHotkey=stop;draft.statusHotkey=status;return true;
 }
 INT_PTR CALLBACK playbackProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
     auto* draft=reinterpret_cast<PlaybackDraft*>(GetWindowLongPtrW(window,DWLP_USER));
@@ -2712,15 +2762,17 @@ INT_PTR CALLBACK playbackProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             draft->fpsHint=child(L"STATIC",L"Choose a whole number from 1 to 120. Higher fps plays the captured frames faster and makes a shorter video. Capture every stays unchanged.",SS_NOPREFIX,0);
             draft->pauseLabel=child(L"STATIC",L"Global &pause / resume",0,0);draft->second=child(HOTKEY_CLASSW,L"",WS_TABSTOP,PlaybackPause);draft->clearPause=child(L"BUTTON",L"C&lear",WS_TABSTOP|BS_PUSHBUTTON|BS_NOTIFY,PlaybackClearPause);
             draft->stopLabel=child(L"STATIC",L"Global &stop and save",0,0);draft->stop=child(HOTKEY_CLASSW,L"",WS_TABSTOP,PlaybackStop);draft->clearStop=child(L"BUTTON",L"Cl&ear",WS_TABSTOP|BS_PUSHBUTTON|BS_NOTIFY,PlaybackClearStop);
-            draft->help=child(L"STATIC",draft->readOnly?L"These settings are frozen for the current recording. Shortcuts work while minimized, and are suspended while a Timelapse dialog or menu is open. Stop saves the recording; during preparation it cancels the start.":
-                L"Press a combination with Ctrl or Alt in a shortcut field. Alt with a letter also needs Ctrl to keep access keys available. Clear disables it. Shortcuts work while minimized, and are suspended while a Timelapse dialog or menu is open. Stop saves the recording; during preparation it cancels the start.",SS_NOPREFIX,CustomHelp);
+            draft->statusLabel=child(L"STATIC",L"Global set stat&us",0,0);draft->status=child(HOTKEY_CLASSW,L"",WS_TABSTOP,PlaybackStatus);draft->clearStatus=child(L"BUTTON",L"Clea&r",WS_TABSTOP|BS_PUSHBUTTON|BS_NOTIFY,PlaybackClearStatus);
+            draft->help=child(L"STATIC",draft->readOnly?L"These settings are frozen for the current recording. Shortcuts work while minimized, and are suspended while a Timelapse dialog or menu is open. Stop saves the recording; during preparation it cancels the start. Set status opens the status window from anywhere.":
+                L"Press a combination with Ctrl or Alt in a shortcut field. Alt with a letter also needs Ctrl to keep access keys available. Clear disables it. Shortcuts work while minimized, and are suspended while a Timelapse dialog or menu is open. Stop saves the recording; during preparation it cancels the start. Set status opens the status window from anywhere.",SS_NOPREFIX,CustomHelp);
             draft->error=child(L"STATIC",app.hotkeyWarning.c_str(),SS_NOPREFIX,CustomError);
             draft->okay=child(L"BUTTON",L"OK",WS_TABSTOP|BS_DEFPUSHBUTTON|BS_NOTIFY,IDOK);draft->cancel=child(L"BUTTON",draft->readOnly?L"Close":L"Cancel",WS_TABSTOP|BS_PUSHBUTTON|BS_NOTIFY,IDCANCEL);
-            if(!draft->firstLabel || !draft->first || !draft->fpsHint || !draft->pauseLabel || !draft->second || !draft->clearPause || !draft->stopLabel || !draft->stop || !draft->clearStop || !draft->help || !draft->error || !draft->okay || !draft->cancel){EndDialog(window,-1);return TRUE;}
+            if(!draft->firstLabel || !draft->first || !draft->fpsHint || !draft->pauseLabel || !draft->second || !draft->clearPause || !draft->stopLabel || !draft->stop || !draft->clearStop ||
+               !draft->statusLabel || !draft->status || !draft->clearStatus || !draft->help || !draft->error || !draft->okay || !draft->cancel){EndDialog(window,-1);return TRUE;}
             if(!dialogWheelCombos({draft->first})){EndDialog(window,-1);return TRUE;}
-            if(!SetWindowSubclass(draft->second,playbackFocusProc,2,0) || !SetWindowSubclass(draft->stop,playbackFocusProc,2,0)){EndDialog(window,-1);return TRUE;}
-            SendMessageW(draft->second,HKM_SETHOTKEY,draft->pauseHotkey,0);SendMessageW(draft->stop,HKM_SETHOTKEY,draft->stopHotkey,0);
-            if(draft->readOnly)for(HWND field:{draft->first,draft->second,draft->stop,draft->clearPause,draft->clearStop,draft->okay})EnableWindow(field,FALSE);
+            if(!SetWindowSubclass(draft->second,playbackFocusProc,2,0) || !SetWindowSubclass(draft->stop,playbackFocusProc,2,0) || !SetWindowSubclass(draft->status,playbackFocusProc,2,0)){EndDialog(window,-1);return TRUE;}
+            SendMessageW(draft->second,HKM_SETHOTKEY,draft->pauseHotkey,0);SendMessageW(draft->stop,HKM_SETHOTKEY,draft->stopHotkey,0);SendMessageW(draft->status,HKM_SETHOTKEY,draft->statusHotkey,0);
+            if(draft->readOnly)for(HWND field:{draft->first,draft->second,draft->stop,draft->status,draft->clearPause,draft->clearStop,draft->clearStatus,draft->okay})EnableWindow(field,FALSE);
             customFont(window,*draft);RECT bounds{0,0,draft->scale(460),draft->scale(400)};
             AdjustWindowRectExForDpi(&bounds,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_STYLE)),FALSE,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_EXSTYLE)),draft->dpi);
             RECT owner{};GetWindowRect(app.window,&owner);OffsetRect(&bounds,(owner.left+owner.right-(bounds.right-bounds.left))/2-bounds.left,(owner.top+owner.bottom-(bounds.bottom-bounds.top))/2-bounds.top);
@@ -2742,8 +2794,8 @@ INT_PTR CALLBACK playbackProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             if(id==IDOK && code==BN_CLICKED){if(draft->readOnly || app.active()){EndDialog(window,IDCANCEL);return TRUE;}
                 std::wstring error;HWND invalid{};if(validatePlaybackDraft(*draft,error,invalid)){EndDialog(window,IDOK);return TRUE;}
                 SetWindowTextW(draft->error,error.c_str());playbackLayout(window,*draft);playbackFitHeight(window,*draft);SetFocus(invalid);playbackReveal(window,*draft,invalid);return TRUE;}
-            if((id==PlaybackClearPause || id==PlaybackClearStop) && code==BN_CLICKED && !draft->readOnly && !app.active()){
-                const HWND field=id==PlaybackClearPause?draft->second:draft->stop;SendMessageW(field,HKM_SETHOTKEY,0,0);SetFocus(field);playbackReveal(window,*draft,field);return TRUE;}
+            if((id==PlaybackClearPause || id==PlaybackClearStop || id==PlaybackClearStatus) && code==BN_CLICKED && !draft->readOnly && !app.active()){
+                const HWND field=id==PlaybackClearPause?draft->second:id==PlaybackClearStop?draft->stop:draft->status;SendMessageW(field,HKM_SETHOTKEY,0,0);SetFocus(field);playbackReveal(window,*draft,field);return TRUE;}
             return FALSE;}
         case WM_CTLCOLORSTATIC:if(reinterpret_cast<HWND>(lp)==draft->error){SetTextColor(reinterpret_cast<HDC>(wp),RGB(164,40,40));SetBkColor(reinterpret_cast<HDC>(wp),GetSysColor(COLOR_BTNFACE));return reinterpret_cast<INT_PTR>(GetSysColorBrush(COLOR_BTNFACE));}break;
         case WM_CLOSE:EndDialog(window,IDCANCEL);return TRUE;
@@ -2753,7 +2805,7 @@ INT_PTR CALLBACK playbackProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
 }
 bool savePreferences();
 void editPlayback() {
-    if(app.customDialog)return;PlaybackDraft draft;draft.fps=app.settings.outputFps;draft.pauseHotkey=app.pauseHotkey;draft.stopHotkey=app.stopHotkey;draft.readOnly=app.active();CustomTemplate resource;
+    if(app.customDialog)return;PlaybackDraft draft;draft.fps=app.settings.outputFps;draft.pauseHotkey=app.pauseHotkey;draft.stopHotkey=app.stopHotkey;draft.statusHotkey=app.statusHotkey;draft.readOnly=app.active();CustomTemplate resource;
     const auto outcome=DialogBoxIndirectParamW(GetModuleHandleW(nullptr),&resource.dialog,app.window,playbackProc,reinterpret_cast<LPARAM>(&draft));
     if(!IsWindow(app.window))return;
     if(outcome==IDOK && !draft.readOnly && !app.active()){
@@ -2762,6 +2814,314 @@ void editPlayback() {
     }
     if(outcome==-1)MessageBoxW(app.window,L"Playback and shortcut settings could not be opened. Try again.",L"Timelapse",MB_OK|MB_ICONERROR);
     if(!app.closeWhenDone && !app.hiddenToTray){SetFocus(app.playbackConfigure);revealFocusedControl();}
+}
+
+// Live status line: what the user is doing, burned into the video corner by
+// the engine. Changing it strikes the old line through and fades it out.
+constexpr const wchar_t* StatusKindLabels[]={L"Text only",L"Stopwatch (counts up)",L"Timer (counts down)"};
+constexpr const wchar_t* StatusCornerLabels[]={L"Top left",L"Top right",L"Bottom left",L"Bottom right"};
+constexpr const wchar_t* StatusSizeLabels[]={L"Small",L"Medium (default)",L"Large"};
+constexpr const wchar_t* StatusStyleLabels[]={L"Shadow only (default)",L"Edge fade"};
+constexpr size_t MaxRecentStatuses=8;
+// Fixed storage: the 200 ms status tick must not allocate when nothing changed.
+void liveStatusCaption(uint64_t now,std::array<wchar_t,160>& caption) noexcept {
+    caption.fill(L'\0');
+    const auto view=resolveStatus(app.liveStatus,now);
+    if(!view.visible){wcscpy_s(caption.data(),caption.size(),L"No status. Set one to show what you're doing in the video.");return;}
+    const wchar_t* label=view.label.data();const wchar_t* value=view.value.data();
+    switch(view.icon){
+    case StatusIcon::Stopwatch:swprintf_s(caption.data(),caption.size(),L"%ls \u00b7 %ls",label,value);break;
+    case StatusIcon::Timer:case StatusIcon::Break:swprintf_s(caption.data(),caption.size(),L"%ls \u00b7 %ls left",label,value);break;
+    case StatusIcon::Overtime:swprintf_s(caption.data(),caption.size(),L"%ls \u00b7 %ls over",label,value+1);break;
+    default:wcscpy_s(caption.data(),caption.size(),label);break;
+    }
+}
+void updateLiveStatus(bool force) {
+    if(!app.liveStatusSummary)return;
+    std::array<wchar_t,160> caption{};liveStatusCaption(GetTickCount64(),caption);
+    if(force || caption!=app.liveStatusCaption){SetWindowTextW(app.liveStatusSummary,caption.data());app.liveStatusCaption=caption;}
+    if(app.liveStatusClear)EnableWindow(app.liveStatusClear,app.liveStatus.kind!=StatusKind::None);
+}
+void statusNotice(const wchar_t* title,const std::wstring& text) {
+    if(app.trayRegistered){
+        NOTIFYICONDATAW data{sizeof(data)};data.hWnd=app.window;data.uID=1;data.uFlags=NIF_INFO;data.dwInfoFlags=NIIF_INFO;
+        wcsncpy_s(data.szInfoTitle,title,_TRUNCATE);wcsncpy_s(data.szInfo,text.c_str(),_TRUNCATE);Shell_NotifyIconW(NIM_MODIFY,&data);
+    } else if(IsWindow(app.window)) {
+        FLASHWINFO flash{sizeof(flash)};flash.hwnd=app.window;flash.dwFlags=FLASHW_TRAY|FLASHW_TIMERNOFG;FlashWindowEx(&flash);
+        MessageBeep(MB_ICONASTERISK);
+    }
+}
+std::wstring minutesInput(int64_t milliseconds) {
+    // Accepted lengths are whole seconds that were typed as exact minutes, so
+    // the decimal expansion terminates.
+    std::wstring value=std::to_wstring(milliseconds/60000);int64_t rest=milliseconds%60000;
+    if(rest){value+=L'.';for(int digit=0;rest && digit<9;++digit){rest*=10;value+=static_cast<wchar_t>(L'0'+rest/60000);rest%=60000;}}
+    return value;
+}
+// Timers announce their end and each work/break change once.
+void checkStatusNotice() {
+    const auto view=resolveStatus(app.liveStatus,GetTickCount64());
+    const bool same=view.sequence==app.statusNoticeSequence;
+    const auto icon=app.statusNoticeIcon;const auto phase=app.statusNoticePhase;
+    app.statusNoticeSequence=view.sequence;app.statusNoticePhase=view.phase;app.statusNoticeIcon=view.icon;
+    if(!same || !view.visible)return;
+    if(view.icon==StatusIcon::Overtime && icon==StatusIcon::Timer)
+        statusNotice(L"Time's up",std::wstring(view.label.data())+L" reached its planned time.");
+    else if(view.phase!=phase && view.icon==StatusIcon::Break)
+        statusNotice(L"Break time",minutesInput(app.liveStatus.breakMs)+L" minute break. Next: "+app.liveStatus.text.data()+L".");
+    else if(view.phase!=phase && view.icon==StatusIcon::Timer)
+        statusNotice(L"Back to it",std::wstring(view.label.data())+L": "+minutesInput(app.liveStatus.durationMs)+L" minutes.");
+}
+void publishStatus(const StatusItem& item) {
+    app.liveStatus=item;
+    if(app.engine)app.engine->setStatus(item);
+    const auto view=resolveStatus(item,GetTickCount64());
+    app.statusNoticeSequence=view.sequence;app.statusNoticePhase=view.phase;app.statusNoticeIcon=view.icon;
+    updateLiveStatus(true);
+}
+void clearLiveStatus() {
+    if(app.liveStatus.kind==StatusKind::None || app.closeWhenDone)return;
+    StatusItem cleared;cleared.sequence=++app.liveStatusSequence;publishStatus(cleared);
+}
+void rememberStatus(const std::wstring& text) {
+    auto& recent=app.recentStatuses;
+    recent.erase(std::remove(recent.begin(),recent.end(),text),recent.end());
+    recent.insert(recent.begin(),text);
+    if(recent.size()>MaxRecentStatuses)recent.resize(MaxRecentStatuses);
+}
+enum StatusDialogId { StatusTextBox=5601,StatusKindBox,StatusMinutes,StatusRepeat,StatusBreak,StatusCornerBox,StatusSizeBox,StatusStyleBox,StatusPreview,StatusClearAction };
+constexpr INT_PTR StatusDialogCleared=3;
+struct StatusDraft : CustomDraft {
+    StatusFeedSettings appearance;
+    StatusItem result;
+    StatusFeedRenderer renderer;
+    Frame illustration;
+    bool readOnlyAppearance=false,ready=false,appearanceOnly=false;
+    int naturalHeight=0;
+    // The quarter of the illustration around the chosen corner, enlarged so
+    // the status text is readable in the dialog.
+    RECT zoom{};
+    HWND text{},kind{},minutes{},repeat{},breakMinutes{},corner{},size{},style{},preview{},clear{},labels[8]{};
+};
+StatusFeedSettings statusDraftAppearance(const StatusDraft& draft) {
+    StatusFeedSettings value=draft.appearance;
+    if(draft.readOnlyAppearance)return value;
+    const int corner=choice(draft.corner),size=choice(draft.size),style=choice(draft.style);
+    if(corner>=0 && corner<4)value.corner=static_cast<StatusCorner>(corner);
+    if(size>=0 && size<3)value.textSize=static_cast<StatusTextSize>(size);
+    if(style>=0 && style<2)value.style=static_cast<StatusStyle>(style);
+    return value;
+}
+bool statusDraftItem(StatusDraft& draft,StatusItem& item,std::wstring& error,HWND& invalid) {
+    item={};invalid=draft.text;
+    if(GetWindowTextLengthW(draft.text)>=256){error=L"Use at most 60 characters.";return false;}
+    wchar_t text[256]{};GetWindowTextW(draft.text,text,256);setStatusText(item,text);
+    if(!item.text[0]){error=L"Type what you're doing, or choose Clear status.";return false;}
+    const int kind=choice(draft.kind);
+    if(kind<0 || kind>2){invalid=draft.kind;error=L"Choose what to show.";return false;}
+    item.kind=static_cast<StatusKind>(kind+1);
+    if(item.kind==StatusKind::Timer){
+        const auto minutes=[&](HWND edit,int64_t& output){
+            invalid=edit;if(GetWindowTextLengthW(edit)>=64){error=L"Enter a shorter number of minutes.";return false;}
+            wchar_t value[64]{};GetWindowTextW(edit,value,64);std::wstring detail;
+            if(!parseDuration(value,DurationUnit::Minutes,1000,StatusMaxTimerMs,1000,output,detail)){
+                error=L"Enter minutes from 1 second up to 600 minutes, in whole seconds (for example 25 or 1.5).";return false;}
+            return true;
+        };
+        if(!minutes(draft.minutes,item.durationMs))return false;
+        if(isChecked(draft.repeat) && !minutes(draft.breakMinutes,item.breakMs))return false;
+    }
+    invalid=draft.text;return validateStatusItem(item,error);
+}
+void statusIllustration(StatusDraft& draft) {
+    illustrationBackdrop(draft.illustration);
+    StatusItem item;std::wstring error;HWND invalid{};
+    if(!statusDraftItem(draft,item,error,invalid)){
+        // Show the replacement effect while the draft is still incomplete.
+        item={};item.kind=StatusKind::Note;setStatusText(item,L"What you're doing");
+    }
+    error.clear();
+    const uint64_t now=GetTickCount64();item.sequence=UINT64_MAX;item.startTick=now;
+    if(draft.renderer.prepare(statusDraftAppearance(draft),app.settings.width,app.settings.height,error)){
+        StatusFeed feed;feed.reset(app.settings.outputFps);uint64_t frame=0;
+        if(app.liveStatus.kind!=StatusKind::None){feed.advance(app.liveStatus,now,0);frame=feed.transitionFrames();feed.advance(app.liveStatus,now,frame);}
+        feed.advance(item,now,++frame);
+        draft.renderer.apply(draft.illustration,feed,frame+feed.transitionFrames(),error);
+        const auto corner=statusDraftAppearance(draft).corner;const int w=draft.illustration.width,h=draft.illustration.height;
+        const bool right=corner==StatusCorner::TopRight || corner==StatusCorner::BottomRight,bottom=corner==StatusCorner::BottomLeft || corner==StatusCorner::BottomRight;
+        draft.zoom={right?w/2:0,bottom?h/2:0,right?w:w/2,bottom?h:h/2};
+        if(!draft.renderer.fits())error=L"This video size is too small to show a status. Choose a larger video size or smaller text.";
+    }
+    SetWindowTextW(draft.error,error.c_str());InvalidateRect(draft.preview,nullptr,FALSE);
+}
+void statusLayout(HWND window,StatusDraft& draft) {
+    if(draft.layingOut)return;draft.layingOut=true;
+    const bool timer=choice(draft.kind)==2,repeat=timer && isChecked(draft.repeat);
+    const auto show=[](HWND child,bool visible){ShowWindow(child,visible?SW_SHOWNA:SW_HIDE);};
+    for(HWND child:{draft.labels[2],draft.minutes,draft.repeat})show(child,timer);
+    for(HWND child:{draft.labels[3],draft.breakMinutes})show(child,repeat);
+    for(HWND child:{draft.corner,draft.size,draft.style})EnableWindow(child,!draft.readOnlyAppearance);
+    RECT client{};GetClientRect(window,&client);const auto style=GetWindowLongPtrW(window,GWL_STYLE);
+    const int bw=GetSystemMetricsForDpi(SM_CXVSCROLL,draft.dpi),bh=GetSystemMetricsForDpi(SM_CYHSCROLL,draft.dpi);
+    const int availableW=client.right+((style&WS_VSCROLL)?bw:0),availableH=client.bottom+((style&WS_HSCROLL)?bh:0);
+    const int pad=draft.scale(18),gap=draft.scale(14),minimumWidth=draft.scale(380);
+    const auto wrap=[&](HWND child,int width,int minimum){wchar_t value[1024]{};GetWindowTextW(child,value,1024);RECT rect{0,0,std::max(1,width),0};
+        HDC dc=GetDC(window);if(!dc)return minimum;auto old=SelectObject(dc,draft.font?static_cast<HGDIOBJ>(draft.font):GetStockObject(DEFAULT_GUI_FONT));
+        DrawTextW(dc,value,-1,&rect,DT_CALCRECT|DT_WORDBREAK|DT_NOPREFIX);SelectObject(dc,old);ReleaseDC(window,dc);return std::max(minimum,int(rect.bottom));};
+    const int kindTop=draft.scale(76),repeatTop=draft.scale(136),appearanceTop=draft.scale(timer?198:144);
+    const int cornerTop=appearanceTop+draft.scale(28),styleTop=cornerTop+draft.scale(60),previewTop=styleTop+draft.scale(64),previewHeight=draft.scale(150);
+    const int helpTop=previewTop+previewHeight+draft.scale(12);
+    int helpHeight=0,errorTop=0,errorHeight=0,buttonTop=0,minHeight=0;
+    const auto measure=[&](int width){helpHeight=wrap(draft.help,width-2*pad,draft.scale(36));errorTop=helpTop+helpHeight+draft.scale(8);
+        errorHeight=wrap(draft.error,width-2*pad,draft.scale(20));buttonTop=errorTop+errorHeight+draft.scale(8);minHeight=buttonTop+draft.scale(44);};
+    bool horizontal=false,vertical=false;
+    for(int i=0;i<3;++i){horizontal=availableW-(vertical?bw:0)<minimumWidth;measure(std::max(minimumWidth,availableW-(vertical?bw:0)));vertical=availableH-(horizontal?bh:0)<minHeight;}
+    ShowScrollBar(window,SB_HORZ,horizontal);ShowScrollBar(window,SB_VERT,vertical);GetClientRect(window,&client);
+    const int width=std::max(minimumWidth,int(client.right));measure(width);const int height=std::max(minHeight,int(client.bottom));draft.naturalHeight=minHeight;
+    if(width<=client.right)draft.wheelX=0;if(height<=client.bottom)draft.wheelY=0;
+    draft.scrollX=std::clamp(draft.scrollX,0,width-int(std::max(1L,client.right)));draft.scrollY=std::clamp(draft.scrollY,0,height-int(std::max(1L,client.bottom)));
+    SCROLLINFO info{sizeof(info),SIF_RANGE|SIF_PAGE|SIF_POS};info.nMax=width-1;info.nPage=std::max(1L,client.right);info.nPos=draft.scrollX;SetScrollInfo(window,SB_HORZ,&info,TRUE);
+    info.nMax=height-1;info.nPage=std::max(1L,client.bottom);info.nPos=draft.scrollY;SetScrollInfo(window,SB_VERT,&info,TRUE);
+    const int half=(width-2*pad-gap)/2,x2=pad+half+gap,full=width-2*pad;
+    const auto move=[&](HWND child,int x,int y,int w,int h){MoveWindow(child,x-draft.scrollX,y-draft.scrollY,w,h,TRUE);};
+    move(draft.labels[0],pad,draft.scale(16),full,draft.scale(20));move(draft.text,pad,draft.scale(38),full,draft.scale(220));
+    move(draft.labels[1],pad,kindTop,half,draft.scale(20));move(draft.kind,pad,kindTop+draft.scale(22),half,draft.scale(140));
+    move(draft.labels[2],x2,kindTop,half,draft.scale(20));move(draft.minutes,x2,kindTop+draft.scale(22),half,draft.scale(28));
+    move(draft.repeat,pad,repeatTop+draft.scale(22),half,draft.scale(28));
+    move(draft.labels[3],x2,repeatTop,half,draft.scale(20));move(draft.breakMinutes,x2,repeatTop+draft.scale(22),half,draft.scale(28));
+    move(draft.labels[4],pad,appearanceTop,full,draft.scale(20));
+    move(draft.labels[5],pad,cornerTop,half,draft.scale(20));move(draft.corner,pad,cornerTop+draft.scale(22),half,draft.scale(160));
+    move(draft.labels[6],x2,cornerTop,half,draft.scale(20));move(draft.size,x2,cornerTop+draft.scale(22),half,draft.scale(140));
+    move(draft.labels[7],pad,styleTop,half,draft.scale(20));move(draft.style,pad,styleTop+draft.scale(22),half,draft.scale(120));
+    move(draft.preview,pad,previewTop,full,previewHeight);
+    move(draft.help,pad,helpTop,full,helpHeight);move(draft.error,pad,errorTop,full,errorHeight);
+    move(draft.clear,pad,buttonTop,draft.scale(110),draft.scale(28));
+    move(draft.okay,width-pad-draft.scale(190),buttonTop,draft.scale(102),draft.scale(28));move(draft.cancel,width-pad-draft.scale(80),buttonTop,draft.scale(80),draft.scale(28));
+    draft.layingOut=false;
+}
+void statusFitHeight(HWND window,StatusDraft& draft) {
+    RECT rect{},client{};GetWindowRect(window,&rect);GetClientRect(window,&client);rect.bottom+=draft.naturalHeight-client.bottom;
+    rect=fitWindow(rect,workArea(MonitorFromWindow(window,MONITOR_DEFAULTTONEAREST)));
+    SetWindowPos(window,nullptr,rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top,SWP_NOZORDER|SWP_NOACTIVATE);statusLayout(window,draft);
+}
+void statusReveal(HWND window,StatusDraft& draft,HWND child) {
+    if(!child || !IsChild(window,child))return;
+    // An edit inside the text combo reports itself; reveal the whole combo.
+    if(GetParent(child)!=window)child=GetParent(child);
+    RECT bounds{},client{};GetWindowRect(child,&bounds);MapWindowPoints(nullptr,window,reinterpret_cast<POINT*>(&bounds),2);GetClientRect(window,&client);
+    if(bounds.left<0)draft.scrollX+=bounds.left;else if(bounds.right>client.right)draft.scrollX+=bounds.right-client.right;
+    if(bounds.top<0)draft.scrollY+=bounds.top;else if(bounds.bottom>client.bottom)draft.scrollY+=bounds.bottom-client.bottom;statusLayout(window,draft);
+}
+INT_PTR CALLBACK statusProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
+    auto* draft=reinterpret_cast<StatusDraft*>(GetWindowLongPtrW(window,DWLP_USER));
+    try {
+        if(message==WM_INITDIALOG){
+            draft=reinterpret_cast<StatusDraft*>(lp);SetWindowLongPtrW(window,DWLP_USER,lp);draft->previousDialog=app.customDialog;app.customDialog=window;
+            draft->dpi=static_cast<int>(GetDpiForWindow(window));if(draft->dpi<=0)draft->dpi=app.dpi;SetWindowTextW(window,L"Status");
+            const auto combo=[&](int id){return skipChild(window,L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL,id);};
+            const auto label=[&](int i,const wchar_t* text){return draft->labels[i]=skipChild(window,L"STATIC",text,0,5700+i);};
+            label(0,L"What are you &doing?");
+            draft->text=skipChild(window,L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWN|CBS_AUTOHSCROLL|WS_VSCROLL,StatusTextBox);
+            label(1,L"&Show");draft->kind=combo(StatusKindBox);for(auto value:StatusKindLabels)add(draft->kind,value);
+            label(2,L"&Minutes");draft->minutes=skipChild(window,L"EDIT",minutesInput(app.statusDraftTimerMs).c_str(),WS_TABSTOP|ES_AUTOHSCROLL,StatusMinutes);
+            draft->repeat=skipChild(window,L"BUTTON",L"&Repeat with breaks",WS_TABSTOP|BS_AUTOCHECKBOX|BS_NOTIFY,StatusRepeat);
+            label(3,L"&Break minutes");draft->breakMinutes=skipChild(window,L"EDIT",minutesInput(app.statusDraftBreakMs).c_str(),WS_TABSTOP|ES_AUTOHSCROLL,StatusBreak);
+            label(4,L"Appearance in the video");
+            label(5,L"C&orner");draft->corner=combo(StatusCornerBox);for(auto value:StatusCornerLabels)add(draft->corner,value);
+            label(6,L"Text si&ze");draft->size=combo(StatusSizeBox);for(auto value:StatusSizeLabels)add(draft->size,value);
+            label(7,L"St&yle");draft->style=combo(StatusStyleBox);for(auto value:StatusStyleLabels)add(draft->style,value);
+            draft->preview=skipChild(window,L"STATIC",L"Status illustration",SS_OWNERDRAW,StatusPreview);
+            draft->help=skipChild(window,L"STATIC",L"",SS_NOPREFIX,CustomHelp);draft->error=skipChild(window,L"STATIC",L"",SS_NOPREFIX,CustomError);
+            draft->clear=skipChild(window,L"BUTTON",L"C&lear status",WS_TABSTOP|BS_PUSHBUTTON|BS_NOTIFY,StatusClearAction);
+            draft->okay=skipChild(window,L"BUTTON",L"S&et status",WS_TABSTOP|BS_DEFPUSHBUTTON|BS_NOTIFY,IDOK);
+            draft->cancel=skipChild(window,L"BUTTON",L"Cancel",WS_TABSTOP|BS_PUSHBUTTON|BS_NOTIFY,IDCANCEL);
+            for(HWND child:{draft->text,draft->kind,draft->minutes,draft->repeat,draft->breakMinutes,draft->corner,draft->size,draft->style,draft->preview,draft->help,draft->error,draft->clear,draft->okay,draft->cancel})
+                if(!child){EndDialog(window,-1);return TRUE;}
+            for(HWND child:draft->labels)if(!child){EndDialog(window,-1);return TRUE;}
+            if(!dialogWheelCombos({draft->kind,draft->corner,draft->size,draft->style})){EndDialog(window,-1);return TRUE;}
+            SendMessageW(draft->text,CB_LIMITTEXT,StatusMaxTextLength,0);
+            for(const auto& recent:app.recentStatuses)add(draft->text,recent.c_str());
+            if(app.liveStatus.kind!=StatusKind::None)SetWindowTextW(draft->text,app.liveStatus.text.data());
+            for(HWND edit:{draft->minutes,draft->breakMinutes})SendMessageW(edit,EM_SETLIMITTEXT,32,0);
+            choose(draft->kind,std::clamp(app.statusDraftKind,0,2));SendMessageW(draft->repeat,BM_SETCHECK,app.statusDraftRepeat?BST_CHECKED:BST_UNCHECKED,0);
+            choose(draft->corner,static_cast<int>(draft->appearance.corner));choose(draft->size,static_cast<int>(draft->appearance.textSize));choose(draft->style,static_cast<int>(draft->appearance.style));
+            EnableWindow(draft->clear,app.liveStatus.kind!=StatusKind::None);
+            std::wstring help=L"Shows in the video from the next saved frame, even while recording. A new status strikes the old one through and fades it out. Stopwatches and timers count real time, including pauses.";
+            if(draft->readOnlyAppearance)help+=L" Appearance is fixed until this recording ends.";
+            SetWindowTextW(draft->help,help.c_str());
+            customFont(window,*draft);draft->ready=true;statusIllustration(*draft);
+            RECT rect{0,0,draft->scale(520),draft->scale(600)};AdjustWindowRectExForDpi(&rect,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_STYLE)),FALSE,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_EXSTYLE)),draft->dpi);
+            const HMONITOR monitor=IsWindowVisible(app.window)?MonitorFromWindow(app.window,MONITOR_DEFAULTTONEAREST):MonitorFromPoint(POINT{},MONITOR_DEFAULTTOPRIMARY);
+            const RECT area=workArea(monitor);RECT owner{};
+            if(IsWindowVisible(app.window))GetWindowRect(app.window,&owner);else owner=area;
+            OffsetRect(&rect,(owner.left+owner.right-(rect.right-rect.left))/2-rect.left,(owner.top+owner.bottom-(rect.bottom-rect.top))/2-rect.top);
+            rect=fitWindow(rect,area);SetWindowPos(window,nullptr,rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top,SWP_NOZORDER|SWP_NOACTIVATE);
+            statusLayout(window,*draft);statusFitHeight(window,*draft);
+            // Opened by a global shortcut or the tray: come to the front.
+            SetForegroundWindow(window);SetFocus(draft->text);SendMessageW(draft->text,CB_SETEDITSEL,0,MAKELPARAM(0,-1));return FALSE;
+        }
+        if(draft && message==WM_DESTROY){draft->renderer.reset();if(draft->font){DeleteObject(draft->font);draft->font=nullptr;}if(app.customDialog==window)app.customDialog=IsWindow(draft->previousDialog)?draft->previousDialog:nullptr;return TRUE;}
+        if(!draft || !draft->ready)return FALSE;
+        switch(message){
+        case WM_SIZE:statusLayout(window,*draft);return TRUE;
+        case WM_MOUSEWHEEL:case WM_MOUSEHWHEEL:{
+            const auto result=dialogWheel(window,*draft,message,wp);
+            if(result==DialogWheel::Scrolled)statusLayout(window,*draft);
+            if(result!=DialogWheel::Pass)return TRUE;break;}
+        case WM_DPICHANGED:{draft->dpi=HIWORD(wp);customFont(window,*draft);RECT rect=*reinterpret_cast<RECT*>(lp);rect=fitWindow(rect,workArea(MonitorFromRect(&rect,MONITOR_DEFAULTTONEAREST)));
+            SetWindowPos(window,nullptr,rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top,SWP_NOZORDER|SWP_NOACTIVATE);statusLayout(window,*draft);statusReveal(window,*draft,GetFocus());return TRUE;}
+        case WM_DRAWITEM:if(wp==StatusPreview){paintIllustration(*reinterpret_cast<DRAWITEMSTRUCT*>(lp),draft->illustration,&draft->zoom);return TRUE;}break;
+        case WM_HSCROLL:case WM_VSCROLL:{const int bar=message==WM_HSCROLL?SB_HORZ:SB_VERT;SCROLLINFO info{sizeof(info),SIF_ALL};GetScrollInfo(window,bar,&info);int position=info.nPos;
+            switch(LOWORD(wp)){case SB_LINEUP:position-=draft->scale(24);break;case SB_LINEDOWN:position+=draft->scale(24);break;case SB_PAGEUP:position-=info.nPage;break;case SB_PAGEDOWN:position+=info.nPage;break;case SB_THUMBPOSITION:case SB_THUMBTRACK:position=info.nTrackPos;break;case SB_TOP:position=0;break;case SB_BOTTOM:position=info.nMax;break;default:return TRUE;}
+            (bar==SB_HORZ?draft->scrollX:draft->scrollY)=position;statusLayout(window,*draft);return TRUE;}
+        case WM_COMMAND:{const int id=LOWORD(wp),code=HIWORD(wp);
+            if(((id==IDOK || id==IDCANCEL || id==StatusClearAction || id==StatusRepeat) && code==BN_SETFOCUS) || ((id==StatusMinutes || id==StatusBreak) && code==EN_SETFOCUS) ||
+               ((id==StatusTextBox || id==StatusKindBox || id==StatusCornerBox || id==StatusSizeBox || id==StatusStyleBox) && code==CBN_SETFOCUS)){
+                statusReveal(window,*draft,reinterpret_cast<HWND>(lp));return TRUE;
+            }
+            if(id==IDCANCEL && code==BN_CLICKED){EndDialog(window,IDCANCEL);return TRUE;}
+            if(id==StatusClearAction && code==BN_CLICKED){draft->appearance=statusDraftAppearance(*draft);EndDialog(window,StatusDialogCleared);return TRUE;}
+            if(id==IDOK && code==BN_CLICKED){
+                StatusItem item;std::wstring error;HWND invalid{};
+                const auto appearance=statusDraftAppearance(*draft);
+                if(GetWindowTextLengthW(draft->text)==0 && !sameStatusFeedSettings(appearance,draft->appearance)){
+                    // Only the look changed: keep the current status.
+                    draft->appearance=appearance;draft->appearanceOnly=true;EndDialog(window,IDOK);return TRUE;
+                }
+                if(statusDraftItem(*draft,item,error,invalid)){draft->appearance=appearance;draft->result=item;EndDialog(window,IDOK);return TRUE;}
+                SetWindowTextW(draft->error,error.c_str());statusLayout(window,*draft);statusFitHeight(window,*draft);SetFocus(invalid);statusReveal(window,*draft,invalid);return TRUE;}
+            const bool changed=((id==StatusRepeat) && code==BN_CLICKED) || ((id==StatusKindBox || id==StatusCornerBox || id==StatusSizeBox || id==StatusStyleBox) && code==CBN_SELCHANGE) ||
+                ((id==StatusMinutes || id==StatusBreak) && code==EN_CHANGE) || (id==StatusTextBox && code==CBN_EDITCHANGE);
+            if(changed){statusIllustration(*draft);statusLayout(window,*draft);statusFitHeight(window,*draft);statusReveal(window,*draft,reinterpret_cast<HWND>(lp));return TRUE;}
+            if(id==StatusTextBox && code==CBN_SELCHANGE){
+                // The edit field takes the chosen recent text after this notice.
+                const int selected=choice(draft->text);wchar_t value[256]{};
+                if(selected>=0 && SendMessageW(draft->text,CB_GETLBTEXTLEN,selected,0)<256 && SendMessageW(draft->text,CB_GETLBTEXT,selected,reinterpret_cast<LPARAM>(value))!=CB_ERR)SetWindowTextW(draft->text,value);
+                statusIllustration(*draft);return TRUE;}
+            return FALSE;}
+        case WM_CTLCOLORSTATIC:if(reinterpret_cast<HWND>(lp)==draft->error){SetTextColor(reinterpret_cast<HDC>(wp),RGB(164,40,40));SetBkColor(reinterpret_cast<HDC>(wp),GetSysColor(COLOR_BTNFACE));return reinterpret_cast<INT_PTR>(GetSysColorBrush(COLOR_BTNFACE));}break;
+        case WM_CLOSE:EndDialog(window,IDCANCEL);return TRUE;
+        }
+    } catch(...){EndDialog(window,-1);return TRUE;}return FALSE;
+}
+void editStatus() {
+    if(app.customDialog || app.closeWhenDone || app.failureNotice==FailureNotice::Presenting)return;
+    StatusDraft draft;draft.appearance=app.settings.statusFeed;draft.readOnlyAppearance=app.active();CustomTemplate resource;
+    const auto outcome=DialogBoxIndirectParamW(GetModuleHandleW(nullptr),&resource.dialog,app.window,statusProc,reinterpret_cast<LPARAM>(&draft));
+    if(!IsWindow(app.window))return;
+    if(outcome==-1){MessageBoxW(app.window,L"Status settings could not be opened. Try again.",L"Timelapse",MB_OK|MB_ICONERROR);return;}
+    if(outcome==IDOK || outcome==StatusDialogCleared){
+        if(!app.active() && !sameStatusFeedSettings(draft.appearance,app.settings.statusFeed)){app.settings.statusFeed=draft.appearance;configure();}
+        if(outcome==StatusDialogCleared)clearLiveStatus();
+        else if(!draft.appearanceOnly){
+            auto item=draft.result;item.sequence=++app.liveStatusSequence;item.startTick=GetTickCount64();
+            app.statusDraftKind=static_cast<int>(item.kind)-1;
+            if(item.kind==StatusKind::Timer){app.statusDraftTimerMs=item.durationMs;app.statusDraftRepeat=item.breakMs>0;if(item.breakMs)app.statusDraftBreakMs=item.breakMs;}
+            rememberStatus(item.text.data());publishStatus(item);
+        }
+        if(app.startupComplete)savePreferences();
+    }
+    if(!app.closeWhenDone && !app.hiddenToTray && IsWindowVisible(app.window)){SetFocus(app.liveStatusSet);revealFocusedControl();}
 }
 
 void selectFolder() {
@@ -2828,6 +3188,7 @@ TimeSkipSettings loadSkip(const wchar_t* path) {
         if(count>=511 || std::wcscmp(value,L"?")==0)complete=false;values[i]=value;}
     TimeSkipSettings policy;if(!complete || !parseSkipValues(values,policy))return {};return policy;
 }
+constexpr const wchar_t* StatusKeys[]={L"StatusHotkey",L"StatusCorner",L"StatusTextSize",L"StatusStyle",L"StatusLastKind",L"StatusTimerSeconds",L"StatusBreakSeconds",L"StatusRepeat"};
 constexpr const wchar_t* WatermarkKeys[]={L"WatermarkEnabled",L"WatermarkShowTime",L"WatermarkShowSpeed",L"WatermarkTimeKind",L"WatermarkX",L"WatermarkY",L"WatermarkTextSize"};
 std::array<std::wstring,7> watermarkValues(const WatermarkSettings& value) {
     return {value.enabled?L"1":L"0",value.showTime?L"1":L"0",value.showSpeed?L"1":L"0",std::to_wstring(static_cast<int>(value.timeKind)),
@@ -2888,7 +3249,11 @@ bool savePreferences() {
         const auto segmentDuration=std::to_wstring(selectedSegment());
         const auto startDelay=std::to_wstring(selectedStartDelay());
         const auto outputFps=std::to_wstring(app.settings.outputFps),pauseHotkey=std::to_wstring(app.pauseHotkey),stopHotkey=std::to_wstring(app.stopHotkey);
-        std::wstring playbackError;if(!validateOutputFps(app.settings.outputFps,playbackError) || !validateHotkeys(app.pauseHotkey,app.stopHotkey,playbackError))return false;
+        std::wstring playbackError;if(!validateOutputFps(app.settings.outputFps,playbackError) || !validateHotkeys(app.pauseHotkey,app.stopHotkey,app.statusHotkey,playbackError))return false;
+        if(!validateStatusFeedSettings(app.settings.statusFeed,playbackError))return false;
+        const std::wstring statusValues[]={std::to_wstring(app.statusHotkey),std::to_wstring(static_cast<int>(app.settings.statusFeed.corner)),
+            std::to_wstring(static_cast<int>(app.settings.statusFeed.textSize)),std::to_wstring(static_cast<int>(app.settings.statusFeed.style)),
+            std::to_wstring(std::clamp(app.statusDraftKind,0,2)),std::to_wstring(app.statusDraftTimerMs/1000),std::to_wstring(app.statusDraftBreakMs/1000),app.statusDraftRepeat?L"1":L"0"};
         auto skipPolicy=app.settings.timeSkip;std::wstring skipError;
         if(!normalizeTimeSkipSettings(skipPolicy,skipError))return false;
         const auto skip=skipValues(skipPolicy);
@@ -2937,6 +3302,9 @@ bool savePreferences() {
             WritePrivateProfileStringW(L"Settings",L"StopHotkey",stopHotkey.c_str(),pending.path);
         if(saved)saved=WritePrivateProfileStringW(L"Settings",L"AlsoSaveDesktop",isChecked(app.alsoDesktop)?L"1":L"0",pending.path) &&
             WritePrivateProfileStringW(L"Settings",L"AlsoSaveCamera",isChecked(app.alsoCamera)?L"1":L"0",pending.path);
+        for(size_t i=0;saved && i<std::size(StatusKeys);++i)saved=WritePrivateProfileStringW(L"Settings",StatusKeys[i],statusValues[i].c_str(),pending.path)!=FALSE;
+        for(size_t i=0;saved && i<MaxRecentStatuses;++i){const auto key=L"StatusRecent"+std::to_wstring(i+1);
+            saved=WritePrivateProfileStringW(L"Settings",key.c_str(),i<app.recentStatuses.size()?app.recentStatuses[i].c_str():L"",pending.path)!=FALSE;}
         // This cache-flush form returns zero even when successful.
         WritePrivateProfileStringW(nullptr,nullptr,nullptr,pending.path);
         if(!saved)return false;
@@ -3023,10 +3391,24 @@ void preferences(bool save) {
         app.settings.outputFps=DefaultOutputFps;
         exactInteger(L"OutputFps",MinOutputFps,MaxOutputFps,app.settings.outputFps);
         app.recordedOutputFps=app.settings.outputFps;
-        int pause=0,stop=0;exactInteger(L"PauseHotkey",0,UINT16_MAX,pause);exactInteger(L"StopHotkey",0,UINT16_MAX,stop);
+        int pause=0,stop=0,status=0;exactInteger(L"PauseHotkey",0,UINT16_MAX,pause);exactInteger(L"StopHotkey",0,UINT16_MAX,stop);exactInteger(L"StatusHotkey",0,UINT16_MAX,status);
         if(!validHotkey(static_cast<uint16_t>(pause)))pause=0;if(!validHotkey(static_cast<uint16_t>(stop)) || (pause && hotkeyIdentity(static_cast<uint16_t>(pause))==hotkeyIdentity(static_cast<uint16_t>(stop))))stop=0;
-        unregisterRecordingHotkeys();app.pauseHotkey=static_cast<uint16_t>(pause);app.stopHotkey=static_cast<uint16_t>(stop);
-        std::wstring shortcutError;if(!setRecordingHotkeys(app.pauseHotkey,app.stopHotkey,shortcutError))app.hotkeyWarning=std::move(shortcutError);
+        {std::wstring ignored;if(!validateHotkeys(static_cast<uint16_t>(pause),static_cast<uint16_t>(stop),static_cast<uint16_t>(status),ignored))status=0;}
+        unregisterRecordingHotkeys();app.pauseHotkey=static_cast<uint16_t>(pause);app.stopHotkey=static_cast<uint16_t>(stop);app.statusHotkey=static_cast<uint16_t>(status);
+        std::wstring shortcutError;if(!setRecordingHotkeys(app.pauseHotkey,app.stopHotkey,app.statusHotkey,shortcutError))app.hotkeyWarning=std::move(shortcutError);
+        {   // Status look and the Set status window's last choices.
+            int corner=0,size=1,style=0,kind=0,timer=25*60,pauseLength=5*60,repeat=0;
+            exactInteger(L"StatusCorner",0,3,corner);exactInteger(L"StatusTextSize",0,2,size);exactInteger(L"StatusStyle",0,1,style);
+            exactInteger(L"StatusLastKind",0,2,kind);exactInteger(L"StatusTimerSeconds",1,static_cast<int>(StatusMaxTimerMs/1000),timer);
+            exactInteger(L"StatusBreakSeconds",1,static_cast<int>(StatusMaxTimerMs/1000),pauseLength);exactInteger(L"StatusRepeat",0,1,repeat);
+            app.settings.statusFeed={static_cast<StatusCorner>(corner),static_cast<StatusTextSize>(size),static_cast<StatusStyle>(style)};
+            app.statusDraftKind=kind;app.statusDraftTimerMs=int64_t(timer)*1000;app.statusDraftBreakMs=int64_t(pauseLength)*1000;app.statusDraftRepeat=repeat!=0;
+            app.recentStatuses.clear();
+            for(size_t i=0;i<MaxRecentStatuses;++i){const auto key=L"StatusRecent"+std::to_wstring(i+1);wchar_t value[256]{};
+                GetPrivateProfileStringW(L"Settings",key.c_str(),L"",value,256,path);StatusItem sample;setStatusText(sample,value);
+                const std::wstring text=sample.text.data();
+                if(!text.empty() && std::find(app.recentStatuses.begin(),app.recentStatuses.end(),text)==app.recentStatuses.end())app.recentStatuses.push_back(text);}
+        }
         app.advancedOutputFps=-1;
         app.settings.timeSkip=loadSkip(path);++app.skipRevision;
         app.settings.watermark=loadWatermark(path);app.watermarkCheckValid=false;++app.watermarkRevision;
@@ -3211,9 +3593,9 @@ void paintStats(HDC dc) {
 }
 void paintPanel(HDC dc) {
     const int pad=app.scale(PanelPad),left=app.panelRect.left+pad,right=app.panelRect.right-pad,offset=app.panelScroll;
-    static constexpr const wchar_t* Headings[]={L"INPUT",L"OUTPUT",L"SAVE TO"};
+    static constexpr const wchar_t* Headings[]={L"INPUT",L"OUTPUT",L"SAVE TO",L"STATUS"};
     const int spacing=SetTextCharacterExtra(dc,std::max(1,app.scale(1)));
-    for(int i=0;i<3;++i){const int top=app.sectionTops[i]-offset;text(dc,Headings[i],{left,top,right-app.scale(100),top+app.scale(30)},Muted,app.headerFont);}
+    for(int i=0;i<4;++i){const int top=app.sectionTops[i]-offset;text(dc,Headings[i],{left,top,right-app.scale(100),top+app.scale(30)},Muted,app.headerFont);}
     SetTextCharacterExtra(dc,spacing);
     for(int i=0;i<app.panelRuleCount;++i){const int y=app.panelRules[i]-offset;solid(dc,{left,y,right,y+1},Border);}
     RECT path=app.savePathRect;OffsetRect(&path,0,-offset);
@@ -3394,6 +3776,8 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         app.videoSize=combo(2,L"Video si&ze",SizeBox);add(app.videoSize,L"720p");add(app.videoSize,L"1080p");
         app.encodingQuality=combo(3,L"Video &quality",EncodingQualityBox);for(auto s:{L"Smaller file",L"Balanced",L"More detail"})add(app.encodingQuality,s);
         app.folder=button(L"C&hange...",Folder);app.openFolder=button(L"&Open folder",OpenFolder);
+        app.liveStatusSummary=requiredControl(L"STATIC",L"",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX,StatusSummaryLine);
+        app.liveStatusSet=button(L"Set stat&us...",SetStatusButton);app.liveStatusClear=button(L"Clear",ClearStatusButton);
         app.advanced=requiredControl(L"BUTTON",L"&Advanced",WS_TABSTOP|BS_AUTOCHECKBOX|BS_PUSHLIKE,AdvancedToggle);
         app.encodingMode=combo(6,L"Encodin&g",EncodingModeBox);
         for(auto label:EncodingModeLabels)add(app.encodingMode,label);
@@ -3452,6 +3836,9 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
         tip.uId=reinterpret_cast<UINT_PTR>(app.playbackConfigure);
         tip.lpszText=const_cast<LPWSTR>(L"Set the final MP4 playback frame rate and optional global shortcuts for pause/resume and stop/save. Available before recording. Shortcuts work while minimized and pause while a Timelapse dialog or menu is open.");
+        SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
+        tip.uId=reinterpret_cast<UINT_PTR>(app.liveStatusSet);
+        tip.lpszText=const_cast<LPWSTR>(L"Show what you're doing in a corner of the video, optionally with a stopwatch or timer. Change it any time, even while recording or from the tray; the old status is struck through and fades out. Choose the corner, size and style here too.");
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
         tip.uId=reinterpret_cast<UINT_PTR>(app.stopAfter);
         tip.lpszText=const_cast<LPWSTR>(L"Finish and save automatically after this much active recording time. Pauses and initial startup do not count. Never records until you choose Finish.");
@@ -3539,6 +3926,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
     case WM_TIMER: {
         if(wp!=1 || !app.engine)return 0;
         const bool wasHidden=app.hiddenToTray;applyStatus(app.engine->status());
+        updateLiveStatus();checkStatusNotice();
         if(app.trayRegistered && !updateTray() && app.hiddenToTray)showWindow();
         if(app.failureNotice==FailureNotice::Presenting)return 0;
         if(app.closeWhenDone && !app.active()) {
@@ -3555,8 +3943,10 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
     }
     case WM_HOTKEY: {
         if(!app.engine || app.customDialog || app.trayMenuOpen || app.closeWhenDone || app.failureNotice==FailureNotice::Presenting || !IsWindowEnabled(w))return 0;
-        const int id=static_cast<int>(wp);const uint16_t binding=id==app.pauseHotkeyId?app.pauseHotkey:id==app.stopHotkeyId?app.stopHotkey:0;
+        const int id=static_cast<int>(wp);
+        const uint16_t binding=id==app.pauseHotkeyId?app.pauseHotkey:id==app.stopHotkeyId?app.stopHotkey:id==app.statusHotkeyId?app.statusHotkey:0;
         if(!binding || HIWORD(lp)!=LOBYTE(binding) || LOWORD(lp)!=(hotkeyRegistrationModifiers(binding)&~MOD_NOREPEAT))return 0;
+        if(id==app.statusHotkeyId){editStatus();return 0;}
         applyStatus(app.engine->status());
         return windowProc(w,WM_COMMAND,id==app.pauseHotkeyId?Pause:Finish,0);
     }
@@ -3653,6 +4043,8 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
             break;
         case NightBox:if(!app.active()){configure();updateControls();layout();revealFocusedControl();}break;
         case TrayShow:showWindow(true);break;
+        case SetStatusButton:case TraySetStatus:if(code==BN_CLICKED)editStatus();break;
+        case ClearStatusButton:case TrayClearStatus:if(code==BN_CLICKED)clearLiveStatus();break;
         case TrayPause:case Pause:if(!app.closeWhenDone && (app.status.state==State::Recording || app.status.state==State::Paused))app.engine->setPaused(app.status.state!=State::Paused);break;
         case TrayFinish:case Finish:if(!app.closeWhenDone && (app.status.state==State::Waiting || app.status.state==State::Starting || app.status.state==State::Recording || app.status.state==State::Paused))app.engine->finish();break;
         case TrayExit:exitApplication();break;

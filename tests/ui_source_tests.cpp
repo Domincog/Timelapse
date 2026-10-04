@@ -100,7 +100,8 @@ std::vector<CameraDevice> listedCameras;
 std::wstring listError;
 Settings configured, recorded;
 Status fixtureStatus;
-int configurationCalls=0, recordCalls=0, refreshCalls=0, cameraListCalls=0;
+int configurationCalls=0, recordCalls=0, refreshCalls=0, cameraListCalls=0, statusCalls=0;
+StatusItem engineStatus;
 class FixtureEngine {
 public:
     FixtureEngine(){if(startupUnderTest)++startupEngines;}
@@ -109,7 +110,7 @@ public:
     void record() { recorded=configured; ++recordCalls; fixtureStatus.state=State::Starting; }
     void pause() {}
     void setPaused(bool) {}
-    void finish() {} void cancelDelayedStart() noexcept {}
+    void finish() {} void cancelDelayedStart() noexcept {} void setStatus(const StatusItem& value) { engineStatus=value; ++statusCalls; }
     Status status() { return fixtureStatus; }
 };
 std::vector<Monitor> enumerateMonitors() { return listedMonitors; }

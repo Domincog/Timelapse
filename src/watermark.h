@@ -38,10 +38,12 @@ public:
     // preflights the longest supported text before file creation. Relative font
     // heights use the shorter output edge, with legible minimum pixel heights.
     bool prepare(const WatermarkSettings&, int outputWidth, int outputHeight, std::wstring& error);
-    // Stamp directly into a valid BGRA frame. Layout is based on prepared output
-    // geometry and scaled to this frame (including a smaller disposable preview).
-    // Reuses the logical text tile; no full-frame copy or warmed heap allocation.
-    // On failure the input frame is unchanged. Alpha inside the box becomes 255.
+    // Stamp directly into a valid BGRA frame: Segoe UI text over a soft dark
+    // halo (see overlay.h), with no backing box; lines align toward the nearer
+    // side. Layout is based on prepared output geometry and area-sampled to
+    // this frame (including a smaller disposable preview). Reuses the text
+    // tile; no full-frame copy or warmed heap allocation. On failure the input
+    // frame is unchanged. Touched pixels become opaque (alpha 255).
     // A reset/unprepared renderer is a no-op; callers must check prepare's result.
     bool apply(Frame&, const WatermarkContext&, std::wstring& error);
     void reset() noexcept;

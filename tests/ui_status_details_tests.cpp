@@ -184,7 +184,7 @@ public:
     void record(){++detailsProbe::records;detailsProbe::current.state=State::Starting;}
     void pause(){}
     void setPaused(bool value){++detailsProbe::pauses;detailsProbe::current.state=value?State::Paused:State::Recording;}
-    void finish(){++detailsProbe::finishes;detailsProbe::current.state=State::Finishing;} void cancelDelayedStart() noexcept {}
+    void finish(){++detailsProbe::finishes;detailsProbe::current.state=State::Finishing;} void cancelDelayedStart() noexcept {} void setStatus(const StatusItem&) {}
     Status status(){++detailsProbe::statusQueries;return detailsProbe::current;}
 };
 std::vector<Monitor> enumerateMonitors(){++detailsProbe::enumerations;return {{L"Synthetic display",{0,0,1280,720},L"owned-display"}};}

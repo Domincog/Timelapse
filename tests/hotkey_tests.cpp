@@ -28,5 +28,12 @@ int main() {
     check(!validateHotkeys(shortcut('P', 6), shortcut('P', 6), error) && !error.empty(), "duplicate actions rejected");
     check(!validateHotkeys(shortcut(VK_LEFT, 2), shortcut(VK_LEFT, 10), error) && !error.empty(), "extended hint cannot disguise duplicate chord");
     check(validateHotkeys(shortcut('P', 6), shortcut('S', 6), error) && error.empty(), "distinct actions accepted");
+    check(validateHotkeys(0, 0, 0, error) && error.empty(), "all three shortcuts default to disabled");
+    check(validateHotkeys(shortcut('P', 6), shortcut('S', 6), shortcut('U', 6), error) && error.empty(), "distinct status shortcut accepted");
+    check(validateHotkeys(0, 0, shortcut('U', 2), error), "status shortcut works alone");
+    check(!validateHotkeys(shortcut('P', 6), 0, shortcut('P', 6), error) && !error.empty(), "status duplicate of pause rejected");
+    check(!validateHotkeys(0, shortcut(VK_LEFT, 2), shortcut(VK_LEFT, 10), error) && !error.empty(), "status duplicate of stop rejected despite extended hint");
+    check(!validateHotkeys(0, 0, shortcut('U', 4), error) && !error.empty(), "status Alt+letter rejected like other actions");
+    check(!validateHotkeys(shortcut('P', 6), shortcut('P', 6), shortcut('U', 6), error) && !error.empty(), "pause/stop duplicate still rejected with a status shortcut");
     return failures ? 1 : 0;
 }
