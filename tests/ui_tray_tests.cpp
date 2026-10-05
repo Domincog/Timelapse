@@ -186,9 +186,8 @@ struct Fixture {
         probe::menuItemCount=0;probe::menuDefault=0;probe::failProgressAppend=probe::failProgressSeparator=false;probe::progressAppendFailures=probe::progressSeparatorFailures=0;
         probe::failAfterStatus=noticeAllocation::failNext=false;noticeAllocation::failures=0;
         app.visibleDirty=true;app.controlsUpdated=app.trayStateValid=probe::iconic=false;
-        app.advancedExpanded=false;app.advancedLimitIndex=app.advancedVisibility=-1;
-        app.advancedNightState=app.nightVisibility=-1;app.nightValidation.clear();
-        app.skipRevision=0;app.advancedSkipRevision=app.skipSummaryRevision=app.skipVisibility=-1;app.skipCheckAge=UINT64_MAX;
+        app.panelTab=CaptureTab;invalidatePanel();app.nightValidation.clear();
+        app.skipRevision=0;app.skipSummaryRevision=-1;app.skipCheckAge=UINT64_MAX;
         app.skipSummaryCaption.clear();app.skipDetailCaption.clear();probe::now=1000000;
         app.scrollX=app.scrollY=0;app.contentWidth=920;app.contentHeight=720;
         app.hiddenToTray=app.trayRegistered=app.trayNoticeShown=app.trayVersion4=app.startupComplete=false;
@@ -623,7 +622,7 @@ void unchangedTrayTip(){Fixture f;f.close();probe::resetWork();app.settings.sepa
     app.settings.separateFiles=false;app.settings.layers=preset(Mode::Overlay);app.settings.alsoSaveDesktop=app.settings.alsoSaveCamera=true;
     require(updateTray()&&app.trayOutputs==3&&probe::tip.find(L" - 3 files")!=std::wstring::npos,"Collage companion tray summary did not count every file");
 }
-void nightResultDetails(){Fixture f;app.settings.layers=preset(Mode::Camera);app.advancedExpanded=true;
+void nightResultDetails(){Fixture f;app.settings.layers=preset(Mode::Camera);app.panelTab=RecordingTab;
     SendMessageW(app.nightEnabled,BM_SETCHECK,BST_CHECKED,0);configure();updateControls();f.tick();
     wchar_t value[300]{};GetWindowTextW(app.nightDetail,value,300);
     require(std::wstring(value).find(L"during recording")!=std::wstring::npos,"Night help claims processed idle preview.");
@@ -636,16 +635,16 @@ void nightResultDetails(){Fixture f;app.settings.layers=preset(Mode::Camera);app
     f.close();probe::resetWork();probe::current.nightDurationMs=10000;probe::current.night.samples=31;probe::current.night.appliedGain=3;f.tick();
     require(app.visibleDirty&&probe::textWrites==0&&probe::invalidated.empty(),"Hidden night results repainted the window.");
     f.command(TrayShow);GetWindowTextW(app.nightDetail,value,300);require(std::wstring(value).find(L"10.0 s")!=std::wstring::npos&&std::wstring(value).find(L"31 camera frames")!=std::wstring::npos,"Restore lost deferred night facts.");
-    app.advancedExpanded=false;probe::resetWork();probe::current.night.samples=32;f.tick();require(probe::textWrites==0,"Collapsed night facts rewrote hidden detail.");
-    app.advancedExpanded=true;updateNightText();GetWindowTextW(app.nightDetail,value,300);require(std::wstring(value).find(L"32 camera frames")!=std::wstring::npos,"Expanding night details left stale facts.");
+    app.panelTab=CaptureTab;probe::resetWork();probe::current.night.samples=32;f.tick();require(probe::textWrites==0,"Night facts on a hidden page rewrote hidden detail.");
+    app.panelTab=RecordingTab;updateNightText();GetWindowTextW(app.nightDetail,value,300);require(std::wstring(value).find(L"32 camera frames")!=std::wstring::npos,"Showing night details left stale facts.");
 }
-void compressionResultWork(){Fixture f;app.advancedExpanded=true;app.settings.timeSkip.mode=TimeSkipMode::Quiet;++app.skipRevision;
+void compressionResultWork(){Fixture f;app.panelTab=RecordingTab;app.settings.timeSkip.mode=TimeSkipMode::Quiet;++app.skipRevision;
     probe::current.state=State::Recording;probe::current.timeSkip.enabled=true;probe::current.timeSkip.reason=TimeSkipReason::Quiet;
     probe::current.timeSkip.intervalMs=4000;probe::current.timeSkip.lastCheckTick=probe::now;f.tick();probe::resetWork();
     for(int i=0;i<1000;++i)f.tick();require(probe::statusQueries==1000 && probe::textWrites==0 && probe::enables==0 && probe::invalidated.empty(),"Unchanged compression facts repeated visual work or lost status checks.");
     probe::now+=3000;f.tick();require(probe::textWrites==1 && app.skipDetailCaption.find(L"3 s ago")!=std::wstring::npos,"Old source check appeared permanently fresh while worker status stayed unchanged.");
-    app.advancedExpanded=false;probe::resetWork();probe::now+=3000;probe::current.timeSkip.reason=TimeSkipReason::Unavailable;f.tick();require(probe::textWrites==0 && probe::invalidated.empty(),"Collapsed compression status rewrote hidden details.");
-    app.advancedExpanded=true;updateSkipText();require(app.skipDetailCaption.find(L"6 s ago")!=std::wstring::npos && app.skipDetailCaption.find(L"unavailable")!=std::wstring::npos,"Expansion lost deferred facts or check age.");
+    app.panelTab=CaptureTab;probe::resetWork();probe::now+=3000;probe::current.timeSkip.reason=TimeSkipReason::Unavailable;f.tick();require(probe::textWrites==0 && probe::invalidated.empty(),"Compression status on a hidden page rewrote hidden details.");
+    app.panelTab=RecordingTab;updateSkipText();require(app.skipDetailCaption.find(L"6 s ago")!=std::wstring::npos && app.skipDetailCaption.find(L"unavailable")!=std::wstring::npos,"Showing the page lost deferred facts or check age.");
     f.close();probe::resetWork();probe::now+=5000;probe::current.timeSkip.intervalMs=1000;f.tick();require(probe::textWrites==0 && probe::invalidated.empty() && app.visibleDirty,"Hidden compression update performed visual work.");
     f.command(TrayShow);require(app.skipDetailCaption.find(L"11 s ago")!=std::wstring::npos && app.skipDetailCaption.find(L"target every 1 s")!=std::wstring::npos,"Tray restore lost current target cadence or source age.");
     probe::current.state=State::Paused;f.tick();probe::resetWork();probe::now+=10000;for(int i=0;i<1000;++i)f.tick();

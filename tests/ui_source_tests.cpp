@@ -199,7 +199,7 @@ std::wstring caption(HWND box) {
 struct HiddenFixture {
     HiddenFixture() {
         app.dpi=96;app.visibleDirty=true;app.controlsUpdated=false;
-        app.skipRevision=0;app.advancedSkipRevision=app.skipSummaryRevision=app.skipVisibility=-1;app.skipSummaryCaption.clear();app.skipDetailCaption.clear();app.skipCheckAge=UINT64_MAX;
+        app.skipRevision=0;app.skipSummaryRevision=-1;invalidatePanel();app.skipSummaryCaption.clear();app.skipDetailCaption.clear();app.skipCheckAge=UINT64_MAX;
         app.window=CreateWindowExW(0,L"STATIC",L"Selection review",WS_OVERLAPPED,0,0,920,720,nullptr,nullptr,nullptr,nullptr);
         require(app.window!=nullptr,"Hidden parent creation.");
         auto child=[&](const wchar_t* cls,DWORD style) {
@@ -211,7 +211,7 @@ struct HiddenFixture {
             for(int i=0;i<count;++i)add(handle,std::to_wstring(i)); choose(handle,0); return handle;
         };
         app.mode=combo(6); app.interval=combo(6); app.videoSize=combo(2); app.encodingQuality=combo(4); app.encodingMode=combo(static_cast<int>(std::size(EncodingModeLabels)));app.stopAfter=combo(6);
-        app.splitEvery=combo(5);app.segmentLabel=child(L"STATIC",0);app.hasCustomSegment=false;app.committedSegment=0;app.customSegmentSeconds=900;app.advancedSegmentSeconds=-1;
+        app.splitEvery=combo(5);app.segmentLabel=child(L"STATIC",0);app.hasCustomSegment=false;app.committedSegment=0;app.customSegmentSeconds=900;
         app.lowDisk=child(L"BUTTON",BS_AUTOCHECKBOX);SendMessageW(app.lowDisk,BM_SETCHECK,BST_CHECKED,0);
         app.recoveryMode=child(L"BUTTON",BS_AUTOCHECKBOX);
         app.captureCursor=child(L"BUTTON",BS_AUTOCHECKBOX);SendMessageW(app.captureCursor,BM_SETCHECK,BST_CHECKED,0);

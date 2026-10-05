@@ -332,15 +332,16 @@ void Engine::run() {
             return true;
         };
         auto currentStatus = [&]() { std::lock_guard<std::mutex> lock(mutex_); return statusItem_; };
-        // Each saved part gets a small text log of when each status appeared,
-        // in saved-video time, ready to paste as video chapters. Best effort:
-        // it never changes the recording or its result.
+        // When chosen, each saved part gets a small text log of when each status
+        // appeared, in saved-video time, ready to paste as video chapters. Best
+        // effort: it never changes the recording or its result.
         struct StatusLogEntry { uint64_t frame = 0; StatusView view; };
         std::vector<StatusLogEntry> statusLog;
         std::wstring statusLogBase;
         uint64_t loggedSequence = 0, loggedPhase = 0;
         bool loggedVisible = false;
         auto logStatus = [&](uint64_t partFrame) noexcept {
+            if (statusLogBase.empty()) return;
             StatusView shown;
             const bool visible = statusFeed.current(shown);
             if (visible == loggedVisible && (!visible || (shown.sequence == loggedSequence && shown.phase == loggedPhase))) return;
@@ -1715,7 +1716,7 @@ void Engine::run() {
                                 closeRecording(openFailure(0)); admit = false; break;
                             }
                             writing = segmentWriting = true;
-                            statusLogBase = ioBase; statusLog.clear(); loggedVisible = false;
+                            statusLogBase = cfg.saveStatusLog ? ioBase : std::wstring(); statusLog.clear(); loggedVisible = false;
                             bool opened = true;
                             for (size_t i = 1; i < plan.count; ++i) {
                                 if (sessionStarted) advanceElapsed(Clock::now());

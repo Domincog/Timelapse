@@ -567,8 +567,8 @@ void failuresAndUnchangedTicks(){
     std::cout<<"PASS snapshot/dialog failures preserve report; 100 unchanged ticks add no text, enumeration, modal or allocations beyond Status copies\n";
 }
 void cursorKeyboard(){
-    Fixture fixture;showOffscreen(fixture);fixture.command(AdvancedToggle);
-    require(IsWindowEnabled(app.captureCursor)&&ownVisible(app.captureCursor)&&SendMessageW(app.captureCursor,BM_GETCHECK,0,0)==BST_CHECKED,"Cursor checkbox did not start visible, editable and checked in Advanced.");
+    Fixture fixture;showOffscreen(fixture);fixture.command(TabRecording);
+    require(IsWindowEnabled(app.captureCursor)&&ownVisible(app.captureCursor)&&SendMessageW(app.captureCursor,BM_GETCHECK,0,0)==BST_CHECKED,"Cursor checkbox did not start visible, editable and checked on the Recording page.");
     const int configured=detailsProbe::configures,folders=detailsProbe::folderCalls,dialogs=detailsProbe::dialogs;
     nativeMnemonic(app.interval,L'k');
     require(!app.settings.captureCursor&&!detailsProbe::configured.captureCursor&&detailsProbe::configures==configured+1&&GetFocus()==app.captureCursor,"Native Alt+K did not toggle only the desktop cursor option.");
@@ -600,14 +600,14 @@ void distinctMainMnemonics(){
         closeDetails(window);
     };
     for(State state:{State::Idle,State::Recording,State::Paused})for(bool expanded:{false,true}){
-        if(app.advancedExpanded!=expanded)fixture.command(AdvancedToggle);
+        if(app.panelTab!=(expanded?RecordingTab:CaptureTab))fixture.command(expanded?TabRecording:TabCapture);
         Status report;report.state=state;report.message=L"Saved synthetic part: owned-camera.mp4";report.savedPath=L"owned-camera.mp4";report.savedPaths={report.savedPath};fixture.publish(report);
-        require(ownVisible(app.skipConfigure)==expanded,"Advanced visibility state is inconsistent.");expectReadOnly=state!=State::Idle;const auto settings=app.settings;const int configurations=detailsProbe::configures;
-        std::vector<HWND> starts{app.openFolder,app.advanced,app.statusDetails};if(expanded)starts.push_back(app.skipConfigure);if(state==State::Idle)starts.push_back(app.folder);
+        require(ownVisible(app.skipConfigure)==expanded,"Settings page visibility is inconsistent.");expectReadOnly=state!=State::Idle;const auto settings=app.settings;const int configurations=detailsProbe::configures;
+        std::vector<HWND> starts{app.tabs[app.panelTab],app.statusDetails};if(expanded)starts.push_back(app.skipConfigure);else starts.push_back(app.openFolder);if(state==State::Idle && !expanded)starts.push_back(app.folder);
         for(HWND start:starts){
             const int folders=detailsProbe::folderCalls,compressed=compressionDialogs,shells=detailsProbe::shellCalls,details=detailDialogs;
             nativeMnemonic(start,L'h');require(detailsProbe::folderCalls==folders+(state==State::Idle?1:0)&&compressionDialogs==compressed&&detailDialogs==details,"Alt+H failed to route only to the enabled Change action.");
-            // IsDialogMessage also activates unique mnemonics of collapsed advanced buttons.
+            // IsDialogMessage also activates unique mnemonics of buttons on hidden pages.
             nativeMnemonic(start,L'c');require(compressionDialogs==compressed+1&&detailsProbe::folderCalls==folders+(state==State::Idle?1:0)&&detailDialogs==details,"Alt+C changed folder or failed to invoke compression.");
             nativeMnemonic(start,L'o');waitFileWorker();fixture.tick();
             require(detailsProbe::shellCalls==shells+1 && !detailsProbe::fileProbeError && !app.openFolderTask,"Alt+O no longer completes the configured folder action asynchronously.");
@@ -616,17 +616,17 @@ void distinctMainMnemonics(){
         require(detailsProbe::configures==configurations&&app.settings.folder==settings.folder&&app.settings.intervalMs==settings.intervalMs&&skipValues(app.settings.timeSkip)==skipValues(settings.timeSkip),"Canceled keyboard inspection changed accepted settings/configuration.");
     }
     require(detailsProbe::records==0&&detailsProbe::finishes==0&&detailsProbe::pauses==0&&detailsProbe::notices==0&&!app.customDialog,"Main shortcuts dispatched recording, notices or left a modal owner.");
-    std::cout<<"PASS distinct native Alt+H/Alt+C plus preserved Alt+O/Alt+I from multiple controls, collapsed/expanded and idle/recording/paused locks\n";
+    std::cout<<"PASS distinct native Alt+H/Alt+C plus preserved Alt+O/Alt+I from multiple controls, Capture/Recording pages and idle/recording/paused locks\n";
 }
 void delayKeyboard(){Fixture fixture;showOffscreen(fixture);
-    if(!app.advancedExpanded)fixture.command(AdvancedToggle);
-    nativeMnemonic(app.openFolder,L'x');
+    if(app.panelTab!=RecordingTab)fixture.command(TabRecording);
+    nativeMnemonic(app.tabs[RecordingTab],L'a');
     require(GetFocus()==app.startDelay && IsWindowEnabled(app.startDelay) && ownVisible(app.startDelay),
-        "Native Alt+X failed to focus the expanded editable start-delay selector");
+        "Native Alt+A failed to focus the visible editable start-delay selector");
     const auto selected=choice(app.startDelay);const int configs=detailsProbe::configures;
     for(bool expanded:{false,true})for(State state:{State::Waiting,State::Starting}){
-        if(app.advancedExpanded!=expanded)fixture.command(AdvancedToggle);
-        for(HWND start:{app.openFolder,app.advanced,app.preview}){Status value;value.state=state;
+        if(app.panelTab!=(expanded?RecordingTab:CaptureTab))fixture.command(expanded?TabRecording:TabCapture);
+        for(HWND start:{app.tabs[app.panelTab],app.preview}){Status value;value.state=state;
             value.startDeadlineTick=state==State::Waiting?GetTickCount64()+5000:0;fixture.publish(value);
             require(!IsWindowEnabled(app.stopAfter) && !IsWindowEnabled(app.startDelay) && IsWindowEnabled(app.finish) &&
                 textOf(app.finish)==L"Cancel s&tart","Waiting/Preparing keyboard preconditions were not locked");
@@ -641,10 +641,10 @@ void delayKeyboard(){Fixture fixture;showOffscreen(fixture);
                 "Native Alt+T failed to cancel start or routed to the disabled Stop-after setting");
         }
     }
-    fixture.publish(Status{});nativeMnemonic(app.openFolder,L't');
+    fixture.publish(Status{});nativeMnemonic(app.tabs[app.panelTab],L't');
     require(GetFocus()==app.stopAfter && IsWindowEnabled(app.stopAfter) && detailsProbe::configures==configs,
         "Returning idle failed to restore the native Stop-after mnemonic");
-    std::cout<<"PASS actual Alt+X delay focus and Alt+T Cancel across Waiting/Preparing, collapsed/expanded and multiple starting controls\n";
+    std::cout<<"PASS actual Alt+A delay focus and Alt+T Cancel across Waiting/Preparing, Capture/Recording pages and multiple starting controls\n";
 }
 void clickFiles(HWND window){const HWND button=GetDlgItem(window,StatusDetailsFiles);require(button&&IsWindowEnabled(button),"Expected Show files action is unavailable.");SendMessageW(button,BM_CLICK,0,0);checkCallback();}
 void completeFiles(HWND window){waitFileWorker();SendMessageW(window,WM_TIMER,StatusDetailsFilesTimer,0);checkCallback();require(IsWindowEnabled(GetDlgItem(window,StatusDetailsFiles))&&!shellOperationBusy,"Completed task retained busy action/global slot.");}

@@ -10,9 +10,7 @@ std::function<void(HWND,DLGPROC,LPARAM)> statusScript;
 struct ModalOutcome {HWND window{};INT_PTR value=0;};
 std::vector<ModalOutcome> modalOutcomes;
 int statusDialogCalls=0,flashes=0,beeps=0;
-int statusTextComboMessages=0,statusTextLimitMessages=0,statusTextSelectionMessages=0,statusRecentMenus=0;
-UINT statusRecentSelection=0;
-std::vector<std::wstring> statusRecentLabels;
+int statusTextComboMessages=0,statusTextLimitMessages=0,statusTextSelectionMessages=0,statusMenus=0;
 LRESULT WINAPI statusSend(HWND window,UINT message,WPARAM wp,LPARAM lp){
     wchar_t title[32]{};GetWindowTextW(GetParent(window),title,32);
     if(GetDlgCtrlID(window)==5601 && std::wcscmp(title,L"Status")==0){
@@ -22,11 +20,8 @@ LRESULT WINAPI statusSend(HWND window,UINT message,WPARAM wp,LPARAM lp){
     }
     return SendMessageW(window,message,wp,lp);
 }
-BOOL WINAPI statusRecentMenu(HMENU menu,UINT flags,int,int,int,HWND window,const RECT*){
-    ++statusRecentMenus;statusRecentLabels.clear();
-    for(int i=0;i<GetMenuItemCount(menu);++i){wchar_t label[256]{};GetMenuStringW(menu,static_cast<UINT>(i),label,256,MF_BYPOSITION);statusRecentLabels.emplace_back(label);}
-    return (flags&TPM_RETURNCMD) && window && !IsWindowVisible(window)?static_cast<BOOL>(statusRecentSelection):0;
-}
+// The Status window has no popup menus; count any attempt to open one.
+BOOL WINAPI statusMenu(HMENU,UINT,int,int,int,HWND,const RECT*){++statusMenus;return 0;}
 bool statusDialogFailure=false;
 INT_PTR WINAPI statusOwnedDialog(HINSTANCE,LPCDLGTEMPLATEW,HWND,DLGPROC,LPARAM);
 BOOL WINAPI statusOwnedEndDialog(HWND window,INT_PTR value){for(auto& modal:modalOutcomes)if(modal.window==window)modal.value=value;return TRUE;}
@@ -44,7 +39,7 @@ BOOL WINAPI statusUnregister(HWND,int id){for(auto i=registeredHotkeys.begin();i
 #define RegisterHotKey statusRegister
 #define UnregisterHotKey statusUnregister
 #define SendMessageW statusSend
-#define TrackPopupMenu statusRecentMenu
+#define TrackPopupMenu statusMenu
 #define main sourceFixtureMain
 #include "ui_source_tests.cpp"
 #undef main
@@ -75,15 +70,15 @@ struct StatusFixture : HiddenFixture {
         const auto make=[&](const wchar_t* type,int id){HWND child=CreateWindowExW(0,type,L"",WS_CHILD|(std::wcscmp(type,L"BUTTON")==0?BS_PUSHBUTTON:0),0,0,100,24,app.window,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),nullptr,nullptr);require(child!=nullptr,"Status control creation.");return child;};
         app.liveStatusSummary=make(L"STATIC",StatusSummaryLine);app.liveStatusSet=make(L"BUTTON",SetStatusButton);app.liveStatusClear=make(L"BUTTON",ClearStatusButton);
-        app.advanced=app.nightHint=app.nightDetail=nullptr;app.customDialog=nullptr;app.advancedExpanded=false;app.hiddenToTray=false;app.trayRegistered=false;
+        app.nightHint=app.nightDetail=nullptr;for(auto& tab:app.tabs)tab=nullptr;app.customDialog=nullptr;app.panelTab=CaptureTab;app.hiddenToTray=false;app.trayRegistered=false;
         app.hasCustomInterval=app.hasCustomSize=app.hasCustomLimit=false;choose(app.interval,2);choose(app.videoSize,0);choose(app.stopAfter,0);
         seed(false);
         app.liveStatus={};app.liveStatusSequence=app.statusNoticeSequence=app.statusNoticePhase=0;app.statusNoticeIcon=StatusIcon::None;
-        app.liveStatusCaption={};app.recentStatuses.clear();app.settings.statusFeed={};
+        app.liveStatusCaption={};app.settings.statusFeed={};app.settings.saveStatusLog=false;
         app.statusDraftKind=0;app.statusDraftTimerMs=25*60000;app.statusDraftBreakMs=5*60000;app.statusDraftRepeat=false;
         app.statusHotkey=0;app.statusHotkeyId=0;
         statusScript={};statusDialogCalls=flashes=beeps=0;statusDialogFailure=false;lapse::statusCalls=0;lapse::engineStatus={};
-        statusTextComboMessages=statusTextLimitMessages=statusTextSelectionMessages=statusRecentMenus=0;statusRecentSelection=0;statusRecentLabels.clear();
+        statusTextComboMessages=statusTextLimitMessages=statusTextSelectionMessages=statusMenus=0;
         configure();updateControls();
     }
     ~StatusFixture(){unregisterRecordingHotkeys();app.pauseHotkey=app.stopHotkey=app.statusHotkey=0;app.liveStatusSummary=app.liveStatusSet=app.liveStatusClear=nullptr;}
@@ -105,21 +100,21 @@ void noteAndStopwatch(){
     windowProc(app.window,WM_COMMAND,MAKEWPARAM(SetStatusButton,BN_CLICKED),reinterpret_cast<LPARAM>(app.liveStatusSet));
     require(app.liveStatus.kind==StatusKind::Note && std::wstring(app.liveStatus.text.data())==L"First task done!!" && lapse::statusCalls==1 &&
         lapse::engineStatus.sequence==app.liveStatus.sequence && lapse::engineStatus.startTick==app.liveStatus.startTick,"Note did not reach the engine trimmed and once.");
-    require(caption(app.liveStatusSummary)==L"First task done!!" && IsWindowEnabled(app.liveStatusClear) && app.recentStatuses==std::vector<std::wstring>{L"First task done!!"},"Note summary, Clear or recents wrong.");
+    require(caption(app.liveStatusSummary)==L"First task done!!" && IsWindowEnabled(app.liveStatusClear),"Note summary or Clear wrong.");
     const auto firstSequence=app.liveStatus.sequence;
     statusScript=[&](HWND window,DLGPROC,LPARAM parameter){auto& draft=draftOf(parameter);
-        require(caption(draft.text)==L"First task done!!" && draft.recentTexts==std::vector<std::wstring>{L"First task done!!"} && visible(draft.recent) && IsWindowEnabled(draft.clear),"Dialog did not reopen with the current status and recents.");
+        require(caption(draft.text)==L"First task done!!" && IsWindowEnabled(draft.clear) && GetDlgItem(window,5611)==draft.saveLogBox,"Dialog did not reopen with the current status.");
         select(window,draft.kind,StatusKindBox,1);require(!visible(draft.minutes),"Stopwatch showed timer fields.");
         type(window,draft.text,StatusTextBox,L"Shower");submit(window);
     };
     windowProc(app.window,WM_COMMAND,MAKEWPARAM(TraySetStatus,0),0);
     require(app.liveStatus.kind==StatusKind::Stopwatch && app.liveStatus.sequence==firstSequence+1 && lapse::statusCalls==2 && app.statusDraftKind==1,"Tray stopwatch failed.");
-    require(caption(app.liveStatusSummary).rfind(L"Shower · 0:0",0)==0 && app.recentStatuses.front()==L"Shower" && app.recentStatuses.size()==2,"Stopwatch summary or recents wrong.");
+    require(caption(app.liveStatusSummary).rfind(L"Shower · 0:0",0)==0,"Stopwatch summary wrong.");
     // Re-setting the same text is a new status (the stopwatch restarts).
     statusScript=[&](HWND window,DLGPROC,LPARAM){submit(window);};
     windowProc(app.window,WM_COMMAND,MAKEWPARAM(SetStatusButton,BN_CLICKED),reinterpret_cast<LPARAM>(app.liveStatusSet));
-    require(app.liveStatus.sequence==firstSequence+2 && app.recentStatuses.size()==2,"Same text was not a new status or duplicated recents.");
-    std::cout<<"PASS note and stopwatch from the panel and tray, trimmed text, engine handoff, summary, recents and restart\n";
+    require(app.liveStatus.sequence==firstSequence+2,"Same text was not a new status.");
+    std::cout<<"PASS note and stopwatch from the panel and tray, trimmed text, engine handoff, summary and restart\n";
 }
 void timerAndValidation(){
     StatusFixture owned;
@@ -158,10 +153,9 @@ LRESULT CALLBACK observeStatusText(HWND window,UINT message,WPARAM wp,LPARAM lp,
     return result;
 }
 struct TextObservationGuard {HWND window{};~TextObservationGuard(){if(IsWindow(window))RemoveWindowSubclass(window,observeStatusText,81);}};
-void plainTextAndHistory(){
+void plainTextAndList(){
     StatusFixture owned;
     app.liveStatus.kind=StatusKind::Note;app.liveStatus.sequence=7;setStatusText(app.liveStatus,L"Current status");
-    app.recentStatuses={L"Work & plans",L"Shower"};
     statusScript=[&](HWND window,DLGPROC,LPARAM parameter){auto& draft=draftOf(parameter);
         wchar_t typeName[32]{};require(GetClassNameW(draft.text,typeName,32)>0 && _wcsicmp(typeName,L"EDIT")==0,"Status text is not a native EDIT control.");
         require(!(GetWindowLongPtrW(draft.text,GWL_STYLE)&ES_MULTILINE) && (GetWindowLongPtrW(draft.text,GWL_STYLE)&ES_AUTOHSCROLL) &&
@@ -169,8 +163,7 @@ void plainTextAndHistory(){
         DWORD first=99,last=99;SendMessageW(draft.text,EM_GETSEL,reinterpret_cast<WPARAM>(&first),reinterpret_cast<LPARAM>(&last));
         require(GetFocus()==draft.text && first==0 && last==std::wcslen(L"Current status") && statusTextSelectionMessages>0,
             "Reopening did not focus and select the complete status text.");
-        require(GetNextDlgTabItem(window,draft.text,FALSE)==draft.recent && GetNextDlgTabItem(window,draft.recent,FALSE)==draft.kind,
-            "Recent history interrupted the text/Show tab order.");
+        require(GetNextDlgTabItem(window,draft.text,FALSE)==draft.kind,"Something interrupted the text/Show tab order.");
         TextNotifications seen{draft.text};require(SetWindowSubclass(window,observeStatusText,81,reinterpret_cast<DWORD_PTR>(&seen))!=FALSE,"Cannot observe owned native edit notifications.");
         TextObservationGuard observation{window};
         const auto before=draft.illustration.pixels;
@@ -178,19 +171,12 @@ void plainTextAndHistory(){
         require(fullText(draft.text)==L"New note" && seen.changes>=8 && before!=draft.illustration.pixels && !outcome(),
             "Native typing did not replace selection and update the live preview through EN_CHANGE.");
         SendMessageW(draft.text,WM_KEYDOWN,VK_DOWN,1);
-        require(fullText(draft.text)==L"New note" && statusRecentMenus==0,"An editor arrow key opened or selected recent history.");
-        statusRecentSelection=0;statusProc(window,WM_COMMAND,MAKEWPARAM(StatusRecentAction,BN_CLICKED),reinterpret_cast<LPARAM>(draft.recent));
-        require(fullText(draft.text)==L"New note" && GetFocus()==draft.text,"Cancelling history changed the draft or lost text focus.");
-        statusRecentSelection=1;statusProc(window,WM_COMMAND,MAKEWPARAM(StatusRecentAction,BN_CLICKED),reinterpret_cast<LPARAM>(draft.recent));
-        require(fullText(draft.text)==L"Work & plans" && statusRecentLabels==std::vector<std::wstring>{L"Work && plans",L"Shower"} &&
-            app.liveStatus.sequence==7 && !lapse::statusCalls && !outcome(),"Separate recent history changed live status or interpreted literal ampersands.");
-        SendMessageW(draft.text,EM_GETSEL,reinterpret_cast<WPARAM>(&first),reinterpret_cast<LPARAM>(&last));
-        require(GetFocus()==draft.text && first==0 && last==std::wcslen(L"Work & plans"),"History did not return a selected editable draft.");
+        require(fullText(draft.text)==L"New note" && statusMenus==0,"An editor arrow key opened a menu or changed the text.");
         for(int dpi:{96,192,288}){
             RECT proposed{0,0,360,250};statusProc(window,WM_DPICHANGED,MAKELONG(dpi,dpi),reinterpret_cast<LPARAM>(&proposed));
-            RECT text{},recent{},kind{};GetWindowRect(draft.text,&text);GetWindowRect(draft.recent,&recent);GetWindowRect(draft.kind,&kind);
-            require(text.bottom-text.top==draft.scale(28) && text.bottom<kind.top && text.right<recent.left && text.top==recent.top,
-                "Plain status editor overlaps its history or Show row at supported DPI.");
+            RECT text{},kind{},style{},list{},preview{};GetWindowRect(draft.text,&text);GetWindowRect(draft.kind,&kind);GetWindowRect(draft.style,&style);GetWindowRect(draft.saveLogBox,&list);GetWindowRect(draft.preview,&preview);
+            require(text.bottom-text.top==draft.scale(28) && text.bottom<kind.top && text.left==kind.left && text.right>kind.right && style.bottom<list.top && list.bottom<preview.top,
+                "Status editor, Show row or status list option overlap at supported DPI.");
             draft.scrollY=100000;statusLayout(window,draft);SetFocus(draft.kind);const int focusNotices=seen.focus;SetFocus(draft.text);
             RECT bounds{},client{};GetWindowRect(draft.text,&bounds);MapWindowPoints(nullptr,window,reinterpret_cast<POINT*>(&bounds),2);GetClientRect(window,&client);
             require(seen.focus>focusNotices && bounds.top>=0 && bounds.bottom<=client.bottom,"Native EN_SETFOCUS did not reveal the plain text field after scrolling.");
@@ -199,18 +185,46 @@ void plainTextAndHistory(){
         RemoveWindowSubclass(window,observeStatusText,81);
         statusProc(window,WM_COMMAND,IDCANCEL,0);
     };
-    editStatus();require(app.liveStatus.sequence==7 && !lapse::statusCalls && app.recentStatuses==std::vector<std::wstring>{L"Work & plans",L"Shower"},"Cancel published text/history draft changes.");
-    app.liveStatus={};app.recentStatuses.clear();
+    editStatus();require(app.liveStatus.sequence==7 && !lapse::statusCalls,"Cancel published text draft changes.");
+    app.liveStatus={};
     statusScript=[&](HWND window,DLGPROC,LPARAM parameter){auto& draft=draftOf(parameter);
-        require(!visible(draft.recent) && GetNextDlgTabItem(window,draft.text,FALSE)==draft.kind,"An empty history left a blank action in the text row or Tab order.");
         const std::wstring pasted(80,L'x');SendMessageW(draft.text,EM_REPLACESEL,TRUE,reinterpret_cast<LPARAM>(pasted.c_str()));
         require(GetWindowTextLengthW(draft.text)==StatusMaxTextLength,"Native plain-text paste exceeded the 60-character limit.");
         MSG enter{};enter.hwnd=draft.text;enter.message=WM_KEYDOWN;enter.wParam=VK_RETURN;
         require(IsDialogMessageW(window,&enter) && outcome()==IDOK,"Enter in the single-line editor did not submit the status.");
     };
-    editStatus();require(app.liveStatus.kind==StatusKind::Note && std::wcslen(app.liveStatus.text.data())==StatusMaxTextLength && lapse::statusCalls==1,
+    editStatus();require(app.liveStatus.kind==StatusKind::Note && std::wcslen(app.liveStatus.text.data())==StatusMaxTextLength && lapse::statusCalls==1 && statusMenus==0,
         "Plain-text Enter submission did not reach the engine exactly once.");
-    std::cout<<"PASS native EDIT class, direct typing/EN_CHANGE, focus/select-all, text limit, compact DPI geometry and separate cancellable recent history\n";
+    std::cout<<"PASS native EDIT class, direct typing/EN_CHANGE, focus/select-all, text limit, compact DPI geometry and no status history\n";
+}
+void statusList(){
+    StatusFixture owned;const int configures=lapse::configurationCalls;
+    require(!app.settings.saveStatusLog && !lapse::configured.saveStatusLog,"The status list was on by default.");
+    // The option alone can be changed without setting a status.
+    statusScript=[&](HWND window,DLGPROC,LPARAM parameter){auto& draft=draftOf(parameter);
+        require(IsWindowEnabled(draft.saveLogBox) && SendMessageW(draft.saveLogBox,BM_GETCHECK,0,0)==BST_UNCHECKED,"Idle status list option was locked or checked.");
+        SendMessageW(draft.saveLogBox,BM_SETCHECK,BST_CHECKED,0);statusProc(window,WM_COMMAND,MAKEWPARAM(StatusSaveLog,BN_CLICKED),reinterpret_cast<LPARAM>(draft.saveLogBox));
+        submit(window);require(outcome()==IDOK,"Choosing only the status list was rejected.");
+    };
+    editStatus();
+    require(app.settings.saveStatusLog && lapse::configured.saveStatusLog && lapse::configurationCalls==configures+1 && app.liveStatus.kind==StatusKind::None && !lapse::statusCalls,
+        "The status list option did not reach the engine once or changed the status.");
+    // Cancel keeps it; Clear status also applies the option.
+    statusScript=[&](HWND window,DLGPROC,LPARAM parameter){auto& draft=draftOf(parameter);
+        require(SendMessageW(draft.saveLogBox,BM_GETCHECK,0,0)==BST_CHECKED,"Reopening lost the status list choice.");
+        SendMessageW(draft.saveLogBox,BM_SETCHECK,BST_UNCHECKED,0);statusProc(window,WM_COMMAND,IDCANCEL,0);};
+    editStatus();require(app.settings.saveStatusLog,"Cancel changed the status list option.");
+    statusScript=[&](HWND window,DLGPROC,LPARAM parameter){auto& draft=draftOf(parameter);
+        SendMessageW(draft.saveLogBox,BM_SETCHECK,BST_UNCHECKED,0);statusProc(window,WM_COMMAND,MAKEWPARAM(StatusClearAction,BN_CLICKED),reinterpret_cast<LPARAM>(draft.clear));};
+    editStatus();require(!app.settings.saveStatusLog && !lapse::configured.saveStatusLog,"Clear status did not apply the status list option.");
+    // Fixed while recording, like the appearance.
+    app.status.state=State::Recording;
+    statusScript=[&](HWND window,DLGPROC,LPARAM parameter){auto& draft=draftOf(parameter);
+        require(!IsWindowEnabled(draft.saveLogBox),"The status list option was editable while recording.");
+        SendMessageW(draft.saveLogBox,BM_SETCHECK,BST_CHECKED,0);type(window,draft.text,StatusTextBox,L"Live");submit(window);};
+    editStatus();require(!app.settings.saveStatusLog && app.liveStatus.kind==StatusKind::Note,"Recording changed the frozen status list option or blocked the status.");
+    app.status={};
+    std::cout<<"PASS status list off by default, opt-in alone or with Clear, kept on Cancel and fixed while recording\n";
 }
 void clearing(){
     StatusFixture owned;
@@ -282,7 +296,7 @@ void lifecycle(){
     require(startupMessage.find(L"could not be opened")!=std::wstring::npos && app.liveStatus.kind==StatusKind::None,"Dialog creation failure was silent or changed the status.");
     for(int dpi:{96,192,288}){statusScript=[&](HWND window,DLGPROC,LPARAM parameter){auto& draft=draftOf(parameter);select(window,draft.kind,StatusKindBox,2);check(window,draft.repeat,true);
         RECT proposed{0,0,360,250};statusProc(window,WM_DPICHANGED,MAKELONG(dpi,dpi),reinterpret_cast<LPARAM>(&proposed));
-        for(HWND child:{draft.text,draft.kind,draft.minutes,draft.repeat,draft.breakMinutes,draft.corner,draft.size,draft.style,draft.clear,draft.okay,draft.cancel}){
+        for(HWND child:{draft.text,draft.kind,draft.minutes,draft.repeat,draft.breakMinutes,draft.corner,draft.size,draft.style,draft.saveLogBox,draft.clear,draft.okay,draft.cancel}){
             if(!IsWindowEnabled(child))continue;
             SendMessageW(window,WM_NEXTDLGCTL,reinterpret_cast<WPARAM>(child),TRUE);RECT rect{},client{};GetWindowRect(child,&rect);MapWindowPoints(nullptr,window,reinterpret_cast<POINT*>(&rect),2);GetClientRect(window,&client);
             require(rect.right>0 && rect.left<client.right && rect.bottom>0 && rect.top<client.bottom && !outcome(),"Focus did not reveal a status control at a constrained DPI.");
@@ -293,5 +307,5 @@ void lifecycle(){
     std::cout<<"PASS open failure, constrained-DPI focus reveal, Escape and owned-modal Exit\n";
 }
 }
-int main(){try{noteAndStopwatch();timerAndValidation();plainTextAndHistory();clearing();appearance();shortcutAndNotices();lifecycle();std::cout<<"All seven status UI groups passed with owned synthetic fixtures.\n";return 0;}
+int main(){try{noteAndStopwatch();timerAndValidation();plainTextAndList();statusList();clearing();appearance();shortcutAndNotices();lifecycle();std::cout<<"All eight status UI groups passed with owned synthetic fixtures.\n";return 0;}
     catch(const std::exception& error){std::cerr<<"STATUS UI FAILURE: "<<error.what()<<'\n';return 1;}}

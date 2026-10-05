@@ -142,7 +142,7 @@ void untouched(const std::filesystem::path& root) {
     std::cout << "PASS no status prepares nothing and leaves recordings unchanged.\n";
 }
 void liveChanges(const std::filesystem::path& root) {
-    reset(); auto settings = config(root / L"live"); settings.statusFeed.corner = StatusCorner::BottomRight;
+    reset(); auto settings = config(root / L"live"); settings.statusFeed.corner = StatusCorner::BottomRight; settings.saveStatusLog = true;
     Engine engine; engine.configure(settings); engine.record();
     await(engine, [](const Status& status) { return status.frames >= 2; });
     const size_t plain = writes();
@@ -181,7 +181,9 @@ void liveChanges(const std::filesystem::path& root) {
     std::cout << "PASS live status changes reach the next frames, strike the old line and keep frozen appearance.\n";
 }
 void bothFiles(const std::filesystem::path& root) {
-    reset(); Engine engine; engine.configure(config(root / L"pair", true));
+    reset(); const auto settings = config(root / L"pair", true);
+    require(!settings.saveStatusLog, "The status list must be off by default");
+    Engine engine; engine.configure(settings);
     engine.setStatus(item(3, StatusKind::Note, L"First task done!!"));
     engine.record();
     await(engine, [](const Status& status) { return status.frames >= 4; });
@@ -195,7 +197,9 @@ void bothFiles(const std::filesystem::path& root) {
     }
     require(shown >= 6, "Paired outputs did not show the status");
     for (const auto count : perFrame) require(count == 2, "Each admitted frame must stamp both paired files");
-    std::cout << "PASS a status set before Record appears in every output file.\n";
+    for (const auto& entry : std::filesystem::directory_iterator(settings.folder))
+        require(entry.path().filename().wstring().find(L"-status.txt") == std::wstring::npos, "A status list was saved although it was not chosen");
+    std::cout << "PASS a status set before Record appears in every output file; no status list unless chosen.\n";
 }
 void failure(const std::filesystem::path& root) {
     reset(); failApplyAt = 3; Engine engine; engine.configure(config(root / L"fault"));
@@ -221,7 +225,7 @@ void preview(const std::filesystem::path& root) {
     std::cout << "PASS idle preview shows a status at once without recording.\n";
 }
 void splitLogs(const std::filesystem::path& root) {
-    reset(); auto settings = config(root / L"split"); settings.segmentDurationSeconds = 1;
+    reset(); auto settings = config(root / L"split"); settings.segmentDurationSeconds = 1; settings.saveStatusLog = true;
     Engine engine; engine.configure(settings); engine.setStatus(item(6, StatusKind::Note, L"Planning"));
     engine.record();
     await(engine, [](const Status& status) { return status.completedSegments >= 2; }, 12000);

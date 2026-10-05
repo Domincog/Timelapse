@@ -68,7 +68,7 @@ INT_PTR WINAPI ownedDialog(HINSTANCE instance,LPCDLGTEMPLATEW resource,HWND owne
     return dialogOutcome;
 }
 void setupCustom(){
-    app.advanced=app.nightHint=app.nightDetail=nullptr;
+    app.nightHint=app.nightDetail=nullptr;for(auto& tab:app.tabs)tab=nullptr;
     app.hasCustomInterval=app.hasCustomSize=app.hasCustomLimit=false;
     app.hasCustomSegment=false;app.committedSegment=0;app.customSegmentSeconds=900;choose(app.splitEvery,0);
     app.hasCustomNightDuration=false;app.committedNightDuration=0;app.customNightDurationMs=3000;choose(app.nightDuration,0);

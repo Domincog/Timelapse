@@ -84,6 +84,12 @@ BOOL WINAPI fixtureWriteProfile(LPCWSTR section,LPCWSTR key,LPCWSTR value,LPCWST
     }
     SetLastError(error);return result;
 }
+// Reset asks first; the answer and the question count are owned here.
+int resetAnswer=IDNO,resetQuestions=0;
+int WINAPI fixtureMessageBox(HWND,LPCWSTR,LPCWSTR title,UINT){
+    if(std::wcscmp(title,L"Reset all settings")!=0)throw std::runtime_error("Unexpected message box.");
+    ++resetQuestions;return resetAnswer;
+}
 void WINAPI fixtureSaveDebug(LPCWSTR message){
     if(std::wcscmp(message,L"Timelapse could not save preferences.\n")!=0)throw std::runtime_error("Unexpected preference diagnostic.");
     ++saveDiagnostics;
@@ -99,6 +105,7 @@ BOOL WINAPI fixtureMoveFileEx(LPCWSTR source,LPCWSTR target,DWORD flags){
 #define MoveFileExW fixtureMoveFileEx
 #define WritePrivateProfileStringW fixtureWriteProfile
 #define OutputDebugStringW fixtureSaveDebug
+#define MessageBoxW fixtureMessageBox
 // The reject-entry sentinel intentionally makes the GUI entry unreachable.
 #pragma warning(push)
 #pragma warning(disable: 4702)
@@ -109,6 +116,7 @@ BOOL WINAPI fixtureMoveFileEx(LPCWSTR source,LPCWSTR target,DWORD flags){
 #undef MoveFileExW
 #undef WritePrivateProfileStringW
 #undef OutputDebugStringW
+#undef MessageBoxW
 
 namespace {
 void require(bool value,const char* message){if(!value)throw std::runtime_error(message);}
@@ -248,7 +256,7 @@ void newUnicodeFile(){
 }
 void existingUnicodeRewrite(){
     PreferencesFixture fixture;
-    const std::wstring initial=L"[Settings]\r\nFolder="+unicodeFolder+L"\r\nInterval=5\r\nQuality=1\r\nEncodingQuality=2\r\nAv1Preset=6\r\nEncodingRateControl=0\r\nAv1Crf=32\r\nEncodingBitrateKbps=4000\r\nEncodingMode=0\r\nRecordingLimit=0\r\nStopOnLowDiskSpace=1\r\nRecoveryMode=0\r\nShowDesktopCursor=1\r\nNightEnabled=0\r\nNightDurationMs=0\r\nNightTargetBrightness=96\r\nCaptureIntervalMs=5000\r\nVideoWidth=1280\r\nVideoHeight=720\r\nRecordingLimitSeconds=900\r\nSegmentDurationSeconds=0\r\nTimeSkipMode=0\r\nTimeSkipMultiplier=4\r\nTimeSkipQuietAfterMs=120000\r\nTimeSkipRampFrames=30\r\nTimeSkipRepeatSeconds=0\r\nTimeSkipRanges=\r\nTimeSkipQuietSensitivity=1\r\nTimeSkipUncertainAsAbsent=1\r\nWatermarkEnabled=0\r\nWatermarkShowTime=1\r\nWatermarkShowSpeed=1\r\nWatermarkTimeKind=0\r\nWatermarkX=10000\r\nWatermarkY=10000\r\nWatermarkTextSize=1\r\nStartDelaySeconds=0\r\nOutputFps=30\r\nPauseHotkey=0\r\nStopHotkey=0\r\nAlsoSaveDesktop=0\r\nAlsoSaveCamera=0\r\nStatusHotkey=0\r\nStatusCorner=0\r\nStatusTextSize=1\r\nStatusStyle=0\r\nStatusLastKind=0\r\nStatusTimerSeconds=1500\r\nStatusBreakSeconds=300\r\nStatusRepeat=0\r\nStatusRecent1=\r\nStatusRecent2=\r\nStatusRecent3=\r\nStatusRecent4=\r\nStatusRecent5=\r\nStatusRecent6=\r\nStatusRecent7=\r\nStatusRecent8=\r\n";
+    const std::wstring initial=L"[Settings]\r\nFolder="+unicodeFolder+L"\r\nInterval=5\r\nQuality=1\r\nEncodingQuality=2\r\nAv1Preset=6\r\nEncodingRateControl=0\r\nAv1Crf=32\r\nEncodingBitrateKbps=4000\r\nEncodingMode=0\r\nRecordingLimit=0\r\nStopOnLowDiskSpace=1\r\nRecoveryMode=0\r\nShowDesktopCursor=1\r\nNightEnabled=0\r\nNightDurationMs=0\r\nNightTargetBrightness=96\r\nCaptureIntervalMs=5000\r\nVideoWidth=1280\r\nVideoHeight=720\r\nRecordingLimitSeconds=900\r\nSegmentDurationSeconds=0\r\nTimeSkipMode=0\r\nTimeSkipMultiplier=4\r\nTimeSkipQuietAfterMs=120000\r\nTimeSkipRampFrames=30\r\nTimeSkipRepeatSeconds=0\r\nTimeSkipRanges=\r\nTimeSkipQuietSensitivity=1\r\nTimeSkipUncertainAsAbsent=1\r\nWatermarkEnabled=0\r\nWatermarkShowTime=1\r\nWatermarkShowSpeed=1\r\nWatermarkTimeKind=0\r\nWatermarkX=10000\r\nWatermarkY=10000\r\nWatermarkTextSize=1\r\nStartDelaySeconds=0\r\nOutputFps=30\r\nPauseHotkey=0\r\nStopHotkey=0\r\nAlsoSaveDesktop=0\r\nAlsoSaveCamera=0\r\nStatusHotkey=0\r\nStatusCorner=0\r\nStatusTextSize=1\r\nStatusStyle=0\r\nStatusLastKind=0\r\nStatusTimerSeconds=1500\r\nStatusBreakSeconds=300\r\nStatusRepeat=0\r\nStatusSaveLog=0\r\n";
     fixture.seed(utf16(initial));reload();expectOptions(unicodeFolder,5,1,2);
     const auto initialBytes=fixture.bytes();
     const std::wstring changed=L"C:\\Synthetic videos\\\u65e5\u672c\u8a9e-\U0001f3a5";
@@ -762,29 +770,65 @@ void checkpointBeforeRecording(){
 
 void statusPreferences(){
     PreferencesFixture fixture;fixture.seed(legacy);reload();
-    require(sameStatusFeedSettings(app.settings.statusFeed,StatusFeedSettings{}) && app.recentStatuses.empty() && !app.statusHotkey && app.statusDraftKind==0 &&
-        app.statusDraftTimerMs==25*60000 && app.statusDraftBreakMs==5*60000 && !app.statusDraftRepeat,"Old settings changed status defaults.");
+    require(sameStatusFeedSettings(app.settings.statusFeed,StatusFeedSettings{}) && !app.settings.saveStatusLog && !app.statusHotkey && app.statusDraftKind==0 &&
+        app.statusDraftTimerMs==25*60000 && app.statusDraftBreakMs==5*60000 && !app.statusDraftRepeat,"Old settings changed status defaults or turned on the status list.");
     const StatusFeedSettings look{StatusCorner::BottomRight,StatusTextSize::Large,StatusStyle::EdgeFade};
-    const std::vector<std::wstring> recent={L"Work on Essay",L"Caf\u00e9 \u2615 \u65e5\u672c\u8a9e",L"Shower"};
     const auto key=static_cast<uint16_t>(MAKEWORD('U',HOTKEYF_CONTROL|HOTKEYF_ALT));
-    app.settings.statusFeed=look;app.recentStatuses=recent;app.statusDraftKind=2;app.statusDraftTimerMs=90000;app.statusDraftBreakMs=450000;app.statusDraftRepeat=true;app.statusHotkey=key;
-    preferences(true);
-    app.settings.statusFeed={};app.recentStatuses.clear();app.statusDraftKind=0;app.statusDraftTimerMs=app.statusDraftBreakMs=0;app.statusDraftRepeat=false;app.statusHotkey=0;
-    reload();
-    require(sameStatusFeedSettings(look,app.settings.statusFeed) && app.recentStatuses==recent && app.statusDraftKind==2 && app.statusDraftTimerMs==90000 &&
-        app.statusDraftBreakMs==450000 && app.statusDraftRepeat && app.statusHotkey==key,"Status look, recents, last choices or shortcut lost the real roundtrip.");
-    // Each malformed key falls back alone; recents are folded, trimmed and deduplicated.
     const auto put=[&](const wchar_t* name,const wchar_t* value){require(WritePrivateProfileStringW(L"Settings",name,value,app.preferences.c_str())!=FALSE,"Cannot seed status key.");};
-    put(L"StatusCorner",L"9");put(L"StatusTextSize",L"1junk");put(L"StatusTimerSeconds",L"0");put(L"StatusLastKind",L"-1");
-    put(L"StatusRecent2",L"   spaced out   ");put(L"StatusRecent3",L"Work on Essay");put(L"StatusHotkey",std::to_wstring(MAKEWORD('U',HOTKEYF_ALT)).c_str());
+    // Recent statuses from older versions are no longer kept; saving removes them.
+    put(L"StatusRecent1",L"Work on Essay");put(L"StatusRecent8",L"Shower");
+    app.settings.statusFeed=look;app.settings.saveStatusLog=true;app.statusDraftKind=2;app.statusDraftTimerMs=90000;app.statusDraftBreakMs=450000;app.statusDraftRepeat=true;app.statusHotkey=key;
+    preferences(true);
+    for(const wchar_t* retired:{L"StatusRecent1",L"StatusRecent8"}){wchar_t value[32]{};
+        GetPrivateProfileStringW(L"Settings",retired,L"missing",value,32,app.preferences.c_str());require(std::wcscmp(value,L"missing")==0,"Saving kept a retired recent status.");}
+    app.settings.statusFeed={};app.settings.saveStatusLog=false;app.statusDraftKind=0;app.statusDraftTimerMs=app.statusDraftBreakMs=0;app.statusDraftRepeat=false;app.statusHotkey=0;
+    reload();
+    require(sameStatusFeedSettings(look,app.settings.statusFeed) && app.settings.saveStatusLog && app.statusDraftKind==2 && app.statusDraftTimerMs==90000 &&
+        app.statusDraftBreakMs==450000 && app.statusDraftRepeat && app.statusHotkey==key,"Status look, status list choice, last choices or shortcut lost the real roundtrip.");
+    // Each malformed key falls back alone.
+    put(L"StatusCorner",L"9");put(L"StatusTextSize",L"1junk");put(L"StatusTimerSeconds",L"0");put(L"StatusLastKind",L"-1");put(L"StatusSaveLog",L"2");
+    put(L"StatusHotkey",std::to_wstring(MAKEWORD('U',HOTKEYF_ALT)).c_str());
     reload();
     require(app.settings.statusFeed.corner==StatusCorner::TopLeft && app.settings.statusFeed.textSize==StatusTextSize::Medium && app.settings.statusFeed.style==StatusStyle::EdgeFade &&
-        app.statusDraftTimerMs==25*60000 && app.statusDraftKind==0 && app.statusDraftBreakMs==450000 && !app.statusHotkey,"Malformed status keys were coerced or reset their neighbours.");
-    require(app.recentStatuses==std::vector<std::wstring>{L"Work on Essay",L"spaced out"},"Recent statuses were not trimmed and deduplicated.");
-    unregisterRecordingHotkeys();app.statusHotkey=0;app.settings.statusFeed={};app.recentStatuses.clear();app.statusDraftKind=0;
+        app.statusDraftTimerMs==25*60000 && app.statusDraftKind==0 && app.statusDraftBreakMs==450000 && !app.statusHotkey && !app.settings.saveStatusLog,"Malformed status keys were coerced or reset their neighbours.");
+    unregisterRecordingHotkeys();app.statusHotkey=0;app.settings.statusFeed={};app.settings.saveStatusLog=false;app.statusDraftKind=0;
     app.statusDraftTimerMs=25*60000;app.statusDraftBreakMs=5*60000;app.statusDraftRepeat=false;
     expectUnknownContent(fixture);fixture.onlySettingsRemain();
-    std::cout<<"PASS status look, Unicode recents, last timer choices and shortcut roundtrip; malformed keys fall back individually\n";
+    std::cout<<"PASS status look, opt-in status list, last timer choices and shortcut roundtrip; retired recents removed; malformed keys fall back individually\n";
+}
+void resetToDefaults(){
+    PreferencesFixture fixture;fixture.seed(legacy);reload();
+    std::wstring defaultFolder,ignored;require(defaultPaths(defaultFolder,ignored),"Windows profile folders are unavailable.");
+    const auto customize=[&]{
+        app.settings.folder=L"C:\\Custom reset folder";choose(app.interval,5);choose(app.videoSize,1);choose(app.encodingQuality,0);choose(app.encodingMode,5);
+        choose(app.stopAfter,3);choose(app.startDelay,3);choose(app.splitEvery,2);choose(app.nightTarget,2);
+        SendMessageW(app.lowDisk,BM_SETCHECK,BST_UNCHECKED,0);SendMessageW(app.captureCursor,BM_SETCHECK,BST_UNCHECKED,0);SendMessageW(app.nightEnabled,BM_SETCHECK,BST_CHECKED,0);
+        app.settings.outputFps=60;app.settings.watermark.enabled=true;app.settings.timeSkip.mode=TimeSkipMode::Quiet;app.settings.encodingOptions.av1Preset=3;
+        app.settings.statusFeed={StatusCorner::BottomRight,StatusTextSize::Large,StatusStyle::EdgeFade};app.settings.saveStatusLog=true;app.statusDraftKind=2;
+        configure();preferences(true);
+    };
+    customize();const auto customized=fixture.bytes();
+    // Declining changes nothing in memory or on disk.
+    resetAnswer=IDNO;resetQuestions=0;app.startupComplete=true;resetSettings();
+    require(resetQuestions==1 && choice(app.interval)==5 && app.settings.folder==L"C:\\Custom reset folder" && app.settings.saveStatusLog && fixture.bytes()==customized,"Declined reset changed settings.");
+    // While recording, reset is unavailable and does not ask.
+    app.status.state=State::Recording;resetSettings();app.status={};
+    require(resetQuestions==1 && choice(app.interval)==5,"Reset ran or asked during a recording.");
+    resetAnswer=IDYES;resetSettings();
+    const EncodingOptions defaultOptions;
+    const auto expectDefaults=[&](const char* message){
+        require(choice(app.interval)==2 && choice(app.videoSize)==0 && choice(app.encodingQuality)==encodingQualityChoice(EncodingQuality::Balanced) && choice(app.encodingMode)==0 &&
+            choice(app.stopAfter)==0 && choice(app.startDelay)==0 && choice(app.splitEvery)==0 && choice(app.nightTarget)==1 && choice(app.mode)==0 &&
+            isChecked(app.lowDisk) && isChecked(app.captureCursor) && !isChecked(app.nightEnabled) && !isChecked(app.recoveryMode) &&
+            app.settings.outputFps==DefaultOutputFps && !app.settings.watermark.enabled && app.settings.timeSkip.mode==TimeSkipMode::Off &&
+            app.settings.encodingOptions.av1Preset==defaultOptions.av1Preset && app.settings.encodingOptions.rateControl==EncodingRateControl::Automatic &&
+            sameStatusFeedSettings(app.settings.statusFeed,StatusFeedSettings{}) && !app.settings.saveStatusLog && app.statusDraftKind==0 && app.settings.folder==defaultFolder,message);
+    };
+    expectDefaults("Reset left a setting changed.");
+    require(resetQuestions==2 && fixture.bytes()!=customized,"Confirmed reset did not ask once or did not save.");
+    choose(app.interval,5);app.settings.saveStatusLog=true;app.settings.outputFps=60;app.settings.folder=L"C:\\Another";reload();expectDefaults("Reset defaults were not saved.");
+    app.startupComplete=false;expectUnknownContent(fixture);fixture.onlySettingsRemain();
+    std::cout<<"PASS reset all settings asks first, is unavailable while recording, restores every default including the folder and saves them\n";
 }
 int main(){
     try{
@@ -792,8 +836,8 @@ int main(){
         HiddenControls controls;
         newUnicodeFile();existingUnicodeRewrite();playbackStagingRollback();migrateAnsi();encodingModes();recordingLimits();startDelayOptions();segmentOptions();diskSafety();companionOptions();recoveryOptions();cursorOptions();nightOptions();customOptions();readFailure();replacementFailure();
         preparationAllocationFailure();partialKeyWriteFailure();stagedExceptionCleanup();
-        preferencePathBoundary(248);preferencePathBoundary(278);timeCompressionPreferences();watermarkPreferences();statusPreferences();sizeCommandPreferences();checkpointBeforeRecording();
+        preferencePathBoundary(248);preferencePathBoundary(278);timeCompressionPreferences();watermarkPreferences();statusPreferences();sizeCommandPreferences();checkpointBeforeRecording();resetToDefaults();
         require(!IsWindowVisible(app.window),"Fixture became visible.");
-        std::cout<<"All 26 preference cases passed; only owned hidden controls/settings were used.\n";return 0;
+        std::cout<<"All 27 preference cases passed; only owned hidden controls/settings were used.\n";return 0;
     }catch(const std::exception& error){std::cerr<<"PREFERENCES TEST FAILURE: "<<error.what()<<'\n';return 1;}
 }

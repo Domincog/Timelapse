@@ -58,6 +58,9 @@ struct Settings {
     // Where and how the live status line is drawn. Frozen at Record; the
     // status itself changes at any time through Engine::setStatus.
     StatusFeedSettings statusFeed;
+    // Write a -status.txt list of status changes in saved-video time beside
+    // each video or part. Off unless chosen. Frozen at Record.
+    bool saveStatusLog = false;
     // Optional fragmented H.264 MP4; ordinary MP4 remains the default.
     bool recoveryMode = false;
     // Include the native cursor in desktop video and preview. Frozen with the

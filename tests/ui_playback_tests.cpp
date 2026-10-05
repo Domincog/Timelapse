@@ -54,14 +54,13 @@ struct PlaybackFixture {
     PlaybackFixture(){
         playbackProbe::registrations.clear();playbackProbe::attempts=playbackProbe::removals=0;playbackProbe::blockedKey=0;
         playbackProbe::dialogScript={};playbackProbe::dialogCalls=0;playbackProbe::failDialog=false;
-        app.pauseHotkey=app.stopHotkey=0;app.pauseHotkeyId=app.stopHotkeyId=0;app.hotkeyWarning.clear();app.recordedOutputFps=DefaultOutputFps;app.advancedOutputFps=-1;
-        app.advanced=CreateWindowExW(0,L"BUTTON",L"Advanced",WS_CHILD|BS_AUTOCHECKBOX,0,0,240,30,app.window,nullptr,nullptr,nullptr);
+        app.pauseHotkey=app.stopHotkey=0;app.pauseHotkeyId=app.stopHotkeyId=0;app.hotkeyWarning.clear();app.recordedOutputFps=DefaultOutputFps;
         app.watermarkConfigure=CreateWindowExW(0,L"BUTTON",L"Watermark",WS_CHILD,0,0,202,30,app.window,nullptr,nullptr,nullptr);
         app.watermarkSummary=CreateWindowExW(0,L"STATIC",L"Off",WS_CHILD,0,0,160,30,app.window,nullptr,nullptr,nullptr);
         app.playbackConfigure=CreateWindowExW(0,L"BUTTON",L"Playback && shortcuts...",WS_CHILD|WS_TABSTOP,0,0,202,30,app.window,nullptr,nullptr,nullptr);
-        fonts();app.advancedVisibility=-1;app.advancedExpanded=false;app.advancedCaption.clear();app.advancedTooltip.clear();updateAdvanced();
+        fonts();app.panelTab=CaptureTab;invalidatePanel();app.tabTooltips[OutputTab].clear();updatePanel();
     }
-    ~PlaybackFixture(){unregisterRecordingHotkeys();app.pauseHotkey=app.stopHotkey=0;app.advanced=app.watermarkConfigure=app.watermarkSummary=app.playbackConfigure=nullptr;app.customDialog=nullptr;}
+    ~PlaybackFixture(){unregisterRecordingHotkeys();app.pauseHotkey=app.stopHotkey=0;app.watermarkConfigure=app.watermarkSummary=app.playbackConfigure=nullptr;app.customDialog=nullptr;}
 };
 void acceptPlayback(HWND window){playbackProc(window,WM_COMMAND,IDOK,0);}
 void sendHotkey(int id,uint16_t binding){windowProc(app.window,WM_HOTKEY,id,MAKELPARAM(hotkeyRegistrationModifiers(binding)&~MOD_NOREPEAT,LOBYTE(binding)));}
@@ -130,9 +129,10 @@ void dialogStateAndGeometry(){
             RECT bounds{},client{};GetWindowRect(draft.cancel,&bounds);MapWindowPoints(nullptr,window,reinterpret_cast<POINT*>(&bounds),2);GetClientRect(window,&client);
             require(bounds.left>=0 && bounds.top>=0 && bounds.right<=client.right && bounds.bottom<=client.bottom,"Small viewport cannot reveal its Cancel button.");}
         playbackProc(window,WM_COMMAND,IDCANCEL,0);};editPlayback();
-    app.dpi=96;app.advancedExpanded=true;layout();RECT watermark{},summary{},playback{};GetWindowRect(app.watermarkConfigure,&watermark);GetWindowRect(app.watermarkSummary,&summary);GetWindowRect(app.playbackConfigure,&playback);
-    require(watermark.bottom<=summary.top && summary.bottom<playback.top && watermark.left==playback.left,"Panel playback entry overlaps the watermark controls or leaves the panel column.");
-    app.advancedExpanded=false;updateAdvanced();require(!(GetWindowLongPtrW(app.playbackConfigure,GWL_STYLE)&WS_VISIBLE),"Playback entry leaked into the collapsed main interface.");
+    app.dpi=96;app.panelTab=OutputTab;updatePanel();layout();RECT watermark{},summary{},playback{};GetWindowRect(app.watermarkConfigure,&watermark);GetWindowRect(app.watermarkSummary,&summary);GetWindowRect(app.playbackConfigure,&playback);
+    require(watermark.right<summary.left && summary.top==watermark.top && watermark.bottom<playback.top && watermark.left==playback.left && (GetWindowLongPtrW(app.playbackConfigure,GWL_STYLE)&WS_VISIBLE),
+        "Output page playback entry overlaps the watermark row, hides or leaves the panel column.");
+    app.panelTab=CaptureTab;updatePanel();require(!(GetWindowLongPtrW(app.playbackConfigure,GWL_STYLE)&WS_VISIBLE),"Playback entry leaked into the Capture page.");
     playbackProbe::failDialog=true;editPlayback();require(probe::lastDialog.find(L"could not be opened")!=std::wstring::npos && !app.customDialog,"Failed dialog lost recovery feedback or modal ownership.");
     std::cout<<"PASS active-settings lock, dialog DPI/scroll geometry, compact main row and creation failure recovery\n";
 }
@@ -184,7 +184,7 @@ void advancedEncoderDialog(){
     editEncoderSettings();require(app.settings.encodingOptions.av1Preset==8 && app.settings.encodingOptions.rateControl==EncodingRateControl::ConstantQuality &&
         app.settings.encodingOptions.av1Crf==40 && probe::configured.encodingOptions.av1Crf==40,"Advanced AV1 settings did not reach the engine.");
     choose(app.encodingMode,static_cast<int>(EncodingMode::Compatible));configure();updateControls();
-    require(!app.encodingValidation.empty() && !IsWindowEnabled(app.record) && app.advancedCaption.find(L"check encoding")!=std::wstring::npos && app.advancedTooltip.find(L"SVT-AV1 preset")==std::wstring::npos,
+    require(!app.encodingValidation.empty() && !IsWindowEnabled(app.record) && app.tabMarks[OutputTab]==2 && app.tabTooltips[OutputTab].find(app.encodingValidation)!=std::wstring::npos && app.tabTooltips[OutputTab].find(L"Preset ")==std::wstring::npos,
         "Switching encoders silently retained unsupported custom CRF or mislabeled its warning.");
     playbackProbe::dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<EncoderDraft*>(parameter);
         require(SendMessageW(draft.rate,CB_GETCOUNT,0,0)==2 && !(GetWindowLongPtrW(draft.preset,GWL_STYLE)&WS_VISIBLE),"H.264 exposed AV1-only controls.");
@@ -205,7 +205,7 @@ void advancedEncoderDialog(){
             require(bounds.left>=0 && bounds.top>=0 && bounds.right<=client.right && bounds.bottom<=client.bottom,"Small encoder viewport cannot reveal Cancel.");}
         encoderSettingsProc(window,WM_COMMAND,EncoderDefaults,0);require(choice(draft.preset)==6 && encoderDraftRate(draft)==EncodingRateControl::Automatic,"Use defaults did not restore preset 6 and automatic quality.");
         encoderSettingsProc(window,WM_COMMAND,IDOK,0);};editEncoderSettings();require(app.settings.encodingOptions.av1Preset==6 && app.settings.encodingOptions.rateControl==EncodingRateControl::Automatic,"Encoder defaults did not commit.");
-    app.dpi=96;app.advancedExpanded=false;app.advancedVisibility=-1;updateAdvanced();require(!(GetWindowLongPtrW(app.encoderConfigure,GWL_STYLE)&WS_VISIBLE),"Encoder entry leaked into collapsed Advanced.");
+    app.dpi=96;app.panelTab=CaptureTab;invalidatePanel();updatePanel();require(!(GetWindowLongPtrW(app.encoderConfigure,GWL_STYLE)&WS_VISIBLE),"Encoder entry leaked outside the Output page.");
     app.encoderConfigure=nullptr;
     std::cout<<"PASS encoder native drafts, AV1-only preset/CRF, all-mode bitrate, strict validation, frozen sessions and DPI/scroll geometry\n";
 }

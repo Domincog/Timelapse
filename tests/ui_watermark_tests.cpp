@@ -37,7 +37,7 @@ INT_PTR WINAPI skipOwnedDialog(HINSTANCE instance,LPCDLGTEMPLATEW resource,HWND 
 }
 INT_PTR outcome(){return modalOutcomes.back().value;}
 void setupSkip(){
-    app.advanced=app.nightHint=app.nightDetail=nullptr;app.customDialog=nullptr;app.advancedExpanded=false;app.hiddenToTray=false;
+    app.nightHint=app.nightDetail=nullptr;for(auto& tab:app.tabs)tab=nullptr;app.customDialog=nullptr;app.panelTab=CaptureTab;app.hiddenToTray=false;
     app.hasCustomInterval=app.hasCustomSize=app.hasCustomLimit=false;choose(app.interval,2);choose(app.videoSize,0);choose(app.stopAfter,0);
     seed(false);skipScript={};skipDialogCalls=0;skipDialogFailure=false;
     app.personPack={};app.personPackKnown=false;lapse::uiPersonPackInfo={};lapse::uiPersonPackInspections=0;
@@ -45,7 +45,7 @@ void setupSkip(){
 }
 }
 namespace {
-void setupWatermark(){setupSkip();app.settings.watermark={};app.watermarkChecked={};app.watermarkCheckValid=false;app.watermarkValidation.clear();app.watermarkCaption.clear();app.watermarkRevision=0;app.advancedWatermarkRevision=-1;configure();}
+void setupWatermark(){setupSkip();app.settings.watermark={};app.watermarkChecked={};app.watermarkCheckValid=false;app.watermarkValidation.clear();app.watermarkCaption.clear();app.watermarkRevision=0;invalidatePanel();configure();}
 void markCheck(HWND window,HWND child,int id,bool checked){SendMessageW(child,BM_SETCHECK,checked?BST_CHECKED:BST_UNCHECKED,0);watermarkProc(window,WM_COMMAND,MAKEWPARAM(id,BN_CLICKED),reinterpret_cast<LPARAM>(child));}
 void markSelect(HWND window,HWND child,int id,int selected){choose(child,selected);watermarkProc(window,WM_COMMAND,MAKEWPARAM(id,CBN_SELCHANGE),reinterpret_cast<LPARAM>(child));}
 bool markVisible(HWND child){return (GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0;}

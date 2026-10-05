@@ -55,7 +55,7 @@ INT_PTR WINAPI skipOwnedDialog(HINSTANCE instance,LPCDLGTEMPLATEW resource,HWND 
 }
 INT_PTR outcome(){return modalOutcomes.back().value;}
 void setupSkip(){
-    app.advanced=app.nightHint=app.nightDetail=nullptr;app.customDialog=nullptr;app.advancedExpanded=false;app.hiddenToTray=false;
+    app.nightHint=app.nightDetail=nullptr;for(auto& tab:app.tabs)tab=nullptr;app.customDialog=nullptr;app.panelTab=CaptureTab;app.hiddenToTray=false;
     app.hasCustomInterval=app.hasCustomSize=app.hasCustomLimit=false;choose(app.interval,2);choose(app.videoSize,0);choose(app.stopAfter,0);
     seed(false);skipScript={};skipDialogCalls=0;skipDialogFailure=false;
     reportedOpenWheelCombo=yieldWheelCombo=nullptr;nativeWheelYields=0;
@@ -179,7 +179,7 @@ void nativeCompressionInsertion(){
     std::cout<<"PASS actual native paste rejects malformed range start/end, quiet and repeat fields; exact inputs including zero remain valid\n";
 }
 void statusAndNestedClose(){
-    HiddenFixture owned;setupSkip();app.advancedExpanded=true;app.settings.timeSkip.mode=TimeSkipMode::Quiet;app.skipRevision++;
+    HiddenFixture owned;setupSkip();app.panelTab=RecordingTab;app.settings.timeSkip.mode=TimeSkipMode::Quiet;app.skipRevision++;
     Status value;value.state=State::Recording;value.timeSkip.enabled=true;value.timeSkip.reason=TimeSkipReason::Quiet;value.timeSkip.intervalMs=20000;
     value.timeSkip.lastCheckTick=GetTickCount64()-3000;value.timeSkip.observationDelayed=true;value.message=L"Original save error";value.error=true;
     applyStatus(value,true);require(app.skipDetailCaption.find(L"target every 20 s")!=std::wstring::npos && app.skipDetailCaption.find(L"3 s ago")!=std::wstring::npos && app.skipDetailCaption.find(L"delayed")!=std::wstring::npos,"Live target/freshness/delay facts missing.");
@@ -188,7 +188,7 @@ void statusAndNestedClose(){
     require(app.status.timeSkip.reason==TimeSkipReason::Unavailable && app.skipDetailCaption==shown && app.visibleDirty,"Hidden status did visual work or lost new facts.");
     app.hiddenToTray=false;applyStatus(value,true);require(app.skipDetailCaption.find(L"unavailable")!=std::wstring::npos,"Restore failed to refresh deferred facts.");
     value.state=State::Paused;applyStatus(value);require(app.skipDetailCaption.find(L"paused")!=std::wstring::npos && app.skipDetailCaption.find(L"ago")==std::wstring::npos,"Pause falsely claimed ongoing checks.");
-    app.status={};app.advancedExpanded=false;
+    app.status={};app.panelTab=CaptureTab;
     skipScript=[](HWND window,DLGPROC procedure,LPARAM parameter){
         if(procedure==customProc){require(modalOutcomes.size()==2,"Missing nested ownership.");cancelOwnedDialogs();require(modalOutcomes[0].value==IDCANCEL && modalOutcomes[1].value==IDCANCEL,"Nested cancellation did not terminate both owned dialogs.");return;}
         auto& draft=*reinterpret_cast<SkipDraft*>(parameter);mode(window,draft,TimeSkipMode::Manual);skipProc(window,WM_COMMAND,SkipAdd,0);
@@ -270,7 +270,7 @@ void personLayoutAndStatus(){
         }
         skipProc(window,WM_COMMAND,IDCANCEL,0);
     };
-    editSkip();app.advancedExpanded=true;++app.skipRevision;
+    editSkip();app.panelTab=RecordingTab;++app.skipRevision;
     Status status;status.state=State::Recording;status.timeSkip.enabled=true;status.timeSkip.intervalMs=20000;
     status.timeSkip.lastCheckTick=GetTickCount64()-2000;status.message=L"Keep original save failure";status.error=true;
     for(auto item:{std::pair{TimeSkipReason::NoPerson,L"No person detected"},std::pair{TimeSkipReason::NoPersonUncertain,L"No person detected (uncertain)"},std::pair{TimeSkipReason::PersonPresent,L"Person detected"},
@@ -525,9 +525,9 @@ void personOnlyPolicy(){
         "Person-only policy lost its buffer or blocked recording.");
     require(skipSummary(app.settings.timeSkip,app.settings.intervalMs).find(L"keeps recording 30 s after")!=std::wstring::npos,"Person-only summary missing its buffer.");
     app.status.state=State::Recording;app.status.timeSkip.enabled=true;app.status.timeSkip.reason=TimeSkipReason::NoPerson;app.status.timeSkip.suspended=true;
-    app.advancedExpanded=true;updateSkipText(true);
+    app.panelTab=RecordingTab;updateSkipText(true);
     require(app.skipDetailCaption.find(L"capture paused until someone appears")!=std::wstring::npos,"Paused person-only status was not explained.");
-    app.status={};app.settings.timeSkip={};app.advancedExpanded=false;
+    app.status={};app.settings.timeSkip={};app.panelTab=CaptureTab;
     std::cout<<"PASS person-only policy: buffer without speed controls, exact commit, summary and paused status\n";
 }
 int main(){try{transactionalRanges();boundsAndFreeze();modalLayoutAndInactiveDraft();strictPolicy();nativeCompressionInsertion();statusAndNestedClose();personModesAndManagement();personOnlyPolicy();personLayoutAndStatus();personUncertaintyChoice();nativeModalButtons();fineTuning();nativeScheduleMnemonicsAndReadOnlyEnter();nativePageWheelOwnership();std::cout<<"All thirteen time-compression UI groups passed using owned synthetic windows only.\n";return 0;}

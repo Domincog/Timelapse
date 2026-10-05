@@ -37,14 +37,18 @@ constexpr COLORREF Canvas = RGB(23, 27, 32), Danger = RGB(196, 43, 28), DangerSo
 constexpr COLORREF Warning = RGB(138, 82, 0), WarningSoft = RGB(255, 243, 205), Info = RGB(0, 95, 184), InfoSoft = RGB(228, 240, 251);
 // Logical (96 DPI) geometry. Settings live in a fixed-width panel on the right
 // that scrolls on its own; the stage on the left keeps preview and transport.
-constexpr int PanelWidth = 328, PanelPad = 20, StagePad = 20, StageMinWidth = 560;
+constexpr int PanelWidth = 372, PanelPad = 20, StagePad = 20, StageMinWidth = 560;
 constexpr int HeaderTop = 14, HeaderHeight = 32, PreviewGap = 10, PreviewMinHeight = 160;
 constexpr int TransportGap = 14, TransportHeight = 64, StatusGap = 8, StatusHeight = 26, StageBottom = 12;
 constexpr int StageMinHeight = HeaderTop + HeaderHeight + PreviewGap + PreviewMinHeight + TransportGap + TransportHeight + StatusGap + StatusHeight + StageBottom;
-// Horizontal space the Advanced disclosure reserves beside its caption text:
-// left inset, chevron, the gap before it and the right inset.
-constexpr int DisclosureChrome = 46;
-enum Id { ModeBox = 100, IntervalBox, SizeBox, EncodingQualityBox, MonitorBox, CameraBox, Refresh, Record, Pause, Finish, Folder, OpenFolder, Reset, Forward, Preview, EncodingModeBox, AdvancedToggle, StopAfterBox, LowDiskBox, NightBox, NightDurationBox, NightTargetBox, NightHint, NightDetail, SkipConfigure, SkipSummary, SkipDetail, RecoveryBox, SegmentBox, WatermarkConfigure, WatermarkSummary, StatusDetails, CursorBox, StartDelayBox, PlaybackConfigure, AlsoDesktopBox, AlsoCameraBox, SetStatusButton, ClearStatusButton, StatusSummaryLine, EncoderConfigure };
+// Panel rows put the label in a fixed left column beside its control; option
+// buttons share a row with their one-line summary.
+constexpr int PanelLabelWidth = 104, PanelOptionWidth = 172;
+// The panel shows one page at a time, chosen by a three-button tab strip.
+enum PanelTab { CaptureTab, RecordingTab, OutputTab, PanelTabCount };
+constexpr const wchar_t* PanelTabLabels[] = {L"Capture",L"Recording",L"Output"};
+enum Id { ModeBox = 100, IntervalBox, SizeBox, EncodingQualityBox, MonitorBox, CameraBox, Refresh, Record, Pause, Finish, Folder, OpenFolder, Reset, Forward, Preview, EncodingModeBox, StopAfterBox, LowDiskBox, NightBox, NightDurationBox, NightTargetBox, NightHint, NightDetail, SkipConfigure, SkipSummary, SkipDetail, RecoveryBox, SegmentBox, WatermarkConfigure, WatermarkSummary, StatusDetails, CursorBox, StartDelayBox, PlaybackConfigure, AlsoDesktopBox, AlsoCameraBox, SetStatusButton, ClearStatusButton, StatusSummaryLine, EncoderConfigure,
+    TabCapture, TabRecording, TabOutput, ResetDefaults, EncoderSummary, PlaybackSummary };
 constexpr int StartDelays[] = {0,5,10,30,60,300};
 constexpr const wchar_t* StartDelayLabels[] = {L"None",L"5 seconds",L"10 seconds",L"30 seconds",L"1 minute",L"5 minutes"};
 constexpr int RecordingLimits[] = {0,900,3600,14400,28800,86400};
@@ -111,6 +115,7 @@ struct App {
     HWND customDialog{};
     HWND skipConfigure{},skipSummary{},skipDetail{};
     HWND watermarkConfigure{},watermarkSummary{},playbackConfigure{},encoderConfigure{};
+    HWND encoderSummary{},playbackSummary{},resetDefaults{},tabs[PanelTabCount]{};
     uint16_t pauseHotkey=0,stopHotkey=0,statusHotkey=0;
     int pauseHotkeyId=0,stopHotkeyId=0,statusHotkeyId=0,recordedOutputFps=DefaultOutputFps;
     // The live status line the engine burns into the video corner. Its look
@@ -120,7 +125,6 @@ struct App {
     uint64_t liveStatusSequence=0,statusNoticeSequence=0,statusNoticePhase=0;
     StatusIcon statusNoticeIcon=StatusIcon::None;
     std::array<wchar_t,160> liveStatusCaption{};
-    std::vector<std::wstring> recentStatuses;
     // The Set status window reopens with the last choices.
     int statusDraftKind=0;
     int64_t statusDraftTimerMs=25*60000,statusDraftBreakMs=5*60000;
@@ -129,9 +133,9 @@ struct App {
     size_t recordedOutputs=1;
     std::wstring hotkeyWarning;
     HWND mode{}, interval{}, videoSize{}, encodingQuality{}, encodingMode{}, monitor{}, camera{}, refresh{}, record{}, pause{}, finish{}, folder{}, openFolder{}, reset{}, forward{};
-    HWND advanced{}, stopAfter{}, lowDisk{}, recoveryMode{}, nightEnabled{}, nightDuration{}, nightTarget{}, nightHint{}, nightDetail{}, labels[10]{};
+    HWND stopAfter{}, lowDisk{}, recoveryMode{}, nightEnabled{}, nightDuration{}, nightTarget{}, nightHint{}, nightDetail{}, labels[10]{};
     HWND segmentLabel{}, splitEvery{}, captureCursor{};
-    HWND startDelayLabel{}, startDelay{}, startDelayHint{};
+    HWND startDelayLabel{}, startDelay{};
     // Optional single-source companions for a collage, written from the same captures.
     HWND alsoLabel{}, alsoDesktop{}, alsoCamera{};
     HFONT font{}, titleFont{}, smallFont{}, strongFont{}, headerFont{};
@@ -148,10 +152,14 @@ struct App {
     bool shellBusyObserved = false, openFolderBusyShown = false;
     bool visibleDirty = true, controlsUpdated = false;
     State controlsState = State::Idle;
-    bool advancedExpanded = false;
-    int advancedLimitIndex = -1, advancedVisibility = -1, advancedNightState = -1, advancedRecoveryState = -1, nightVisibility = -1;
-    int advancedSegmentSeconds = -1,advancedOutputFps=-1,advancedEncodingMode=-1;
-    int advancedCursorState = -1, cursorVisibility = -1, advancedDelaySeconds = -1, committedStartDelay = 0;
+    // The visible settings page, and the inputs its rows, summaries and tab
+    // marks were last refreshed from (-1 forces a refresh).
+    int panelTab = CaptureTab;
+    std::array<int,24> panelSnapshot{};
+    // Per tab: 0 defaults, 1 changed options, 2 needs attention before Record.
+    int tabMarks[PanelTabCount]{};
+    std::wstring tabTooltips[PanelTabCount], encoderCaption, playbackCaption;
+    int committedStartDelay = 0;
     uint64_t waitingRemaining = UINT64_MAX;
     std::wstring waitingCaption;
     int customIntervalMs=5000, customWidth=1280, customHeight=720, customLimitSeconds=900;
@@ -163,13 +171,12 @@ struct App {
     bool hasCustomSegment=false;
     int customNightDurationMs=NightInitialDurationMs, committedNightDuration=0;
     bool hasCustomNightDuration=false;
-    std::wstring advancedCaption, advancedTooltip;
     std::wstring skipSummaryCaption,skipDetailCaption;
-    int skipRevision=0,advancedSkipRevision=-1,skipSummaryRevision=-1,skipVisibility=-1;
+    int skipRevision=0,skipSummaryRevision=-1;
     uint64_t skipCheckAge=UINT64_MAX;
     WatermarkSettings watermarkChecked;
     bool watermarkCheckValid=false;
-    int watermarkWidth=0,watermarkHeight=0,watermarkRevision=0,advancedWatermarkRevision=-1;
+    int watermarkWidth=0,watermarkHeight=0,watermarkRevision=0;
     std::wstring watermarkValidation,watermarkCaption;
     PersonPackInfo personPack{};
     bool personPackKnown=false;
@@ -189,12 +196,14 @@ struct App {
     // Docked: the stage fits the viewport and the window's vertical bar scrolls
     // only the settings panel. Otherwise the whole canvas scrolls (panelScroll=0).
     bool panelDocked = true;
-    int panelScroll = 0, panelHeight = 0, advancedTop = 0;
-    bool collageTools = false, advancedWarning = false;
+    int panelScroll = 0, panelHeight = 0;
+    bool collageTools = false;
     // Painted geometry in logical canvas coordinates, refreshed by layout().
     // Panel-relative rows are stored unscrolled; paint subtracts panelScroll.
-    RECT panelRect{}, headerRect{}, previewRect{}, transportRect{}, statsRect{}, statusRect{}, savePathRect{};
-    int sectionTops[4]{}, panelRules[6]{}, panelRuleCount = 0;
+    RECT panelRect{}, headerRect{}, previewRect{}, transportRect{}, statsRect{}, statusRect{}, savePathRect{}, tabsRect{};
+    struct PanelHeading { int top = 0; const wchar_t* text = L""; };
+    PanelHeading headings[4]{};
+    int headingCount = 0, panelRules[2]{}, panelRuleCount = 0;
     POINT dragStart{};
     Rect dragRect{};
     RECT videoRect{};
@@ -611,7 +620,7 @@ std::wstring skipSummary(const TimeSkipSettings& policy,int intervalMs) {
         L"× · target up to "+formatDuration(int64_t(intervalMs)*policy.multiplier,true)+L" between frames";
 }
 void updateSkipText(bool force=false) {
-    if(!app.skipSummary || !app.advancedExpanded)return;
+    if(!app.skipSummary || app.panelTab!=RecordingTab)return;
     if(app.hiddenToTray || IsIconic(app.window)){app.visibleDirty=true;return;}
     if(force || app.skipSummaryRevision!=app.skipRevision){
         const auto summary=skipSummary(app.settings.timeSkip,app.settings.intervalMs);
@@ -736,7 +745,7 @@ void refreshOpenFolderControl() {
     if(busy==app.openFolderBusyShown)return;
     if(app.hiddenToTray || IsIconic(app.window)){app.visibleDirty=true;return;}
     if(!app.openFolder || !IsWindow(app.openFolder) || GetParent(app.openFolder)!=app.window)return;
-    if(busy && GetFocus()==app.openFolder)restoreStatusFocus(app.window,app.advanced);
+    if(busy && GetFocus()==app.openFolder)restoreStatusFocus(app.window,app.tabs[app.panelTab]);
     SetWindowTextW(app.openFolder,busy?L"Opening...":L"&Open folder");
     EnableWindow(app.openFolder,!busy);app.openFolderBusyShown=busy;
 }
@@ -861,7 +870,7 @@ void updateStatusText(bool force=false) {
     if(error!=app.statusCaptionError){InvalidateRect(app.statusText,nullptr,TRUE);app.statusCaptionError=error;}
 }
 void updateNightText(bool force=false) {
-    if(!app.nightDetail || !app.advancedExpanded || nightRow()!=2)return;
+    if(!app.nightDetail || app.panelTab!=RecordingTab || nightRow()!=2)return;
     if(app.hiddenToTray || IsIconic(app.window)){app.visibleDirty=true;return;}
     const std::wstring hint=app.nightValidation.empty()?L"Software frame blending; camera shutter is unchanged. Movement may blur.":app.nightValidation;
     if(force || hint!=app.nightHintCaption){SetWindowTextW(app.nightHint,hint.c_str());app.nightHintCaption=hint;InvalidateRect(app.nightHint,nullptr,TRUE);}
@@ -891,100 +900,113 @@ void checkWatermark() {
     app.watermarkChecked=app.settings.watermark;app.watermarkWidth=app.settings.width;app.watermarkHeight=app.settings.height;
     app.watermarkCheckValid=true;++app.watermarkRevision;
 }
-void updateAdvanced() {
-    if(!app.advanced)return;
-    const int selection=selectedLimit(),segment=selectedSegment(),delay=selectedStartDelay();
+bool shown(HWND child);
+void showControl(HWND child,bool show);
+// Companion checkboxes are shown for a collage; while recording, only when
+// the session actually writes companion files.
+bool companionRow() { return collageLayout() && (!app.active() || app.recordedOutputs>1); }
+std::wstring encoderSummary() {
+    const auto& options=app.settings.encodingOptions;
+    std::wstring text=app.settings.encodingMode==EncodingMode::SoftwareAV1?L"Preset "+std::to_wstring(options.av1Preset)+L" · ":L"";
+    if(options.rateControl==EncodingRateControl::ConstantQuality)text+=L"CRF "+std::to_wstring(options.av1Crf);
+    else if(options.rateControl==EncodingRateControl::TargetBitrate)text+=std::to_wstring(options.bitrateKbps)+L" kbps";
+    else text+=text.empty()?L"Automatic quality":L"automatic quality";
+    return text;
+}
+std::wstring playbackSummary() {
+    std::wstring text=std::to_wstring(app.settings.outputFps)+L" fps";
+    if(!app.hotkeyWarning.empty())return text+L" · check shortcuts";
+    const int shortcuts=int(app.pauseHotkey!=0)+int(app.stopHotkey!=0)+int(app.statusHotkey!=0);
+    if(shortcuts)text+=L" · "+std::to_wstring(shortcuts)+(shortcuts==1?L" shortcut":L" shortcuts");
+    return text;
+}
+bool defaultEncoderOptions() {
+    const EncodingOptions defaults;const auto& options=app.settings.encodingOptions;
+    return options.rateControl==defaults.rateControl && options.av1Preset==defaults.av1Preset;
+}
+void invalidatePanel() { app.panelSnapshot.fill(-1); }
+void setCaption(HWND child,std::wstring& cache,const std::wstring& value) {
+    if(child && value!=cache){SetWindowTextW(child,value.c_str());cache=value;}
+}
+// Refreshes tab marks and tooltips, option summaries and which rows the
+// visible page shows. Cheap when nothing it depends on has changed.
+void updatePanel() {
+    const int limit=selectedLimit(),segment=selectedSegment(),delay=selectedStartDelay();
     const int night=app.settings.night.enabled?(app.nightValidation.empty()?1:2):0;
-    const int recovery=app.encodingValidation.empty()?(app.settings.recoveryMode?1:0):2;
-    std::wstring advancedEncoderError;
-    const bool encoderWarning=recovery==2 && !validateEncodingOptions(app.settings.encodingMode,app.settings.encodingOptions,advancedEncoderError);
     const int cursor=app.settings.captureCursor?0:hasSource(Source::Desktop)?1:2;
-    if(app.advancedEncodingMode!=static_cast<int>(app.settings.encodingMode) || app.advancedOutputFps!=app.settings.outputFps || delay!=app.advancedDelaySeconds || selection!=app.advancedLimitIndex || segment!=app.advancedSegmentSeconds || night!=app.advancedNightState || recovery!=app.advancedRecoveryState || cursor!=app.advancedCursorState || app.advancedSkipRevision!=app.skipRevision || app.advancedWatermarkRevision!=app.watermarkRevision){
-        std::wstring caption=L"&Advanced";
-        if(recovery==2)caption+=encoderWarning?L" · check encoding":L" · check MP4";
-        else if(night==2)caption+=L" · check blend";
-        else if(!app.watermarkValidation.empty())caption+=L" · check watermark";
-        else if(night){caption+=L" · night";if(selection)caption+=L", "+(choice(app.stopAfter)<6?std::wstring(RecordingLimitShortLabels[std::clamp(choice(app.stopAfter),0,5)]):formatDuration(int64_t(selection)*1000,true));}
-        else if(selection)caption+=L" · stop after "+(choice(app.stopAfter)<6?std::wstring(RecordingLimitLabels[std::clamp(choice(app.stopAfter),0,5)]):formatDuration(int64_t(selection)*1000,true));
-        if(delay && night!=2 && recovery!=2 && app.watermarkValidation.empty())caption+=L" · delay "+formatDuration(int64_t(delay)*1000,true);
-        if(recovery==1 && night!=2 && app.watermarkValidation.empty())caption+=L" · recovery";
-        if(skipEnabled() && night!=2 && recovery!=2 && app.watermarkValidation.empty())caption+=L" · "+skipCaption();
-        if(segment && night!=2 && recovery!=2 && app.watermarkValidation.empty())caption+=L" · split "+formatDuration(int64_t(segment)*1000,true);
-        if(app.settings.watermark.enabled && app.watermarkValidation.empty() && night!=2 && recovery!=2)caption+=L" · watermark";
-        if(cursor==1 && app.watermarkValidation.empty() && night!=2 && recovery!=2)caption+=L" · cursor off";
-        if(app.settings.outputFps!=DefaultOutputFps)caption+=L" · "+std::to_wstring(app.settings.outputFps)+L" fps";
-        if(!app.hotkeyWarning.empty())caption=L"&Advanced · check shortcuts";
-        RECT bounds{};GetClientRect(app.advanced,&bounds);
-        if((delay || selection || segment || skipEnabled() || recovery==1 || app.settings.watermark.enabled || cursor==1 || app.settings.outputFps!=DefaultOutputFps) && app.hotkeyWarning.empty() && night!=2 && recovery!=2 && app.watermarkValidation.empty() && bounds.right>app.scale(40)) {
-            HDC dc=GetDC(app.advanced);if(dc){const auto previous=SelectObject(dc,app.font);SIZE size{};
-                GetTextExtentPoint32W(dc,caption.c_str(),static_cast<int>(caption.size()),&size);
-                SelectObject(dc,previous);ReleaseDC(app.advanced,dc);
-                if(size.cx+app.scale(DisclosureChrome)>bounds.right)caption=delay?L"&Advanced · delay "+formatDuration(int64_t(delay)*1000,true):cursor==1?L"&Advanced · cursor off + options":app.settings.watermark.enabled?L"&Advanced · watermark + options":segment?L"&Advanced · split + options":recovery?L"&Advanced · recovery + options":skipEnabled()?L"&Advanced · "+std::wstring(night?L"night/":L"")+
-                    (selection?L"stop/":L"")+skipCaption():night?L"&Advanced · night + stop":selection?L"&Advanced · timed stop":L"&Advanced · "+std::to_wstring(app.settings.outputFps)+L" fps";
-            }
-        }
-        const bool warning=recovery==2 || night==2 || !app.watermarkValidation.empty() || !app.hotkeyWarning.empty();
-        if(caption!=app.advancedCaption){SetWindowTextW(app.advanced,caption.c_str());app.advancedCaption=caption;}
-        else if(warning!=app.advancedWarning)InvalidateRect(app.advanced,nullptr,FALSE);
-        app.advancedWarning=warning;
-        app.advancedTooltip=L"Show or hide advanced options. Recording options can be changed before recording. Night mode applies only to camera content. Show desktop cursor applies only to desktop content.";
-        app.advancedTooltip+=L" Playback: "+std::to_wstring(app.settings.outputFps)+L" fps. Global shortcuts can be configured in Playback & shortcuts.";
-        app.advancedTooltip+=L" Encoder settings: ";
-        if(app.settings.encodingMode==EncodingMode::SoftwareAV1)app.advancedTooltip+=L"SVT-AV1 preset "+std::to_wstring(app.settings.encodingOptions.av1Preset)+L"; ";
-        app.advancedTooltip+=
-            (app.settings.encodingOptions.rateControl==EncodingRateControl::Automatic?L"automatic Video quality":
-             app.settings.encodingOptions.rateControl==EncodingRateControl::ConstantQuality?L"custom CRF "+std::to_wstring(app.settings.encodingOptions.av1Crf):
-             L"target bitrate "+std::to_wstring(app.settings.encodingOptions.bitrateKbps)+L" kbps")+L".";
-        if(!app.hotkeyWarning.empty())app.advancedTooltip+=L" "+app.hotkeyWarning;
-        if(delay)app.advancedTooltip+=L" After Record, wait "+formatDuration(int64_t(delay)*1000)+L" before preparation. Visible preview continues; Stop after counts active recording time. Sleep cancels the pending start.";
-        if(cursor)app.advancedTooltip+=L" The added system cursor is hidden in desktop preview and recordings; pointers drawn into application pixels are unchanged.";
-        if(selection)app.advancedTooltip+=L" Stop after "+formatDuration(int64_t(selection)*1000)+L" of active recording; pauses and startup do not count.";
-        if(segment)app.advancedTooltip+=L" Split files every "+formatDuration(int64_t(segment)*1000)+L" of active recording. Shorter parts add processing and file overhead.";
-        if(skipEnabled())app.advancedTooltip+=L" Time compression: "+skipSummary(app.settings.timeSkip,app.settings.intervalMs)+L".";
-        if(skipPerson(app.settings.timeSkip.mode)){
-            app.advancedTooltip+=L" Person checks use only selected camera content and require the optional detector. ";
-            app.advancedTooltip+=app.settings.timeSkip.uncertainAsAbsent?
-                L"Uncertain checks count as no person; missing, failed or stale checks keep the normal capture interval.":
-                L"Uncertain, missing, failed or stale checks keep the normal capture interval.";
-        }
-        if(app.settings.recoveryMode)app.advancedTooltip+=L" MP4 recovery mode (H.264) is on; recent frames can still be lost after interruption.";
-        if(!app.encodingValidation.empty())app.advancedTooltip+=L" "+app.encodingValidation;
-        if(app.settings.watermark.enabled)app.advancedTooltip+=L" Watermark: "+watermarkSummary(app.settings.watermark)+L". Same placement in every file.";
-        if(!app.watermarkValidation.empty())app.advancedTooltip+=L" "+app.watermarkValidation;
-        const auto captionWatermark=watermarkSummary(app.settings.watermark);
-        if(captionWatermark!=app.watermarkCaption){SetWindowTextW(app.watermarkSummary,captionWatermark.c_str());app.watermarkCaption=captionWatermark;}
-        app.advancedWatermarkRevision=app.watermarkRevision;
-        app.advancedCursorState=cursor;app.advancedDelaySeconds=delay;
-        app.advancedOutputFps=app.settings.outputFps;
-        app.advancedEncodingMode=static_cast<int>(app.settings.encodingMode);
-        app.advancedLimitIndex=selection;app.advancedSegmentSeconds=segment;app.advancedNightState=night;app.advancedRecoveryState=recovery;app.advancedSkipRevision=app.skipRevision;
-    }
-    const int visibleNight=app.advancedExpanded?nightRow():0;
-    const int visibleSkip=app.advancedExpanded?(skipEnabled()?2:1):0;
-    const bool visibleCursor=app.advancedExpanded && hasSource(Source::Desktop);
-    if(app.advancedVisibility==static_cast<int>(app.advancedExpanded) && app.nightVisibility==visibleNight && app.skipVisibility==visibleSkip && app.cursorVisibility==int(visibleCursor))return;
-    app.cursorVisibility=int(visibleCursor);
-    app.advancedVisibility=static_cast<int>(app.advancedExpanded);
-    app.nightVisibility=visibleNight;
-    app.skipVisibility=visibleSkip;
-    SendMessageW(app.advanced,BM_SETCHECK,app.advancedExpanded?BST_CHECKED:BST_UNCHECKED,0);
-    const auto visible=[](HWND child,bool show){
-        if(child && ((GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE)!=0)!=show)ShowWindow(child,show?SW_SHOWNA:SW_HIDE);
+    const int visibleNight=app.panelTab==RecordingTab?nightRow():0;
+    const bool visibleCursor=app.panelTab==RecordingTab && hasSource(Source::Desktop);
+    const bool companions=app.panelTab==CaptureTab && companionRow();
+    const auto& options=app.settings.encodingOptions;
+    const std::array<int,24> snapshot{app.panelTab,limit,segment,delay,night,cursor,visibleNight,int(visibleCursor)*2+int(companions),
+        app.settings.outputFps,static_cast<int>(app.settings.encodingMode),static_cast<int>(options.rateControl),options.av1Preset,options.av1Crf,options.bitrateKbps,
+        app.skipRevision,app.watermarkRevision,int(app.settings.recoveryMode),int(app.settings.stopOnLowDiskSpace),int(app.encodingValidation.empty()),int(app.watermarkValidation.empty()),
+        int(app.hotkeyWarning.empty()),int(app.pauseHotkey)*2+int(app.stopHotkey!=0),int(app.statusHotkey),int(hasSource(Source::Desktop))*2+int(hasSource(Source::Camera))};
+    if(snapshot==app.panelSnapshot)return;
+    const bool pageChanged=snapshot[0]!=app.panelSnapshot[0];
+    app.panelSnapshot=snapshot;
+    // What differs from the defaults on each page, and what blocks Record.
+    std::vector<std::wstring> recording,output;
+    if(limit)recording.push_back(L"Stop after "+formatDuration(int64_t(limit)*1000));
+    if(segment)recording.push_back(L"Split every "+formatDuration(int64_t(segment)*1000));
+    if(delay)recording.push_back(L"Start delay "+formatDuration(int64_t(delay)*1000));
+    if(!app.settings.stopOnLowDiskSpace)recording.push_back(L"Low disk stop off");
+    if(cursor==1)recording.push_back(L"Desktop cursor hidden");
+    if(skipEnabled())recording.push_back(L"Time compression "+skipCaption());
+    if(night)recording.push_back(L"Night camera");
+    if(app.settings.encodingMode!=EncodingMode::Compatible)output.push_back(EncodingModeLabels[static_cast<int>(app.settings.encodingMode)]);
+    if(!defaultEncoderOptions())output.push_back(L"Encoder: "+encoderSummary());
+    if(app.settings.recoveryMode)output.push_back(L"MP4 recovery mode");
+    if(app.settings.watermark.enabled)output.push_back(L"Watermark: "+watermarkSummary(app.settings.watermark));
+    if(app.settings.outputFps!=DefaultOutputFps)output.push_back(std::to_wstring(app.settings.outputFps)+L" fps playback");
+    if(app.pauseHotkey || app.stopHotkey || app.statusHotkey)output.push_back(L"Global shortcuts");
+    const bool recordingWarning=night==2,outputWarning=!app.encodingValidation.empty() || !app.watermarkValidation.empty() || !app.hotkeyWarning.empty();
+    const auto tooltip=[](const wchar_t* about,const std::vector<std::wstring>& changed,const std::wstring& warning){
+        std::wstring text=about;
+        if(!changed.empty()){text+=L"\nChanged from defaults: ";for(size_t i=0;i<changed.size();++i){if(i)text+=L" · ";text+=changed[i];}}
+        if(!warning.empty())text+=L"\nNeeds attention: "+warning;
+        return text;
     };
-    for(HWND child:{app.labels[6],app.encodingMode,app.encoderConfigure,app.labels[7],app.stopAfter,app.lowDisk,app.recoveryMode,app.segmentLabel,app.splitEvery,app.startDelayLabel,app.startDelay,app.startDelayHint,app.watermarkConfigure,app.watermarkSummary,app.playbackConfigure})visible(child,app.advancedExpanded);
-    if(!visibleCursor && GetFocus()==app.captureCursor)SetFocus(app.advanced);
+    app.tabMarks[CaptureTab]=0;
+    app.tabMarks[RecordingTab]=recordingWarning?2:recording.empty()?0:1;
+    app.tabMarks[OutputTab]=outputWarning?2:output.empty()?0:1;
+    app.tabTooltips[CaptureTab]=L"Sources, capture timing, video size and quality, save folder and status. Ctrl+Tab switches pages.";
+    app.tabTooltips[RecordingTab]=tooltip(L"Automatic stop, file splitting, start delay, low-space protection, desktop cursor, time compression and night camera.",recording,recordingWarning?app.nightValidation:L"");
+    app.tabTooltips[OutputTab]=tooltip(L"Encoder, MP4 recovery, watermark, playback speed, global shortcuts and resetting all settings.",output,
+        !app.encodingValidation.empty()?app.encodingValidation:!app.watermarkValidation.empty()?app.watermarkValidation:app.hotkeyWarning);
+    for(HWND tab:app.tabs)if(tab)InvalidateRect(tab,nullptr,FALSE);
+    setCaption(app.watermarkSummary,app.watermarkCaption,watermarkSummary(app.settings.watermark));
+    setCaption(app.encoderSummary,app.encoderCaption,encoderSummary());
+    setCaption(app.playbackSummary,app.playbackCaption,playbackSummary());
+    // Page visibility. Hidden rows leave Tab order and mnemonics; focus on a
+    // row that disappears moves to the selected tab.
+    for(int i=0;i<PanelTabCount;++i)if(app.tabs[i])SendMessageW(app.tabs[i],BM_SETCHECK,i==app.panelTab?BST_CHECKED:BST_UNCHECKED,0);
+    const bool capture=app.panelTab==CaptureTab,recordingPage=app.panelTab==RecordingTab,outputPage=app.panelTab==OutputTab;
+    const HWND focused=GetFocus();
+    const auto visible=[&](HWND child,bool show,HWND fallback=nullptr){
+        if(!child)return;
+        if(!show && focused && (focused==child || IsChild(child,focused)))SetFocus(fallback && shown(fallback)?fallback:app.tabs[app.panelTab]);
+        showControl(child,show);
+    };
+    const bool desktop=hasSource(Source::Desktop),camera=hasSource(Source::Camera);
+    for(HWND child:{app.refresh,app.labels[0],app.mode,app.labels[1],app.interval,app.labels[2],app.videoSize,app.labels[3],app.encodingQuality,
+        app.folder,app.openFolder,app.liveStatusSummary,app.liveStatusSet,app.liveStatusClear})visible(child,capture);
+    for(HWND child:{app.labels[4],app.monitor})visible(child,capture && desktop,app.mode);
+    for(HWND child:{app.labels[5],app.camera})visible(child,capture && camera,app.mode);
+    for(HWND child:{app.alsoLabel,app.alsoDesktop,app.alsoCamera})visible(child,companions,app.mode);
+    for(HWND child:{app.labels[7],app.stopAfter,app.segmentLabel,app.splitEvery,app.startDelayLabel,app.startDelay,app.lowDisk,app.skipConfigure,app.skipSummary})visible(child,recordingPage);
+    visible(app.skipDetail,recordingPage && skipEnabled());
     visible(app.captureCursor,visibleCursor);
-    for(HWND child:{app.skipConfigure,app.skipSummary})visible(child,visibleSkip!=0);
-    visible(app.skipDetail,visibleSkip==2);
-    if(!visibleNight && app.nightEnabled && GetFocus()==app.nightEnabled)SetFocus(app.advanced);
     visible(app.nightEnabled,visibleNight!=0);
-    for(HWND child:{app.labels[8],app.nightDuration,app.labels[9],app.nightTarget,app.nightHint,app.nightDetail}){
-        const HWND focused=GetFocus();
-        if(visibleNight!=2 && child && (focused==child || (focused && IsChild(child,focused))))SetFocus(visibleNight?app.nightEnabled:app.advanced);
-        visible(child,visibleNight==2);
-    }
-    updateNightText(true);
-    updateSkipText(true);
+    for(HWND child:{app.labels[8],app.nightDuration,app.labels[9],app.nightTarget,app.nightHint,app.nightDetail})visible(child,visibleNight==2,app.nightEnabled);
+    for(HWND child:{app.labels[6],app.encodingMode,app.encoderConfigure,app.encoderSummary,app.recoveryMode,app.watermarkConfigure,app.watermarkSummary,
+        app.playbackConfigure,app.playbackSummary,app.resetDefaults})visible(child,outputPage);
+    if(pageChanged || recordingPage){updateNightText(true);updateSkipText(true);}
+}
+void selectPanelTab(int tab,bool focusTab) {
+    tab=(tab%PanelTabCount+PanelTabCount)%PanelTabCount;
+    if(tab!=app.panelTab){app.panelTab=tab;app.panelScroll=0;updatePanel();layout();}
+    if(focusTab && app.tabs[tab]){SetFocus(app.tabs[tab]);revealFocusedControl();}
 }
 
 // The layout (not devices, size or files) can change while recording or
@@ -993,9 +1015,6 @@ bool sourceEditable() {
     return !app.closeWhenDone && (app.status.state==State::Idle ||
         ((app.status.state==State::Recording || app.status.state==State::Paused) && !app.settings.separateFiles));
 }
-// Companion checkboxes are shown for a collage; while recording, only when
-// the session actually writes companion files.
-bool companionRow() { return collageLayout() && (!app.active() || app.recordedOutputs>1); }
 bool intervalEditable() {
     return !app.closeWhenDone && (app.status.state==State::Idle || app.status.state==State::Recording || app.status.state==State::Paused);
 }
@@ -1088,7 +1107,7 @@ void refreshSources() {
 }
 void updateControls() {
     const bool idle = !app.active();
-    for (auto control : {app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.splitEvery,app.startDelay,app.lowDisk,app.recoveryMode,app.nightEnabled,app.nightDuration,app.nightTarget,app.refresh,app.folder,app.alsoDesktop,app.alsoCamera}) EnableWindow(control,idle);
+    for (auto control : {app.interval,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.splitEvery,app.startDelay,app.lowDisk,app.recoveryMode,app.nightEnabled,app.nightDuration,app.nightTarget,app.refresh,app.folder,app.alsoDesktop,app.alsoCamera,app.resetDefaults}) EnableWindow(control,idle);
     EnableWindow(app.interval,intervalEditable());
     EnableWindow(app.mode,sourceEditable());
     EnableWindow(app.monitor,idle && hasSource(Source::Desktop));
@@ -1108,7 +1127,7 @@ void updateControls() {
         SetWindowTextW(app.pause,app.status.state==State::Paused ? L"&Resume" : L"&Pause");
     bool collage = !app.settings.separateFiles && app.settings.layers.size() > 1;
     EnableWindow(app.reset,collage); EnableWindow(app.forward,collage && app.selected>=0);
-    updateAdvanced();
+    updatePanel();
     updateNightText(!app.controlsUpdated);updateSkipText(!app.controlsUpdated);updateStatusText(!app.controlsUpdated);
     updateLiveStatus(!app.controlsUpdated);
     refreshOpenFolderControl();
@@ -1155,7 +1174,7 @@ void applyStatus(Status value,bool force=false) {
     if(!app.controlsUpdated || app.controlsState!=app.status.state)updateControls();
     if(message || error || outcome || state || deadline || app.status.state==State::Waiting)updateStatusText();
     if(night)updateNightText();
-    if(app.advancedExpanded && skipEnabled()){
+    if(app.panelTab==RecordingTab && skipEnabled()){
         const auto tick=app.status.timeSkip.lastCheckTick,now=GetTickCount64();
         const auto age=tick && now>=tick?(now-tick)/1000:UINT64_MAX;
         if(skip || (app.status.state==State::Recording && skipObserved(app.settings.timeSkip.mode) && age!=app.skipCheckAge))updateSkipText();
@@ -1357,29 +1376,35 @@ bool shown(HWND child) { return child && (GetWindowLongPtrW(child,GWL_STYLE)&WS_
 void showControl(HWND child,bool show) {
     if(child && shown(child)!=show)ShowWindow(child,show?SW_SHOWNA:SW_HIDE);
 }
+// The settings page that holds a panel row, or -1 for the tab strip and
+// everything outside the panel.
+int panelPage(HWND child) {
+    if(!child)return -1;
+    for(HWND member:{app.refresh,app.labels[0],app.mode,app.labels[4],app.monitor,app.labels[5],app.camera,app.alsoLabel,app.alsoDesktop,app.alsoCamera,app.labels[1],app.interval,
+        app.labels[2],app.videoSize,app.labels[3],app.encodingQuality,app.folder,app.openFolder,app.liveStatusSet,app.liveStatusClear,app.liveStatusSummary})
+        if(member==child)return CaptureTab;
+    for(HWND member:{app.labels[7],app.stopAfter,app.segmentLabel,app.splitEvery,app.startDelayLabel,app.startDelay,app.lowDisk,app.captureCursor,app.skipConfigure,app.skipSummary,app.skipDetail,
+        app.nightEnabled,app.labels[8],app.nightDuration,app.labels[9],app.nightTarget,app.nightHint,app.nightDetail})
+        if(member==child)return RecordingTab;
+    for(HWND member:{app.labels[6],app.encodingMode,app.encoderConfigure,app.encoderSummary,app.recoveryMode,app.watermarkConfigure,app.watermarkSummary,
+        app.playbackConfigure,app.playbackSummary,app.resetDefaults})
+        if(member==child)return OutputTab;
+    return -1;
+}
 // Settings-panel membership decides scrolling, focus reveal and background.
 bool panelControl(HWND child) {
     if(!child)return false;
-    for(HWND member:{app.labels[0],app.mode,app.labels[4],app.monitor,app.labels[5],app.camera,app.alsoLabel,app.alsoDesktop,app.alsoCamera,app.refresh,app.labels[1],app.interval,app.labels[2],app.videoSize,
-        app.labels[3],app.encodingQuality,app.folder,app.openFolder,app.advanced,app.labels[6],app.encodingMode,app.encoderConfigure,app.recoveryMode,app.labels[7],app.stopAfter,
-        app.segmentLabel,app.splitEvery,app.startDelayLabel,app.startDelay,app.startDelayHint,app.lowDisk,app.captureCursor,app.skipConfigure,app.skipSummary,
-        app.skipDetail,app.watermarkConfigure,app.watermarkSummary,app.playbackConfigure,app.nightEnabled,app.labels[8],app.nightDuration,app.labels[9],
-        app.nightTarget,app.nightHint,app.nightDetail,app.liveStatusSet,app.liveStatusClear,app.liveStatusSummary})if(member==child)return true;
-    return false;
+    for(HWND member:app.tabs)if(member==child)return true;
+    return panelPage(child)>=0;
 }
 // Device rows appear only for sources the layout uses, and collage tools only
 // for editable collages. Hidden controls drop out of Tab order and mnemonics.
 void updateSourceRows() {
-    const bool desktop=hasSource(Source::Desktop),camera=hasSource(Source::Camera);
     app.collageTools=collageLayout();
     const HWND focused=GetFocus();
-    if(focused && ((!desktop && focused==app.monitor) || (!camera && focused==app.camera)))SetFocus(app.mode);
-    if(focused && !companionRow() && (focused==app.alsoDesktop || focused==app.alsoCamera))SetFocus(app.mode);
     if(focused && !app.collageTools && (focused==app.reset || focused==app.forward))SetFocus(app.preview);
-    for(HWND child:{app.labels[4],app.monitor})showControl(child,desktop);
-    for(HWND child:{app.labels[5],app.camera})showControl(child,camera);
-    for(HWND child:{app.alsoLabel,app.alsoDesktop,app.alsoCamera})showControl(child,companionRow());
     for(HWND child:{app.reset,app.forward})showControl(child,app.collageTools);
+    updatePanel();
 }
 int wrappedHeight(HWND child,int width,HFONT font,int minimum) {
     if(!child)return minimum;
@@ -1390,78 +1415,106 @@ int wrappedHeight(HWND child,int width,HFONT font,int minimum) {
     SelectObject(dc,previous);ReleaseDC(child,dc);
     return std::max(minimum,static_cast<int>(measured.bottom));
 }
-// Lays out the settings panel top to bottom and returns its content height.
+// Lays out the settings panel and returns the selected page's content height.
 // Rows use panel coordinates; offset maps them into the scrolled viewport.
-// Hidden rows keep a parked position but add no height.
+// Every page keeps a parked position so focus and hit-testing never see stale
+// geometry, but only the selected page and its visible rows add height.
 int placePanel(bool place,int left,int offset) {
     const int pad=app.scale(PanelPad),width=app.scale(PanelWidth)-2*pad;
-    const int labelH=app.scale(20),comboTop=app.scale(22),field=app.scale(62),check=app.scale(26),button=app.scale(32);
-    const int line=app.scale(16),rowGap=app.scale(12);
-    int y=app.scale(14),rules=0;
+    const int labelW=app.scale(PanelLabelWidth),gap=app.scale(8),fieldX=labelW+gap,fieldW=width-fieldX;
+    const int optionW=std::min(width,app.scale(PanelOptionWidth)),summaryX=optionW+app.scale(10);
+    const int pitch=app.scale(36),check=app.scale(24),button=app.scale(30),line=app.scale(16);
+    // A closed drop-down list is as tall as its font requires; labels match it.
+    int comboH=app.scale(24);
+    if(app.mode){RECT closed{};GetWindowRect(app.mode,&closed);if(closed.bottom>closed.top)comboH=closed.bottom-closed.top;}
+    int page=CaptureTab,y=0,bottom=0,headings=0,rules=0;
+    const auto selected=[&]{return page==app.panelTab;};
     const auto put=[&](HWND child,int top,int height,int x=0,int w=0){
         if(place && child)MoveWindow(child,left+pad+x,top-offset,w?w:width,height,TRUE);};
+    const auto heading=[&](const wchar_t* caption,bool first=false){
+        if(!first)y+=app.scale(12);
+        if(place && selected() && headings<static_cast<int>(std::size(app.headings)))app.headings[headings++]={y,caption};
+        y+=app.scale(28);};
     const auto combo=[&](HWND label,HWND box,int dropped,bool visible=true){
-        put(label,y,labelH);put(box,y+comboTop,app.scale(dropped));if(visible)y+=field;};
-    const auto rule=[&]{y+=app.scale(4);if(place && rules<static_cast<int>(std::size(app.panelRules)))app.panelRules[rules++]=y;y+=app.scale(16);};
-    const auto section=[&](int index){if(place)app.sectionTops[index]=y;y+=app.scale(34);};
+        put(label,y,comboH,0,labelW);put(box,y,app.scale(dropped),fieldX,fieldW);if(visible)y+=pitch;};
+    const auto checkbox=[&](HWND box,bool visible=true){put(box,y,check);if(visible)y+=check+app.scale(6);};
+    const auto option=[&](HWND configure,HWND summary){
+        put(configure,y,button,0,optionW);put(summary,y,button,summaryX,width-summaryX);y+=button+gap;};
+    // Segmented page selector.
+    const int tabTop=app.scale(14),tabH=app.scale(36),inset=app.scale(3),tabW=(width-2*inset)/PanelTabCount;
+    if(place)app.tabsRect={app.panelRect.left+pad,tabTop,app.panelRect.left+pad+width,tabTop+tabH};
+    for(int i=0;i<PanelTabCount;++i)put(app.tabs[i],tabTop+inset,tabH-2*inset,inset+i*tabW,i==PanelTabCount-1?width-2*inset-i*tabW:tabW);
+    const int pageTop=tabTop+tabH+app.scale(10);
+
+    // Capture: what is recorded, how often, where it goes, and the live status.
+    page=CaptureTab;y=pageTop;
     const int refreshW=app.scale(88);
-    put(app.refresh,y+app.scale(1),app.scale(28),width-refreshW,refreshW);
-    section(0);
+    put(app.refresh,y,app.scale(28),width-refreshW,refreshW);
+    heading(L"SOURCE",true);
     combo(app.labels[0],app.mode,230);
     combo(app.labels[4],app.monitor,220,hasSource(Source::Desktop));
     combo(app.labels[5],app.camera,220,hasSource(Source::Camera));
-    {   // Collage companions: label, then both checkboxes on one row.
-        const int half=(width-app.scale(8))/2;
-        put(app.alsoLabel,y,labelH);
-        put(app.alsoDesktop,y+comboTop,check,0,half);put(app.alsoCamera,y+comboTop,check,width-half,half);
-        if(companionRow())y+=comboTop+check+app.scale(14);
+    {   // Collage companions: one label, both checkboxes in the field column.
+        const int half=(fieldW-gap)/2;
+        put(app.alsoLabel,y,check,0,labelW);
+        put(app.alsoDesktop,y,check,fieldX,half);put(app.alsoCamera,y,check,fieldX+half+gap,fieldW-half-gap);
+        if(companionRow())y+=check+app.scale(12);
     }
-    rule();section(1);
+    heading(L"VIDEO");
     combo(app.labels[1],app.interval,220);
     combo(app.labels[2],app.videoSize,140);
     combo(app.labels[3],app.encodingQuality,160);
-    rule();section(2);
-    if(place)app.savePathRect={app.panelRect.left+pad,y,app.panelRect.left+pad+width,y+app.scale(20)};
+    heading(L"SAVE TO");
+    if(place)app.savePathRect=selected()?RECT{app.panelRect.left+pad,y,app.panelRect.left+pad+width,y+app.scale(20)}:RECT{};
     y+=app.scale(26);
-    const int changeW=app.scale(104),buttonGap=app.scale(8);
-    put(app.folder,y,button,0,changeW);put(app.openFolder,y,button,changeW+buttonGap,width-changeW-buttonGap);
-    y+=button;rule();section(3);
+    const int changeW=app.scale(104);
+    put(app.folder,y,button,0,changeW);put(app.openFolder,y,button,changeW+gap,width-changeW-gap);y+=button;
     // What you're doing, shown in the video corner; usable while recording.
-    put(app.liveStatusSummary,y,labelH);y+=labelH+app.scale(8);
+    heading(L"STATUS");
+    put(app.liveStatusSummary,y,app.scale(20));y+=app.scale(28);
     const int clearW=app.scale(88);
-    put(app.liveStatusSet,y,button,0,width-clearW-buttonGap);put(app.liveStatusClear,y,button,width-clearW,clearW);
-    y+=button;rule();
-    if(place)app.advancedTop=y;
-    put(app.advanced,y,app.scale(38));y+=app.scale(38);
-    // Advanced rows are always positioned so focus and hit-testing never see
-    // stale geometry, but they add height only while expanded.
-    const int collapsedBottom=y;
-    y+=app.scale(14);
-    combo(app.labels[6],app.encodingMode,190);
-    put(app.encoderConfigure,y,button);y+=button+app.scale(14);
-    put(app.recoveryMode,y-app.scale(4),check);y+=check+app.scale(14);
+    put(app.liveStatusSet,y,button,0,width-clearW-gap);put(app.liveStatusClear,y,button,width-clearW,clearW);y+=button;
+    if(selected())bottom=y;
+
+    // Recording: when to stop or split, safety, cursor and frame timing.
+    page=RecordingTab;y=pageTop;
+    heading(L"SCHEDULE",true);
     combo(app.labels[7],app.stopAfter,210);
     combo(app.segmentLabel,app.splitEvery,210);
-    put(app.startDelayLabel,y,labelH);put(app.startDelay,y+comboTop,app.scale(210));
-    const int hintTop=y+comboTop+app.scale(34),hintH=wrappedHeight(app.startDelayHint,width,app.smallFont,2*line);
-    put(app.startDelayHint,hintTop,hintH);y=hintTop+hintH+rowGap;
-    put(app.lowDisk,y,check);y+=check+app.scale(4);
-    put(app.captureCursor,y,check);if(hasSource(Source::Desktop))y+=check+app.scale(16);
-    put(app.skipConfigure,y,button);y+=button+app.scale(6);
-    put(app.skipSummary,y,2*line);y+=2*line;
-    put(app.skipDetail,y,2*line);if(skipEnabled())y+=2*line;
-    y+=rowGap;
-    put(app.watermarkConfigure,y,button);y+=button+app.scale(6);
-    put(app.watermarkSummary,y,line);y+=line+rowGap;
-    put(app.playbackConfigure,y,button);y+=button+app.scale(16);
+    combo(app.startDelayLabel,app.startDelay,210);
+    heading(L"CAPTURE");
+    checkbox(app.lowDisk);
+    checkbox(app.captureCursor,hasSource(Source::Desktop));
+    y+=app.scale(4);
+    put(app.skipConfigure,y,button,0,optionW);put(app.skipSummary,y,button,summaryX,width-summaryX);y+=button;
+    put(app.skipDetail,y+app.scale(6),line+app.scale(4));if(skipEnabled())y+=line+app.scale(10);
     const int night=nightRow();
-    put(app.nightEnabled,y,check);if(night)y+=check+app.scale(8);
+    if(night)heading(L"NIGHT CAMERA");
+    checkbox(app.nightEnabled,night!=0);
     combo(app.labels[8],app.nightDuration,210,night==2);
     combo(app.labels[9],app.nightTarget,150,night==2);
-    put(app.nightHint,y,2*line);if(night==2)y+=2*line+app.scale(2);
-    put(app.nightDetail,y,2*line);if(night==2)y+=2*line;
-    if(place)app.panelRuleCount=rules;
-    return (app.advancedExpanded?y:collapsedBottom)+app.scale(20);
+    // One line each; the full text is in their tooltips.
+    put(app.nightHint,y,line+app.scale(4));if(night==2)y+=line+app.scale(6);
+    put(app.nightDetail,y,line+app.scale(4));if(night==2)y+=line+app.scale(4);
+    if(selected())bottom=y;
+
+    // Output: how files are encoded and finished, and resetting everything.
+    page=OutputTab;y=pageTop;
+    heading(L"ENCODING",true);
+    combo(app.labels[6],app.encodingMode,190);
+    option(app.encoderConfigure,app.encoderSummary);
+    checkbox(app.recoveryMode);
+    heading(L"EXTRAS");
+    option(app.watermarkConfigure,app.watermarkSummary);
+    option(app.playbackConfigure,app.playbackSummary);
+    y+=app.scale(6);
+    if(place && selected())app.panelRules[rules++]=y;
+    y+=app.scale(16);
+    put(app.resetDefaults,y,button,0,optionW);y+=button;
+    if(selected())bottom=y;
+
+    if(place){app.headingCount=headings;app.panelRuleCount=rules;}
+    return bottom+app.scale(20);
 }
 constexpr UINT_PTR SavePathTip=1;
 void updateSavePathTip() {
@@ -1541,9 +1594,7 @@ void layout() {
     layoutStatusRow();
     placePanel(true,panelLeft-app.scrollX,app.scrollY+app.panelScroll);
     updateSavePathTip();
-    app.advancedLimitIndex=-1;updateAdvanced();
     app.layingOut = false;
-    updateAdvanced();
     InvalidateRect(app.window,nullptr,TRUE);
 }
 int viewportHeight() { RECT r{};GetClientRect(app.window,&r);return static_cast<int>(r.bottom); }
@@ -1583,6 +1634,9 @@ void revealFocusedControl() {
     HWND child=GetFocus();
     if(!child || !IsChild(app.window,child))return;
     while(GetParent(child)!=app.window)child=GetParent(child);
+    // A mnemonic can reach a row on another page; show that page with it.
+    const int page=panelPage(child);
+    if(page>=0 && page!=app.panelTab)selectPanelTab(page,false);
     if(!(GetWindowLongPtrW(child,GWL_STYLE)&WS_VISIBLE))return;
     RECT target{}, viewport{};GetWindowRect(child,&target);GetClientRect(app.window,&viewport);
     MapWindowPoints(nullptr,app.window,reinterpret_cast<POINT*>(&target),2);
@@ -1601,16 +1655,6 @@ void revealFocusedControl() {
     const int x=reveal(app.scrollX,viewport.right,target.left,target.right);
     if(panel)scrollPanelTo(reveal(app.panelScroll,viewport.bottom,target.top,target.bottom),x);
     else scrollTo(x,reveal(app.scrollY,viewport.bottom,target.top,target.bottom));
-}
-void toggleAdvanced() {
-    const HWND focused=GetFocus();
-    if(app.advancedExpanded)for(HWND child:{app.encodingMode,app.encoderConfigure,app.stopAfter,app.splitEvery,app.lowDisk,app.recoveryMode,app.captureCursor,app.startDelay,app.skipConfigure,app.watermarkConfigure,app.playbackConfigure,app.nightEnabled,app.nightDuration,app.nightTarget})
-        if(child && (focused==child || (focused && IsChild(child,focused)))){SetFocus(app.advanced);break;}
-    app.advancedExpanded=!app.advancedExpanded;
-    updateAdvanced();layout();
-    // Bring newly expanded options into view, keeping the toggle on screen.
-    if(app.advancedExpanded && app.panelDocked)scrollPanelTo(std::max(app.panelScroll,app.advancedTop-app.scale(12)));
-    revealFocusedControl();
 }
 // Applies one wheel gesture to the panel or canvas. Returns whether that axis
 // can scroll; a closed combo then never consumes the gesture as a selection.
@@ -1662,7 +1706,7 @@ void fonts() {
     app.font=make(14,FW_NORMAL);app.titleFont=make(24,FW_SEMIBOLD);app.smallFont=make(12,FW_NORMAL);
     app.strongFont=make(14,FW_SEMIBOLD);app.headerFont=make(12,FW_SEMIBOLD);
     EnumChildWindows(app.window,[](HWND w,LPARAM p)->BOOL { SendMessageW(w,WM_SETFONT,p,TRUE); return TRUE; },reinterpret_cast<LPARAM>(app.font));
-    for(HWND child:{app.statusText,app.statusDetails,app.startDelayHint,app.nightHint,app.nightDetail,app.skipSummary,app.skipDetail,app.watermarkSummary,app.liveStatusSummary})
+    for(HWND child:{app.statusText,app.statusDetails,app.nightHint,app.nightDetail,app.skipSummary,app.skipDetail,app.watermarkSummary,app.encoderSummary,app.playbackSummary,app.liveStatusSummary})
         if(child)SendMessageW(child,WM_SETFONT,reinterpret_cast<WPARAM>(app.smallFont),TRUE);
 }
 
@@ -2830,7 +2874,7 @@ void editPlayback() {
     const auto outcome=DialogBoxIndirectParamW(GetModuleHandleW(nullptr),&resource.dialog,app.window,playbackProc,reinterpret_cast<LPARAM>(&draft));
     if(!IsWindow(app.window))return;
     if(outcome==IDOK && !draft.readOnly && !app.active()){
-        app.settings.outputFps=draft.fps;app.advancedOutputFps=-1;configure();updateControls();layout();InvalidateRect(app.window,nullptr,FALSE);
+        app.settings.outputFps=draft.fps;invalidatePanel();configure();updateControls();layout();InvalidateRect(app.window,nullptr,FALSE);
         if(app.startupComplete && !savePreferences())MessageBoxW(app.window,L"Your settings apply for this session, but could not be saved. Check that the settings folder is writable.",L"Timelapse",MB_OK|MB_ICONWARNING);
     }
     if(outcome==-1)MessageBoxW(app.window,L"Playback and shortcut settings could not be opened. Try again.",L"Timelapse",MB_OK|MB_ICONERROR);
@@ -2991,7 +3035,7 @@ void editEncoderSettings() {
     const auto outcome=DialogBoxIndirectParamW(GetModuleHandleW(nullptr),&resource.dialog,app.window,encoderSettingsProc,reinterpret_cast<LPARAM>(&draft));
     if(!IsWindow(app.window))return;
     if(outcome==IDOK && !draft.readOnly && !app.active()){
-        app.settings.encodingOptions=draft.options;app.advancedOutputFps=-1;configure();updateControls();layout();InvalidateRect(app.window,nullptr,FALSE);
+        app.settings.encodingOptions=draft.options;invalidatePanel();configure();updateControls();layout();InvalidateRect(app.window,nullptr,FALSE);
         if(app.startupComplete && !savePreferences())MessageBoxW(app.window,L"Your settings apply for this session, but could not be saved. Check that the settings folder is writable.",L"Timelapse",MB_OK|MB_ICONWARNING);
     }
     if(outcome==-1)MessageBoxW(app.window,L"Encoder settings could not be opened. Try again.",L"Timelapse",MB_OK|MB_ICONERROR);
@@ -3004,7 +3048,8 @@ constexpr const wchar_t* StatusKindLabels[]={L"Text only",L"Stopwatch (counts up
 constexpr const wchar_t* StatusCornerLabels[]={L"Top left",L"Top right",L"Bottom left",L"Bottom right"};
 constexpr const wchar_t* StatusSizeLabels[]={L"Small",L"Medium (default)",L"Large"};
 constexpr const wchar_t* StatusStyleLabels[]={L"Shadow only (default)",L"Edge fade"};
-constexpr size_t MaxRecentStatuses=8;
+// Older versions remembered recent statuses under these keys; saving removes them.
+constexpr size_t RetiredRecentStatuses=8;
 // Fixed storage: the 200 ms status tick must not allocate when nothing changed.
 void liveStatusCaption(uint64_t now,std::array<wchar_t,160>& caption) noexcept {
     caption.fill(L'\0');
@@ -3065,26 +3110,19 @@ void clearLiveStatus() {
     if(app.liveStatus.kind==StatusKind::None || app.closeWhenDone)return;
     StatusItem cleared;cleared.sequence=++app.liveStatusSequence;publishStatus(cleared);
 }
-void rememberStatus(const std::wstring& text) {
-    auto& recent=app.recentStatuses;
-    recent.erase(std::remove(recent.begin(),recent.end(),text),recent.end());
-    recent.insert(recent.begin(),text);
-    if(recent.size()>MaxRecentStatuses)recent.resize(MaxRecentStatuses);
-}
-enum StatusDialogId { StatusTextBox=5601,StatusKindBox,StatusMinutes,StatusRepeat,StatusBreak,StatusCornerBox,StatusSizeBox,StatusStyleBox,StatusPreview,StatusClearAction,StatusRecentAction };
+enum StatusDialogId { StatusTextBox=5601,StatusKindBox,StatusMinutes,StatusRepeat,StatusBreak,StatusCornerBox,StatusSizeBox,StatusStyleBox,StatusPreview,StatusClearAction,StatusSaveLog };
 constexpr INT_PTR StatusDialogCleared=3;
 struct StatusDraft : CustomDraft {
     StatusFeedSettings appearance;
     StatusItem result;
     StatusFeedRenderer renderer;
     Frame illustration;
-    bool readOnlyAppearance=false,ready=false,appearanceOnly=false;
+    bool readOnlyAppearance=false,ready=false,appearanceOnly=false,saveLog=false;
     int naturalHeight=0;
     // The quarter of the illustration around the chosen corner, enlarged so
     // the status text is readable in the dialog.
     RECT zoom{};
-    HWND text{},recent{},kind{},minutes{},repeat{},breakMinutes{},corner{},size{},style{},preview{},clear{},labels[8]{};
-    std::vector<std::wstring> recentTexts;
+    HWND text{},kind{},minutes{},repeat{},breakMinutes{},corner{},size{},style{},saveLogBox{},preview{},clear{},labels[8]{};
 };
 StatusFeedSettings statusDraftAppearance(const StatusDraft& draft) {
     StatusFeedSettings value=draft.appearance;
@@ -3140,11 +3178,10 @@ void statusIllustration(StatusDraft& draft) {
 void statusLayout(HWND window,StatusDraft& draft) {
     if(draft.layingOut)return;draft.layingOut=true;
     const bool timer=choice(draft.kind)==2,repeat=timer && isChecked(draft.repeat);
-    showControl(draft.recent,!draft.recentTexts.empty());
     const auto show=[](HWND child,bool visible){ShowWindow(child,visible?SW_SHOWNA:SW_HIDE);};
     for(HWND child:{draft.labels[2],draft.minutes,draft.repeat})show(child,timer);
     for(HWND child:{draft.labels[3],draft.breakMinutes})show(child,repeat);
-    for(HWND child:{draft.corner,draft.size,draft.style})EnableWindow(child,!draft.readOnlyAppearance);
+    for(HWND child:{draft.corner,draft.size,draft.style,draft.saveLogBox})EnableWindow(child,!draft.readOnlyAppearance);
     RECT client{};GetClientRect(window,&client);const auto style=GetWindowLongPtrW(window,GWL_STYLE);
     const int bw=GetSystemMetricsForDpi(SM_CXVSCROLL,draft.dpi),bh=GetSystemMetricsForDpi(SM_CYHSCROLL,draft.dpi);
     const int availableW=client.right+((style&WS_VSCROLL)?bw:0),availableH=client.bottom+((style&WS_HSCROLL)?bh:0);
@@ -3153,7 +3190,7 @@ void statusLayout(HWND window,StatusDraft& draft) {
         HDC dc=GetDC(window);if(!dc)return minimum;auto old=SelectObject(dc,draft.font?static_cast<HGDIOBJ>(draft.font):GetStockObject(DEFAULT_GUI_FONT));
         DrawTextW(dc,value,-1,&rect,DT_CALCRECT|DT_WORDBREAK|DT_NOPREFIX);SelectObject(dc,old);ReleaseDC(window,dc);return std::max(minimum,int(rect.bottom));};
     const int kindTop=draft.scale(76),repeatTop=draft.scale(136),appearanceTop=draft.scale(timer?198:144);
-    const int cornerTop=appearanceTop+draft.scale(28),styleTop=cornerTop+draft.scale(60),previewTop=styleTop+draft.scale(64),previewHeight=draft.scale(150);
+    const int cornerTop=appearanceTop+draft.scale(28),styleTop=cornerTop+draft.scale(60),logTop=styleTop+draft.scale(60),previewTop=logTop+draft.scale(36),previewHeight=draft.scale(150);
     const int helpTop=previewTop+previewHeight+draft.scale(12);
     int helpHeight=0,errorTop=0,errorHeight=0,buttonTop=0,minHeight=0;
     const auto measure=[&](int width){helpHeight=wrap(draft.help,width-2*pad,draft.scale(36));errorTop=helpTop+helpHeight+draft.scale(8);
@@ -3168,9 +3205,7 @@ void statusLayout(HWND window,StatusDraft& draft) {
     info.nMax=height-1;info.nPage=std::max(1L,client.bottom);info.nPos=draft.scrollY;SetScrollInfo(window,SB_VERT,&info,TRUE);
     const int half=(width-2*pad-gap)/2,x2=pad+half+gap,full=width-2*pad;
     const auto move=[&](HWND child,int x,int y,int w,int h){MoveWindow(child,x-draft.scrollX,y-draft.scrollY,w,h,TRUE);};
-    const int recentWidth=draft.recentTexts.empty()?0:draft.scale(90),textWidth=full-(recentWidth?recentWidth+gap:0);
-    move(draft.labels[0],pad,draft.scale(16),full,draft.scale(20));move(draft.text,pad,draft.scale(38),textWidth,draft.scale(28));
-    move(draft.recent,width-pad-draft.scale(90),draft.scale(38),draft.scale(90),draft.scale(28));
+    move(draft.labels[0],pad,draft.scale(16),full,draft.scale(20));move(draft.text,pad,draft.scale(38),full,draft.scale(28));
     move(draft.labels[1],pad,kindTop,half,draft.scale(20));move(draft.kind,pad,kindTop+draft.scale(22),half,draft.scale(140));
     move(draft.labels[2],x2,kindTop,half,draft.scale(20));move(draft.minutes,x2,kindTop+draft.scale(22),half,draft.scale(28));
     move(draft.repeat,pad,repeatTop+draft.scale(22),half,draft.scale(28));
@@ -3179,6 +3214,7 @@ void statusLayout(HWND window,StatusDraft& draft) {
     move(draft.labels[5],pad,cornerTop,half,draft.scale(20));move(draft.corner,pad,cornerTop+draft.scale(22),half,draft.scale(160));
     move(draft.labels[6],x2,cornerTop,half,draft.scale(20));move(draft.size,x2,cornerTop+draft.scale(22),half,draft.scale(140));
     move(draft.labels[7],pad,styleTop,half,draft.scale(20));move(draft.style,pad,styleTop+draft.scale(22),half,draft.scale(120));
+    move(draft.saveLogBox,pad,logTop,full,draft.scale(24));
     move(draft.preview,pad,previewTop,full,previewHeight);
     move(draft.help,pad,helpTop,full,helpHeight);move(draft.error,pad,errorTop,full,errorHeight);
     move(draft.clear,pad,buttonTop,draft.scale(110),draft.scale(28));
@@ -3198,22 +3234,6 @@ void statusReveal(HWND window,StatusDraft& draft,HWND child) {
     if(bounds.left<0)draft.scrollX+=bounds.left;else if(bounds.right>client.right)draft.scrollX+=bounds.right-client.right;
     if(bounds.top<0)draft.scrollY+=bounds.top;else if(bounds.bottom>client.bottom)draft.scrollY+=bounds.bottom-client.bottom;statusLayout(window,draft);
 }
-void statusRecent(HWND window,StatusDraft& draft) {
-    if(draft.recentTexts.empty())return;
-    struct Menu {HMENU value=CreatePopupMenu();~Menu(){if(value)DestroyMenu(value);}} menu;
-    bool ready=menu.value!=nullptr;
-    for(size_t i=0;ready && i<draft.recentTexts.size();++i){
-        // Status text is literal, including ampersands, rather than menu mnemonics.
-        std::wstring label;for(wchar_t character:draft.recentTexts[i]){label+=character;if(character==L'&')label+=L'&';}
-        ready=AppendMenuW(menu.value,MF_STRING,static_cast<UINT_PTR>(i+1),label.c_str())!=FALSE;
-    }
-    if(!ready){MessageBoxW(window,L"Recent statuses could not be opened. Try again.",L"Timelapse",MB_OK|MB_ICONERROR);return;}
-    RECT bounds{};GetWindowRect(draft.recent,&bounds);
-    const auto command=TrackPopupMenu(menu.value,TPM_RETURNCMD|TPM_NONOTIFY|TPM_RIGHTBUTTON,bounds.left,bounds.bottom,0,window,nullptr);
-    if(!IsWindow(window))return;
-    if(command>0 && size_t(command)<=draft.recentTexts.size())SetWindowTextW(draft.text,draft.recentTexts[size_t(command)-1].c_str());
-    SetFocus(draft.text);SendMessageW(draft.text,EM_SETSEL,0,-1);statusReveal(window,draft,draft.text);
-}
 INT_PTR CALLBACK statusProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
     auto* draft=reinterpret_cast<StatusDraft*>(GetWindowLongPtrW(window,DWLP_USER));
     try {
@@ -3224,8 +3244,6 @@ INT_PTR CALLBACK statusProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             const auto label=[&](int i,const wchar_t* text){return draft->labels[i]=skipChild(window,L"STATIC",text,0,5700+i);};
             label(0,L"What are you &doing?");
             draft->text=skipChild(window,L"EDIT",L"",WS_TABSTOP|ES_AUTOHSCROLL,StatusTextBox);
-            draft->recent=skipChild(window,L"BUTTON",L"Recent...",WS_TABSTOP|BS_PUSHBUTTON|BS_NOTIFY,StatusRecentAction);
-            draft->recentTexts=app.recentStatuses;
             label(1,L"&Show");draft->kind=combo(StatusKindBox);for(auto value:StatusKindLabels)add(draft->kind,value);
             label(2,L"&Minutes");draft->minutes=skipChild(window,L"EDIT",minutesInput(app.statusDraftTimerMs).c_str(),WS_TABSTOP|ES_AUTOHSCROLL,StatusMinutes);
             draft->repeat=skipChild(window,L"BUTTON",L"&Repeat with breaks",WS_TABSTOP|BS_AUTOCHECKBOX|BS_NOTIFY,StatusRepeat);
@@ -3234,12 +3252,13 @@ INT_PTR CALLBACK statusProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             label(5,L"C&orner");draft->corner=combo(StatusCornerBox);for(auto value:StatusCornerLabels)add(draft->corner,value);
             label(6,L"Text si&ze");draft->size=combo(StatusSizeBox);for(auto value:StatusSizeLabels)add(draft->size,value);
             label(7,L"St&yle");draft->style=combo(StatusStyleBox);for(auto value:StatusStyleLabels)add(draft->style,value);
+            draft->saveLogBox=skipChild(window,L"BUTTON",L"&Also save a status list (.txt) with each video",WS_TABSTOP|BS_AUTOCHECKBOX|BS_NOTIFY,StatusSaveLog);
             draft->preview=skipChild(window,L"STATIC",L"Status illustration",SS_OWNERDRAW,StatusPreview);
             draft->help=skipChild(window,L"STATIC",L"",SS_NOPREFIX,CustomHelp);draft->error=skipChild(window,L"STATIC",L"",SS_NOPREFIX,CustomError);
             draft->clear=skipChild(window,L"BUTTON",L"C&lear status",WS_TABSTOP|BS_PUSHBUTTON|BS_NOTIFY,StatusClearAction);
             draft->okay=skipChild(window,L"BUTTON",L"S&et status",WS_TABSTOP|BS_DEFPUSHBUTTON|BS_NOTIFY,IDOK);
             draft->cancel=skipChild(window,L"BUTTON",L"Cancel",WS_TABSTOP|BS_PUSHBUTTON|BS_NOTIFY,IDCANCEL);
-            for(HWND child:{draft->text,draft->recent,draft->kind,draft->minutes,draft->repeat,draft->breakMinutes,draft->corner,draft->size,draft->style,draft->preview,draft->help,draft->error,draft->clear,draft->okay,draft->cancel})
+            for(HWND child:{draft->text,draft->kind,draft->minutes,draft->repeat,draft->breakMinutes,draft->corner,draft->size,draft->style,draft->saveLogBox,draft->preview,draft->help,draft->error,draft->clear,draft->okay,draft->cancel})
                 if(!child){EndDialog(window,-1);return TRUE;}
             for(HWND child:draft->labels)if(!child){EndDialog(window,-1);return TRUE;}
             if(!dialogWheelCombos({draft->kind,draft->corner,draft->size,draft->style})){EndDialog(window,-1);return TRUE;}
@@ -3248,9 +3267,10 @@ INT_PTR CALLBACK statusProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             for(HWND edit:{draft->minutes,draft->breakMinutes})SendMessageW(edit,EM_SETLIMITTEXT,32,0);
             choose(draft->kind,std::clamp(app.statusDraftKind,0,2));SendMessageW(draft->repeat,BM_SETCHECK,app.statusDraftRepeat?BST_CHECKED:BST_UNCHECKED,0);
             choose(draft->corner,static_cast<int>(draft->appearance.corner));choose(draft->size,static_cast<int>(draft->appearance.textSize));choose(draft->style,static_cast<int>(draft->appearance.style));
+            SendMessageW(draft->saveLogBox,BM_SETCHECK,draft->saveLog?BST_CHECKED:BST_UNCHECKED,0);
             EnableWindow(draft->clear,app.liveStatus.kind!=StatusKind::None);
-            std::wstring help=L"Shows in the video from the next saved frame, even while recording. A new status strikes the old one through and fades it out. Stopwatches and timers count real time, including pauses.";
-            if(draft->readOnlyAppearance)help+=L" Appearance is fixed until this recording ends.";
+            std::wstring help=L"Shows in the video from the next saved frame, even while recording. A new status strikes the old one through and fades it out. Stopwatches and timers count real time, including pauses. The optional list gives each status change's time in the saved video, for chapters.";
+            if(draft->readOnlyAppearance)help+=L" Appearance and the status list are fixed until this recording ends.";
             SetWindowTextW(draft->help,help.c_str());
             customFont(window,*draft);draft->ready=true;statusIllustration(*draft);
             RECT rect{0,0,draft->scale(520),draft->scale(600)};AdjustWindowRectExForDpi(&rect,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_STYLE)),FALSE,static_cast<DWORD>(GetWindowLongPtrW(window,GWL_EXSTYLE)),draft->dpi);
@@ -3278,21 +3298,20 @@ INT_PTR CALLBACK statusProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             switch(LOWORD(wp)){case SB_LINEUP:position-=draft->scale(24);break;case SB_LINEDOWN:position+=draft->scale(24);break;case SB_PAGEUP:position-=info.nPage;break;case SB_PAGEDOWN:position+=info.nPage;break;case SB_THUMBPOSITION:case SB_THUMBTRACK:position=info.nTrackPos;break;case SB_TOP:position=0;break;case SB_BOTTOM:position=info.nMax;break;default:return TRUE;}
             (bar==SB_HORZ?draft->scrollX:draft->scrollY)=position;statusLayout(window,*draft);return TRUE;}
         case WM_COMMAND:{const int id=LOWORD(wp),code=HIWORD(wp);
-            if(((id==IDOK || id==IDCANCEL || id==StatusClearAction || id==StatusRepeat || id==StatusRecentAction) && code==BN_SETFOCUS) || ((id==StatusTextBox || id==StatusMinutes || id==StatusBreak) && code==EN_SETFOCUS) ||
+            if(((id==IDOK || id==IDCANCEL || id==StatusClearAction || id==StatusRepeat || id==StatusSaveLog) && code==BN_SETFOCUS) || ((id==StatusTextBox || id==StatusMinutes || id==StatusBreak) && code==EN_SETFOCUS) ||
                ((id==StatusKindBox || id==StatusCornerBox || id==StatusSizeBox || id==StatusStyleBox) && code==CBN_SETFOCUS)){
                 statusReveal(window,*draft,reinterpret_cast<HWND>(lp));return TRUE;
             }
             if(id==IDCANCEL && code==BN_CLICKED){EndDialog(window,IDCANCEL);return TRUE;}
-            if(id==StatusRecentAction && code==BN_CLICKED){statusRecent(window,*draft);return TRUE;}
-            if(id==StatusClearAction && code==BN_CLICKED){draft->appearance=statusDraftAppearance(*draft);EndDialog(window,StatusDialogCleared);return TRUE;}
+            if(id==StatusClearAction && code==BN_CLICKED){draft->appearance=statusDraftAppearance(*draft);draft->saveLog=isChecked(draft->saveLogBox);EndDialog(window,StatusDialogCleared);return TRUE;}
             if(id==IDOK && code==BN_CLICKED){
                 StatusItem item;std::wstring error;HWND invalid{};
-                const auto appearance=statusDraftAppearance(*draft);
-                if(GetWindowTextLengthW(draft->text)==0 && !sameStatusFeedSettings(appearance,draft->appearance)){
-                    // Only the look changed: keep the current status.
-                    draft->appearance=appearance;draft->appearanceOnly=true;EndDialog(window,IDOK);return TRUE;
+                const auto appearance=statusDraftAppearance(*draft);const bool saveLog=isChecked(draft->saveLogBox);
+                if(GetWindowTextLengthW(draft->text)==0 && (!sameStatusFeedSettings(appearance,draft->appearance) || saveLog!=draft->saveLog)){
+                    // Only the look or the list option changed: keep the current status.
+                    draft->appearance=appearance;draft->saveLog=saveLog;draft->appearanceOnly=true;EndDialog(window,IDOK);return TRUE;
                 }
-                if(statusDraftItem(*draft,item,error,invalid)){draft->appearance=appearance;draft->result=item;EndDialog(window,IDOK);return TRUE;}
+                if(statusDraftItem(*draft,item,error,invalid)){draft->appearance=appearance;draft->saveLog=saveLog;draft->result=item;EndDialog(window,IDOK);return TRUE;}
                 SetWindowTextW(draft->error,error.c_str());statusLayout(window,*draft);statusFitHeight(window,*draft);SetFocus(invalid);statusReveal(window,*draft,invalid);return TRUE;}
             const bool changed=((id==StatusRepeat) && code==BN_CLICKED) || ((id==StatusKindBox || id==StatusCornerBox || id==StatusSizeBox || id==StatusStyleBox) && code==CBN_SELCHANGE) ||
                 ((id==StatusTextBox || id==StatusMinutes || id==StatusBreak) && code==EN_CHANGE);
@@ -3305,18 +3324,19 @@ INT_PTR CALLBACK statusProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
 }
 void editStatus() {
     if(app.customDialog || app.closeWhenDone || app.failureNotice==FailureNotice::Presenting)return;
-    StatusDraft draft;draft.appearance=app.settings.statusFeed;draft.readOnlyAppearance=app.active();CustomTemplate resource;
+    StatusDraft draft;draft.appearance=app.settings.statusFeed;draft.saveLog=app.settings.saveStatusLog;draft.readOnlyAppearance=app.active();CustomTemplate resource;
     const auto outcome=DialogBoxIndirectParamW(GetModuleHandleW(nullptr),&resource.dialog,app.window,statusProc,reinterpret_cast<LPARAM>(&draft));
     if(!IsWindow(app.window))return;
     if(outcome==-1){MessageBoxW(app.window,L"Status settings could not be opened. Try again.",L"Timelapse",MB_OK|MB_ICONERROR);return;}
     if(outcome==IDOK || outcome==StatusDialogCleared){
-        if(!app.active() && !sameStatusFeedSettings(draft.appearance,app.settings.statusFeed)){app.settings.statusFeed=draft.appearance;configure();}
+        if(!app.active() && (!sameStatusFeedSettings(draft.appearance,app.settings.statusFeed) || draft.saveLog!=app.settings.saveStatusLog)){
+            app.settings.statusFeed=draft.appearance;app.settings.saveStatusLog=draft.saveLog;configure();}
         if(outcome==StatusDialogCleared)clearLiveStatus();
         else if(!draft.appearanceOnly){
             auto item=draft.result;item.sequence=++app.liveStatusSequence;item.startTick=GetTickCount64();
             app.statusDraftKind=static_cast<int>(item.kind)-1;
             if(item.kind==StatusKind::Timer){app.statusDraftTimerMs=item.durationMs;app.statusDraftRepeat=item.breakMs>0;if(item.breakMs)app.statusDraftBreakMs=item.breakMs;}
-            rememberStatus(item.text.data());publishStatus(item);
+            publishStatus(item);
         }
         if(app.startupComplete)savePreferences();
     }
@@ -3507,8 +3527,9 @@ bool savePreferences() {
         if(saved)saved=WritePrivateProfileStringW(L"Settings",L"AlsoSaveDesktop",isChecked(app.alsoDesktop)?L"1":L"0",pending.path) &&
             WritePrivateProfileStringW(L"Settings",L"AlsoSaveCamera",isChecked(app.alsoCamera)?L"1":L"0",pending.path);
         for(size_t i=0;saved && i<std::size(StatusKeys);++i)saved=WritePrivateProfileStringW(L"Settings",StatusKeys[i],statusValues[i].c_str(),pending.path)!=FALSE;
-        for(size_t i=0;saved && i<MaxRecentStatuses;++i){const auto key=L"StatusRecent"+std::to_wstring(i+1);
-            saved=WritePrivateProfileStringW(L"Settings",key.c_str(),i<app.recentStatuses.size()?app.recentStatuses[i].c_str():L"",pending.path)!=FALSE;}
+        if(saved)saved=WritePrivateProfileStringW(L"Settings",L"StatusSaveLog",app.settings.saveStatusLog?L"1":L"0",pending.path)!=FALSE;
+        for(size_t i=0;saved && i<RetiredRecentStatuses;++i){const auto key=L"StatusRecent"+std::to_wstring(i+1);
+            WritePrivateProfileStringW(L"Settings",key.c_str(),nullptr,pending.path);}
         // This cache-flush form returns zero even when successful.
         WritePrivateProfileStringW(nullptr,nullptr,nullptr,pending.path);
         if(!saved)return false;
@@ -3525,10 +3546,16 @@ bool savePreferences() {
         return false;
     }
 }
+// Loads every remembered setting from an INI file. Missing or malformed keys
+// take their defaults individually, so a file that does not exist gives the
+// complete first-start configuration.
+void loadPreferences(const wchar_t* path);
 void preferences(bool save) {
-    if (!save) {
-        const auto preferencesPath=fileIOPath(app.preferences);
-        const auto path=preferencesPath.c_str();
+    if (!save) loadPreferences(fileIOPath(app.preferences).c_str());
+    else if(!savePreferences()) OutputDebugStringW(L"Timelapse could not save preferences.\n");
+}
+void loadPreferences(const wchar_t* path) {
+    {
         wchar_t folder[32768]; GetPrivateProfileStringW(L"Settings",L"Folder",app.settings.folder.c_str(),folder,32768,path); app.settings.folder=folder;
         const int interval=static_cast<int>(GetPrivateProfileIntW(L"Settings",L"Interval",2,path));
         const int videoSize=static_cast<int>(GetPrivateProfileIntW(L"Settings",L"Quality",0,path));
@@ -3618,21 +3645,33 @@ void preferences(bool save) {
             exactInteger(L"StatusBreakSeconds",1,static_cast<int>(StatusMaxTimerMs/1000),pauseLength);exactInteger(L"StatusRepeat",0,1,repeat);
             app.settings.statusFeed={static_cast<StatusCorner>(corner),static_cast<StatusTextSize>(size),static_cast<StatusStyle>(style)};
             app.statusDraftKind=kind;app.statusDraftTimerMs=int64_t(timer)*1000;app.statusDraftBreakMs=int64_t(pauseLength)*1000;app.statusDraftRepeat=repeat!=0;
-            app.recentStatuses.clear();
-            for(size_t i=0;i<MaxRecentStatuses;++i){const auto key=L"StatusRecent"+std::to_wstring(i+1);wchar_t value[256]{};
-                GetPrivateProfileStringW(L"Settings",key.c_str(),L"",value,256,path);StatusItem sample;setStatusText(sample,value);
-                const std::wstring text=sample.text.data();
-                if(!text.empty() && std::find(app.recentStatuses.begin(),app.recentStatuses.end(),text)==app.recentStatuses.end())app.recentStatuses.push_back(text);}
+            int saveLog=0;exactInteger(L"StatusSaveLog",0,1,saveLog);app.settings.saveStatusLog=saveLog!=0;
         }
-        app.advancedOutputFps=-1;
+        invalidatePanel();
         app.settings.timeSkip=loadSkip(path);++app.skipRevision;
         app.settings.watermark=loadWatermark(path);app.watermarkCheckValid=false;++app.watermarkRevision;
         // Launch on desktop: opening the app never silently turns on a camera.
         choose(app.mode,0);
-        updateAdvanced();
-    } else if(!savePreferences()) {
-        OutputDebugStringW(L"Timelapse could not save preferences.\n");
+        updatePanel();
     }
+}
+// Returns every setting to its first-start default, keeping only the
+// selected display and camera. Not available while a recording is active.
+void resetSettings() {
+    if(app.active() || app.customDialog || app.closeWhenDone || app.failureNotice==FailureNotice::Presenting)return;
+    if(MessageBoxW(app.window,L"Reset all settings to their defaults?\n\nThis restores capture timing, video size and quality, the save folder, encoder and recording options, time compression, night camera, watermark, status appearance and global shortcuts. Your selected display and camera stay selected.",
+        L"Reset all settings",MB_YESNO|MB_ICONQUESTION|MB_DEFBUTTON2)!=IDYES || !IsWindow(app.window) || app.active())return;
+    std::wstring folder,ignored;
+    if(defaultPaths(folder,ignored))app.settings.folder=folder;
+    // Read through the normal loader from a file that does not exist.
+    const auto base=fileIOPath(app.preferences)+L".defaults";
+    std::wstring missing=base;std::error_code error;
+    for(int i=1;std::filesystem::exists(missing,error) && i<100;++i)missing=base+std::to_wstring(i);
+    loadPreferences(missing.c_str());
+    changeLayout(true);configure();updateControls();layout();
+    if(app.startupComplete)savePreferences();
+    InvalidateRect(app.window,nullptr,FALSE);InvalidateRect(app.preview,nullptr,FALSE);
+    if(app.resetDefaults && shown(app.resetDefaults)){SetFocus(app.resetDefaults);revealFocusedControl();}
 }
 
 RECT layerRect(const Layer& l) {
@@ -3706,15 +3745,45 @@ void glyph(HDC dc,Glyph kind,const RECT& box,COLORREF ink,COLORREF backdrop) {
     default:break;
     }
 }
-enum class ButtonLook { None, Primary, Secondary, Quiet, Disclosure };
+enum class ButtonLook { None, Primary, Secondary, Quiet, Tab };
+constexpr COLORREF TabTrack = RGB(236, 238, 241);
 ButtonLook buttonLook(HWND button) {
     if(!button)return ButtonLook::None;
     if(button==app.record)return ButtonLook::Primary;
-    if(button==app.advanced)return ButtonLook::Disclosure;
+    for(HWND member:app.tabs)if(member==button)return ButtonLook::Tab;
     if(button==app.statusDetails)return ButtonLook::Quiet;
-    for(HWND member:{app.pause,app.finish,app.refresh,app.folder,app.openFolder,app.reset,app.forward,app.skipConfigure,app.watermarkConfigure,app.playbackConfigure})
+    for(HWND member:{app.pause,app.finish,app.refresh,app.folder,app.openFolder,app.reset,app.forward,app.skipConfigure,app.watermarkConfigure,app.playbackConfigure,
+        app.encoderConfigure,app.liveStatusSet,app.liveStatusClear,app.resetDefaults})
         if(member==button)return ButtonLook::Secondary;
     return ButtonLook::None;
+}
+// One segment of the page selector: the selected page is a raised white tab;
+// a dot marks pages with changed options, red when one needs attention.
+LRESULT drawTab(const NMCUSTOMDRAW& draw) {
+    const HWND button=draw.hdr.hwndFrom;const HDC dc=draw.hdc;const RECT r=draw.rc;
+    int index=0;while(index<PanelTabCount && app.tabs[index]!=button)++index;
+    const bool selected=index==app.panelTab;
+    const auto state=SendMessageW(button,BM_GETSTATE,0,0),cues=SendMessageW(button,WM_QUERYUISTATE,0,0);
+    const bool hot=!selected && ((state&BST_HOT) || (draw.uItemState&CDIS_HOT));
+    const bool focused=(draw.uItemState&CDIS_FOCUS) && !(cues&UISF_HIDEFOCUS);
+    solid(dc,r,TabTrack);
+    const COLORREF fill=selected?Panel:hot?RGB(226,229,233):TabTrack;
+    roundRect(dc,r,app.scale(5),fill,TabTrack,focused?Ink:selected?Border:fill,focused?std::max(2,app.scale(2)):1);
+    wchar_t caption[64]{};GetWindowTextW(button,caption,static_cast<int>(std::size(caption)));
+    const auto previousFont=SelectObject(dc,selected && app.strongFont?app.strongFont:app.font);
+    SetBkMode(dc,TRANSPARENT);SetTextColor(dc,selected?Ink:Muted);
+    const int mark=index<PanelTabCount?app.tabMarks[index]:0,dot=mark?app.scale(6):0,space=mark?app.scale(6):0;
+    RECT measured{};DrawTextW(dc,caption,-1,&measured,DT_CALCRECT|DT_SINGLELINE|DT_NOPREFIX);
+    const int content=static_cast<int>(measured.right-measured.left)+dot+space;
+    const int x=r.left+std::max(app.scale(6),static_cast<int>((r.right-r.left-content)/2));
+    RECT label{x,r.top,r.right-app.scale(4)-dot-space,r.bottom};
+    DrawTextW(dc,caption,-1,&label,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|DT_NOPREFIX);
+    if(mark){
+        const int left=std::min<int>(label.right,x+measured.right-measured.left)+space,middle=(r.top+r.bottom)/2;
+        glyph(dc,Glyph::Dot,{left,middle-dot/2,left+dot,middle-dot/2+dot},mark==2?Danger:Accent,fill);
+    }
+    SelectObject(dc,previousFont);
+    return CDRF_SKIPDEFAULT;
 }
 COLORREF controlBackdrop(HWND child) {
     return child==app.record || child==app.pause || child==app.finish || panelControl(child)?Panel:Background;
@@ -3724,6 +3793,7 @@ COLORREF controlBackdrop(HWND child) {
 LRESULT drawButton(const NMCUSTOMDRAW& draw) {
     const HWND button=draw.hdr.hwndFrom;const auto look=buttonLook(button);
     if(look==ButtonLook::None || draw.dwDrawStage!=CDDS_PREPAINT)return CDRF_DODEFAULT;
+    if(look==ButtonLook::Tab)return drawTab(draw);
     const HDC dc=draw.hdc;const RECT r=draw.rc;
     const auto state=SendMessageW(button,BM_GETSTATE,0,0),cues=SendMessageW(button,WM_QUERYUISTATE,0,0);
     const bool enabled=IsWindowEnabled(button)!=FALSE && !(draw.uItemState&CDIS_DISABLED);
@@ -3740,7 +3810,6 @@ LRESULT drawButton(const NMCUSTOMDRAW& draw) {
     default:
         fill=!enabled?blend(backdrop,Panel,.5):pressed?RGB(229,232,236):hot?RGB(242,244,246):Panel;
         edge=enabled?Border:RGB(232,235,238);
-        if(look==ButtonLook::Disclosure && enabled && app.advancedWarning)ink=Danger;
         break;
     }
     if(focused)edge=Ink;
@@ -3750,18 +3819,12 @@ LRESULT drawButton(const NMCUSTOMDRAW& draw) {
     if(button==app.record)kind=Glyph::Dot;
     else if(button==app.pause)kind=std::wcsstr(caption,L"Resume")?Glyph::Play:Glyph::Bars;
     else if(button==app.finish && !std::wcsstr(caption,L"Cancel"))kind=Glyph::Square;
-    else if(look==ButtonLook::Disclosure)kind=(state&BST_CHECKED)?Glyph::ChevronUp:Glyph::ChevronDown;
     const HFONT owned=reinterpret_cast<HFONT>(SendMessageW(button,WM_GETFONT,0,0));
     const auto previousFont=SelectObject(dc,look==ButtonLook::Primary && app.strongFont?app.strongFont:owned?owned:app.font);
     const UINT prefix=(cues&UISF_HIDEACCEL)?DT_HIDEPREFIX:0;
     SetBkMode(dc,TRANSPARENT);SetTextColor(dc,ink);
     const int icon=kind==Glyph::None?0:app.scale(10),middle=(r.top+r.bottom)/2;
-    if(look==ButtonLook::Disclosure) {
-        const int inset=app.scale(14);
-        RECT label{r.left+inset,r.top,r.right-inset-icon-app.scale(8),r.bottom};
-        DrawTextW(dc,caption,-1,&label,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_END_ELLIPSIS|prefix);
-        glyph(dc,kind,{r.right-inset-icon,middle-icon/2,r.right-inset,middle-icon/2+icon},enabled?Muted:Subtle,fill);
-    } else {
+    {
         RECT measured{};DrawTextW(dc,caption,-1,&measured,DT_CALCRECT|DT_SINGLELINE|prefix);
         const int gap=app.scale(8),textW=measured.right-measured.left;
         // Drop the glyph rather than clip a translated or longer caption.
@@ -3808,13 +3871,14 @@ void paintStats(HDC dc) {
 }
 void paintPanel(HDC dc) {
     const int pad=app.scale(PanelPad),left=app.panelRect.left+pad,right=app.panelRect.right-pad,offset=app.panelScroll;
-    static constexpr const wchar_t* Headings[]={L"INPUT",L"OUTPUT",L"SAVE TO",L"STATUS"};
+    RECT track=app.tabsRect;OffsetRect(&track,0,-offset);
+    if(track.right>track.left)roundRect(dc,track,app.scale(7),TabTrack,Panel);
     const int spacing=SetTextCharacterExtra(dc,std::max(1,app.scale(1)));
-    for(int i=0;i<4;++i){const int top=app.sectionTops[i]-offset;text(dc,Headings[i],{left,top,right-app.scale(100),top+app.scale(30)},Muted,app.headerFont);}
+    for(int i=0;i<app.headingCount;++i){const int top=app.headings[i].top-offset;text(dc,app.headings[i].text,{left,top,right-app.scale(100),top+app.scale(28)},Muted,app.headerFont);}
     SetTextCharacterExtra(dc,spacing);
     for(int i=0;i<app.panelRuleCount;++i){const int y=app.panelRules[i]-offset;solid(dc,{left,y,right,y+1},Border);}
-    RECT path=app.savePathRect;OffsetRect(&path,0,-offset);
-    text(dc,app.settings.folder,path,Ink,app.smallFont,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_PATH_ELLIPSIS);
+    if(app.savePathRect.right>app.savePathRect.left){RECT path=app.savePathRect;OffsetRect(&path,0,-offset);
+        text(dc,app.settings.folder,path,Ink,app.smallFont,DT_LEFT|DT_VCENTER|DT_SINGLELINE|DT_PATH_ELLIPSIS);}
 }
 // Paints the parent surface in client coordinates; children are clipped out.
 void paintWindow(HDC dc,const RECT& dirty) {
@@ -3934,21 +3998,20 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
     }
     case WM_CREATE: {
         cancelOpenFolder();app.shellBusyObserved=shellOperationBusy.load(std::memory_order_acquire);app.openFolderBusyShown=false;
-        app.startupComplete=false;app.advancedExpanded=false;app.advancedLimitIndex=app.advancedVisibility=-1;
-        app.advancedSegmentSeconds=app.advancedEncodingMode=-1;app.settings.encodingOptions={};
-        app.advancedCursorState=app.cursorVisibility=app.advancedDelaySeconds=-1;app.committedStartDelay=0;
+        app.startupComplete=false;app.panelTab=CaptureTab;invalidatePanel();
+        app.settings.encodingOptions={};app.committedStartDelay=0;
         app.waitingRemaining=UINT64_MAX;app.waitingCaption.clear();
         app.failureNotice=FailureNotice::None;
         app.trayMenuOpen=app.trayMenuCanceled=false;
-        app.advancedNightState=app.advancedRecoveryState=app.nightVisibility=-1;app.nightValidation.clear();app.encodingValidation.clear();app.statusCaption.clear();app.statusCaptionError=false;app.nightHintCaption.clear();app.nightDetailCaption.clear();
+        app.nightValidation.clear();app.encodingValidation.clear();app.statusCaption.clear();app.statusCaptionError=false;app.nightHintCaption.clear();app.nightDetailCaption.clear();
         app.cameraListError.clear();app.statusTooltipCaption.clear();
         app.statusDetailsVisible=-1;
-        app.customDialog=nullptr;app.advancedCaption.clear();app.advancedTooltip.clear();
-        app.skipRevision=0;app.advancedSkipRevision=app.skipSummaryRevision=app.skipVisibility=-1;app.skipCheckAge=UINT64_MAX;
+        app.customDialog=nullptr;app.encoderCaption.clear();app.playbackCaption.clear();
+        app.skipRevision=0;app.skipSummaryRevision=-1;app.skipCheckAge=UINT64_MAX;
         app.skipSummaryCaption.clear();app.skipDetailCaption.clear();app.settings.timeSkip={};
         app.personPack={};app.personPackKnown=false;
-        app.settings.watermark={};app.watermarkChecked={};app.watermarkCheckValid=false;app.watermarkRevision=0;app.advancedWatermarkRevision=-1;app.watermarkValidation.clear();app.watermarkCaption.clear();
-        unregisterRecordingHotkeys();app.pauseHotkey=app.stopHotkey=0;app.hotkeyWarning.clear();app.settings.outputFps=app.recordedOutputFps=DefaultOutputFps;app.advancedOutputFps=-1;
+        app.settings.watermark={};app.watermarkChecked={};app.watermarkCheckValid=false;app.watermarkRevision=0;app.watermarkValidation.clear();app.watermarkCaption.clear();
+        unregisterRecordingHotkeys();app.pauseHotkey=app.stopHotkey=0;app.hotkeyWarning.clear();app.settings.outputFps=app.recordedOutputFps=DefaultOutputFps;
         app.hasCustomInterval=app.hasCustomSize=app.hasCustomLimit=false;
         app.customIntervalMs=5000;app.customWidth=1280;app.customHeight=720;app.customLimitSeconds=900;
         app.committedInterval=2;app.committedSize=app.committedLimit=0;
@@ -3956,8 +4019,8 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         app.committedNightDuration=0;app.customNightDurationMs=NightInitialDurationMs;app.hasCustomNightDuration=false;
         app.visibleDirty=true;app.controlsUpdated=false;app.trayStateValid=false;
         app.scrollX=app.scrollY=app.panelScroll=app.wheelVertical=app.wheelHorizontal=app.wheelPanel=0;
-        app.contentWidth=app.contentHeight=app.panelHeight=app.advancedTop=0;
-        app.panelDocked=true;app.collageTools=app.advancedWarning=false;
+        app.contentWidth=app.contentHeight=app.panelHeight=0;
+        app.panelDocked=true;app.collageTools=false;
         try {
         app.window=w;app.dpi=static_cast<int>(GetDpiForWindow(w));fonts();
         // Attribute 35 is DWMWA_CAPTION_COLOR. Older Windows/SDKs simply
@@ -3972,7 +4035,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         };
         // Native label mnemonics and accessibility names follow sibling order.
         auto combo=[&](int index,const wchar_t* label,int id){
-            app.labels[index]=requiredControl(L"STATIC",label,0,200+index);
+            app.labels[index]=requiredControl(L"STATIC",label,SS_CENTERIMAGE,200+index);
             return requiredControl(L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL,id);
         };
         auto button=[&](const wchar_t* s,int id){return requiredControl(L"BUTTON",s,WS_TABSTOP|BS_PUSHBUTTON,id);};
@@ -3981,10 +4044,15 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         app.record=button(L"&Record",Record);app.pause=button(L"&Pause",Pause);app.finish=button(L"&Finish",Finish);
         app.statusText=requiredControl(L"STATIC",app.status.message.c_str(),SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX|SS_NOTIFY,210);
         app.statusDetails=button(L"Deta&ils...",StatusDetails);
-        app.refresh=button(L"Re&fresh",Refresh);
+        // Page selector: a radio group, so arrow keys move between pages and
+        // assistive technology reports the selected one.
+        for(int i=0;i<PanelTabCount;++i)
+            app.tabs[i]=requiredControl(L"BUTTON",PanelTabLabels[i],(i?0:WS_GROUP|WS_TABSTOP)|BS_AUTORADIOBUTTON|BS_PUSHLIKE,TabCapture+i);
+        // Capture page.
+        app.refresh=requiredControl(L"BUTTON",L"Re&fresh",WS_GROUP|WS_TABSTOP|BS_PUSHBUTTON,Refresh);
         app.mode=combo(0,L"&Source",ModeBox);for(auto s:{L"Desktop",L"Camera",L"Desktop + camera",L"Side by side",L"Custom collage",SeparateFilesLabel})add(app.mode,s);
         app.monitor=combo(4,L"&Display",MonitorBox);app.camera=combo(5,L"Ca&mera",CameraBox);
-        app.alsoLabel=requiredControl(L"STATIC",L"Also save separate files",SS_NOPREFIX,214);
+        app.alsoLabel=requiredControl(L"STATIC",L"Also save files",SS_NOPREFIX|SS_CENTERIMAGE,214);
         app.alsoDesktop=requiredControl(L"BUTTON",L"Desktop",WS_TABSTOP|BS_AUTOCHECKBOX,AlsoDesktopBox);
         app.alsoCamera=requiredControl(L"BUTTON",L"Camera",WS_TABSTOP|BS_AUTOCHECKBOX,AlsoCameraBox);
         app.interval=combo(1,L"Capture &every",IntervalBox);for(auto s:{L"1 second",L"2 seconds",L"5 seconds",L"10 seconds",L"30 seconds",L"60 seconds"})add(app.interval,s);
@@ -3993,32 +4061,35 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         app.folder=button(L"C&hange...",Folder);app.openFolder=button(L"&Open folder",OpenFolder);
         app.liveStatusSummary=requiredControl(L"STATIC",L"",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX,StatusSummaryLine);
         app.liveStatusSet=button(L"Set stat&us...",SetStatusButton);app.liveStatusClear=button(L"Clear",ClearStatusButton);
-        app.advanced=requiredControl(L"BUTTON",L"&Advanced",WS_TABSTOP|BS_AUTOCHECKBOX|BS_PUSHLIKE,AdvancedToggle);
-        app.encodingMode=combo(6,L"Encodin&g",EncodingModeBox);
-        for(auto label:EncodingModeLabels)add(app.encodingMode,label);
-        app.encoderConfigure=button(L"Encoder settings...",EncoderConfigure);
-        app.recoveryMode=requiredControl(L"BUTTON",L"MP4 recover&y mode (H.264)",WS_TABSTOP|BS_AUTOCHECKBOX,RecoveryBox);
+        // Recording page.
         app.stopAfter=combo(7,L"S&top after",StopAfterBox);for(auto label:RecordingLimitLabels)add(app.stopAfter,label);
-        app.segmentLabel=requiredControl(L"STATIC",L"Split files e&very",0,211);
+        app.segmentLabel=requiredControl(L"STATIC",L"Split files e&very",SS_CENTERIMAGE,211);
         app.splitEvery=requiredControl(L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL,SegmentBox);for(auto label:SegmentLabels)add(app.splitEvery,label);
-        app.startDelayLabel=requiredControl(L"STATIC",L"Delay ne&xt recording",0,212);
+        app.startDelayLabel=requiredControl(L"STATIC",L"St&art delay",SS_CENTERIMAGE,212);
         app.startDelay=requiredControl(L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL,StartDelayBox);
         for(auto label:StartDelayLabels)add(app.startDelay,label);choose(app.startDelay,0);
-        app.startDelayHint=requiredControl(L"STATIC",L"Preparation starts after the delay. Visible preview continues; Stop after counts active time.",SS_LEFT|SS_NOPREFIX,213);
         app.lowDisk=requiredControl(L"BUTTON",L"Stop on &low disk space",WS_TABSTOP|BS_AUTOCHECKBOX,LowDiskBox);
         app.captureCursor=requiredControl(L"BUTTON",L"Show des&ktop cursor",WS_TABSTOP|BS_AUTOCHECKBOX,CursorBox);
         SendMessageW(app.captureCursor,BM_SETCHECK,BST_CHECKED,0);
         app.skipConfigure=button(L"Time &compression...",SkipConfigure);
-        app.skipSummary=requiredControl(L"STATIC",L"Off",SS_LEFT|SS_ENDELLIPSIS|SS_NOPREFIX|SS_NOTIFY,SkipSummary);
+        app.skipSummary=requiredControl(L"STATIC",L"Off",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX|SS_NOTIFY,SkipSummary);
         app.skipDetail=requiredControl(L"STATIC",L"",SS_LEFT|SS_ENDELLIPSIS|SS_NOPREFIX|SS_NOTIFY,SkipDetail);
-        app.watermarkConfigure=button(L"&Watermark...",WatermarkConfigure);
-        app.watermarkSummary=requiredControl(L"STATIC",L"Off",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX,WatermarkSummary);
-        app.playbackConfigure=button(L"Playback && shortcuts...",PlaybackConfigure);
         app.nightEnabled=requiredControl(L"BUTTON",L"&Night camera (software blend)",WS_TABSTOP|BS_AUTOCHECKBOX,NightBox);
         app.nightDuration=combo(8,L"Blend d&uration",NightDurationBox);for(auto label:NightDurationLabels)add(app.nightDuration,label);
         app.nightTarget=combo(9,L"Auto &brightness",NightTargetBox);for(auto label:{L"Dark",L"Balanced",L"Bright"})add(app.nightTarget,label);
         app.nightHint=requiredControl(L"STATIC",L"",SS_LEFT|SS_ENDELLIPSIS|SS_NOPREFIX|SS_NOTIFY,NightHint);
         app.nightDetail=requiredControl(L"STATIC",L"",SS_LEFT|SS_ENDELLIPSIS|SS_NOPREFIX|SS_NOTIFY,NightDetail);
+        // Output page.
+        app.encodingMode=combo(6,L"Encodin&g",EncodingModeBox);
+        for(auto label:EncodingModeLabels)add(app.encodingMode,label);
+        app.encoderConfigure=button(L"Encoder settings...",EncoderConfigure);
+        app.encoderSummary=requiredControl(L"STATIC",L"",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX|SS_NOTIFY,EncoderSummary);
+        app.recoveryMode=requiredControl(L"BUTTON",L"MP4 recover&y mode (H.264)",WS_TABSTOP|BS_AUTOCHECKBOX,RecoveryBox);
+        app.watermarkConfigure=button(L"&Watermark...",WatermarkConfigure);
+        app.watermarkSummary=requiredControl(L"STATIC",L"Off",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX|SS_NOTIFY,WatermarkSummary);
+        app.playbackConfigure=button(L"Playback && shortcuts...",PlaybackConfigure);
+        app.playbackSummary=requiredControl(L"STATIC",L"",SS_LEFT|SS_CENTERIMAGE|SS_ENDELLIPSIS|SS_NOPREFIX|SS_NOTIFY,PlaybackSummary);
+        app.resetDefaults=button(L"Reset all settings...",ResetDefaults);
         if(!controlsReady) {
             app.mode=nullptr;
             OutputDebugStringW(L"Timelapse could not create its required controls.\n");
@@ -4047,8 +4118,8 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
         tip.uId=reinterpret_cast<UINT_PTR>(app.videoSize);tip.lpszText=LPSTR_TEXTCALLBACKW;
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
-        tip.uId=reinterpret_cast<UINT_PTR>(app.advanced);
-        tip.lpszText=LPSTR_TEXTCALLBACKW;
+        tip.uId=reinterpret_cast<UINT_PTR>(app.resetDefaults);
+        tip.lpszText=const_cast<LPWSTR>(L"Return every setting to its original default: capture timing, video size and quality, save folder, encoder, recording options, watermark, status appearance and global shortcuts. Your selected display and camera stay selected. Available when not recording.");
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
         tip.uId=reinterpret_cast<UINT_PTR>(app.startDelay);
         tip.lpszText=const_cast<LPWSTR>(L"After Record, wait before preparing the recording. Camera startup and Night blending can add time before the first frame. Visible preview continues. Stop after excludes this wait. Closing hides to the tray and keeps the timer; Cancel start, Exit or sleep cancels it.");
@@ -4083,7 +4154,7 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         tip.lpszText=const_cast<LPWSTR>(L"Automatic camera brightness uses 8-bit brightness references: Dark 64/255, Balanced 96/255, Bright 128/255. This is processed image brightness, not sensor exposure. Gain and highlight limits can leave the target unmet.");
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
         tip.lpszText=LPSTR_TEXTCALLBACKW;
-        for(HWND child:{app.nightHint,app.nightDetail,app.skipSummary,app.skipDetail}){tip.uId=reinterpret_cast<UINT_PTR>(child);SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));}
+        for(HWND child:{app.tabs[0],app.tabs[1],app.tabs[2],app.nightHint,app.nightDetail,app.skipSummary,app.skipDetail,app.encoderSummary,app.watermarkSummary,app.playbackSummary}){tip.uId=reinterpret_cast<UINT_PTR>(child);SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));}
         tip.uFlags=TTF_SUBCLASS;tip.uId=SavePathTip;tip.rect={};tip.lpszText=LPSTR_TEXTCALLBACKW;
         SendMessageW(app.tooltip,TTM_ADDTOOLW,0,reinterpret_cast<LPARAM>(&tip));
         preferences(false);refreshSources();changeLayout(true);
@@ -4174,8 +4245,8 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         const int id=LOWORD(wp),code=HIWORD(wp);
         // SS_NOTIFY gives static labels mouse input for hover tooltips. Their
         // STN_CLICKED value equals BN_CLICKED; never treat them as buttons.
-        if(lp && (reinterpret_cast<HWND>(lp)==app.statusText || reinterpret_cast<HWND>(lp)==app.nightHint ||
-           reinterpret_cast<HWND>(lp)==app.nightDetail || reinterpret_cast<HWND>(lp)==app.skipSummary || reinterpret_cast<HWND>(lp)==app.skipDetail))return 0;
+        if(lp)for(HWND label:{app.statusText,app.nightHint,app.nightDetail,app.skipSummary,app.skipDetail,app.encoderSummary,app.watermarkSummary,app.playbackSummary})
+            if(reinterpret_cast<HWND>(lp)==label)return 0;
         if(id==SizeBox && code==CBN_DROPDOWN){refreshSizeSuggestions();return 0;}
         if(code==CBN_SELCHANGE){
             if(app.active() && (id==EncodingQualityBox || id==EncodingModeBox || id==NightDurationBox || id==NightTargetBox || (id==IntervalBox && !intervalEditable()) || id==SizeBox || id==StopAfterBox || id==SegmentBox || id==StartDelayBox)){
@@ -4241,7 +4312,8 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         }
         switch(id) {
         case StatusDetails:if(code==BN_CLICKED)showStatusDetails();break;
-        case AdvancedToggle:toggleAdvanced();break;
+        case TabCapture:case TabRecording:case TabOutput:if(code==BN_CLICKED)selectPanelTab(id-TabCapture,false);break;
+        case ResetDefaults:if(code==BN_CLICKED)resetSettings();break;
         case SkipConfigure:editSkip();break;
         case WatermarkConfigure:if(code==BN_CLICKED)editWatermark();break;
         case PlaybackConfigure:if(code==BN_CLICKED)editPlayback();break;
@@ -4298,7 +4370,9 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         if(reinterpret_cast<NMHDR*>(lp)->code==TTN_GETDISPINFOW){
             auto info=reinterpret_cast<NMTTDISPINFOW*>(lp);const auto child=reinterpret_cast<HWND>(info->hdr.idFrom);
             info->lpszText=const_cast<LPWSTR>(child==app.statusText?statusTooltip():child==app.videoSize?videoSizeTooltip():
-                (child==app.advanced?app.advancedTooltip:child==app.nightHint?app.nightHintCaption:child==app.nightDetail?app.nightDetailCaption:
+                (child==app.tabs[0]?app.tabTooltips[0]:child==app.tabs[1]?app.tabTooltips[1]:child==app.tabs[2]?app.tabTooltips[2]:
+                 child==app.encoderSummary?app.encoderCaption:child==app.watermarkSummary?app.watermarkCaption:child==app.playbackSummary?app.playbackCaption:
+                 child==app.nightHint?app.nightHintCaption:child==app.nightDetail?app.nightDetailCaption:
                  child==app.skipSummary?app.skipSummaryCaption:child==app.skipDetail?app.skipDetailCaption:statusCaption()).c_str());return 0;
         }break;
     case WM_CTLCOLORSTATIC: {
@@ -4342,8 +4416,23 @@ LRESULT CALLBACK windowProc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
     }
     return DefWindowProcW(w,msg,wp,lp);
 }
+// Ctrl+Tab / Ctrl+Shift+Tab and Ctrl+PageDown / Ctrl+PageUp change settings
+// pages. Focus follows only when it was already in the settings panel.
+bool pageShortcut(HWND window,const MSG& msg) {
+    if(msg.message!=WM_KEYDOWN || !(GetKeyState(VK_CONTROL)&0x8000) || (msg.hwnd!=window && !IsChild(window,msg.hwnd)))return false;
+    int step=0;
+    if(msg.wParam==VK_TAB)step=(GetKeyState(VK_SHIFT)&0x8000)?-1:1;
+    else if(msg.wParam==VK_NEXT)step=1;
+    else if(msg.wParam==VK_PRIOR)step=-1;
+    if(!step)return false;
+    HWND focused=GetFocus();
+    while(focused && GetParent(focused) && GetParent(focused)!=window)focused=GetParent(focused);
+    selectPanelTab(app.panelTab+step,panelControl(focused));
+    return true;
+}
 void dispatchAppMessage(HWND window,MSG& msg) {
     const HWND focused=GetFocus();
+    if(pageShortcut(window,msg))return;
     if(!scrollWheelMessage(msg) && !IsDialogMessageW(window,&msg)){TranslateMessage(&msg);DispatchMessageW(&msg);}
     // Reveal keyboard targets once. Mouse focus must not relocate a clicked
     // control or the preview after a drag captures its starting point.
