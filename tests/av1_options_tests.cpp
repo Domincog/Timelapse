@@ -1,4 +1,5 @@
 ﻿#include "av1_encoder.h"
+#include "encoder_conversion.h"
 #include <iostream>
 #include <stdexcept>
 #include <algorithm>
@@ -49,6 +50,40 @@ void shortClip(int width, int height, int count, const lapse::EncodingOptions& o
     require(!encoder.encode(nv12.data(),error),"Finished stream accepted another frame");
 }
 }
+// Compare the complete compressed stream (including hidden reference pictures)
+// and timestamps when identical pixels are supplied through either layout.
+std::vector<lapse::Av1Packet> layoutClip(bool planar,int width,int height,int count,const lapse::EncodingOptions& options) {
+    lapse::Av1Encoder encoder;std::wstring error;
+    encoded(encoder.open(width,height,6,lapse::EncodingQuality::Balanced,error,options),error);
+    lapse::Frame frame{width,height,std::vector<uint8_t>(size_t(width)*height*4)};
+    std::vector<uint8_t> converted(size_t(width)*height*3/2);
+    std::vector<lapse::Av1Packet> packets;
+    bool eos=false;
+    auto drain=[&](bool finishing){
+        for(;;){lapse::Av1Packet packet;encoded(encoder.receive(packet,eos,error),error);
+            if(!packet.unit.empty())packets.push_back(std::move(packet));
+            else if(!finishing)break;
+            if(eos)break;
+        }
+    };
+    for(int i=0;i<count;++i){
+        for(size_t p=0;p<frame.pixels.size();++p)frame.pixels[p]=uint8_t((p*17+p/13+i*23)%256);
+        if(planar){lapse::encoding_detail::toI420(frame,converted.data());encoded(encoder.encodeI420(converted.data(),error),error);}
+        else{lapse::encoding_detail::toNv12(frame,converted.data());encoded(encoder.encode(converted.data(),error),error);}
+        // Verify copied ownership while asynchronous lookahead retains frames.
+        std::fill(converted.begin(),converted.end(),0xa5);drain(false);
+    }
+    encoded(encoder.end(error),error);drain(true);
+    require(eos && packets.size()==size_t(count),"Layout comparison lost frames");
+    require(!encoder.encodeI420(converted.data(),error),"Finished stream accepted planar input");
+    return packets;
+}
+void sameLayoutStream(int width,int height,int count,const lapse::EncodingOptions& options){
+    const auto nv12=layoutClip(false,width,height,count,options),i420=layoutClip(true,width,height,count,options);
+    require(nv12.size()==i420.size(),"Input layouts produced different packet counts");
+    for(size_t i=0;i<nv12.size();++i)require(nv12[i].unit==i420[i].unit && nv12[i].pts==i420[i].pts &&
+        nv12[i].keyFrame==i420[i].keyFrame,"Planar input changed compressed bytes, timestamps or keyframes");
+}
 int main() {
     try {
         lapse::EncodingOptions options;
@@ -71,6 +106,12 @@ int main() {
         options.bitrateKbps=100000;
         shortClip(64,64,1,options);
         std::cout<<"SVT-AV1: preset/CRF/bitrate limits, minimum and nonaligned geometry, short-clip EOS passed.\n";
+        options={};
+        sameLayoutStream(50,66,3,options);
+        sameLayoutStream(320,240,80,options);
+        options.rateControl=lapse::EncodingRateControl::TargetBitrate;options.bitrateKbps=500;
+        sameLayoutStream(64,64,18,options);
+        std::cout<<"NV12/I420 produced identical AV1 bytes and timestamps across tails, lookahead, keyframes and VBR.\n";
         return 0;
     } catch(const std::exception& e) { std::cerr<<e.what()<<'\n';return 1; }
 }

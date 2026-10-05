@@ -27,12 +27,16 @@ public:
     const std::vector<uint8_t>& sequenceHeader() const noexcept;
     // Tightly packed NV12: width x height luma, then interleaved chroma.
     bool encode(const uint8_t* nv12, std::wstring& error);
+    // Tightly packed I420: luma followed by separate U and V quarter planes.
+    // Avoids NV12 rearrangement; input may be reused when this call returns.
+    bool encodeI420(const uint8_t* i420, std::wstring& error);
     bool end(std::wstring& error);
     // Nonblocking before end(), blocking after it. Empty unit means no packet
     // is ready. EOS can accompany the final nonempty unit.
     bool receive(Av1Packet& packet, bool& eos, std::wstring& error);
 
 private:
+    bool encodePlanes(const uint8_t* y, const uint8_t* u, const uint8_t* v, std::wstring& error);
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

@@ -78,7 +78,6 @@ bool Av1Encoder::open(int width, int height, int fps, EncodingQuality quality, s
         candidate = std::make_unique<Impl>();
         candidate->width = static_cast<unsigned>(width);
         candidate->height = static_cast<unsigned>(height);
-        candidate->chroma.resize(size_t(width) * height / 2);
         EbSvtAv1EncConfiguration config{};
         EbErrorType result = svt_av1_enc_init_handle(&candidate->codec, &config);
         if (result != EB_ErrorNone) return fail(result, L"Cannot create the AV1 encoder", error);
@@ -147,7 +146,7 @@ bool Av1Encoder::open(int width, int height, int fps, EncodingQuality quality, s
         if (!start(primer.impl_)) return false;
         primer.impl_->priming = true;
         std::vector<uint8_t> flat(size_t(width) * height * 3 / 2, 128);
-        if (!primer.encode(flat.data(), error) || !primer.end(error)) return false;
+        if (!primer.encodeI420(flat.data(), error) || !primer.end(error)) return false;
         Av1Packet packet;
         bool eos = false;
         int received = 0;
@@ -178,15 +177,31 @@ bool Av1Encoder::encode(const uint8_t* nv12, std::wstring& error) {
     if (impl_->failed || impl_->ending) { error = L"The AV1 encoder has stopped."; return false; }
     impl_->failed = true;
     const size_t luma = size_t(impl_->width) * impl_->height, plane = luma / 4;
-    // SVT copies planar input during send_picture(), so both caller NV12
-    // storage and this chroma scratch buffer can be reused immediately.
+    // Allocate scratch only for callers that actually supply NV12. Recording
+    // and header priming use planar input and need no rearrangement buffer.
+    try { impl_->chroma.resize(luma / 2); }
+    catch (const std::bad_alloc&) { error = L"Cannot prepare the AV1 frame: not enough memory."; return false; }
     for (size_t i = 0; i < plane; ++i) {
         impl_->chroma[i] = nv12[luma + 2 * i];
         impl_->chroma[plane + i] = nv12[luma + 2 * i + 1];
     }
+    return encodePlanes(nv12, impl_->chroma.data(), impl_->chroma.data() + plane, error);
+}
+bool Av1Encoder::encodeI420(const uint8_t* i420, std::wstring& error) {
+    error.clear();
+    if (!impl_ || !i420) { error = L"The AV1 encoder is not open."; return false; }
+    if (impl_->failed || impl_->ending) { error = L"The AV1 encoder has stopped."; return false; }
+    const size_t luma = size_t(impl_->width) * impl_->height;
+    return encodePlanes(i420, i420 + luma, i420 + luma + luma / 4, error);
+}
+bool Av1Encoder::encodePlanes(const uint8_t* y, const uint8_t* u, const uint8_t* v, std::wstring& error) {
+    impl_->failed = true;
+    const size_t luma = size_t(impl_->width) * impl_->height;
+    // SVT copies all three planes during send_picture(). Caller storage can
+    // be reused immediately, including while lookahead retains the frame.
     EbSvtIOFormat image{};
-    image.luma = const_cast<uint8_t*>(nv12);
-    image.cb = impl_->chroma.data(); image.cr = impl_->chroma.data() + plane;
+    image.luma = const_cast<uint8_t*>(y);
+    image.cb = const_cast<uint8_t*>(u); image.cr = const_cast<uint8_t*>(v);
     image.y_stride = impl_->width; image.cb_stride = image.cr_stride = impl_->width / 2;
     EbBufferHeaderType input{};
     input.size = sizeof(input); input.p_buffer = reinterpret_cast<uint8_t*>(&image);

@@ -80,6 +80,7 @@ function New-Fixture([string]$Name, [string]$Script = $PackageScript) {
     Write-Text (Join-Path $root '.gitignore') "build/`npackages/`n"
     Write-Text (Join-Path $root 'README.md') "Owned synthetic package $Name.`n"
     Write-Text (Join-Path $root 'NIGHT_VALIDATION.md') "Owned public Night validation sentinel.`n"
+    Write-Text (Join-Path $root 'AV1_EFFICIENCY.md') "Owned public AV1 validation sentinel.`n"
     Write-Text (Join-Path $root 'media/night-v032-synthetic.png') "Owned synthetic-only figure sentinel.`n"
     Write-Text (Join-Path $root 'CMakeLists.txt') "# Fixture only; never configured.`n"
     Write-Text (Join-Path $root 'build.ps1') "throw 'Fixture build must never run.'`n"
@@ -189,7 +190,7 @@ function Assert-Package([string]$Root, [string]$UseVersion = $version, [bool]$Ha
         $parts = $line -split '  ', 2
         Assert ($parts.Count -eq 2 -and (File-Sha (Join-Path $packages $parts[1])) -eq $parts[0]) 'External archive checksum mismatch.'
     }
-    $expected = @('.gitignore', 'README.md', 'NIGHT_VALIDATION.md', 'media/night-v032-synthetic.png', 'CMakeLists.txt', 'build.ps1', 'package.ps1', 'src/app.cpp', 'src/helper.h', 'tests/probe.cpp', 'tests/fixture.cmake', 'tests/package_tests.ps1', 'tests/build_tests.ps1', 'tools/verify-encoding-quality.ps1', 'tools/night_camera_lab.cpp', 'installer/Timelapse.iss', 'installer/build-installer.ps1', 'tests/installer_tests.ps1')
+    $expected = @('.gitignore', 'README.md', 'AV1_EFFICIENCY.md', 'NIGHT_VALIDATION.md', 'media/night-v032-synthetic.png', 'CMakeLists.txt', 'build.ps1', 'package.ps1', 'src/app.cpp', 'src/helper.h', 'tests/probe.cpp', 'tests/fixture.cmake', 'tests/package_tests.ps1', 'tests/build_tests.ps1', 'tools/verify-encoding-quality.ps1', 'tools/night_camera_lab.cpp', 'installer/Timelapse.iss', 'installer/build-installer.ps1', 'tests/installer_tests.ps1')
     $expected += @('src/person_pack_metadata.h') + $personSources + $av1Sources
     if ($HasWorker) {
         $metadata = [IO.File]::ReadAllText((Join-Path $Root 'src/person_pack_metadata.h'))

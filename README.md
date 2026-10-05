@@ -4,6 +4,13 @@ A small native Windows timelapse recorder. Record a display, a camera, or both i
 
 ## Use
 
+Version 0.41.2 reduces AV1 frame preparation work while preserving its input
+pixels and compression settings. Six benchmark comparisons produced identical
+compressed video samples and file sizes. Local 1080p measurements averaged
+33.8% less frame preparation CPU and 1.8-4.6% less total encoding CPU across
+two synthetic scenes; actual savings vary. See [AV1 validation](AV1_EFFICIENCY.md)
+in the repository or source ZIP for the method and results.
+
 1. Run the Windows x64 setup program, or extract the portable ZIP and open `Timelapse.exe`. Windows 10 (version 2004 or later) or Windows 11, x64 is required. If building from source, use `dist/Timelapse.exe`.
 2. Choose Desktop, Camera, Desktop + camera, Side by side, Custom collage, or Desktop + camera (2 files). Pick a display and camera where needed. A collage can also save separate desktop and camera files at the same time, and the source can change while recording.
 3. Choose how often to capture a frame. At the default five seconds and 30 fps playback, one hour becomes 24 seconds of video. Output has no audio. Change playback FPS through Advanced → Playback & shortcuts.

@@ -116,7 +116,7 @@ struct Encoder::Impl {
     // A frame the encoder accepted but the file did not can be referenced by
     // later frames, so any AV1 write failure ends this output's writes.
     std::unique_ptr<Av1Encoder> av1;
-    std::vector<uint8_t> nv12;
+    std::vector<uint8_t> i420;
     Av1Packet packet;
     LONGLONG av1Written = 0;
     bool av1Stopped = false;
@@ -136,7 +136,7 @@ struct Encoder::Impl {
         bytes.Reset();
         writing = false;
         av1.reset();
-        std::vector<uint8_t>().swap(nv12);
+        std::vector<uint8_t>().swap(i420);
         std::vector<uint8_t>().swap(packet.unit);
     }
 
@@ -296,7 +296,7 @@ bool Encoder::open(const std::wstring& path, int width, int height, int fps, std
         try {
             candidate->av1 = std::make_unique<Av1Encoder>();
             started = candidate->av1->open(width, height, fps, quality, error, options);
-            if (started) candidate->nv12.resize(candidate->bufferSize);
+            if (started) candidate->i420.resize(candidate->bufferSize);
         } catch (const std::bad_alloc&) {
             error = L"Cannot start the AV1 encoder: not enough memory.";
             started = false;
@@ -446,8 +446,8 @@ bool Encoder::write(const Frame& frame, std::wstring& error) {
     if (impl_->av1) {
         // Accepted frames count immediately, even while lookahead has not
         // emitted a sample. Finalization verifies that all are stored.
-        toNv12(frame, impl_->nv12.data());
-        if (!impl_->av1->encode(impl_->nv12.data(), error)) {
+        encoding_detail::toI420(frame, impl_->i420.data());
+        if (!impl_->av1->encodeI420(impl_->i420.data(), error)) {
             impl_->rememberAv1Failure(error);
             return false;
         }
