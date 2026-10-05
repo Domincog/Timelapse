@@ -3071,7 +3071,7 @@ void rememberStatus(const std::wstring& text) {
     recent.insert(recent.begin(),text);
     if(recent.size()>MaxRecentStatuses)recent.resize(MaxRecentStatuses);
 }
-enum StatusDialogId { StatusTextBox=5601,StatusKindBox,StatusMinutes,StatusRepeat,StatusBreak,StatusCornerBox,StatusSizeBox,StatusStyleBox,StatusPreview,StatusClearAction };
+enum StatusDialogId { StatusTextBox=5601,StatusKindBox,StatusMinutes,StatusRepeat,StatusBreak,StatusCornerBox,StatusSizeBox,StatusStyleBox,StatusPreview,StatusClearAction,StatusRecentAction };
 constexpr INT_PTR StatusDialogCleared=3;
 struct StatusDraft : CustomDraft {
     StatusFeedSettings appearance;
@@ -3083,7 +3083,8 @@ struct StatusDraft : CustomDraft {
     // The quarter of the illustration around the chosen corner, enlarged so
     // the status text is readable in the dialog.
     RECT zoom{};
-    HWND text{},kind{},minutes{},repeat{},breakMinutes{},corner{},size{},style{},preview{},clear{},labels[8]{};
+    HWND text{},recent{},kind{},minutes{},repeat{},breakMinutes{},corner{},size{},style{},preview{},clear{},labels[8]{};
+    std::vector<std::wstring> recentTexts;
 };
 StatusFeedSettings statusDraftAppearance(const StatusDraft& draft) {
     StatusFeedSettings value=draft.appearance;
@@ -3139,6 +3140,7 @@ void statusIllustration(StatusDraft& draft) {
 void statusLayout(HWND window,StatusDraft& draft) {
     if(draft.layingOut)return;draft.layingOut=true;
     const bool timer=choice(draft.kind)==2,repeat=timer && isChecked(draft.repeat);
+    showControl(draft.recent,!draft.recentTexts.empty());
     const auto show=[](HWND child,bool visible){ShowWindow(child,visible?SW_SHOWNA:SW_HIDE);};
     for(HWND child:{draft.labels[2],draft.minutes,draft.repeat})show(child,timer);
     for(HWND child:{draft.labels[3],draft.breakMinutes})show(child,repeat);
@@ -3166,7 +3168,9 @@ void statusLayout(HWND window,StatusDraft& draft) {
     info.nMax=height-1;info.nPage=std::max(1L,client.bottom);info.nPos=draft.scrollY;SetScrollInfo(window,SB_VERT,&info,TRUE);
     const int half=(width-2*pad-gap)/2,x2=pad+half+gap,full=width-2*pad;
     const auto move=[&](HWND child,int x,int y,int w,int h){MoveWindow(child,x-draft.scrollX,y-draft.scrollY,w,h,TRUE);};
-    move(draft.labels[0],pad,draft.scale(16),full,draft.scale(20));move(draft.text,pad,draft.scale(38),full,draft.scale(220));
+    const int recentWidth=draft.recentTexts.empty()?0:draft.scale(90),textWidth=full-(recentWidth?recentWidth+gap:0);
+    move(draft.labels[0],pad,draft.scale(16),full,draft.scale(20));move(draft.text,pad,draft.scale(38),textWidth,draft.scale(28));
+    move(draft.recent,width-pad-draft.scale(90),draft.scale(38),draft.scale(90),draft.scale(28));
     move(draft.labels[1],pad,kindTop,half,draft.scale(20));move(draft.kind,pad,kindTop+draft.scale(22),half,draft.scale(140));
     move(draft.labels[2],x2,kindTop,half,draft.scale(20));move(draft.minutes,x2,kindTop+draft.scale(22),half,draft.scale(28));
     move(draft.repeat,pad,repeatTop+draft.scale(22),half,draft.scale(28));
@@ -3188,11 +3192,27 @@ void statusFitHeight(HWND window,StatusDraft& draft) {
 }
 void statusReveal(HWND window,StatusDraft& draft,HWND child) {
     if(!child || !IsChild(window,child))return;
-    // An edit inside the text combo reports itself; reveal the whole combo.
+    // Combo controls may report their child window; reveal their complete row.
     if(GetParent(child)!=window)child=GetParent(child);
     RECT bounds{},client{};GetWindowRect(child,&bounds);MapWindowPoints(nullptr,window,reinterpret_cast<POINT*>(&bounds),2);GetClientRect(window,&client);
     if(bounds.left<0)draft.scrollX+=bounds.left;else if(bounds.right>client.right)draft.scrollX+=bounds.right-client.right;
     if(bounds.top<0)draft.scrollY+=bounds.top;else if(bounds.bottom>client.bottom)draft.scrollY+=bounds.bottom-client.bottom;statusLayout(window,draft);
+}
+void statusRecent(HWND window,StatusDraft& draft) {
+    if(draft.recentTexts.empty())return;
+    struct Menu {HMENU value=CreatePopupMenu();~Menu(){if(value)DestroyMenu(value);}} menu;
+    bool ready=menu.value!=nullptr;
+    for(size_t i=0;ready && i<draft.recentTexts.size();++i){
+        // Status text is literal, including ampersands, rather than menu mnemonics.
+        std::wstring label;for(wchar_t character:draft.recentTexts[i]){label+=character;if(character==L'&')label+=L'&';}
+        ready=AppendMenuW(menu.value,MF_STRING,static_cast<UINT_PTR>(i+1),label.c_str())!=FALSE;
+    }
+    if(!ready){MessageBoxW(window,L"Recent statuses could not be opened. Try again.",L"Timelapse",MB_OK|MB_ICONERROR);return;}
+    RECT bounds{};GetWindowRect(draft.recent,&bounds);
+    const auto command=TrackPopupMenu(menu.value,TPM_RETURNCMD|TPM_NONOTIFY|TPM_RIGHTBUTTON,bounds.left,bounds.bottom,0,window,nullptr);
+    if(!IsWindow(window))return;
+    if(command>0 && size_t(command)<=draft.recentTexts.size())SetWindowTextW(draft.text,draft.recentTexts[size_t(command)-1].c_str());
+    SetFocus(draft.text);SendMessageW(draft.text,EM_SETSEL,0,-1);statusReveal(window,draft,draft.text);
 }
 INT_PTR CALLBACK statusProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
     auto* draft=reinterpret_cast<StatusDraft*>(GetWindowLongPtrW(window,DWLP_USER));
@@ -3203,7 +3223,9 @@ INT_PTR CALLBACK statusProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             const auto combo=[&](int id){return skipChild(window,L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWNLIST|WS_VSCROLL,id);};
             const auto label=[&](int i,const wchar_t* text){return draft->labels[i]=skipChild(window,L"STATIC",text,0,5700+i);};
             label(0,L"What are you &doing?");
-            draft->text=skipChild(window,L"COMBOBOX",L"",WS_TABSTOP|CBS_DROPDOWN|CBS_AUTOHSCROLL|WS_VSCROLL,StatusTextBox);
+            draft->text=skipChild(window,L"EDIT",L"",WS_TABSTOP|ES_AUTOHSCROLL,StatusTextBox);
+            draft->recent=skipChild(window,L"BUTTON",L"Recent...",WS_TABSTOP|BS_PUSHBUTTON|BS_NOTIFY,StatusRecentAction);
+            draft->recentTexts=app.recentStatuses;
             label(1,L"&Show");draft->kind=combo(StatusKindBox);for(auto value:StatusKindLabels)add(draft->kind,value);
             label(2,L"&Minutes");draft->minutes=skipChild(window,L"EDIT",minutesInput(app.statusDraftTimerMs).c_str(),WS_TABSTOP|ES_AUTOHSCROLL,StatusMinutes);
             draft->repeat=skipChild(window,L"BUTTON",L"&Repeat with breaks",WS_TABSTOP|BS_AUTOCHECKBOX|BS_NOTIFY,StatusRepeat);
@@ -3217,12 +3239,11 @@ INT_PTR CALLBACK statusProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             draft->clear=skipChild(window,L"BUTTON",L"C&lear status",WS_TABSTOP|BS_PUSHBUTTON|BS_NOTIFY,StatusClearAction);
             draft->okay=skipChild(window,L"BUTTON",L"S&et status",WS_TABSTOP|BS_DEFPUSHBUTTON|BS_NOTIFY,IDOK);
             draft->cancel=skipChild(window,L"BUTTON",L"Cancel",WS_TABSTOP|BS_PUSHBUTTON|BS_NOTIFY,IDCANCEL);
-            for(HWND child:{draft->text,draft->kind,draft->minutes,draft->repeat,draft->breakMinutes,draft->corner,draft->size,draft->style,draft->preview,draft->help,draft->error,draft->clear,draft->okay,draft->cancel})
+            for(HWND child:{draft->text,draft->recent,draft->kind,draft->minutes,draft->repeat,draft->breakMinutes,draft->corner,draft->size,draft->style,draft->preview,draft->help,draft->error,draft->clear,draft->okay,draft->cancel})
                 if(!child){EndDialog(window,-1);return TRUE;}
             for(HWND child:draft->labels)if(!child){EndDialog(window,-1);return TRUE;}
             if(!dialogWheelCombos({draft->kind,draft->corner,draft->size,draft->style})){EndDialog(window,-1);return TRUE;}
-            SendMessageW(draft->text,CB_LIMITTEXT,StatusMaxTextLength,0);
-            for(const auto& recent:app.recentStatuses)add(draft->text,recent.c_str());
+            SendMessageW(draft->text,EM_SETLIMITTEXT,StatusMaxTextLength,0);
             if(app.liveStatus.kind!=StatusKind::None)SetWindowTextW(draft->text,app.liveStatus.text.data());
             for(HWND edit:{draft->minutes,draft->breakMinutes})SendMessageW(edit,EM_SETLIMITTEXT,32,0);
             choose(draft->kind,std::clamp(app.statusDraftKind,0,2));SendMessageW(draft->repeat,BM_SETCHECK,app.statusDraftRepeat?BST_CHECKED:BST_UNCHECKED,0);
@@ -3240,7 +3261,7 @@ INT_PTR CALLBACK statusProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             rect=fitWindow(rect,area);SetWindowPos(window,nullptr,rect.left,rect.top,rect.right-rect.left,rect.bottom-rect.top,SWP_NOZORDER|SWP_NOACTIVATE);
             statusLayout(window,*draft);statusFitHeight(window,*draft);
             // Opened by a global shortcut or the tray: come to the front.
-            SetForegroundWindow(window);SetFocus(draft->text);SendMessageW(draft->text,CB_SETEDITSEL,0,MAKELPARAM(0,-1));return FALSE;
+            SetForegroundWindow(window);SetFocus(draft->text);SendMessageW(draft->text,EM_SETSEL,0,-1);return FALSE;
         }
         if(draft && message==WM_DESTROY){draft->renderer.reset();if(draft->font){DeleteObject(draft->font);draft->font=nullptr;}if(app.customDialog==window)app.customDialog=IsWindow(draft->previousDialog)?draft->previousDialog:nullptr;return TRUE;}
         if(!draft || !draft->ready)return FALSE;
@@ -3257,11 +3278,12 @@ INT_PTR CALLBACK statusProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
             switch(LOWORD(wp)){case SB_LINEUP:position-=draft->scale(24);break;case SB_LINEDOWN:position+=draft->scale(24);break;case SB_PAGEUP:position-=info.nPage;break;case SB_PAGEDOWN:position+=info.nPage;break;case SB_THUMBPOSITION:case SB_THUMBTRACK:position=info.nTrackPos;break;case SB_TOP:position=0;break;case SB_BOTTOM:position=info.nMax;break;default:return TRUE;}
             (bar==SB_HORZ?draft->scrollX:draft->scrollY)=position;statusLayout(window,*draft);return TRUE;}
         case WM_COMMAND:{const int id=LOWORD(wp),code=HIWORD(wp);
-            if(((id==IDOK || id==IDCANCEL || id==StatusClearAction || id==StatusRepeat) && code==BN_SETFOCUS) || ((id==StatusMinutes || id==StatusBreak) && code==EN_SETFOCUS) ||
-               ((id==StatusTextBox || id==StatusKindBox || id==StatusCornerBox || id==StatusSizeBox || id==StatusStyleBox) && code==CBN_SETFOCUS)){
+            if(((id==IDOK || id==IDCANCEL || id==StatusClearAction || id==StatusRepeat || id==StatusRecentAction) && code==BN_SETFOCUS) || ((id==StatusTextBox || id==StatusMinutes || id==StatusBreak) && code==EN_SETFOCUS) ||
+               ((id==StatusKindBox || id==StatusCornerBox || id==StatusSizeBox || id==StatusStyleBox) && code==CBN_SETFOCUS)){
                 statusReveal(window,*draft,reinterpret_cast<HWND>(lp));return TRUE;
             }
             if(id==IDCANCEL && code==BN_CLICKED){EndDialog(window,IDCANCEL);return TRUE;}
+            if(id==StatusRecentAction && code==BN_CLICKED){statusRecent(window,*draft);return TRUE;}
             if(id==StatusClearAction && code==BN_CLICKED){draft->appearance=statusDraftAppearance(*draft);EndDialog(window,StatusDialogCleared);return TRUE;}
             if(id==IDOK && code==BN_CLICKED){
                 StatusItem item;std::wstring error;HWND invalid{};
@@ -3273,13 +3295,8 @@ INT_PTR CALLBACK statusProc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
                 if(statusDraftItem(*draft,item,error,invalid)){draft->appearance=appearance;draft->result=item;EndDialog(window,IDOK);return TRUE;}
                 SetWindowTextW(draft->error,error.c_str());statusLayout(window,*draft);statusFitHeight(window,*draft);SetFocus(invalid);statusReveal(window,*draft,invalid);return TRUE;}
             const bool changed=((id==StatusRepeat) && code==BN_CLICKED) || ((id==StatusKindBox || id==StatusCornerBox || id==StatusSizeBox || id==StatusStyleBox) && code==CBN_SELCHANGE) ||
-                ((id==StatusMinutes || id==StatusBreak) && code==EN_CHANGE) || (id==StatusTextBox && code==CBN_EDITCHANGE);
+                ((id==StatusTextBox || id==StatusMinutes || id==StatusBreak) && code==EN_CHANGE);
             if(changed){statusIllustration(*draft);statusLayout(window,*draft);statusFitHeight(window,*draft);statusReveal(window,*draft,reinterpret_cast<HWND>(lp));return TRUE;}
-            if(id==StatusTextBox && code==CBN_SELCHANGE){
-                // The edit field takes the chosen recent text after this notice.
-                const int selected=choice(draft->text);wchar_t value[256]{};
-                if(selected>=0 && SendMessageW(draft->text,CB_GETLBTEXTLEN,selected,0)<256 && SendMessageW(draft->text,CB_GETLBTEXT,selected,reinterpret_cast<LPARAM>(value))!=CB_ERR)SetWindowTextW(draft->text,value);
-                statusIllustration(*draft);return TRUE;}
             return FALSE;}
         case WM_CTLCOLORSTATIC:if(reinterpret_cast<HWND>(lp)==draft->error){SetTextColor(reinterpret_cast<HDC>(wp),RGB(164,40,40));SetBkColor(reinterpret_cast<HDC>(wp),GetSysColor(COLOR_BTNFACE));return reinterpret_cast<INT_PTR>(GetSysColorBrush(COLOR_BTNFACE));}break;
         case WM_CLOSE:EndDialog(window,IDCANCEL);return TRUE;
