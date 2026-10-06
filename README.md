@@ -1,233 +1,143 @@
 # Timelapse
 
-A small native Windows timelapse recorder. Record a display, a camera, or both into H.264, HEVC or AV1 MP4 files. Use the Windows installer or the portable ZIP. No bundled browser, external encoder, or .NET runtime is required.
+Timelapse is a free Windows app that turns hours of screen or webcam activity into a short video. It takes a picture every few seconds and saves the pictures as an MP4, so a whole afternoon of work, a painting session or a sunset plays back in a minute or two.
 
-## Use
+- Record your **screen**, your **webcam**, or **both at once** (picture-in-picture, side by side, or your own layout).
+- Everything stays on your PC. No account, no upload, no ads.
+- Small and self-contained: no browser engine, .NET or separate video encoder to install.
 
-Version 0.43.0 lets many more settings change while recording or paused,
-applying them to the running video instead of only the next one: Display,
-Show desktop cursor, Stop after, the length of split parts, Stop on low disk
-space, Night camera (on/off, blend duration and brightness), Time compression,
-the watermark, status appearance and the global shortcuts. Video size, quality,
-encoder, playback FPS, camera, save folder and which files are written stay
-fixed until the recording ends. See **Change settings while recording** below.
+**[Download the latest version](https://github.com/Domincog/Timelapse/releases/latest)**: pick the `setup.exe` installer, or the portable `.zip` if you'd rather not install anything.
 
-Version 0.42.0 reorganizes the settings panel into three pages (Capture,
-Recording and Output) with compact one-line rows, so each page fits without
-scrolling at the normal window size. It adds Reset all settings, removes the
-recent-status history, and makes the `-status.txt` status list optional and off
-by default.
+Requires Windows 10 (version 2004 or later) or Windows 11, 64-bit. The app isn't code-signed yet, so Windows SmartScreen may warn you the first time; choose **More info → Run anyway**. On Windows "N" editions, install the Media Feature Pack first.
 
-Version 0.41.2 reduced AV1 frame preparation work while preserving its input
-pixels and compression settings. Six benchmark comparisons produced identical
-compressed video samples and file sizes. Local 1080p measurements averaged
-33.8% less frame preparation CPU and 1.8-4.6% less total encoding CPU across
-two synthetic scenes; actual savings vary. See [AV1 validation](AV1_EFFICIENCY.md)
-in the repository or source ZIP for the method and results.
+## Quick start
 
-1. Run the Windows x64 setup program, or extract the portable ZIP and open `Timelapse.exe`. Windows 10 (version 2004 or later) or Windows 11, x64 is required. If building from source, use `dist/Timelapse.exe`.
-2. Choose Desktop, Camera, Desktop + camera, Side by side, Custom collage, or Desktop + camera (2 files). Pick a display and camera where needed. A collage can also save separate desktop and camera files at the same time, and the source can change while recording.
-3. Choose how often to capture a frame. At the default five seconds and 30 fps playback, one hour becomes 24 seconds of video. Output has no audio. Change playback FPS on the Output page → Playback & shortcuts.
-4. In a collage, click and drag a source to move it. Drag its lower-right corner to resize it. Use Bring forward to change overlap. Changes during recording appear in subsequent frames.
-5. Press Record. Pause skips recording until resumed; Finish finalizes the MP4 file or set of files. Open folder shows the saved files. The default destination is Videos/Timelapse.
+1. Open Timelapse. It starts in **Desktop** mode and shows a live preview.
+2. Under **Source**, choose what to record: Desktop, Camera, Desktop + camera, Side by side, Custom collage, or Desktop + camera (2 files).
+3. Set **Capture every** to how often a picture is taken. The default, 5 seconds, turns one hour into about 24 seconds of video.
+4. Press **Record**. Use **Pause** whenever you step away, and **Finish** when you're done.
+5. Click **Open folder** to see your video. By default it's saved in `Videos\Timelapse`.
 
-**Change speed while recording:** Capture every remains available while recording or paused, including Custom intervals. For example, switch from 5 seconds to 60 seconds before leaving, then back to 5 seconds when you return. Future captures use the new interval in the same video; saved frames and playback FPS stay unchanged. The next capture is scheduled from the last saved sample, so shortening a long interval takes effect promptly without a catch-up burst. Capture or encoding already underway finishes first. Both files in two-file mode share the change, and a paused edit applies when you resume. The latest accepted interval is remembered on normal exit.
+You can close the window while recording: Timelapse keeps going in the system tray (near the clock). Click the tray icon to bring it back, or right-click it for Pause, Finish and more.
 
-With Night camera, an accepted blend finishes at its full duration before later windows use the new interval. Auto blend duration stays within the new base interval. Live intervals must be at least 1 second and at least the fixed Night blend duration, if selected; invalid changes leave recording at its previous interval. Time compression retains its selected multiplier, ramp phase and observation history, applying them to the new base interval. Capture every stays locked during the start countdown, preparation and final saving.
+**How long will my video be?** Divide the recording time by the capture interval to get the number of frames, then divide by 30 (frames per second). For example, 2 hours at one picture every 10 seconds is 720 frames, which plays for 24 seconds.
 
-**Change settings while recording:** While recording or paused, these settings apply to the running recording from its next captured frame (a paused change applies on Resume), and are remembered as usual:
+## Settings
 
-- **Capture every** and **Source** (see above), and **Display**: switch which screen a desktop recording shows. The new display is checked first; if it cannot be captured, recording continues on the current one.
-- **Show desktop cursor**.
-- **Stop after**: add, change or remove the limit. A time the recording has already passed is refused with a message; choose Finish to stop now.
-- **Split files every**: change the part length. The open part is recut on the new length's grid of active time, so it can be saved at once if it is already longer. Splitting itself can be turned on or off only before recording.
-- **Stop on low disk space**: turning it on checks space before the next frame.
-- **Night camera**: turn it on or off, or change the blend duration or brightness. The change applies from the next blend window; a blend in progress when Night is turned off is discarded. A choice that does not fit the current capture interval is refused with a message.
-- **Time compression**: any change applies at once and starts again from the normal interval, as Pause/Resume does. Turning it off returns to the normal interval. Managing the optional person detector stays available only when not recording.
-- **Watermark** and **status appearance** (corner, size, style): from the next saved frame, on every file of the recording.
-- **Global shortcuts** in Playback & shortcuts.
-- **Start delay**: applies to the next recording.
+The settings panel on the right has three tabs. A dot on a tab means something there differs from the default; a red dot means something needs fixing before you can record. Hover over most settings for a short explanation.
 
-Video size, video quality, encoding mode and encoder settings, MP4 recovery, playback FPS, camera device, save folder, Also save separate files, Desktop + camera (2 files), the status list (.txt) option and Reset all settings stay fixed until the recording ends. Nothing can change while a start is being prepared or the video is finishing.
+### Capture tab
 
-Open folder uses the save destination selected when clicked and creates it if needed. Slow folder operations leave the recording controls responsive. The button shows Opening... while an Open folder or Show files request is outstanding; another request can start after it finishes. Hiding or exiting cancels a request that has not yet been sent to Explorer. A request already sent may still finish, and directory creation already in progress may complete. Folder-opening errors do not replace recording or recovery details.
-
-The preview, coloured recording state, Record/Pause/Finish controls and status message occupy the left side. Settings live in the right panel on three pages, chosen with the tabs at its top: **Capture** (source, display, camera, capture interval, video size and quality, save folder and status), **Recording** (Stop after, file splitting, start delay, low-space protection, desktop cursor, time compression and night camera) and **Output** (encoder, MP4 recovery, watermark, playback and shortcuts, and Reset all settings). Each setting sits on one row with its label beside it, so at the normal window size every page fits without scrolling. A dot on the Recording or Output tab means options there differ from the defaults; it turns red when a setting needs correcting before Record. Hover over a tab to list them. Hover over the save path or a status/detail label to read its full text. Display and Camera choices appear only for sources in use; collage tools appear only for editable collages.
-
-Use the mouse wheel over settings to scroll the panel, or Tab to bring a control into view. Shift + wheel scrolls horizontally when needed. On very small work areas or at high display scaling, the window provides scrolling in both directions so every control remains reachable.
-
-When a camera source is selected and the camera list cannot be loaded, choose Details beside the status message, or hover over it, for the Windows error and a retry hint. The reason also appears in the status line when no current error, saved result or settings warning takes priority.
-
-**Status details:** Save results, errors and settings warnings offer a compact Details button (Alt + I). It opens the full message in a selectable, read-only view: use Ctrl + A and Ctrl + C to copy the text, including long recovery paths. The view is a snapshot from when you opened it; recording continues, and reopening shows the current details. Recording outcomes appear before any additional settings or source diagnostic. Close or Escape returns to the main window. A failed recording's recovery details remain available after Refresh or source changes; starting a new recording replaces the previous outcome.
-
-When the report has finished files, Show files (Alt + F within Details) asks File Explorer to select them. This uses the opened report's paths, even if you later change the save folder or another split part finishes. It supports one video, a pair or a set of three files, and finished videos retained at their `.recording.mp4` names after a rename failure. Unfinished partial files are described in the report without a Show files action for those paths. Folder lookup runs only when requested. Closing Details does not wait for a slow folder: it cancels requests still locating their files, while an Explorer request already underway may finish. A lookup error leaves the original report available to copy.
-
-**Custom values:** Capture every and Video size keep their presets and offer Custom. Capture intervals can be from 0.1 seconds to 24 hours, in exact milliseconds. Video dimensions can be even numbers from 48 to 4096 pixels per side, with at most 8,847,360 pixels (4096 x 2160); portrait and square outputs are supported. The preview follows the chosen aspect ratio. Installed encoders may reject some sizes; try a smaller size or another encoding mode if this happens. Large outputs need more memory and encoding time. The actual capture rate can be lower than requested when processing is slow; missed slots are skipped without a catch-up burst. Custom dialogs keep the previous value until you accept valid input.
-
-**Source sizes:** Video size also offers the selected screen's resolution and, once verified camera frames are available, the camera's current input size. Use screen or Use camera input copies that size into the fixed output setting. Fit screen indicates a size reduced or rounded to meet the even-dimension and total-pixel limits; it preserves aspect within pixel rounding. These choices do not make output size follow later device changes. Camera suggestions show the input actually received, not the camera's advertised maximum. No extra camera activation is needed to populate the list.
-
-Camera input stays within 1280 x 720 when the output fits inside that box. Larger outputs request up to 1920 x 1080 from the camera's supported modes, including for Night and separate files. A camera may supply a smaller input; larger saved dimensions cannot add detail beyond that input. Switching between these two output ranges while idle restarts the camera, so its size suggestion is temporarily unavailable until a fresh frame arrives. Recording keeps its original input limit. Higher-resolution capture uses more memory and processing, even with a long capture interval; the 720p default keeps its existing input budget.
-
-**Separate files:** Desktop + camera (2 files) saves a `-desktop.mp4` and a `-camera.mp4` with a shared capture interval, playback rate, quality, and pause/resume controls. Each file shows the complete source at the selected output size, preserving its aspect ratio. The side-by-side preview helps position the camera; it is not burned into either output. Collage editing is disabled in this mode. If a source or encoder fails, both recordings stop and the app attempts to save each file, reporting each outcome.
-
-**Several videos at once:** With Desktop + camera, Side by side or Custom collage, Also save separate files (below Camera) adds a full-frame Desktop and/or Camera video next to the combined one. For example, Desktop + camera with both boxes checked saves the overlay video plus separate desktop and camera timelapses. Each source is captured once per frame and encoded once per file, so every file shares the capture interval, playback FPS, size, quality, encoding mode, pause/resume, Stop after, file splits, time compression, Night blending and watermark, and their frames line up exactly. The combined video keeps the plain session name; the others end in `-desktop.mp4` and `-camera.mp4`. Collage edits during recording change only the combined video. Each extra file adds an encoder's processing time, memory and disk space. The choices are remembered and fixed while recording. They are not offered for Desktop, Camera or Desktop + camera (2 files), which already save each source once. If any file fails, recording stops and the app attempts to save every file, reporting each outcome.
-
-**Change the source while recording:** Source stays available while recording or paused, so one video can switch between Desktop, Camera, Desktop + camera, Side by side and Custom collage. For example, start with the desktop alone and add the camera overlay later, or cut between the desktop and the camera. A change applies from the next captured frame; output size, the camera device, saved files and the encoder stay as they were at Record. Choose the display and camera before recording: a source that was not selected then cannot be added, and Desktop + camera (2 files) can be chosen only before recording. A source added during recording is optional. If it cannot start (for example, another app is using the camera), recording continues without it and the status explains why; when nothing else is in the layout, frames are skipped until you switch back. Switching away and back retries it. The tray icon menu offers the same Source choices while the window is hidden. Sources selected at Record keep the usual behavior: if one fails, recording stops and saves. Switching to a layout without the camera turns the camera off; switching back restarts it, which can take a few seconds. Night blending applies whenever the camera is in the layout and Night camera is on.
-
-**Desktop cursor:** The Recording page includes Show desktop cursor (Alt + K), enabled by default. Turn it off to omit the Windows mouse cursor from desktop previews and saved desktop content, including collages and the desktop file in two-file mode. The choice is remembered and can change while recording, from the next captured frame. Camera-only mode retains the choice for later desktop use. Quiet-scene checks always omit the cursor. This controls Timelapse's cursor overlay; it cannot remove pointers already drawn into an application's pixels.
-
-**System tray:** Closing the window hides Timelapse while recording continues. Reopen it from its tray icon or the Start menu. Right-click the tray icon for Show, Pause/Resume, Finish, Set status, Clear status, or Exit. While recording or paused, its Source submenu switches what the recording shows without reopening the window. Exit finishes an active recording before closing; a saving failure brings the window back with the recovery information. Hidden windows stop preview processing. If Windows cannot add the tray icon, the app stays accessible in its window.
-
-While recording, paused or saving, the menu also shows active recording time and total accumulated video time at the recording's selected FPS. Before the first second of video, it shows the frame count instead. Totals include all split parts; files saved together share one timeline and are counted once. These are accepted-frame totals, not a guarantee that the current file has finished saving. The heading is a snapshot from when you opened the menu; reopen it to refresh. Viewing it does not restore the preview or add background polling.
-
-A recording failure received while hidden opens the window with its details. Opening the tray menu does not dismiss that notice. A fresh failure is shown before Hide or Exit can dismiss it; after it has been shown, those controls work normally.
-
-Hiding to the tray cancels open settings drafts. Custom-value dialogs leave keyboard focus out of the hidden window; ordinary Cancel returns focus to the setting you were editing.
-
-**Start delay:** The Recording page offers a self-timer (Alt + A): None, 5 seconds, 10 seconds, 30 seconds, 1 minute, or 5 minutes. Press Record to begin the countdown, then arrange the scene or hide the window. Preparation starts after the delay; camera startup and an initial Night blend can add more time before the first saved frame. Ordinary visible preview continues during the countdown. Stop after, file splits, time-compression ranges and the elapsed-time watermark count active recording time, excluding the countdown and preparation.
-
-Cancel start cancels a waiting or preparing recording. Closing the window keeps the armed countdown running in the tray; Exit cancels it. The selected delay is remembered, but restarting the app never restores an armed countdown. Windows sleep or hibernation cancels a delayed start that has not yet admitted its first frame; starting again requires an explicit Record. The app requests that the system stay awake during the countdown without keeping the display on. This is a short self-timer, not a calendar or recurring schedule.
-
-**Stop after:** The Recording page offers an optional Stop after limit (Alt + T). Choose a preset or Custom for a positive active duration in seconds, minutes, hours, or days. Custom limits must equal a whole number of seconds, up to 2,147,483,647 seconds. Initial startup and paused time do not count. Reported elapsed time includes capture or encoding work up to the point recording stops; final saving is excluded. Timelapse automatically finishes and saves the video or pair of videos at the limit, including while hidden in the tray. Finishing may wait for a capture or encoding operation already in progress and for the files to save. The default is Never. The selected limit is remembered. You can change or remove it while recording or paused; a limit at or below the time already recorded is refused. Settings that cannot change while recording are disabled; you can still switch pages to look at them. Finishing a hidden recording also releases the camera.
-
-**Playback & shortcuts:** A single button on the Output page opens a compact dialog for playback FPS and optional global Pause / resume, Stop and save, and Set status shortcuts. FPS accepts whole numbers from 1 to 120 and defaults to 30. It sets how quickly saved frames play; Capture every still sets how often a new frame is taken. Higher FPS makes the same captured frames play faster and produces a shorter video. It does not create extra frames. The chosen rate applies to both separate files and every split part; video-time statistics and watermark target speed use that rate.
-
-The shortcuts start disabled. Click a shortcut field and press a combination containing Ctrl or Alt, or use Clear to disable it. Add Ctrl to Alt+letter combinations so the interface's existing access keys stay available. The shortcuts must differ. Set status opens the Status window from anywhere, including while Timelapse is hidden in the tray. Reserved or unavailable combinations show a message when you press OK, keeping your previous settings. Pause / resume operates an existing recording; Stop and save finishes it using the ordinary save flow, or cancels a delayed/preparing start. Shortcuts work while Timelapse is hidden in the tray and never start a new recording. They are suspended while a Timelapse dialog or menu is open. FPS and shortcuts are remembered. Shortcuts can change at any time except while a recording is starting or finishing; FPS can change only when not recording.
-
-**Reset all settings:** At the bottom of the Output page, Reset all settings... asks for confirmation, then returns every setting to its first-start default: capture timing, video size and quality, the save folder, encoder and recording options, time compression, night camera, watermark, status appearance and the status list, playback FPS and global shortcuts. The selected display and camera stay selected, and recordings are not touched. It is unavailable while recording.
-
-**Split files every:** The Recording page can periodically save completed parts while the recording continues. Never is the default; choose 15 minutes, 1 hour, 6 hours, 24 hours, or a Custom duration in whole seconds. This measures active recording time, not video playback time: initial preparation and pauses are excluded, while saving and opening the next part count. Every part remains a separate MP4 at the selected playback FPS. Very short parts require more encoder restarts, increase overhead, and may cause missed capture slots. While recording, the part length can change; splitting itself is turned on or off only before recording.
-
-Parts share a session name with numbered `-part-000001` suffixes. In two-file mode or with Also save separate files, each part has the matching set of files. The app saves a nonempty part at its time boundary even when the next frame is not due, and opens the next part only when a frame is ready. Empty time windows create no files. For example, with ten-minute splits and frames captured at 0 and 35 minutes, the first part saves around minute 10 and the second around minute 40. Capture or encoding already in progress can delay saving.
-
-Splitting keeps the overall Stop after deadline, capture schedule, time-compression observations and full Night blend windows. Frame and elapsed-time statistics remain session totals; the parts-saved count treats each set of files as one part. Status identifies the latest output set; earlier parts stay in the same folder. A save failure stops the session and reports the affected files. Already saved parts remain available; splitting does not guarantee recovery of the currently open part after a crash or power loss.
-
-**Low disk space:** The Recording page also contains Stop on low disk space, enabled by default. Before opening a recording and before each captured frame is admitted, Timelapse checks the space available to your account in the save folder. It stops and attempts to save when 64 MiB or less remains per output file (128 MiB for two files, 192 MiB for three). If Windows cannot report available space, recording is refused or stopped with a diagnostic. The option is remembered and can change during a recording; turn it off for a folder that cannot provide space information. Checks do not run for preview, idle time, or paused recordings.
-
-This is a best-effort headroom check, not reserved disk space: another program, encoder buffering, large video indexes, or drive failure can still prevent saving. A slow network-folder query can delay recording or Finish. The original stop reason remains visible if saving or renaming also fails.
-
-**MP4 recovery mode:** The Output page offers an optional H.264 recording format that writes small completed sections as recording proceeds. After a forced app termination, completed sections in the retained `.recording.mp4` file may play in a compatible player without first pressing Finish. Recent frames and files interrupted before initialization may still be lost. This does not guarantee recovery after power loss, drive failure or every type of interruption, and it does not repair existing recordings.
-
-Recovery mode is off by default. It adds container bytes and processing work without changing the selected H.264 compression settings. Some players and editors may not accept fragmented MP4; use ordinary MP4 for the widest compatibility. Recovery works with any available H.264 encoder and with single, separate or companion files, Night blending and time compression. Hardware HEVC and AV1 require recovery mode to be off; an incompatible selection stays visible and blocks Record until corrected. Finish still saves the file normally. The option is remembered and locked during a recording.
-
-Accepted settings are saved before a new recording starts as well as on normal exit. A preferences-write failure does not prevent recording and leaves the previous saved settings intact.
-
-**Watermark:** The Output page offers an optional text overlay, off by default. Show active elapsed time, recorded local date/time, the total target speed, or time and speed together. Choose a corner or set custom horizontal and vertical percentages, and select Small, Medium or Large text. The text has no background box: it is drawn in Segoe UI with a thin dark outline and soft shadow, so it reads over light and dark content, and its lines align toward the nearer side. The preview shows the placement within the chosen video size; the text stays within the frame. Settings are remembered and can change during a recording, from the next saved frame, with the same values and placement on every file.
-
-Elapsed time excludes the self-timer, initial preparation and pauses and continues across automatic file splits. Recorded local date/time is sampled when the prepared frame is labeled for saving; it is not the camera's exposure time and can jump when the system clock changes. Target speed describes planned capture spacing at the selected playback FPS: at 30 fps, Capture every 5 seconds gives Target 150x, and an additional 4x time-compression interval gives Target 600x. At 60 fps those targets double. Processing delays and skipped capture slots can make the actual speed different. The first frame uses the base interval. Idle preview uses illustrative elapsed/speed values; a paused recording keeps its last saved label.
-
-The watermark is added after source processing, so its changing text does not trigger image-change or person checks or alter Night blending. Its native text tile is cached; no font package, image model or extra capture is needed. The live status line below uses the same drawing. Very small video sizes can be too narrow for the selected text, in which case choose a larger output, fewer fields or smaller text. Adding changing text can increase encoded file size, especially on an otherwise static scene.
-
-**Status in the video:** Show what you're doing in a corner of the video, like a game's event feed. In the STATUS section of the settings panel choose Set status... (Alt + U), or use the tray menu or an optional global shortcut, and type or paste a short line such as "Shower", "Work on Essay" or "First task done!!" (up to 60 characters). Choose Text only, Stopwatch (counts up), or Timer (counts down) with a length in minutes.
-
-When you set a new status, the old line is struck through, slides under the new one and fades out. Several quick changes stack up to three older lines. The animation is timed in saved video frames, so it looks the same at every capture interval: at Capture every 5 seconds, a fade that lasts two seconds of video covers several real minutes. Stopwatches and timers count real time from when you set them, including while recording is paused or Windows sleeps. A finished timer shows how far over it is (for example +3:12) in amber. Turn on Repeat with breaks to alternate work blocks with breaks (for example 25 and 5 minutes) until you change the status. Timelapse notifies you when a timer ends and when each block changes. Clear status strikes the current line out without a new one.
-
-A status can be set or changed at any time, including before and during a recording; it appears from the next saved frame and immediately in the preview. Corner, text size and style (Shadow only, or Edge fade, a dark strip that fades from the screen edge) are in the same window, with a zoomed preview of the chosen corner; they are remembered and can change while recording. Every file of a recording shows the status. Optionally, turn on **Also save a status list (.txt) with each video** in the same window. Each saved video, or each part of a split recording, then gets a `-status.txt` file listing when each status appeared in video time (for example `0:12 Shower (stopwatch)`), which you can paste into a video description to add chapters. The list is off by default, remembered, and fixed while recording. Timelapse does not keep a history of earlier statuses. Very small video sizes cannot show the status; the window says so. The current status lasts until you change or clear it, or until Timelapse closes; it is not restored at the next start.
-
-**Night camera:** For camera recordings, the Recording page offers an optional Night camera (software blend) mode. It combines distinct camera frames over a period of time and adjusts brightness automatically. This can reduce random noise and blur movement; the camera's shutter settings remain unchanged. It uses an approximate linear-light blend of the camera's processed video, rather than raw sensor exposures, and cannot recover detail that the camera did not capture. Night mode is off by default.
-
-Leave Blend duration on Auto, choose 1, 2, 5, 10, or 30 seconds, or use Custom for a duration from 1 to 30 seconds in exact milliseconds (for example, 1.5 or 15 seconds). These are requested software blending windows; camera frame timing and processing can vary. Auto starts with up to three seconds, then adjusts the blend duration using scene darkness and the observed camera-frame cadence, including when brightness correction reaches its limit. Every window stays within Capture every and the 30-second maximum. Night camera requires a capture interval of at least one second, including with Auto. A manual duration must not exceed Capture every; the app keeps an invalid selection visible and disables Record until corrected. While recording, a duration that does not fit is refused instead. Automatic brightness remains active with a manual duration.
-
-Dark, Balanced, and Bright choose the desired brightness; Balanced is the default. Automatic brightness gives darker areas more influence than lamps or other bright patches, and lifts shadows while helping preserve highlight detail and color. Shadow gain is limited to 8× for one frame and can reach 64× with enough contributing frames and sufficiently stable signal. Temporal noise measurements limit amplification when successive frames remain noisy or correlated; the maximum is not applied to every scene. A small adaptive color-noise filter cleans up noisy blends while preserving luminance detail and protecting color edges. Clean blends skip this filter. These changes run inside the existing camera helper with no model, download, new thread, or additional camera captures.
-
-More frames can reduce independent noise, but cannot remove every fixed-pattern artifact or recover shadows already clipped by the camera. Longer blends can reveal more dark detail at the cost of movement blur; for a stationary very dark scene, try Capture every 10 or 30 seconds with Auto blend duration. The last-blend “brightness target limited” note compares the whole-image average with the selected reference; it can also appear in mixed lighting even when darker areas reach their target. See [Night engineering and validation](https://github.com/Domincog/Timelapse/blob/v0.32.0/NIGHT_VALIDATION.md) for measured quality, processing cost, scientific limitations, and reproducible tests.
-
-The initial full blend is preparation and does not consume a Stop after limit. Pause, Finish, or a time limit discards an unfinished blend; Resume starts a fresh one. Idle preview remains ordinary camera video. During recording, preview holds the most recently completed blend while the next one is prepared. Last-blend duration, camera-frame count, and shadow gain describe that completed result; the gain applies most strongly to the darkest tones. In collages, only the camera is blended; in two-file mode and with separate files, the desktop is captured near the end of the camera window. The files share playback timestamps, but their physical exposure periods differ. Slow cameras or processing can reduce the actual capture rate; full windows are never shortened to catch up. If no distinct camera frame arrives within a window, choose a longer blend and capture interval.
-
-**Time compression:** The Recording page offers an optional configuration for saving fewer frames during selected stretches. Off is the default. Scene is quiet uses image-change checks; Inside scheduled ranges follows your recording-time ranges regardless of movement; Quiet scene + schedule requires both a scheduled range and a quiet scene. All files from one recording always follow the same timing decision. Output plays at the selected playback FPS, and omitted source moments cannot be recovered from the resulting video.
-
-Choose a maximum extra speed from 2x to 64x. At Capture every 5 seconds, 4x targets one saved frame every 20 seconds. Expand Fine tuning for transition duration and quiet-scene sensitivity; ordinary trigger, speed, waiting-time and schedule controls stay visible. Fine tuning starts collapsed and its caption identifies nondefault values.
-
-Speed transitions use approximately 0.5, 1, or 2 seconds of **video time** (15, 30, or 60 saved frames at the default 30 fps). Frame counts adapt to the selected FPS, rounded to at least one frame. Their recording-time duration depends on capture interval and speed. Known manual ranges ramp up and reserve time to slow down before their end; short ranges may reach only a small part of the chosen maximum. Processing delays can interrupt the planned ramp. This changes capture timing; it does not create interpolated images or crossfades.
-
-Add up to 16 ranges using offsets from recording-ready time, optionally repeating them at a chosen active duration. Overlapping or touching ranges merge. Initial preparation and pauses do not count, including for repeats: a repeating 24-hour schedule follows active recording time, not midnight or the wall clock. Stop after continues to count the full active recording time. Pause/resume, source/layout changes and Time compression changes made while recording restart compression from the normal interval.
-
-Quiet modes request small raw-image checks once per second, including while hidden, and wait for the chosen quiet duration (two minutes by default). Change in either selected source prevents quiet-mode compression. These checks measure image changes, not people or semantic importance. Very small, low-contrast, repetitive, or brief changes between checks may be missed. Desktop checks omit the cursor. Noise can conservatively prevent acceleration. An unavailable or stale check restores the normal capture interval and has its own status detail; a busy capture, encoder, or disk can delay checks.
-
-Fine tuning offers Low, Standard and High change sensitivity for quiet modes. Standard keeps the existing behavior. Low tolerates more small image variation, which can also miss subtle activity; High responds to smaller changes and can stay at normal speed because of noise. All levels retain the same once-per-second checks and stale-result handling. This setting does not adjust the person detector.
-
-Detected change returns directly to the normal interval rather than continuing a long slowdown. The next frame still respects Capture every, so return is not an immediate-event capture guarantee. Night camera checks use raw images, keep each blend bounded by the original Capture every, and never shorten an in-progress blend. Its response also includes the remaining or newly started full blend window. Current target cadence and actual last-check age are shown on the Recording page. Off and manual-only modes do no image-change checking; automatic checking adds work, so fewer encoded frames does not by itself establish lower total CPU use or energy consumption.
-
-**Optional person checks:** Time compression also offers No person detected (camera) and No person + schedule (camera). They check only the selected camera and can accelerate when other objects move. People or activity shown only on the desktop are not checked. All saved files still share the same cadence. Choose how long no person must be detected before acceleration; two minutes is the default. Distinct eligible camera checks must span that full active duration. A detected person, missing or failed check, or stale image clears that history and returns toward the next normal capture deadline. A full Night exposure still finishes before its frame can be saved.
-
-Treat uncertain checks as no person is enabled by default in Time compression. Completed uncertain checks, including poor-detail images, count toward the selected no-person duration and can accelerate recording. The status says No person detected (uncertain) when that policy qualifies. Uncheck the option to keep normal cadence and clear absence history whenever a result is uncertain; those results then display Person check uncertain. The choice is remembered and can change during a recording. Missing, stale or failed checks always display Checks unavailable and keep normal cadence.
-
-Qualified no-person checks use the same 0.25 model-score threshold as person detection, with an image-detail check. Lower background scores qualify in an otherwise clear empty scene. These scores are model outputs, not calibrated probabilities. In either uncertainty mode, the selected no-person duration must pass before the capture interval gradually increases toward the selected multiplier.
-
-Choose Manage detector, then Download / reinstall to obtain the optional local NanoDet-m model and CPU runtime (about 3.7 MiB installed). Opening the app, selecting a person mode, and pressing Record never download it. The default installer and portable ZIP do not contain this payload. It is stored in `LocalAppData\Timelapse\Person\NanoDet-r1` for both installed and portable users. Manage can remove it while recording is stopped. Uninstall preserves this optional per-user data with your preferences; remove it through Manage if wanted. Installation does not enable the feature.
-
-Person checks run locally, at most once per second, after recording begins. Camera thumbnails are not sent over the network or saved separately. No detector is loaded for ordinary preview, Off, either Quiet mode, Manual schedule, or while paused. A separate owned process contains detector crashes and hangs; recording continues at its normal cadence if the model is missing, invalid or unavailable. Restart recording to retry a detector that failed. The app verifies the exact published worker size and SHA-256 before launch. Checks and their extra raw camera reads use CPU and memory while enabled; saving fewer frames does not guarantee reduced total power.
-
-The detector can miss people, especially when small, obscured, unusual or poorly lit, and brief visits between checks can be skipped. With Treat uncertain checks as no person enabled, blank or low-detail images can accelerate recording after the waiting period. Uncheck it to suppress acceleration for those uncertain images; this is not a general blocked-lens detector. This feature is a recording convenience, not an occupancy or security guarantee. The normal capture interval still limits how promptly a newly detected person appears in the saved video.
-
-**Record only while someone is there:** Time compression also offers No person detected: pause capture (camera), a stricter person mode. It saves frames at your normal Capture every interval while a person is detected in the camera, and saves nothing once nobody has been detected for the Keep recording after a person leaves time (set 1 second to stop almost at once). When someone appears again, the next frame is captured promptly instead of waiting out a slowed schedule. There is no speed ramp; the video cuts from the last frame before the break to the first frame after it. The first frame is saved when recording starts, before the first check completes. Missing, failed or stale checks keep recording normally, and Treat uncertain checks as no person decides whether uncertain checks can pause capture. Active time keeps counting while capture is paused, so Stop after and file splits follow the clock; a part with no frames creates no file. It uses the same optional detector, limits and privacy as the person modes above.
-
-The installer keeps Timelapse in your user account's `LocalAppData\Programs\Timelapse` directory and adds Start menu and uninstall entries. Start with Windows is optional and starts the app in the tray without recording. Exit Timelapse from its tray menu before upgrading or uninstalling. Uninstalling preserves your recordings and settings.
-
-Tab moves between controls. Ctrl + Tab and Ctrl + Shift + Tab (or Ctrl + Page Down and Ctrl + Page Up) switch settings pages, and the arrow keys move between the page tabs. An access key for a setting on another page switches to that page. Alt + H changes the save folder while idle, and Alt + O opens it. Alt + C opens Time compression from any page. In its schedule editor, Alt + R focuses the ranges list and Alt + M removes the selected range; changes take effect only after OK. During recording, compression settings are read-only and Enter from the ranges list closes the view.
-
-In the collage preview, Space cycles between sources, arrow keys move the selected source, and Shift + arrow keys resize it. Using these keys while dragging ends the current drag and preserves the keyboard edit. Reset layout restores the preset.
-
-On smaller work areas, the settings panel scrolls independently while the preview and recording controls stay visible. When the work area cannot fit the preview's minimum height, the whole window scrolls to keep every control reachable. Shift + wheel scrolls horizontally, and keyboard navigation brings focused controls into view.
-
-Custom-value, Playback & shortcuts, Encoder settings, Time compression, Watermark and Status Details dialogs also support these wheel gestures. Closed dropdowns retain their values while you scroll an overflowing dialog; open dropdowns, the scheduled-ranges list and the Details report keep their own scrolling. Wheel amount follows your Windows settings. In a constrained Details window, Tab brings the focused action into view.
-
-The quality selector offers Extra small file, Smaller file, Balanced, and More detail. Balanced is the default. Extra small file uses stronger compression; More detail prioritizes image detail. File size depends on the scene and can grow substantially with motion, texture, or frequent cuts.
-
-On the Output page, choose an encoding mode separately from resolution and quality:
-
-| Encoding | Use |
+| Setting | What it does |
 | --- | --- |
-| Compatible H.264 | Original software encoding settings and broad playback support. This remains the default. |
-| Efficient H.264 | Tuned software encoding with a bitrate target and longer keyframe spacing. A useful starting point for long recordings. |
-| Hardware H.264 | Uses an available hardware encoder to reduce CPU work, with broad H.264 playback support. |
-| Hardware HEVC | Uses an available hardware HEVC encoder. Playback requires a compatible player or installed HEVC decoder. |
-| Quality H.264 | Software encoding that prioritizes detail. Static screens can produce small files; frequent changes can produce much larger files. |
-| AV1 | Built-in SVT-AV1 software encoding with a fixed quality target. Uses more processor time and memory; playback needs AV1 support. |
+| **Source** | What goes in the video. Desktop + camera puts the webcam in a corner of the screen. In a collage you can drag a source to move it, drag its corner to resize it, and use **Bring forward** to change which one is on top. **Desktop + camera (2 files)** saves the screen and the webcam as two separate videos instead. |
+| **Display / Camera** | Which screen and which webcam to use. Press **Refresh** if you plug one in. |
+| **Also save files** | With a combined layout, also save the full screen and/or the full webcam as their own videos at the same time. |
+| **Capture every** | Time between pictures: 1 to 60 seconds, or **Custom** (from 0.1 seconds up to 24 hours). Longer gaps make shorter, faster videos. |
+| **Video size** | 720p (default), 1080p, your screen's or camera's own size, or a custom size, including portrait and square. |
+| **Video quality** | Extra small file, Smaller file, Balanced (default) or More detail. Busy, fast-changing scenes make bigger files. |
+| **Save to** | Where videos go. **Change...** picks a folder; **Open folder** opens it. |
+| **Status** | Show what you're doing in a corner of the video. See [Status in the video](#status-in-the-video). |
 
-**AV1:** Timelapse includes SVT-AV1 v4.2.0, so this mode works on any supported PC without a special GPU; it runs on the processor. Preset 6 is the default balance of encoding speed and compression. Each normal quality choice uses a fixed CRF target, so complex scenes can produce larger files.
+### Recording tab
 
-**Encoder settings:** On the Output page, choose Encoder settings… to adjust SVT-AV1's preset from 0 to 11. Lower presets spend more encoding time to improve compression; higher presets prioritize speed. Rate control defaults to Automatic (Video quality). For AV1, Custom CRF accepts 1–70: lower values retain more detail and usually make larger files. Target bitrate accepts 1–100,000 kbps for any encoding mode and aims for that rate rather than a strict size limit. AV1 target bitrate requires dimensions of at least 64 × 64 pixels; Automatic and Custom CRF support the normal 48-pixel minimum. Custom CRF or bitrate overrides the normal Video quality choice. Return to Automatic to use the quality labels again. These settings are remembered and cannot change during a recording.
+| Setting | What it does |
+| --- | --- |
+| **Stop after** | Finish and save automatically after this much recording time (pauses don't count). Default: Never. |
+| **Split files every** | Save the recording in parts, for example one file per hour, so a crash or power cut can only affect the part in progress. Parts are named `...-part-000001.mp4`, `...-part-000002.mp4` and so on. Default: Never. |
+| **Start delay** | A countdown (up to 5 minutes) after pressing Record, so you can get ready or hide the window first. |
+| **Stop on low disk space** | Stops and saves before the drive fills up. On by default; turn it off only for folders that can't report free space, such as some network drives. |
+| **Show desktop cursor** | Include the mouse pointer in screen recordings. On by default. |
+| **Time compression...** | Save fewer pictures during boring stretches so they fly by. See [Time compression](#time-compression). |
+| **Night camera** | Brighten dark webcam footage by blending several camera frames into each picture. See [Night camera](#night-camera). |
 
-When encoding cannot keep up with a short capture interval, capture slots are skipped as usual, and Pause or Finish can wait for encoding already underway. Desktop + camera (2 files) runs two encoders, and a collage with both separate files runs three. Large outputs and additional files need more encoding time and memory.
+### Output tab
 
-AV1 playback requires an AV1-capable player or decoder. Windows playback may need the AV1 Video Extension. Some older players, editors and TVs cannot open these files. MP4 recovery mode requires H.264. Writing AV1 MP4 uses Windows Media Foundation and has been verified on Windows 11; Windows 10 AV1 MP4 writing has not been verified. If Windows cannot write AV1 MP4, recording reports an error when it starts and no file remains.
+| Setting | What it does |
+| --- | --- |
+| **Encoding** | The video format. **Compatible H.264** (default) plays almost everywhere. **Efficient H.264** usually makes smaller files. **Hardware H.264 / HEVC** use your graphics chip to save CPU. **Quality H.264** keeps more detail. **SVT-AV1** makes the smallest files but uses more CPU, and needs an AV1-capable player (Windows may need the free *AV1 Video Extension*). HEVC needs an HEVC-capable player. |
+| **Encoder settings...** | For experts: AV1 speed preset (0–11, default 6), a fixed AV1 quality level (CRF), or a target bitrate. |
+| **MP4 recovery mode** | H.264 only. Writes the video in small sections so that if the app is forced to close, what was recorded so far is more likely to play. Off by default because some editors don't support this kind of MP4. |
+| **Watermark...** | Stamp the video with the elapsed time, the date and time, and/or the playback speed, in any corner or position. |
+| **Playback & shortcuts...** | Playback frame rate (1–120 fps, default 30; higher means a shorter, faster video), plus optional global keyboard shortcuts for Pause/Resume, Stop and save, and Set status that work even when Timelapse is hidden. |
+| **Reset all settings...** | Puts every setting back to its default (your chosen display and camera stay selected). |
 
-Hardware support depends on the computer and driver. If a hardware mode is unavailable, choose Compatible H.264 or Efficient H.264. The app verifies that hardware modes actually use a hardware encoder. Encoding and quality choices are saved and remain locked during a recording.
+Settings are remembered between sessions.
 
-Efficient uses variable bitrate at all quality levels. Its bitrate is a target, not a strict file-size cap. Quality H.264, AV1 and the hardware modes normally use quality targets: detailed scenes, noise and frequent changes can need substantially more data. A long capture interval reduces the number of frames but can also make consecutive frames less alike. The quality labels describe a tradeoff within each mode and do not promise identical image quality or file size across different codecs. Hardware encoding can reduce CPU use while keeping a dedicated GPU awake, so lower CPU use does not establish better battery life.
+## Changing settings while recording
 
-Desktop capture excludes this app's window on supported Windows versions. Minimize or close the window to stop preview updates while recording continues. Camera modes activate the camera for preview and recording. The app starts in Desktop mode so opening it does not silently activate a camera.
+Most settings can be changed while you record or while paused, and apply to the video from the next picture: Source and the collage layout, Display, Capture every, Show desktop cursor, Stop after, the length of split parts, Stop on low disk space, Night camera, Time compression, Watermark, status appearance and the keyboard shortcuts. If a change can't work with the current recording (for example, a Stop after time that has already passed), Timelapse tells you and keeps recording as before.
 
-Switching sources or devices clears the previous preview until the new selection produces a frame.
+A few things are fixed once recording starts, because changing them would need a new file: video size and quality, encoding and encoder settings, MP4 recovery mode, playback frame rate, the camera, the save folder, which files are saved, and turning file splitting on or off. Change those before you press Record.
 
-Refresh keeps the selected camera and display when the device list changes. If a selected source is unavailable, choose a replacement or refresh after it returns. Record stays disabled while a source needed by the current layout is unavailable.
+## Status in the video
 
-Recording follows the selected display's identity and current bounds. If the display is missing or changes while a recording frame is captured, that frame is rejected and recording stops, attempting to save earlier frames.
+Click **Set status...** (or use the tray menu or a shortcut) and type a short note such as "Lunch" or "Working on chapter 3". It appears in a corner of the video, like a game's event feed: when you set a new one, the old one is crossed out and fades away. A status can also be a **Stopwatch** that counts up or a **Timer** that counts down, optionally repeating with breaks (for example 25 minutes of work, 5 minutes of break). Timelapse notifies you when a timer ends.
 
-Saving keeps ownership of the original recording through finalization and the final filename change. An existing destination is never overwritten. If the filename change fails, the status message identifies the finished video retained at its `.recording.mp4` path. If finalization itself fails, any retained partial file may be incomplete. Save folders and preference files support long local Windows paths and Unicode names.
+In the same window you can choose the corner, size and style, and turn on **Also save a status list (.txt)**. That writes a text file next to each video listing when each status appeared, for example `0:12 Lunch`, ready to paste into a YouTube description as chapters.
 
-Frame and video-time statistics describe samples accepted by the encoder, including a sample accepted just before an MP4 recovery-section error. They remain session totals across file splits; multi-file recordings use the common count, with any difference described in the final report. These statistics do not guarantee that every accepted sample remains playable after a finalization failure or interruption.
+## Time compression
 
-## Build and verify
+Time compression speeds up the dull parts by taking pictures less often while nothing is happening, then returning to normal as soon as something changes. Choose when to speed up:
 
-Install CMake 3.20 or later (3.21 or later for Visual Studio 2022) and Visual Studio 2019 or 2022 Build Tools with the Desktop development with C++ workload and Windows 10 SDK.
+- **Scene is quiet**: when the picture hasn't changed for a while (two minutes by default).
+- **Inside scheduled ranges**: during set periods of the recording, such as minutes 30–90, optionally repeating.
+- **Quiet scene + schedule**: both at once.
+- **No person detected (camera)** and **No person + schedule (camera)**: when nobody is visible on the webcam.
+- **No person detected: pause capture (camera)**: record only while someone is on camera.
 
-The first build downloads the pinned [SVT-AV1 v4.2.0](https://gitlab.com/AOMediaCodec/SVT-AV1/-/tree/v4.2.0) release and the NASM 3.02 assembler used to build it, and verifies each against a fixed SHA-256 digest (see `third-party/svt-av1.cmake`). This adds a few minutes to the first build only. For an offline build, download the same files and pass `-DTIMELAPSE_SVT_AV1_ARCHIVE=<path>\SVT-AV1-v4.2.0.tar.gz -DTIMELAPSE_NASM_ARCHIVE=<path>\nasm-3.02-win64.zip` when configuring; they are verified the same way. SVT-AV1 is configured in its own isolated build tree (`build/svt`) and compiled into the app; nothing is installed system-wide. Keep the build path reasonably short because dependency intermediate file paths can be long.
+Choose how much faster it can go (2× to 64×). The speed-up ramps in and out smoothly. The quiet check looks for changes in the picture, not their importance, so very small or brief changes can be missed.
 
-Run from PowerShell:
+**Person detection** needs a small optional download (about 3.7 MB). In Time compression, choose **Manage detector → Download**. It runs entirely on your PC; camera images are never uploaded or saved separately. It can miss people who are small, partly hidden or poorly lit, so don't rely on it for security.
+
+## Night camera
+
+For dark rooms or night scenes, Night camera combines many webcam frames into each picture and brightens it automatically, which cuts down grainy noise. Moving things will look blurred. Leave **Blend duration** on Auto, or pick 1–30 seconds; it can't be longer than Capture every. **Auto brightness** offers Dark, Balanced (default) and Bright. For a very dark, still scene, try capturing every 10 or 30 seconds. It brightens what the camera captures; it can't recover detail the camera never saw.
+
+## Tips
+
+- **Desktop capture hides the Timelapse window itself**, so it won't appear in your recording. Minimize it to save a little CPU; recording continues.
+- **The computer must stay awake and unlocked** for screen recording. Timelapse asks Windows to stay awake while recording; locking the screen or protected video (some streaming apps) can show as black.
+- **If something goes wrong**, Timelapse stops and saves what it already recorded, and the status line explains why. Click **Details** to read or copy the full message, and **Show files** to find the saved videos.
+- **Stopping safely:** always use **Finish**, Exit from the tray menu, or Stop after. A normal MP4 that's cut off by a crash or power loss may not play; turn on **Split files every** or **MP4 recovery mode** for long sessions.
+- **Several files at once** (two-file mode or Also save files) each need their own encoding work, so they use more CPU and disk space.
+- **Very short capture intervals** with large videos may be more than your PC can keep up with. Timelapse then simply skips pictures rather than falling behind.
+
+## Keyboard shortcuts
+
+| Keys | Action |
+| --- | --- |
+| Ctrl + Tab, Ctrl + Shift + Tab | Switch settings tabs |
+| Alt + underlined letter | Jump to that setting (for example Alt + T for Stop after) |
+| Alt + C | Open Time compression |
+| Alt + I | Status details |
+| Space / arrow keys / Shift + arrows | In a collage preview: select, move, and resize a source |
+| Your own global shortcuts | Pause/Resume, Stop and save, Set status (set them in Playback & shortcuts) |
+
+## Install, update and uninstall
+
+The installer puts Timelapse in your user account (`%LocalAppData%\Programs\Timelapse`) and adds it to the Start menu. It can optionally start with Windows (in the tray, without recording). To update, exit Timelapse from its tray menu and run the new installer. Uninstalling keeps your recordings and settings. The portable ZIP needs no installation: extract it and run `Timelapse.exe`.
+
+## Known limitations
+
+- One display and one webcam per recording. No audio.
+- Removing the display or camera being recorded stops the recording (what was recorded is saved).
+- Camera compatibility varies by device.
+- Writing AV1 files has been verified on Windows 11 but not on Windows 10.
+
+## For developers
+
+### Build
+
+Requirements: Visual Studio 2019 or 2022 (or Build Tools) with the **Desktop development with C++** workload and a Windows 10 SDK, and CMake 3.20 or later (3.21 or later for Visual Studio 2022). From this folder in PowerShell:
 
 ```powershell
 .\build.ps1 -Test
 ```
 
-For an offline build through the script, use `-SvtAv1Archive <path>\SVT-AV1-v4.2.0.tar.gz -NasmArchive <path>\nasm-3.02-win64.zip`.
+This builds, runs the tests and writes `dist\Timelapse.exe`, `dist\Timelapse-portable.zip` and `dist\SHA256SUMS.txt`. The first build downloads the pinned [SVT-AV1 v4.2.0](https://gitlab.com/AOMediaCodec/SVT-AV1/-/tree/v4.2.0) source and the NASM 3.02 assembler and checks them against fixed SHA-256 digests (see `third-party/svt-av1.cmake`). For an offline build, pass `-SvtAv1Archive <path>\SVT-AV1-v4.2.0.tar.gz -NasmArchive <path>\nasm-3.02-win64.zip`. Keep the build path short, because dependency paths can get long.
 
-Successful builds publish `dist/Timelapse.exe`, `dist/Timelapse-portable.zip`, and `dist/SHA256SUMS.txt`. These files are prepared before replacing the previous distribution. If publication fails, the script attempts to restore the previous files. If recovery cannot finish, the error identifies the retained staging folder.
-
-The build statically links the C++ runtime. Automated tests exercise compositor geometry and pixels, actual MP4 encoding and decoding, and recording lifecycle behavior through Windows Media Foundation. The desktop integration test requires an unlocked interactive Windows session with desktop capture access.
-
-If PowerShell scripts are disabled, run the equivalent commands directly (use `Visual Studio 17 2022` for VS 2022):
+Without PowerShell scripts (use `Visual Studio 17 2022` for VS 2022; add `-DTIMELAPSE_SVT_AV1_ARCHIVE=...` and `-DTIMELAPSE_NASM_ARCHIVE=...` for offline builds):
 
 ```powershell
 cmake -S . -B build -G "Visual Studio 16 2019" -A x64
@@ -235,111 +145,28 @@ cmake --build build --config Release --parallel
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-For checks that use only synthetic capture sources, add `-E "^engine_tests$"` to the CTest command. This excludes the desktop recording integration test.
+The app is then `build\release\Timelapse.exe`. The tests use generated images and real MP4 encoding and decoding. `engine_tests` also records the real desktop and needs an unlocked interactive session; add `-E "^engine_tests$"` to skip it. Launching with `--inspect-ui` allows screenshots of the app window for visual checks.
 
-The executable is then in `build/release/Timelapse.exe`. Developers can launch it with `--inspect-ui` to allow window screenshots during visual QA; normal launches exclude the app from desktop capture.
+### Packaging
 
-## Current limits
+After a Release build, `.\package.ps1` writes the portable ZIP, a source ZIP and checksums to `packages\`. Add `-InstallerCompiler '<path>\ISCC.exe'` (Inno Setup 7) to also build the installer. Packaging regression checks: `tests\build_tests.ps1`, `tests\package_tests.ps1` and, with an Inno Setup compiler, `tests\installer_tests.ps1` (run each with `powershell -NoProfile -ExecutionPolicy Bypass -File`).
 
-- One display and one camera at a time, saved as up to three files that share one capture schedule; 720p, 1080p, or custom output within the size limits above, preserving source aspect ratios. Camera input is bounded at 720p for smaller outputs and up to 1080p for larger outputs, subject to camera support. Desktop output can retain more detail when the selected display provides it.
-- The desktop must remain unlocked and awake. Protected content may appear black. A removed display or unavailable camera stops recording and attempts to save captured frames.
-- MP4 is finalized by Finish, Exit, an automatic time limit, or a configured file-split boundary. Closing the window keeps recording. An unfinished ordinary MP4 can be unplayable after forced termination or power loss. Optional H.264 recovery mode improves the chance of playing completed sections after interruption, with the limits described above.
-- Windows N requires the Media Feature Pack. The app and installer are currently unsigned.
-- Camera compatibility and performance vary by device; automated media tests use generated frames and do not establish physical-camera compatibility.
-- Display identity uses a Windows monitor interface when available, with a GDI display-name fallback. The fallback cannot distinguish a replacement using the same name; changes that disappear and return entirely within one capture can escape detection.
+### Encoding benchmarks
 
-The app retains the latest preview and camera frame, and writes samples incrementally. Preview runs at two frames per second when idle and one while recording; minimized windows do not generate preview frames. There is no growing in-memory recording buffer. The app requests that Windows stay awake while recording or saving. It releases the request while paused and after saving finishes. Manual locking is still respected.
+Optional tools measure file size, CPU time and quality on generated test scenes (they never capture your screen or camera). Configure with `-DTIMELAPSE_BUILD_BENCHMARKS=ON` and build the `encoding_benchmark` and `encoding_quality_verifier` targets; `tools\verify-encoding-quality.ps1` adds an independent FFmpeg check. See [AV1 validation](AV1_EFFICIENCY.md) and [Night validation](NIGHT_VALIDATION.md) for measured results and methods.
 
-Desktop capture reuses its recording surface alongside a bounded preview surface, avoiding repeated native allocations as capture and preview sizes alternate. The extra preview surface uses at most 900 KiB. This keeps the recording-sized surface resident between saved frames while recording is visible, trading retained memory for reuse. Pause and Finish release the native surfaces even when the window stays visible; continued preview recreates only what it needs. Hidden idle or paused sessions and switching away from desktop capture release them too.
+### Repository layout
 
-A single full-frame source already matching the output size avoids unnecessary composition scratch allocation and background clearing. Sources that need no scaling copy four pixels at a time using the SSE2 instructions available on supported x64 processors, including matching-size layers within a collage. Pixel values, alpha handling, and scaling/letterboxing are unchanged.
+- `src/`: the app (capture, layout, encoding, user interface).
+- `tests/`: automated tests.
+- `tools/`: optional verification scripts.
+- `installer/`: Inno Setup script for the per-user installer.
+- `third-party/`: the pinned SVT-AV1 build recipe, licenses and notices.
+- `person-pack/`: the separately built optional person detector.
 
-While a night window is active, its camera helper blends up to five distinct contributions per second, at the selected input limit of up to 720p or 1080p. Accumulation buffers are bounded and sized to the delivered input. Intermediate blend data stays in the helper; only the completed blend crosses to the recorder. During initial Night preparation, raw preview can reuse a fresh contribution from the same helper iteration instead of converting it again. After the first completed blend, preview holds the processed image. These optional buffers are released when night recording is cancelled or finished. Hardware camera capture/conversion can still consume resources independently of the blend processing.
+## Third-party notices
 
-Camera access runs in a private helper process launched from the same executable. A stuck camera driver can be stopped without trapping the app in shutdown. The helper exits with its parent and uses only local shared memory; there are no network services.
-
-The recording worker sleeps until capture, preview, an enabled activity check, a schedule boundary, a clock update or a command is due. Hidden idle and paused sessions have no periodic worker tick. Outside an active Night window, the camera helper converts and copies pixels only when requested, including the optional activity checks; its camera reader continues receiving current samples. During a Night window, the helper processes distinct contributions locally at up to five per second and shares those raw samples with activity checks. Completed Night pixels take priority over optional observation work. This reduces unnecessary work between captures without making an old frame appear fresh.
-
-The interface applies control, text, tray, and paint updates only when their inputs change. Hidden or minimized windows defer visual updates until restored, while recording failures and Exit still receive regular status checks. The GUI's 200 ms status timer remains active; these changes reduce repeated work, not timer wakeups.
-
-Media implementation references: [Microsoft's sink writer tutorial](https://learn.microsoft.com/en-us/windows/win32/medfound/tutorial--using-the-sink-writer-to-encode-video) and [asynchronous source reader](https://learn.microsoft.com/en-us/windows/win32/medfound/using-the-source-reader-in-asynchronous-mode).
-
-## Reproduce encoding measurements
-
-In the v0.2.0 encoding validation, Efficient H.264 reduced file size by 7–60% and encoding CPU time by 13–61% versus Compatible H.264 in the same build. Both used Balanced quality. These were four synthetic 180-frame, 1920×1080 clips at 30 fps on an AMD Ryzen 7 5800H; CPU times are the mean of two alternating runs:
-
-| Scene | Compatible / Efficient file size (MB) | Compatible / Efficient encoding CPU (seconds) |
-| --- | --- | --- |
-| Mostly static desktop text | 0.878 / 0.349 | 3.70 / 3.23 |
-| Scrolling and cuts | 3.105 / 2.875 | 4.97 / 3.73 |
-| Textured motion and noise | 6.385 / 5.110 | 23.01 / 9.05 |
-| Large changes every frame | 7.042 / 5.213 | 30.55 / 15.74 |
-
-MB means 1,000,000 bytes. Encoding CPU is accumulated process CPU time, including conversion and finalization, and excludes capture and input generation. It is not elapsed recording time or a battery measurement. Repeated runs produced identical compressed packets and timestamps. Results depend on scene, hardware and Windows encoder implementation; a bitrate target is not a strict cap.
-
-Independent decoding found a modest fidelity tradeoff: Efficient's pooled luma PSNR was 0.86 dB lower on the static scene and 0.31 dB lower on frequent cuts, but 1.08 dB higher on scrolling and 0.54 dB higher on motion. Motion's worst-frame block SSIM improved from 0.896 to 0.919; frequent cuts stayed close at 0.731 versus 0.730. All frames, timestamps, durations, dimensions and color tags passed verification. These metrics describe the test clips, not perceptual quality for every source.
-
-Optional tools generate synthetic desktop text, scrolling/cuts, camera-like motion/noise, and large changes between captures. They do not capture a display or camera. Build them separately:
-
-```powershell
-cmake -S . -B build-benchmark -G "Visual Studio 16 2019" -A x64 -DTIMELAPSE_BUILD_BENCHMARKS=ON
-cmake --build build-benchmark --config Release --target encoding_benchmark encoding_quality_verifier
-.\build-benchmark\Release\encoding_quality_verifier.exe --self-test
-.\build-benchmark\Release\encoding_benchmark.exe efficient balanced 0 1920 1080 180 screen.mp4
-.\build-benchmark\Release\encoding_quality_verifier.exe screen.mp4 0 1920 1080 180
-```
-
-Use a new output filename for every run. Modes are `compatible`, `efficient`, `hardware-h264`, `hardware-hevc`, `quality-h264`, and `av1`; qualities are `extra-small`, `compact`, `balanced`, and `detail`. Scenes `0`, `1`, and `2` exercise a mostly static screen, scrolling/cuts, and textured motion/noise. Scene `3` stresses large changes and frequent cuts between captures. A 180-frame clip crosses the five-second keyframe boundary of the H.264 modes other than Compatible; AV1 places keyframes ten seconds apart. To test advanced settings, append the preset, rate control (`auto`, `crf`, or `bitrate`), and CRF or kbps value, for example `6 crf 32` or `6 bitrate 1000`.
-
-The benchmark pre-renders its input outside the encoding measurement. At 180 frames of 1080p this requires about 1.4 GiB of temporary benchmark memory; the recorder itself streams frames. CSV output reports total encoding CPU time, wall time, setup/submission/finalization CPU time, and sampled additional process-private memory. GPU memory and energy are not included. Repeat modes in alternating order without other benchmark or build jobs running.
-
-The independent verifier checks frame count, every timestamp, duration, luma/chroma fidelity, block SSIM, and small-text edges. PSNR is pooled across frames; whole-image averages can conceal local damage, so inspect text and the worst frames too. Color differences from NV12's 4:2:0 subsampling are included in the RGB text metric. These are synthetic measurements, not a guarantee for every recording.
-
-If Windows has no decoder for a tested codec, use the independent FFmpeg verifier. Install `ffmpeg` and `ffprobe` on PATH, then run:
-
-```powershell
-.\tools\verify-encoding-quality.ps1 -InputVideo screen.mp4 -Scene 0 -Width 1920 -Height 1080 -Frames 180 -Verifier .\build-benchmark\Release\encoding_quality_verifier.exe
-```
-
-This also checks BT.709 limited-range color metadata. FFmpeg is used only by the optional verification script and is not required by Timelapse. The script writes metadata and quality reports next to the benchmark video and removes its temporary decoded frames.
-
-## Repository contents
-
-- `src/`: the native Windows app, capture worker, compositor, and MP4 encoder.
-- `tests/`: media roundtrips, recording recovery, file collision protection, camera helper isolation, and a 600-frame 1080p resource check.
-- `tools/verify-encoding-quality.ps1`: optional independent FFmpeg decoding and quality checks for synthetic benchmark videos.
-- `CMakeLists.txt` and `build.ps1`: build and test the app.
-- `package.ps1`: create a portable release ZIP and a source ZIP from a Release build.
-- `installer/`: Inno Setup source and compiler wrapper for the per-user installer.
-- `third-party/`: the pinned SVT-AV1 build recipe (`svt-av1.cmake`), its licenses and patent text, and dependency notices.
-- `person-pack/`: separately built optional detector, pinned dependency instructions, licenses and model/protocol checks. A normal app build needs no model download.
-
-After building and testing, run `./package.ps1` to create both archives in `packages/`. The release ZIP is intended for GitHub Releases. Extract the source ZIP into an empty folder, then run the build commands from that folder; build outputs, test recordings, and local settings are excluded.
-
-To also create the Windows setup EXE for the current version, supply an installed or portable Inno Setup 7 compiler:
-
-```powershell
-.\package.ps1 -InstallerCompiler 'C:\Path\To\Inno Setup 7\ISCC.exe'
-```
-
-The setup EXE, both ZIPs, and their checksums are published together from frozen inputs. The compiler is a build dependency and is not bundled with the app. To exercise installation, upgrades, opt-in startup, running-app protection and uninstall in an isolated directory without creating a real installed-app registration or Start menu entries:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\installer_tests.ps1 -Compiler 'C:\Path\To\Inno Setup 7\ISCC.exe' -Executable .\dist\Timelapse.exe -WorkDirectory .\.tmp\installer-test
-```
-
-Use a new work directory and exit other Timelapse instances before this installer test. It uses the production installer source with only destination and registration overrides; it does not launch the recorder.
-
-Archives and checksums are prepared before replacing existing packages. If publication fails, the script attempts to restore the previous files. If recovery cannot finish, the error names the staging directory containing the backups.
-
-Run the distribution and packaging regression checks with:
-
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\build_tests.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File .\tests\package_tests.ps1
-```
-
-They use temporary projects and dummy executable bytes. The build-script checks substitute the build and test commands, so they do not compile or launch the app.
+Timelapse includes code from the projects below. Their licenses require these notices.
 
 ## Thumbnail resize attribution
 
