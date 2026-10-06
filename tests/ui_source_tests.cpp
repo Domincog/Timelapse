@@ -466,16 +466,19 @@ void activeControls() {
     seed(true);
     for(auto state:{State::Starting,State::Recording,State::Paused,State::Finishing}) {
         app.status.state=state; updateControls();
-        for(auto control:{app.refresh,app.monitor,app.camera,app.videoSize,app.encodingQuality,app.encodingMode,app.stopAfter,app.splitEvery,app.lowDisk,app.nightEnabled,app.nightDuration,app.nightTarget,app.folder,app.record})
-            require(!IsWindowEnabled(control),"An active-session source/settings control remained enabled.");
-        require((IsWindowEnabled(app.interval)!=FALSE)==(state==State::Recording || state==State::Paused),"Live interval availability did not follow session state");
-        require((IsWindowEnabled(app.mode)!=FALSE)==(state==State::Recording || state==State::Paused),"Live source availability did not follow session state");
+        for(auto control:{app.refresh,app.camera,app.videoSize,app.encodingQuality,app.encodingMode,app.folder,app.record})
+            require(!IsWindowEnabled(control),"An active-session device/size/encoder/file control remained enabled.");
+        const bool live=state==State::Recording || state==State::Paused;
+        for(auto control:{app.interval,app.mode,app.stopAfter,app.startDelay,app.lowDisk,app.nightEnabled,app.nightDuration,app.nightTarget})
+            if(control)require((IsWindowEnabled(control)!=FALSE)==live,"Live option availability did not follow session state");
+        require((IsWindowEnabled(app.monitor)!=FALSE)==(live && hasSource(Source::Desktop)),"Live display availability did not follow session state");
+        require((IsWindowEnabled(app.splitEvery)!=FALSE)==(live && app.settings.segmentDurationSeconds>0),"Split length availability did not follow session state");
     }
     app.status=lapse::fixtureStatus={};updateControls();
     sourceMode(static_cast<Mode>(SeparateFilesMode));app.status.state=State::Recording;updateControls();
     require(app.settings.separateFiles&&!IsWindowEnabled(app.mode),"A separate-files session offered a live source change.");
     app.status=lapse::fixtureStatus={};updateControls();
-    std::cout<<"PASS capture interval and source layout editable in Recording/Paused; devices, files and other settings remain locked.\n";
+    std::cout<<"PASS capture timing, layout, display and recording options editable in Recording/Paused; camera, size, encoder and files remain locked.\n";
 }
 void resetKnownFolders(){
     require(knownFolderBuffers.empty(),"A previous known-folder lookup leaked its returned buffer.");
@@ -625,9 +628,23 @@ void nightSettings(){
     record();require(lapse::recorded.night.enabled&&lapse::recorded.night.durationMs==30000&&lapse::recorded.night.targetBrightness==128,"Record did not freeze the chosen night policy.");
     for(State state:{State::Starting,State::Recording,State::Paused,State::Finishing}){
         app.status.state=state;updateControls();const int calls=lapse::configurationCalls;
-        require(!IsWindowEnabled(app.nightEnabled)&&!IsWindowEnabled(app.nightDuration)&&!IsWindowEnabled(app.nightTarget),"Active session allowed night edits.");
-        windowProc(app.window,WM_COMMAND,NightBox,0);windowProc(app.window,WM_COMMAND,MAKEWPARAM(NightDurationBox,CBN_SELCHANGE),0);windowProc(app.window,WM_COMMAND,MAKEWPARAM(NightTargetBox,CBN_SELCHANGE),0);
-        require(lapse::configurationCalls==calls,"Disabled night commands still configured active session.");
+        if(state==State::Starting || state==State::Finishing){
+            require(!IsWindowEnabled(app.nightEnabled)&&!IsWindowEnabled(app.nightDuration)&&!IsWindowEnabled(app.nightTarget),"Preparation or finishing allowed night edits.");
+            SendMessageW(app.nightEnabled,BM_SETCHECK,BST_UNCHECKED,0);choose(app.nightTarget,0);
+            windowProc(app.window,WM_COMMAND,NightBox,0);windowProc(app.window,WM_COMMAND,MAKEWPARAM(NightDurationBox,CBN_SELCHANGE),0);windowProc(app.window,WM_COMMAND,MAKEWPARAM(NightTargetBox,CBN_SELCHANGE),0);
+            require(lapse::configurationCalls==calls&&isChecked(app.nightEnabled)&&choice(app.nightTarget)==2&&app.settings.night.enabled&&app.settings.night.targetBrightness==128,
+                "Disabled night commands configured the session or displayed a false selection.");
+            continue;
+        }
+        // Recording or paused: Night changes join the session.
+        require(IsWindowEnabled(app.nightEnabled)&&IsWindowEnabled(app.nightDuration)&&IsWindowEnabled(app.nightTarget),"A live session locked night edits.");
+        choose(app.nightTarget,0);windowProc(app.window,WM_COMMAND,MAKEWPARAM(NightTargetBox,CBN_SELCHANGE),0);
+        require(lapse::configured.night.targetBrightness==64,"Live night brightness was not configured.");
+        choose(app.nightTarget,2);windowProc(app.window,WM_COMMAND,MAKEWPARAM(NightTargetBox,CBN_SELCHANGE),0);
+        SendMessageW(app.nightEnabled,BM_SETCHECK,BST_UNCHECKED,0);windowProc(app.window,WM_COMMAND,NightBox,0);
+        require(!lapse::configured.night.enabled&&!app.settings.night.enabled,"Turning night off live was not configured.");
+        SendMessageW(app.nightEnabled,BM_SETCHECK,BST_CHECKED,0);windowProc(app.window,WM_COMMAND,NightBox,0);
+        require(lapse::configured.night.enabled&&lapse::configured.night.durationMs==30000&&lapse::configured.night.targetBrightness==128,"Turning night back on live lost its policy.");
     }
     app.status=lapse::fixtureStatus={};sourceMode(Mode::Desktop);
     require(!app.settings.night.enabled&&SendMessageW(app.nightEnabled,BM_GETCHECK,0,0)==BST_CHECKED&&IsWindowEnabled(app.record),"Desktop source applied camera processing or lost the saved camera preference.");
@@ -652,7 +669,12 @@ void cursorSettings(){
         record();require(lapse::recorded.captureCursor==visible&&lapse::recorded.separateFiles,"Paired Record lost the accepted cursor policy.");
         for(State state:{State::Starting,State::Recording,State::Paused,State::Finishing}){
             app.status.state=state;updateControls();const auto count=lapse::configurationCalls;set(!visible);
-            require(!IsWindowEnabled(app.captureCursor)&&app.settings.captureCursor==visible&&lapse::configurationCalls==count&&SendMessageW(app.captureCursor,BM_GETCHECK,0,0)==(visible?BST_CHECKED:BST_UNCHECKED),"Active cursor command changed frozen/displayed policy.");
+            if(state==State::Recording || state==State::Paused){
+                require(IsWindowEnabled(app.captureCursor)&&app.settings.captureCursor==!visible&&lapse::configured.captureCursor==!visible,"Live cursor change was not configured.");
+                set(visible);require(app.settings.captureCursor==visible&&lapse::configured.captureCursor==visible,"Live cursor change could not be reverted.");
+                continue;
+            }
+            require(!IsWindowEnabled(app.captureCursor)&&app.settings.captureCursor==visible&&lapse::configurationCalls==count&&SendMessageW(app.captureCursor,BM_GETCHECK,0,0)==(visible?BST_CHECKED:BST_UNCHECKED),"Locked cursor command changed the session or displayed policy.");
         }
         app.status=lapse::fixtureStatus={};sourceMode(Mode::Desktop);
     }

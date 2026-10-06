@@ -179,14 +179,14 @@ void pairedCadence(const std::filesystem::path& root,bool automatic) {
     auto first=await(engine,[](const auto& value){return value.frames==1&&value.preview;});
     const auto rawCalls=previews.load();
     require(first.elapsed<.2&&first.night.samples==5&&first.nightDurationMs==1000&&first.night.suggestedDurationMs==NightMaxDurationMs,"Initial blend counted as active time or lost its dark-scene suggestion");
-    s.night.enabled=false;s.night.durationMs=30000;s.night.targetBrightness=128;
+    // Output size stays frozen; the unchanged Night policy keeps running.
     s.width=1920;s.height=1080;
     engine.configure(s);writeDelayMs=80;
     const auto third=await(engine,[](const auto& value){return value.frames>=3;});
     const auto result=finish(engine);verify(result,third.frames,true);
     const auto starts=observations();require(starts.size()>=3,"Missing night windows");
     for(size_t i=0;i<3;++i) {
-        require(starts[i].duration==1000&&starts[i].target==64,"Live settings changed frozen night policy or auto interval bound");
+        require(starts[i].duration==1000&&starts[i].target==64,"Live output edit changed night policy or auto interval bound");
         if(i)require(starts[i].token>starts[i-1].token&&starts[i].tick-starts[i-1].tick>=1000&&
             starts[i].tick-starts[i-1].tick<1800,"Equal interval window shortened or skipped a whole slot");
     }
@@ -194,6 +194,67 @@ void pairedCadence(const std::filesystem::path& root,bool automatic) {
     require(resolutions()==std::vector<CameraResolution>{CameraResolution::Standard720},"Active output edit renegotiated frozen low camera tier");
     require(resultPolls<=9,"Parent polled long integration at excessive frequency");
     std::cout<<"PASS paired full windows, frozen policy, decoded sources, cadence and auto clamp="<<automatic<<".\n";
+}
+// Center luma of each decoded frame, in order.
+std::vector<int> centers(const std::wstring& path) {
+    ComPtr<IMFSourceReader> reader;
+    checked(MFCreateSourceReaderFromURL(path.c_str(),nullptr,&reader),"Cannot open live Night MP4");
+    const DWORD stream=static_cast<DWORD>(MF_SOURCE_READER_FIRST_VIDEO_STREAM);
+    ComPtr<IMFMediaType> type;checked(MFCreateMediaType(&type),"Cannot create decoded type");
+    checked(type->SetGUID(MF_MT_MAJOR_TYPE,MFMediaType_Video),"Cannot set video type");
+    checked(type->SetGUID(MF_MT_SUBTYPE,MFVideoFormat_NV12),"Cannot set pixel type");
+    checked(reader->SetCurrentMediaType(stream,nullptr,type.Get()),"Cannot decode live Night MP4");
+    std::vector<int> result;
+    for(int attempt=0;attempt<1000;++attempt){
+        DWORD flags=0;LONGLONG timestamp=0;ComPtr<IMFSample> sample;
+        checked(reader->ReadSample(stream,0,nullptr,&flags,&timestamp,&sample),"Live Night MP4 read failed");
+        if(sample){
+            ComPtr<IMFMediaBuffer> buffer;checked(sample->ConvertToContiguousBuffer(&buffer),"Cannot read live Night pixels");
+            BYTE* p=nullptr;DWORD length=0;checked(buffer->Lock(&p,nullptr,&length),"Cannot lock live Night pixels");
+            result.push_back(length>=320*240*3/2?p[120*320+160]:-1);buffer->Unlock();
+        }
+        if(flags&MF_SOURCE_READERF_ENDOFSTREAM)break;
+    }
+    return result;
+}
+void liveNight(const std::filesystem::path& root) {
+    reset();auto s=config(root/L"live-night");s.night.targetBrightness=64;
+    Engine engine;engine.configure(s);engine.record();
+    await(engine,[](const auto& value){return value.frames==2;});
+    // A new brightness target and an over-long blend: only the valid edit joins.
+    s.night.targetBrightness=128;engine.configure(s);
+    await(engine,[](const auto& value){return value.frames==4;});
+    auto rejected=s;rejected.night.durationMs=2000;engine.configure(rejected);
+    await(engine,[](const auto& value){return value.frames==6;});
+    engine.configure(s);
+    // Turning Night off records raw camera frames on the same schedule.
+    s.night.enabled=false;engine.configure(s);
+    const auto off=await(engine,[](const auto& value){return !value.nightEnabled;});
+    const size_t windows=observations().size();
+    const auto rawTarget=off.frames+3;
+    await(engine,[&](const auto& value){return value.frames>=rawTarget;});
+    require(observations().size()<=windows+1,"Night kept starting blend windows after it was turned off");
+    s.night.enabled=true;engine.configure(s);
+    const auto onTarget=rawTarget+3;
+    await(engine,[&](const auto& value){return value.frames>=onTarget&&value.nightEnabled;});
+    const auto result=finish(engine);
+    require(!result.recordingFailed&&result.savedPaths.size()==1&&off.state==State::Recording,"Live Night changes failed the recording");
+    const auto starts=observations();
+    require(starts.front().target==64&&starts.back().target==128&&starts.back().duration==1000,"Live Night target or rejected duration reached the session wrongly");
+    for(const auto& start:starts)require(start.duration==1000,"An over-long live blend replaced the valid one");
+    // Blended (180) frames, then raw (24), then blended again; no gaps or errors.
+    const int blended=16+180*219/255,raw=16+24*219/255;
+    const auto frames=centers(result.savedPath);require(frames.size()==result.frames,"Live Night video frame count differs");
+    int phase=0,changes=0;
+    for(int value:frames){
+        const int now=std::abs(value-blended)<=8?0:std::abs(value-raw)<=8?1:-1;
+        require(now>=0,"Live Night video contains unexpected pixels");
+        if(now!=phase){++changes;phase=now;}
+    }
+    require(changes==2&&phase==0,"Live Night did not switch off and back on exactly once each");
+    // Every frame stays on the one-second schedule across both switches.
+    for(size_t i=1;i<starts.size();++i)require(starts[i].tick-starts[i-1].tick>=900,"Re-enabled Night started its first blend early");
+    std::cout<<"PASS live Night target, rejected blend, off and back on keep cadence and switch exactly at frames.\n";
 }
 void limitWindow(const std::filesystem::path& root) {
     reset();auto s=config(root/L"limit-window",true);s.night.durationMs=0;s.intervalMs = 5000;s.recordingLimitSeconds=2;suggestedMs=5000;
@@ -352,7 +413,7 @@ int main() {
     int result=0;
     try {
         validation(root);preparingPreview(root);firstProcessedPreview(root);singleSource(root,Mode::Camera);singleSource(root,Mode::Overlay);
-        pairedCadence(root,false);pairedCadence(root,true);
+        pairedCadence(root,false);pairedCadence(root,true);liveNight(root);
         limitWindow(root);splitDuringWindow(root);pauseWindow(root);lateResult(root,false);lateResult(root,true);
         retainedFailure(root,false);retainedFailure(root,true);beginFailure(root);shutdownPending(root);frozenInputTier(root);
         std::filesystem::remove_all(root);std::cout<<"Night engine: all synthetic real-encoder scenarios passed.\n";

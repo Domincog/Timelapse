@@ -158,6 +158,30 @@ void off(const std::filesystem::path& root) {
     for (const auto& event : events(Kind::Write)) if (!event.camera) require(event.after == pixelsHash(reference), "Off altered desktop pixels");
     std::cout << "PASS Off performs no prepare/render and preserves pixels.\n";
 }
+// Watermark changes join a running recording. A change that cannot be
+// prepared leaves the working watermark in place and is retried on the next
+// configuration; turning it off stops stamping.
+void liveChanges(const std::filesystem::path& root) {
+    reset(); auto settings = config(root / L"live"); settings.watermark.enabled = false;
+    Engine engine; engine.configure(settings); engine.record();
+    await(engine, [](const Status& status) { return status.frames >= 2; });
+    require(!prepareCalls && !fullCalls, "An Off watermark prepared or stamped before it was turned on");
+    settings.watermark.enabled = true; engine.configure(settings);
+    await(engine, [](const Status&) { return fullCalls >= 2; });
+    failPrepare = true; auto refused = settings; refused.watermark.x = 0; engine.configure(refused);
+    const auto stamped = fullCalls.load(); await(engine, [&](const Status&) { return fullCalls >= stamped + 3; });
+    require(engine.status().state == State::Recording && !engine.status().error && events(Kind::ApplyFull).back().settings.x != 0,
+        "A watermark change that could not be prepared stopped the recording or replaced the working one");
+    failPrepare = false; engine.configure(refused);
+    await(engine, [](const Status&) { const auto full = events(Kind::ApplyFull); return !full.empty() && full.back().settings.x == 0; });
+    settings.watermark.enabled = false; engine.configure(settings);
+    std::this_thread::sleep_for(450ms); const auto stopped = fullCalls.load(); const auto frames = engine.status().frames;
+    await(engine, [&](const Status& status) { return status.frames >= frames + 2; });
+    require(fullCalls == stopped, "A watermark turned off live kept stamping");
+    const auto result = finish(engine);
+    require(!result.error && result.savedPaths.size() == 1, "Live watermark changes failed the recording");
+    std::cout << "PASS live watermark on, refused change kept the working one, retry and off.\n";
+}
 void paired(const std::filesystem::path& root) {
     reset(); auto settings = config(root / L"paired", true); settings.watermark.timeKind = WatermarkTimeKind::RecordedLocal;
     settings.outputFps = 24;
@@ -221,19 +245,21 @@ void pausedSession(const std::filesystem::path& root) {
     await(engine, [&](const Status&) { const auto previews = events(Kind::ApplyPreview); return !previews.empty() && sameContext(previews.back().context, last.context); });
     std::this_thread::sleep_for(350ms);
     require(engine.status().elapsed == paused.elapsed && events(Kind::ApplyFull).size() == count, "Pause advanced watermark/session clock");
+    // A live watermark edit shows at once over the paused frame's context.
+    await(engine, [&](const Status&) { const auto previews = events(Kind::ApplyPreview); return !previews.empty() && previews.back().settings.x == 0; });
     const auto preview = events(Kind::ApplyPreview).back();
-    require(sameContext(preview.context, last.context) && preview.settings.x == 10000 && preview.settings.showSpeed && prepareCalls == 1,
-        "Paused preview changed frozen context or watermark settings");
+    require(sameContext(preview.context, last.context) && !preview.settings.showSpeed && preview.settings.timeKind == WatermarkTimeKind::RecordedLocal,
+        "Paused preview changed its frozen context or missed the live watermark edit");
     const auto resets = watermarkResets.load(); settings.preview = false; engine.configure(settings);
     std::this_thread::sleep_for(100ms);
     require(watermarkResets == resets, "Hidden pause discarded its prepared recording renderer");
     engine.setPaused(false); await(engine, [&](const Status&) { return events(Kind::ApplyFull).size() > count; });
     const auto resumed = events(Kind::ApplyFull)[count];
     require(resumed.before != resumed.after && resumed.context.targetIntervalMs == 350 && resumed.context.outputFps == 59 &&
-        resumed.context.activeMs - last.context.activeMs < 300,
-        "Resume target or active time includes pause");
+        resumed.context.activeMs - last.context.activeMs < 300 && resumed.settings.x == 0 && !resumed.settings.showSpeed,
+        "Resume target, active time or live watermark edit is wrong");
     require(!finish(engine).error, "Pause/resume recording failed");
-    std::cout << "PASS paused context stays fixed; resume stamps the edited interval at frozen playback FPS.\n";
+    std::cout << "PASS paused context stays fixed; live watermark edit shows at once; resume stamps the edited interval at frozen playback FPS.\n";
 }
 void manualRate(const std::filesystem::path& root) {
     reset(); auto settings = config(root / L"manual"); settings.intervalMs = 100;
@@ -357,10 +383,10 @@ int main() {
     const auto root = std::filesystem::current_path() / (L"engine-watermark-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
     int result = 0;
     try {
-        off(root); paired(root); faults(root, 0); faults(root, 2); faults(root, 4); previewFailure(root);
+        off(root); liveChanges(root); paired(root); faults(root, 0); faults(root, 2); faults(root, 4); previewFailure(root);
         pausedSession(root); manualRate(root); rollover(root); night(root); slowRender(root); generation(root, false); generation(root, true);
         cacheRetirement(root, true); cacheRetirement(root, false);
-        std::filesystem::remove_all(root); std::cout << "Watermark engine: all 15 synthetic scenarios passed.\n";
+        std::filesystem::remove_all(root); std::cout << "Watermark engine: all 16 synthetic scenarios passed.\n";
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; std::wcerr << L"Artifacts retained at " << root.wstring() << L'\n'; result = 1; }
     MFShutdown(); CoUninitialize(); return result;
 }

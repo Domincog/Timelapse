@@ -177,16 +177,21 @@ void offAndManual(const std::filesystem::path& root) {
     Engine engine;engine.configure(settings);engine.record();
     const auto accelerated=await(engine,[](const auto& s){return s.timeSkip.intervalMs>=350;});
     require(accelerated.timeSkip.reason==TimeSkipReason::Manual&&checks==0&&observerCaptures==0,"Manual mode scanned activity");
-    settings.timeSkip.mode=TimeSkipMode::Off;engine.configure(settings);
-    const auto count=accelerated.frames;await(engine,[&](const auto& s){return s.frames>=count+2;});
-    require(engine.status().timeSkip.intervalMs>=350,"Live settings changed frozen cadence policy");
     settings.layers.front().rect={0.1,0.1,0.8,0.8};engine.configure(settings);
     await(engine,[](const auto& s){return s.timeSkip.intervalMs<=110;},700);
     engine.setPaused(true);await(engine,[](const auto& s){return s.state==State::Paused;});
     const auto paused=engine.status();std::this_thread::sleep_for(300ms);require(engine.status().frames==paused.frames,"Paused manual session admitted a frame");
     engine.setPaused(false);await(engine,[&](const auto& s){return s.frames>paused.frames;});
-    const auto saved=finish(engine);spacing(submitted());decode(saved,160,120,1);
-    std::cout<<"PASS Off/manual zero observation work, smooth growth, frozen policy and pause/resume.\n";
+    // Turning compression off live returns the session to its base cadence.
+    // That ordinary cadence keeps its schedule, so spacing is checked only
+    // while compression was active.
+    const size_t compressedWrites=submitted().size();
+    settings.timeSkip.mode=TimeSkipMode::Off;engine.configure(settings);
+    const auto count=engine.status().frames;await(engine,[&](const auto& s){return !s.timeSkip.enabled&&s.frames>=count+3;},1500);
+    {std::vector<int64_t> primary;for(const auto& value:submitted())if(!value.secondary)primary.push_back(value.microseconds);
+     require(primary.size()>=2&&primary.back()-primary[primary.size()-2]<250000,"Compression turned off live kept the stretched interval");}
+    const auto saved=finish(engine);auto compressed=submitted();compressed.resize(std::min(compressed.size(),compressedWrites));spacing(compressed);decode(saved,160,120,1);
+    std::cout<<"PASS Off/manual zero observation work, smooth growth, live Off returns to base cadence and pause/resume.\n";
 }
 void liveIntervals(const std::filesystem::path& root,bool paired) {
     reset();auto settings=config(root/(paired?L"live-paired":L"live-single"),TimeSkipMode::Off);

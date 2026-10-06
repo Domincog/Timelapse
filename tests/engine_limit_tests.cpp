@@ -142,9 +142,6 @@ void sourceMode(const std::filesystem::path& root, lapse::Mode mode, bool separa
     const auto stopsBefore = cameraStops.load();
     lapse::Engine engine; engine.configure(config); engine.record();
     await(engine, [](const auto& s) { return s.state == lapse::State::Recording && s.frames == 1; });
-    if (mode == lapse::Mode::Desktop && !separate) {
-        config.recordingLimitSeconds = 0; engine.configure(config); // The active session remains bounded.
-    }
     const auto saved = await(engine, [](const auto& s) { return s.state == lapse::State::Idle; }, 3000);
     verifySaved(saved, 1, separate ? 2 : 1);
     if (!config.preview && (mode == lapse::Mode::Camera || separate))
@@ -153,7 +150,7 @@ void sourceMode(const std::filesystem::path& root, lapse::Mode mode, bool separa
         std::this_thread::sleep_for(150ms);
         require(engine.status().message == saved.message && !engine.status().recordingFailed, "Idle preview erased successful automatic completion");
     }
-    std::wcout << L"PASS " << name << L": boundary excludes a second frame, frozen limit, successful output.\n";
+    std::wcout << L"PASS " << name << L": boundary excludes a second frame, successful output.\n";
 }
 void startupExcluded(const std::filesystem::path& root, bool encoderDelay) {
     auto config = settings(root / (encoderDelay ? L"writer-startup" : L"camera-warmup"), lapse::Mode::Camera, encoderDelay);
@@ -207,15 +204,43 @@ void unlimitedAndManualFinish(const std::filesystem::path& root, int limit) {
     const unsigned stopsBefore = cameraStops;
     lapse::Engine engine; engine.configure(config); engine.record();
     await(engine, [](const auto& s) { return s.state == lapse::State::Recording && s.frames == 1; });
-    config.recordingLimitSeconds = 1; engine.configure(config);
+    config.recordingLimitSeconds = limit ? 0 : -1; engine.configure(config);
     std::this_thread::sleep_for(1200ms);
-    require(engine.status().state == lapse::State::Recording, "Live settings changed the unlimited session limit");
+    require(engine.status().state == lapse::State::Recording, "Another unlimited value added a limit to the session");
     engine.finish(); const auto saved = await(engine, [](const auto& s) { return s.state == lapse::State::Idle; });
     require(!saved.error && !saved.recordingFailed && saved.frames == 1 && saved.savedPaths.size() == 1 && cameraStops > stopsBefore,
         "Manual hidden-camera Finish failed or retained the active device");
     require(saved.message.find(L"time limit") == std::wstring::npos, "Manual finish was mislabeled as automatic completion");
     verify(saved.savedPath, 1);
-    std::cout << "PASS unlimited=" << limit << ", frozen setting, manual Finish releases hidden camera.\n";
+    std::cout << "PASS unlimited=" << limit << ", stays unlimited, manual Finish releases hidden camera.\n";
+}
+// Stop after changes live: adding a limit stops at it, removing one keeps
+// recording, and a limit already passed finishes at once.
+void liveLimit(const std::filesystem::path& root) {
+    {
+        auto config = settings(root / L"live-added"); config.recordingLimitSeconds = 0;
+        lapse::Engine engine; engine.configure(config); engine.record();
+        await(engine, [](const auto& s) { return s.state == lapse::State::Recording && s.frames == 1; });
+        config.recordingLimitSeconds = 2; engine.configure(config);
+        const auto saved = await(engine, [](const auto& s) { return s.state == lapse::State::Idle; }, 4000);
+        require(!saved.error && !saved.recordingFailed && saved.frames == 2 && saved.elapsed >= 2 && saved.elapsed < 3 &&
+            saved.message.find(L"Recording time limit reached.") != std::wstring::npos, "A live limit did not stop the session at its boundary");
+        verify(saved.savedPath, 2);
+    }
+    {
+        auto config = settings(root / L"live-removed");
+        lapse::Engine engine; engine.configure(config); engine.record();
+        await(engine, [](const auto& s) { return s.state == lapse::State::Recording && s.frames == 1; });
+        config.recordingLimitSeconds = 0; engine.configure(config);
+        std::this_thread::sleep_for(1500ms);
+        require(engine.status().state == lapse::State::Recording && engine.status().frames == 2, "Removing the limit live did not keep recording");
+        config.recordingLimitSeconds = 1; engine.configure(config);
+        const auto saved = await(engine, [](const auto& s) { return s.state == lapse::State::Idle; }, 1000);
+        require(!saved.error && !saved.recordingFailed && saved.frames == 2 && saved.elapsed >= 1.4 && saved.elapsed < 2.5 &&
+            saved.message.find(L"Recording time limit reached.") != std::wstring::npos, "A live limit already passed did not finish at once");
+        verify(saved.savedPath, 2);
+    }
+    std::cout << "PASS live limit added, removed and already passed.\n";
 }
 void collision(const std::filesystem::path& root, bool separate = true) {
     const auto directory = root / (separate ? L"collision-separate" : L"collision-single");
@@ -428,7 +453,7 @@ int main(int argc, char** argv) {
         sourceMode(root, lapse::Mode::Desktop, false); sourceMode(root, lapse::Mode::Camera, false);
         sourceMode(root, lapse::Mode::Overlay, false); sourceMode(root, lapse::Mode::Desktop, true);
         startupExcluded(root, false); startupExcluded(root, true); pauseExcluded(root); slowCapture(root);
-        unlimitedAndManualFinish(root, 0); unlimitedAndManualFinish(root, -1); collision(root);
+        unlimitedAndManualFinish(root, 0); unlimitedAndManualFinish(root, -1); liveLimit(root); collision(root);
         previewFailureDeadline(root); finalizationExcluded(root);
         collision(root, false); singleFinalizationFailure(root);
         for (int i = 0; i < 4; ++i) delayedFailureElapsed(root, i); terminalClockControls(root);

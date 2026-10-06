@@ -238,33 +238,35 @@ void cursorPolicy(const std::filesystem::path& root) {
     engine.configure(config); engine.record();
     await(engine, [](const auto& s) { return s.frames == 1; }); check(stop(), true);
 
-    config.folder = (root / L"cursor-frozen").wstring(); config.captureCursor = false; config.segmentDurationSeconds = 1;
+    config.folder = (root / L"cursor-live").wstring(); config.captureCursor = false; config.segmentDurationSeconds = 1;
     config.preview = true; config.layers = lapse::preset(lapse::Mode::SideBySide);
     engine.configure(config); engine.record();
     await(engine, [](const auto& s) { return s.frames == 1 && s.completedSegments == 1; });
     engine.setPaused(true); await(engine, [](const auto& s) { return s.state == lapse::State::Paused; });
     const auto pausedPreview = await(engine, [](const auto& s) { return s.preview && s.preview->valid(); }).preview;
-    // Next-session edits while paused cannot change the active session's next
-    // part, including its freshly opened encoder after a completed boundary.
+    // A cursor edit while paused joins the session: the paused preview shows it
+    // and the next part records it, without admitting a frame or resetting splits.
     config.captureCursor = true; engine.configure(config);
-    const auto refreshed = await(engine, [&](const auto& s) { return s.preview && s.preview != pausedPreview; });
-    bool white = false;
-    for (size_t i = 0; i < refreshed.preview->pixels.size(); i += 4)
-        white |= refreshed.preview->pixels[i] == 255 && refreshed.preview->pixels[i + 1] == 255 && refreshed.preview->pixels[i + 2] == 255;
-    require(!white && refreshed.state == lapse::State::Paused && refreshed.frames == 1,
-        "Active paused preview used a next-session cursor policy or admitted a frame.");
+    const auto white = [](const lapse::Status& s) {
+        for (size_t i = 0; i < s.preview->pixels.size(); i += 4)
+            if (s.preview->pixels[i] == 255 && s.preview->pixels[i + 1] == 255 && s.preview->pixels[i + 2] == 255) return true;
+        return false;
+    };
+    const auto refreshed = await(engine, [&](const auto& s) { return s.preview && s.preview != pausedPreview && white(s); });
+    require(refreshed.state == lapse::State::Paused && refreshed.frames == 1, "A live cursor edit while paused admitted a frame.");
     engine.setPaused(false);
     await(engine, [](const auto& s) { return s.frames == 2; });
     const auto saved = stop();
     require(saved.frames == 2 && saved.completedSegments == 2, "Cursor policy reset split counters.");
     const auto parts = files(config.folder); require(parts.size() == 4, "Cursor split did not publish exactly two paired sets.");
     for (const auto& path : parts)
-        verify(path, 1, path.wstring().find(L"-camera") != std::wstring::npos, false, nullptr, 0);
+        verify(path, 1, path.wstring().find(L"-camera") != std::wstring::npos, false, nullptr,
+            path.wstring().find(L"-part-000002") != std::wstring::npos ? 1 : 0);
 
     config.folder = (root / L"cursor-next-session").wstring(); config.segmentDurationSeconds = 0; config.preview = false;
     engine.configure(config); engine.record();
     await(engine, [](const auto& s) { return s.frames == 1; }); check(stop(), true);
-    std::cout << "PASS decoded default/on/off desktop cursor marker, unchanged paired camera, frozen pause/split and next-session setting.\n";
+    std::cout << "PASS decoded default/on/off desktop cursor marker, unchanged paired camera, live cursor across pause/split and next-session setting.\n";
 }
 
 void lifecycle(const std::filesystem::path& root, bool recoveryMode = false) {

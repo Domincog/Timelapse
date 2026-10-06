@@ -13,6 +13,11 @@
 
 namespace lapse {
 enum class State { Idle, Starting, Recording, Paused, Finishing, Waiting };
+// While recording or paused, these follow configure() live: capture cadence,
+// collage layout, display, cursor, stop time, split length (splitting itself
+// stays on or off), low-space stop, Night, time compression, watermark and
+// status appearance. Invalid live requests leave that part of the session
+// unchanged. Everything else is fixed when Record is accepted.
 struct Settings {
     RECT monitor{};
     // Resolve the selected display by identity for every requested frame.
@@ -40,9 +45,11 @@ struct Settings {
     bool alsoSaveDesktop = false, alsoSaveCamera = false;
     // Active recording time, excluding initial startup and pauses. Nonpositive
     // values keep recording until the user finishes or a capture/save fails.
+    // A live limit at or below the elapsed active time finishes at once.
     int recordingLimitSeconds = 0;
     // Split at active recording-time boundaries; zero keeps one output set.
     // Pauses/initial preparation are excluded; automatic saving stays active.
+    // A live change between lengths recuts the current part on the new grid.
     int segmentDurationSeconds = 0;
     // Optional self-timer before preparation; does not consume recording time.
     // Zero starts immediately; positive whole seconds are bounded to 1..300.
@@ -50,21 +57,23 @@ struct Settings {
     // Best-effort room for finalization; query failure also stops admission.
     // Disable only for destinations that cannot report caller-available space.
     bool stopOnLowDiskSpace = true;
-    // Camera-only software exposure; blend policy is frozen with the session.
+    // Camera-only software exposure. A live change applies from the next
+    // blend window and must fit the capture interval.
     NightSettings night;
     TimeSkipSettings timeSkip;
-    // Final-frame overlay; raw source analysis is unaffected. Frozen at Record.
+    // Final-frame overlay; raw source analysis is unaffected. A live change
+    // that cannot be drawn at the session size is ignored.
     WatermarkSettings watermark;
-    // Where and how the live status line is drawn. Frozen at Record; the
-    // status itself changes at any time through Engine::setStatus.
+    // Where and how the live status line is drawn; the status itself changes
+    // at any time through Engine::setStatus.
     StatusFeedSettings statusFeed;
     // Write a -status.txt list of status changes in saved-video time beside
     // each video or part. Off unless chosen. Frozen at Record.
     bool saveStatusLog = false;
     // Optional fragmented H.264 MP4; ordinary MP4 remains the default.
     bool recoveryMode = false;
-    // Include the native cursor in desktop video and preview. Frozen with the
-    // session; dedicated desktop Quiet observations always omit the cursor.
+    // Include the native cursor in desktop video and preview. Dedicated
+    // desktop Quiet observations always omit the cursor.
     bool captureCursor = true;
 };
 // Every recording writes one to three MP4 outputs from the same admitted

@@ -65,6 +65,21 @@ bool validateNightCapture(const Settings& settings, std::wstring& error) {
     }
     return true;
 }
+// The allocation-free form of validateNightCapture, for live requests.
+bool nightFitsInterval(const NightSettings& night, int intervalMs) noexcept {
+    return !night.enabled || (intervalMs >= NightMinDurationMs && validNightSettings(night) && night.durationMs <= intervalMs);
+}
+bool sameNightSettings(const NightSettings& a, const NightSettings& b) noexcept {
+    return a.enabled == b.enabled && a.durationMs == b.durationMs && a.targetBrightness == b.targetBrightness;
+}
+bool sameTimeSkipSettings(const TimeSkipSettings& a, const TimeSkipSettings& b) noexcept {
+    if (a.mode != b.mode || a.multiplier != b.multiplier || a.quietAfterMs != b.quietAfterMs ||
+        a.quietSensitivity != b.quietSensitivity || a.uncertainAsAbsent != b.uncertainAsAbsent ||
+        a.rampFrames != b.rampFrames || a.repeatSeconds != b.repeatSeconds || a.rangeCount != b.rangeCount) return false;
+    for (unsigned i = 0; i < a.rangeCount && i < a.ranges.size(); ++i)
+        if (a.ranges[i].startSeconds != b.ranges[i].startSeconds || a.ranges[i].endSeconds != b.ranges[i].endSeconds) return false;
+    return true;
+}
 bool validateRecordingSettings(Settings& settings, std::wstring& error) {
     if (settings.startDelaySeconds < 0 || settings.startDelaySeconds > 300)
         error = L"Delay next recording must be between 0 and 300 whole seconds.";
@@ -173,7 +188,7 @@ void Engine::configure(const Settings& s) {
           cameraResolutionForOutput(s.width, s.height) != cameraResolutionForOutput(settings_.width, settings_.height);
       if (!sameWatermarkSettings(s.watermark, settings_.watermark) || !sameStatusFeedSettings(s.statusFeed, settings_.statusFeed) ||
           (status_.state == State::Idle && s.watermark.enabled && s.watermark.showSpeed && s.outputFps != settings_.outputFps) ||
-          (status_.state == State::Idle && (mask & 1) && s.captureCursor != settings_.captureCursor)) retirePreview(true);
+          ((mask & 1) && s.captureCursor != settings_.captureCursor)) retirePreview(true);
       if (mask != sources(settings_) || s.cameraId != settings_.cameraId || !s.preview || cameraTierChanged) retireCameraInput();
       if (!s.preview || (status_.state == State::Idle && (s.width != settings_.width || s.height != settings_.height)) ||
           mask != sources(settings_) || ((mask & 2) && s.cameraId != settings_.cameraId) ||
@@ -320,6 +335,10 @@ void Engine::run() {
         int statusWidth = 0, statusHeight = 0;
         StatusFeed statusFeed;
         uint64_t statusFrame = 0;
+        // A live overlay or display request that could not be used, at the
+        // settings revision it arrived with.
+        bool watermarkRefused = false, statusRefused = false, monitorRefused = false;
+        uint64_t watermarkRefusedRevision = 0, statusRefusedRevision = 0, monitorRefusedRevision = 0;
         auto resetWatermark = [&]() noexcept {
             watermark.reset(); watermarkPrepared = haveWatermarkContext = false;
             statusRenderer.reset();
@@ -432,7 +451,8 @@ void Engine::run() {
                 frames = std::min(frames, segmentFrameTotal(closedFrames[i], encoders[i] ? encoders[i]->frames() : 0));
             return plan.count ? frames : 0;
         };
-        Clock::duration nextSegmentBoundary{};
+        // A part's first-frame active time; a live split change recuts it.
+        Clock::duration nextSegmentBoundary{}, segmentStart{};
         std::wstring sessionStem;
         bool nightMode = false, nightQueued = false, nightFrameReady = false;
         uint64_t nightToken = 0;
@@ -1293,6 +1313,7 @@ void Engine::run() {
                     { std::lock_guard<std::mutex> lock(mutex_); sessionPlan_ = plan; }
                     resetWatermark(); incomingIntervalMs = cfg.intervalMs;
                     statusFeed.reset(cfg.outputFps); statusFrame = 0;
+                    watermarkRefused = statusRefused = monitorRefused = false;
                     partOpen = {}; sessionStarted = segmentFailed = false;
                     closedFrames = {}; segmentOrdinal = completedSegments = 0; sessionStem.clear();
                     activeDuration = Clock::duration::zero(); recordingLimitReached = false; terminalClockFrozen = false;
@@ -1342,15 +1363,87 @@ void Engine::run() {
                 // do not discard their reset intent as a disposable preview.
                 previewOnlyWork = !captureDue && !segmentExpired();
                 if (writing || pending) {
-                    if (writing && cfg.intervalMs != session->intervalMs) {
+                    // Live edits join the running session. Each is checked
+                    // against the session it would join; an invalid request
+                    // leaves that part of the current recording unchanged.
+                    // Size, frame rate, encoder, files and devices stay frozen.
+                    if (writing) {
+                        auto& live = *session;
                         std::wstring error;
-                        const int minimum = session->night.enabled
-                            ? std::max(NightMinDurationMs, session->night.durationMs) : MinCaptureIntervalMs;
-                        // Invalid live requests leave the current recording intact.
-                        if (cfg.intervalMs >= minimum && validateCaptureInterval(cfg.intervalMs, error)) {
-                            session->intervalMs = cfg.intervalMs;
-                            intervalChanged = true;
-                            if (skipping) timeSkip.rebase(cfg.intervalMs);
+                        if (cfg.intervalMs != live.intervalMs || !sameNightSettings(cfg.night, live.night)) {
+                            // Capture spacing and Night constrain each other.
+                            // Prefer the pair the user now sees, then each
+                            // change against the other's current value.
+                            const bool intervalValid = cfg.intervalMs == live.intervalMs ||
+                                validateCaptureInterval(cfg.intervalMs, error);
+                            int interval = live.intervalMs;
+                            NightSettings night = live.night;
+                            if (intervalValid && nightFitsInterval(cfg.night, cfg.intervalMs)) { interval = cfg.intervalMs; night = cfg.night; }
+                            else {
+                                if (intervalValid && nightFitsInterval(live.night, cfg.intervalMs)) interval = cfg.intervalMs;
+                                if (nightFitsInterval(cfg.night, interval)) night = cfg.night;
+                            }
+                            if (interval != live.intervalMs) {
+                                live.intervalMs = interval;
+                                intervalChanged = true;
+                                if (skipping) timeSkip.rebase(interval);
+                            }
+                            live.night = night;
+                        }
+                        live.recordingLimitSeconds = cfg.recordingLimitSeconds;
+                        live.stopOnLowDiskSpace = cfg.stopOnLowDiskSpace;
+                        live.captureCursor = cfg.captureCursor;
+                        if (!cfg.monitorId.empty()) {
+                            // The display is resolved by identity for every
+                            // frame. Switch only to one that can be captured
+                            // now; otherwise keep recording the current one
+                            // until the next configuration retries.
+                            const bool otherDisplay = CompareStringOrdinal(cfg.monitorId.c_str(), -1, live.monitorId.c_str(), -1, TRUE) != CSTR_EQUAL;
+                            if (!otherDisplay) live.monitor = cfg.monitor;
+                            else if (!monitorRefused || monitorRefusedRevision != settingsRevision) {
+                                bool available = false;
+                                try {
+                                    Frame probe; std::wstring probeError;
+                                    available = captureMonitor(cfg.monitorId, TimeSkipWidth, TimeSkipHeight, false, probe, probeError);
+                                } catch (const std::exception&) {}
+                                monitorRefused = !available; monitorRefusedRevision = settingsRevision;
+                                if (available) {
+                                    // Activity evidence from the old display is void.
+                                    if (skipping && (observedSources & 1u)) resetSkipRequested = true;
+                                    live.monitorId = cfg.monitorId; live.monitor = cfg.monitor;
+                                }
+                            }
+                        }
+                        // Splitting stays on or off for the whole session; a
+                        // new length recuts the current part on the same grid.
+                        if (live.segmentDurationSeconds > 0 && cfg.segmentDurationSeconds > 0 &&
+                            cfg.segmentDurationSeconds != live.segmentDurationSeconds) {
+                            live.segmentDurationSeconds = cfg.segmentDurationSeconds;
+                            if (segmentWriting && encoders[0] && encoders[0]->frames())
+                                nextSegmentBoundary = nextSegmentCut(segmentStart, live.segmentDurationSeconds);
+                        }
+                        if (!sameTimeSkipSettings(cfg.timeSkip, live.timeSkip)) {
+                            auto policy = cfg.timeSkip;
+                            if (normalizeTimeSkipSettings(policy, error) && !sameTimeSkipSettings(policy, live.timeSkip)) {
+                                live.timeSkip = policy;
+                                resetSkipRequested = true;
+                            }
+                        }
+                        // Overlays are checked on a scratch renderer, so a
+                        // request that cannot be drawn never disturbs the
+                        // working one. A refusal is retried only after the
+                        // next configuration, not on every wake.
+                        if (!sameWatermarkSettings(cfg.watermark, live.watermark) && (!watermarkRefused || watermarkRefusedRevision != settingsRevision)) {
+                            WatermarkRenderer probe;
+                            watermarkRefused = !probe.prepare(cfg.watermark, live.width, live.height, error);
+                            watermarkRefusedRevision = settingsRevision;
+                            if (!watermarkRefused) live.watermark = cfg.watermark;
+                        }
+                        if (!sameStatusFeedSettings(cfg.statusFeed, live.statusFeed) && (!statusRefused || statusRefusedRevision != settingsRevision)) {
+                            StatusFeedRenderer probe;
+                            statusRefused = !probe.prepare(cfg.statusFeed, live.width, live.height, error);
+                            statusRefusedRevision = settingsRevision;
+                            if (!statusRefused) live.statusFeed = cfg.statusFeed;
                         }
                     }
                     if (!session->separateFiles && !delayedLayersFrozen) {
@@ -1372,6 +1465,10 @@ void Engine::run() {
                 const bool useNight = (pending || writing) && cfg.night.enabled && needCamera;
                 if (useNight != nightMode) {
                     cancelNight(); nightMode = useNight; nightStartAt = now;
+                    // Night started mid-recording keeps the next frame's slot:
+                    // its first blend window ends there instead of early.
+                    if (useNight && writing && !paused && lastAdmission != Clock::time_point::min())
+                        nightStartAt = std::max(now, nextFrame - std::chrono::milliseconds(nightWindowDuration(cfg, suggestedNightDurationMs)));
                     std::wstring validationError;
                     if (useNight && !validateNightCapture(cfg, validationError)) {
                         previewOnlyWork = false;
@@ -1381,6 +1478,9 @@ void Engine::run() {
                 }
                 if (resetSkipRequested) {
                     resetSkipping(cfg, (needDesktop ? 1u : 0u) | (needCamera ? 2u : 0u));
+                    // Compression turned off live: bring a stretched quiet
+                    // interval back to the base cadence.
+                    if (!skipping) returnToBase();
                     if (skipping && writing && !paused && lastAdmission != Clock::time_point::min()) {
                         nextFrame = std::max(lastAdmission + std::chrono::milliseconds(cfg.intervalMs), Clock::now());
                         if (nightMode && !nightQueued) {
@@ -1772,12 +1872,16 @@ void Engine::run() {
                     }
                     if (!admit) continue;
                     if (cfg.segmentDurationSeconds > 0 && !encoders[0]->frames()) {
+                        segmentStart = activeDuration;
                         nextSegmentBoundary = nextSegmentCut(activeDuration, cfg.segmentDurationSeconds);
                         ++segmentOrdinal;
                     }
                     if (!delayedOrigin) sessionStarted = true;
                     const auto admittedActiveMs = std::chrono::duration_cast<std::chrono::milliseconds>(activeDuration).count();
                     if (cfg.watermark.enabled) {
+                        // A live watermark change prepares here, once, before
+                        // the first frame it appears on.
+                        if (!prepareWatermark(cfg, error)) { closeRecording(L"Watermark stopped recording: " + error); continue; }
                         // Every completed composition shares one admission context
                         // and finishes rendering before any writer accepts pixels.
                         WatermarkContext context;

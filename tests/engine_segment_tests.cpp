@@ -158,6 +158,19 @@ void sparse(const std::filesystem::path& root) {
         "Sparse ordinal followed elapsed buckets or changed output directory");
     std::cout << "PASS sparse active boundaries, lazy writers, skipped windows, frozen folder and duration.\n";
 }
+// A new part length joins the session and recuts the current part on its grid.
+void liveLength(const std::filesystem::path& root) {
+    auto cfg = settings(root, 100, 4); cfg.segmentDurationSeconds = 3;
+    lapse::Engine engine; engine.configure(cfg); engine.record();
+    await(engine, [](const auto& s) { return s.frames >= 3; });
+    require(!engine.status().completedSegments, "A three-second part ended early");
+    auto changed = cfg; changed.segmentDurationSeconds = 1; engine.configure(changed);
+    const auto saved = await(engine, [](const auto& s) { return s.state == lapse::State::Idle; });
+    verify(cfg, saved);
+    require(saved.completedSegments == 4 && saved.elapsed >= 4 && saved.elapsed < 5 && saved.frames >= 30,
+        "A live split length did not recut the current and later parts");
+    std::cout << "PASS live split length recuts the open part and later parts.\n";
+}
 void pause(const std::filesystem::path& root) {
     auto cfg = settings(root, 3000, 2);
     lapse::Engine engine; engine.configure(cfg); engine.record();
@@ -268,7 +281,7 @@ int main() {
         regular(root / L"overlay", lapse::Mode::Overlay, false, false);
         regular(root / L"paired-recovery", lapse::Mode::Desktop, true, true);
         playbackParts(root / L"fps-parts",false); playbackParts(root / L"fps-recovery-parts",true);
-        sparse(root / L"sparse"); pause(root / L"pause"); exact(root / L"exact");
+        sparse(root / L"sparse"); liveLength(root / L"live-length"); pause(root / L"pause"); exact(root / L"exact");
         for (int variant = 0; variant < 4; ++variant) slow(root / (L"slow-" + std::to_wstring(variant)), variant);
         std::filesystem::remove_all(root);
         std::cout << "All generated segment lifecycle cases passed.\n";

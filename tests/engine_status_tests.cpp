@@ -148,7 +148,7 @@ void liveChanges(const std::filesystem::path& root) {
     const size_t plain = writes();
     engine.setStatus(item(1, StatusKind::Stopwatch, L"Shower"));
     awaitJournal([] { size_t lit = 0; for (const auto& event : applied) lit += event.full && event.top == L"Shower" && event.after != event.before; return lit >= 3; });
-    // Live appearance edits stay frozen for the session.
+    // Live appearance edits join the session from the next admitted frame.
     settings.statusFeed.corner = StatusCorner::TopLeft; engine.configure(settings);
     StatusItem invalid; invalid.sequence = 9; invalid.kind = StatusKind::Note; engine.setStatus(invalid);
     engine.setStatus(item(2, StatusKind::Timer, L"Work on Essay", 3600000));
@@ -158,7 +158,13 @@ void liveChanges(const std::filesystem::path& root) {
     const auto result = finish(engine);
     std::lock_guard<std::mutex> lock(journalMutex);
     require(!result.error && !preparedSettings.empty(), "Live status recording failed");
-    for (const auto& value : preparedSettings) require(value.corner == StatusCorner::BottomRight, "Live appearance edit reached a frozen session");
+    require(preparedSettings.front().corner == StatusCorner::BottomRight && preparedSettings.back().corner == StatusCorner::TopLeft,
+        "Live appearance edit did not reach the session");
+    bool moved = false;
+    for (const auto& value : preparedSettings) {
+        moved = moved || value.corner == StatusCorner::TopLeft;
+        require(!moved || value.corner == StatusCorner::TopLeft, "A superseded appearance was prepared again");
+    }
     for (size_t i = 0; i < plain && i < writtenFrames.size(); ++i) require(writtenFrames[i].hash == plainHash(), "Frames before the first status were altered");
     uint64_t previous = 0; bool first = true;
     for (const auto& event : applied) if (event.full) {

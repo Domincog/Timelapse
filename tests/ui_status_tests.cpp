@@ -252,19 +252,29 @@ void appearance(){
     require(app.settings.statusFeed.corner==StatusCorner::BottomRight && app.settings.statusFeed.textSize==StatusTextSize::Large && app.settings.statusFeed.style==StatusStyle::EdgeFade &&
         sameStatusFeedSettings(app.settings.statusFeed,lapse::configured.statusFeed) && lapse::configurationCalls==configures+1 && app.liveStatus.kind==StatusKind::None && lapse::statusCalls==0,
         "Appearance-only change did not configure the engine once or changed the status.");
+    // Appearance changes live while recording; the status list choice does not.
     const auto frozen=app.settings.statusFeed;app.status.state=State::Recording;
     statusScript=[&](HWND window,DLGPROC,LPARAM parameter){auto& draft=draftOf(parameter);
-        require(draft.readOnlyAppearance && !IsWindowEnabled(draft.corner) && !IsWindowEnabled(draft.style) && fullText(draft.help).find(L"fixed until")!=std::wstring::npos,"Recording did not lock appearance.");
+        require(!draft.readOnlyAppearance && draft.readOnlySaveLog && IsWindowEnabled(draft.corner) && IsWindowEnabled(draft.style) && !IsWindowEnabled(draft.saveLogBox) &&
+            fullText(draft.help).find(L"apply to this recording now")!=std::wstring::npos,"Recording locked appearance or unlocked the status list.");
         select(window,draft.corner,StatusCornerBox,0);type(window,draft.text,StatusTextBox,L"Live change");submit(window);require(outcome()==IDOK,"Status could not change while recording.");
     };
     editStatus();
-    require(sameStatusFeedSettings(frozen,app.settings.statusFeed) && app.liveStatus.kind==StatusKind::Note && lapse::statusCalls==1,"Recording changed frozen appearance or blocked the live status.");
+    require(app.settings.statusFeed.corner==StatusCorner::TopLeft && sameStatusFeedSettings(app.settings.statusFeed,lapse::configured.statusFeed) &&
+        app.liveStatus.kind==StatusKind::Note && lapse::statusCalls==1,"Recording lost the live appearance or blocked the live status.");
+    // Finishing keeps appearance fixed.
+    app.status.state=State::Finishing;const auto finishing=app.settings.statusFeed;
+    statusScript=[&](HWND window,DLGPROC,LPARAM parameter){auto& draft=draftOf(parameter);
+        require(draft.readOnlyAppearance && !IsWindowEnabled(draft.corner) && !IsWindowEnabled(draft.style) && fullText(draft.help).find(L"starting or finishing")!=std::wstring::npos,"Finishing did not lock appearance.");
+        select(window,draft.corner,StatusCornerBox,3);type(window,draft.text,StatusTextBox,L"Late change");submit(window);};
+    editStatus();require(sameStatusFeedSettings(finishing,app.settings.statusFeed),"Finishing changed the appearance.");
+    app.settings.statusFeed=frozen;configure();
     app.status={};
     // Too small to show the feed: the dialog says so.
     app.hasCustomSize=true;app.customWidth=app.customHeight=48;app.committedSize=2;customItems();configure();
     statusScript=[&](HWND window,DLGPROC,LPARAM parameter){require(caption(draftOf(parameter).error).find(L"too small")!=std::wstring::npos,"Tiny video warning missing.");statusProc(window,WM_COMMAND,IDCANCEL,0);};
     editStatus();
-    std::cout<<"PASS idle appearance commit with live illustration, frozen appearance while recording and tiny-video warning\n";
+    std::cout<<"PASS idle appearance commit with live illustration, live appearance while recording, locked while finishing and tiny-video warning\n";
 }
 void shortcutAndNotices(){
     StatusFixture owned;std::wstring error;

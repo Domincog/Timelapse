@@ -95,11 +95,18 @@ void preflightAndFreeze(){
     app.hasCustomSize=false;app.committedSize=0;customItems();app.settings.watermark.enabled=true;choose(app.mode,SeparateFilesMode);app.settings.separateFiles=true;app.settings.layers=preset(Mode::SideBySide);
     SendMessageW(app.nightEnabled,BM_SETCHECK,BST_CHECKED,0);choose(app.nightDuration,0);configure();require(app.watermarkValidation.empty()&&app.settings.night.enabled&&app.settings.separateFiles,"Watermark conflicted with paired Night settings.");
     const auto prior=app.settings.watermark;const int configuredBefore=lapse::configurationCalls;
-    for(auto state:{State::Starting,State::Recording,State::Paused,State::Finishing}){app.status.state=state;skipScript=[&](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<WatermarkDraft*>(parameter);
-        require(draft.readOnly&&!markVisible(draft.okay)&&!IsWindowEnabled(draft.enabled)&&!IsWindowEnabled(draft.position)&&!draft.illustration.pixels.empty(),"Active watermark dialog was editable or lacked preview.");
-        markCheck(window,draft.enabled,MarkEnabled,false);watermarkProc(window,WM_COMMAND,IDOK,0);require(outcome()==IDCANCEL,"Forged active Apply was accepted.");};editWatermark();}
-    app.status={};require(sameWatermarkSettings(prior,app.settings.watermark)&&lapse::configurationCalls==configuredBefore,"Read-only inspection changed session policy.");
-    std::cout<<"PASS cached tiny-output preflight and actual Record guard, engine error precedence, Off and paired/Night compatibility, active read-only locks\n";
+    for(auto state:{State::Starting,State::Finishing}){app.status.state=state;skipScript=[&](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<WatermarkDraft*>(parameter);
+        require(draft.readOnly&&!markVisible(draft.okay)&&!IsWindowEnabled(draft.enabled)&&!IsWindowEnabled(draft.position)&&!draft.illustration.pixels.empty(),"Starting/finishing watermark dialog was editable or lacked preview.");
+        markCheck(window,draft.enabled,MarkEnabled,false);watermarkProc(window,WM_COMMAND,IDOK,0);require(outcome()==IDCANCEL,"Forged locked Apply was accepted.");};editWatermark();}
+    require(sameWatermarkSettings(prior,app.settings.watermark)&&lapse::configurationCalls==configuredBefore,"Read-only inspection changed session policy.");
+    // Recording or paused: the watermark changes live.
+    for(auto state:{State::Recording,State::Paused}){app.status.state=state;skipScript=[&](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<WatermarkDraft*>(parameter);
+        require(!draft.readOnly&&markVisible(draft.okay)&&IsWindowEnabled(draft.enabled)&&IsWindowEnabled(draft.position)&&!draft.illustration.pixels.empty(),"Live watermark dialog was locked or lacked preview.");
+        markCheck(window,draft.enabled,MarkEnabled,false);watermarkProc(window,WM_COMMAND,IDOK,0);require(outcome()==IDOK,"Live Apply was refused.");};editWatermark();
+        require(!app.settings.watermark.enabled&&lapse::configurationCalls>configuredBefore,"Live watermark change did not reach the session.");
+        app.settings.watermark=prior;app.watermarkCheckValid=false;configure();}
+    app.status={};require(sameWatermarkSettings(prior,app.settings.watermark),"Live watermark edit could not be restored.");
+    std::cout<<"PASS cached tiny-output preflight and actual Record guard, engine error precedence, Off and paired/Night compatibility, live edits and starting/finishing locks\n";
 }
 void nativeNavigationAndLifecycle(){
     HiddenFixture owned;setupWatermark();app.settings.watermark.enabled=true;configure();
@@ -162,7 +169,7 @@ void nativeWheelNavigation(){
         };editWatermark();
         require(sameWatermarkSettings(accepted,app.settings.watermark)&&lapse::configurationCalls==configurations,"Wheel/Cancel committed watermark changes.");
     }
-    app.status.state=State::Recording;
+    app.status.state=State::Finishing;
     skipScript=[&](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<WatermarkDraft*>(parameter);
         RECT proposed{0,0,360,250};SendMessageW(window,WM_DPICHANGED,MAKELONG(192,192),reinterpret_cast<LPARAM>(&proposed));
         SetWindowPos(window,nullptr,0,0,360,250,SWP_NOZORDER|SWP_NOACTIVATE);watermarkLayout(window,draft);SendMessageW(window,WM_VSCROLL,SB_TOP,0);

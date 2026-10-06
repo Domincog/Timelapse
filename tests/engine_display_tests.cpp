@@ -160,8 +160,8 @@ void activeCase(bool moved, bool outsideControl, bool pinning = false) {
           require(frameChanged.wait_for(lock,4s,[]{return recordedFrames==1;}),"First recording frame missing.");
           require(recordedMarkers[0]==(outsideControl?colorB:colorA),"Recording began with the wrong selected display."); }
         // The worker is blocked after frame one. Topology changes below do
-        // not call configure. The separate pinning control explicitly changes
-        // live configuration while the recording must retain its accepted ID.
+        // not call configure, so the recording keeps its accepted ID. The
+        // separate live control explicitly chooses display B while recording.
         if(pinning) {
             cfg.monitorId=L"monitor:interface-B"; cfg.monitor=originalB.bounds;
             cfg.layers[0].rect.w=.75; cfg.preview=true; engine.configure(cfg);
@@ -180,11 +180,11 @@ void activeCase(bool moved, bool outsideControl, bool pinning = false) {
         } else {
             const auto status=awaitStatus(engine,[](const lapse::Status& s){return s.frames>=2;});
             require(status.state==lapse::State::Recording && !status.error,"Healthy identified display did not leave recording active.");
-            { std::lock_guard<std::mutex> lock(frameMutex); require(recordedFrames==2 && recordedMarkers[1]==colorA,
-                "Second encoded frame did not retain selected display A."); }
+            { std::lock_guard<std::mutex> lock(frameMutex); require(recordedFrames==2 && recordedMarkers[1]==(pinning?colorB:colorA),
+                pinning?"Second encoded frame did not follow the live display choice B.":"Second encoded frame did not retain selected display A."); }
             engine.finish(); awaitStatus(engine,[](const lapse::Status& s){return s.state==lapse::State::Idle;});
-            std::cout<<"PASS actual Engine records A then A "
-                <<(pinning?"through live ID/layout/preview updates":"after A moves and B occupies old bounds")<<"\n";
+            std::cout<<"PASS actual Engine records "
+                <<(pinning?"A then B through a live display/layout/preview update":"A then A after A moves and B occupies old bounds")<<"\n";
         }
     }
     require(!barrierTimeout,"Recording frame barrier timed out.");

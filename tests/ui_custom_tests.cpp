@@ -136,8 +136,10 @@ void activeAndNight(){
     HiddenFixture owned;setupCustom();
     for(auto state:{State::Starting,State::Recording,State::Paused,State::Finishing}){
         app.status.state=state;const int calls=lapse::configurationCalls;
-        for(auto kind:{CustomKind::Size,CustomKind::Limit,CustomKind::Segment,CustomKind::Night})invoke(kind);
-        if(state==State::Starting || state==State::Finishing)invoke(CustomKind::Interval);
+        // Size is never live; Segment only for a session that splits (this one
+        // does not). Interval, stop time and Night are live while recording.
+        for(auto kind:{CustomKind::Size,CustomKind::Segment})invoke(kind);
+        if(state==State::Starting || state==State::Finishing)for(auto kind:{CustomKind::Interval,CustomKind::Limit,CustomKind::Night})invoke(kind);
         require(!dialogCalls && lapse::configurationCalls==calls && app.settings.intervalMs==5000 && app.settings.width==1280 && app.settings.recordingLimitSeconds==0 && app.settings.segmentDurationSeconds==0 && choice(app.splitEvery)==0 && selectedNightDuration()==0,
             "Active session accepted a forged custom command.");
     }
@@ -180,11 +182,14 @@ void customNightDuration(){
     failDialog=true;invoke(CustomKind::Night);failDialog=false;
     require(selectedNightDuration()==1501 && app.settings.night.durationMs==1501 && lapse::configurationCalls==configurations && !app.customDialog && startupMessage.find(L"could not be opened")!=std::wstring::npos,
         "Failed Night dialog discarded its committed value or lacked a diagnostic.");
-    for(auto state:{State::Starting,State::Recording,State::Paused,State::Finishing}){
+    for(auto state:{State::Starting,State::Finishing}){
         app.status.state=state;const int calls=dialogCalls;
         invoke(CustomKind::Night);choose(app.nightDuration,0);windowProc(app.window,WM_COMMAND,MAKEWPARAM(NightDurationBox,CBN_SELCHANGE),0);
-        require(dialogCalls==calls && selectedNightDuration()==1501 && app.settings.night.durationMs==1501 && lapse::configurationCalls==configurations,"Active Night command changed or falsely displayed frozen custom duration.");
+        require(dialogCalls==calls && selectedNightDuration()==1501 && app.settings.night.durationMs==1501 && lapse::configurationCalls==configurations,"Locked Night command changed or falsely displayed the custom duration.");
     }
+    // Recording: a Night duration that fits the interval applies live.
+    app.status.state=State::Recording;choose(app.nightDuration,0);windowProc(app.window,WM_COMMAND,MAKEWPARAM(NightDurationBox,CBN_SELCHANGE),0);
+    require(selectedNightDuration()==0 && app.settings.night.durationMs==0 && lapse::configured.night.durationMs==0,"Live Night Auto was not configured.");
     app.status={};
     dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<CustomDraft*>(parameter);SetWindowTextW(draft.first,L"15");accept(window);};
     invoke(CustomKind::Night);
@@ -222,9 +227,27 @@ void liveIntervalControls(){
     invoke(CustomKind::Interval);require(app.settings.intervalMs==3000 && app.settings.night.durationMs==2000,"Valid live Night cadence changed the blend policy");
     choose(app.interval,0);windowProc(app.window,WM_COMMAND,MAKEWPARAM(IntervalBox,CBN_SELCHANGE),0);
     require(app.settings.intervalMs==3000 && selectedInterval()==3000,"Invalid Night preset changed live cadence");
+    // A live Night blend longer than the interval is refused with a reason.
+    startupMessage.clear();choose(app.nightDuration,3);windowProc(app.window,WM_COMMAND,MAKEWPARAM(NightDurationBox,CBN_SELCHANGE),0);
+    require(app.settings.night.durationMs==2000 && choice(app.nightDuration)==2 && startupMessage.find(L"must not exceed Capture every")!=std::wstring::npos,"Live Night longer than the interval was accepted or unexplained");
+    dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<CustomDraft*>(parameter);
+        SetWindowTextW(draft.first,L"4");accept(window);require(!dialogOutcome && !caption(draft.error).empty(),"Live custom Night longer than the interval was accepted");
+        SetWindowTextW(draft.first,L"2.5");accept(window);};
+    invoke(CustomKind::Night);require(app.settings.night.durationMs==2500,"Live custom Night that fits was not committed");
+    // Stop after cannot be set to a time the recording has already passed.
+    app.status.elapsed=100;startupMessage.clear();choose(app.stopAfter,1);windowProc(app.window,WM_COMMAND,MAKEWPARAM(StopAfterBox,CBN_SELCHANGE),0);
+    require(app.settings.recordingLimitSeconds==900 && lapse::configured.recordingLimitSeconds==900,"Live stop time was not configured");
+    choose(app.stopAfter,0);windowProc(app.window,WM_COMMAND,MAKEWPARAM(StopAfterBox,CBN_SELCHANGE),0);require(!app.settings.recordingLimitSeconds,"Live Never was not configured");
+    app.status.elapsed=1800;choose(app.stopAfter,1);windowProc(app.window,WM_COMMAND,MAKEWPARAM(StopAfterBox,CBN_SELCHANGE),0);
+    require(!app.settings.recordingLimitSeconds && choice(app.stopAfter)==0 && startupMessage.find(L"already run for 00:30:00")!=std::wstring::npos,"A passed live stop time was accepted or unexplained");
+    dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<CustomDraft*>(parameter);
+        SetWindowTextW(draft.first,L"1800");accept(window);require(!dialogOutcome && !caption(draft.error).empty(),"A passed custom stop time was accepted");
+        SetWindowTextW(draft.first,L"1801");accept(window);};
+    invoke(CustomKind::Limit);require(app.settings.recordingLimitSeconds==1801,"A future custom stop time was not committed");
+    app.status.elapsed=0;
     dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<CustomDraft*>(parameter);SetWindowTextW(draft.first,L"10");app.status.state=State::Finishing;accept(window);};
     invoke(CustomKind::Interval);require(app.settings.intervalMs==3000,"Saving accepted a stale live interval draft");
-    std::cout<<"PASS live interval presets/custom values, cancellation, Night limits and saving guards\n";
+    std::cout<<"PASS live interval presets/custom values, cancellation, Night limits both ways, live stop time and saving guards\n";
 }
 void segmentDurations(){
     HiddenFixture owned;setupCustom();
@@ -248,9 +271,24 @@ void segmentDurations(){
     require(lapse::recorded.segmentDurationSeconds==1 && lapse::recorded.intervalMs==5000 && lapse::recorded.night.enabled && lapse::recorded.separateFiles,
         "Short split was silently coerced or blocked paired/Night recording.");
     for(State state:{State::Starting,State::Recording,State::Paused,State::Finishing}){
-        app.status.state=state;updateControls();const int calls=lapse::configurationCalls;choose(app.splitEvery,0);
+        app.status.state=state;updateControls();const bool live=state==State::Recording || state==State::Paused;
+        const int calls=lapse::configurationCalls;choose(app.splitEvery,0);startupMessage.clear();
         windowProc(app.window,WM_COMMAND,MAKEWPARAM(SegmentBox,CBN_SELCHANGE),0);
-        require(!IsWindowEnabled(app.splitEvery) && choice(app.splitEvery)==5 && app.settings.segmentDurationSeconds==1 && lapse::configurationCalls==calls,"Active split setting changed or displayed a false selection.");}
+        require((IsWindowEnabled(app.splitEvery)!=FALSE)==live && choice(app.splitEvery)==5 && app.settings.segmentDurationSeconds==1 && lapse::configurationCalls==calls,
+            "Splitting was turned off during a session or displayed a false selection.");
+        require(live==(startupMessage.find(L"turned on or off only before recording")!=std::wstring::npos),"Rejected live split change was unexplained, or a locked one explained.");
+        if(!live)continue;
+        // A different part length joins the running session.
+        choose(app.splitEvery,1);windowProc(app.window,WM_COMMAND,MAKEWPARAM(SegmentBox,CBN_SELCHANGE),0);
+        require(app.settings.segmentDurationSeconds==SegmentDurations[1] && lapse::configured.segmentDurationSeconds==SegmentDurations[1],"Live split length was not configured.");
+        dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<CustomDraft*>(parameter);SetWindowTextW(draft.first,L"1");accept(window);};
+        invoke(CustomKind::Segment);require(app.settings.segmentDurationSeconds==1 && choice(app.splitEvery)==5,"Live custom split length was not committed.");
+    }
+    app.status=lapse::fixtureStatus={};
+    app.status.state=State::Recording;app.settings.segmentDurationSeconds=0;choose(app.splitEvery,0);app.committedSegment=0;updateControls();
+    require(!IsWindowEnabled(app.splitEvery),"Splitting could be turned on during a session.");
+    {const int calls=lapse::configurationCalls;choose(app.splitEvery,1);windowProc(app.window,WM_COMMAND,MAKEWPARAM(SegmentBox,CBN_SELCHANGE),0);
+     require(choice(app.splitEvery)==0 && !app.settings.segmentDurationSeconds && lapse::configurationCalls==calls,"Forged selection turned on splitting during a session.");}
     app.status=lapse::fixtureStatus={};
     dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<CustomDraft*>(parameter);SetWindowTextW(draft.first,L"6");choose(draft.units,2);accept(window);};
     invoke(CustomKind::Segment);require(app.settings.segmentDurationSeconds==21600 && choice(app.splitEvery)==3 && !app.hasCustomSegment && SendMessageW(app.splitEvery,CB_GETCOUNT,0,0)==6,

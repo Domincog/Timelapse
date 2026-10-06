@@ -581,12 +581,19 @@ void cursorKeyboard(){
     require(detailsProbe::configures==stable&&detailsProbe::textWrites==0&&detailsProbe::allocations==copyAllocations,"Unchanged cursor-off status ticks added UI work beyond existing Status copies.");
     for(State state:{State::Waiting,State::Starting,State::Recording,State::Paused,State::Finishing}){
         Status status;status.state=state;fixture.publish(status);const int calls=detailsProbe::configures;
-        nativeMnemonic(app.preview,L'k');require(!app.settings.captureCursor&&detailsProbe::configures==calls&&!IsWindowEnabled(app.captureCursor),"Disabled cursor mnemonic changed an active session.");
+        nativeMnemonic(app.preview,L'k');
+        if(state==State::Recording || state==State::Paused){
+            // The cursor choice joins a running desktop recording.
+            require(app.settings.captureCursor&&detailsProbe::configures==calls+1&&IsWindowEnabled(app.captureCursor),"Live cursor mnemonic did not change the session.");
+            nativeMnemonic(app.preview,L'k');require(!app.settings.captureCursor&&detailsProbe::configures==calls+2,"Live cursor mnemonic could not restore the choice.");
+            continue;
+        }
+        require(!app.settings.captureCursor&&detailsProbe::configures==calls&&!IsWindowEnabled(app.captureCursor),"Disabled cursor mnemonic changed a starting or finishing session.");
     }
     fixture.publish({});choose(app.mode,1);SendMessageW(fixture.window,WM_COMMAND,MAKEWPARAM(ModeBox,CBN_SELCHANGE),reinterpret_cast<LPARAM>(app.mode));checkCallback();
     const int calls=detailsProbe::configures;nativeMnemonic(app.preview,L'k');require(!app.settings.captureCursor&&detailsProbe::configures==calls&&!IsWindowEnabled(app.captureCursor),"Camera-only native cursor mnemonic changed the retained choice.");
     require(detailsProbe::folderCalls==folders&&detailsProbe::dialogs==dialogs&&!detailsProbe::records&&!detailsProbe::finishes,"Cursor shortcut activated an unrelated command.");
-    std::cout<<"PASS actual Alt+K/Space, desktop/active/camera locks, distinct commands and no added unchanged cursor-off UI work\n";
+    std::cout<<"PASS actual Alt+K/Space, live cursor while recording, starting/finishing/camera locks, distinct commands and no added unchanged cursor-off UI work\n";
 }
 void distinctMainMnemonics(){
     Fixture fixture;showOffscreen(fixture);app.settings.folder=std::filesystem::current_path().wstring();
@@ -602,7 +609,8 @@ void distinctMainMnemonics(){
     for(State state:{State::Idle,State::Recording,State::Paused})for(bool expanded:{false,true}){
         if(app.panelTab!=(expanded?RecordingTab:CaptureTab))fixture.command(expanded?TabRecording:TabCapture);
         Status report;report.state=state;report.message=L"Saved synthetic part: owned-camera.mp4";report.savedPath=L"owned-camera.mp4";report.savedPaths={report.savedPath};fixture.publish(report);
-        require(ownVisible(app.skipConfigure)==expanded,"Settings page visibility is inconsistent.");expectReadOnly=state!=State::Idle;const auto settings=app.settings;const int configurations=detailsProbe::configures;
+        // Time compression is editable while idle, recording or paused.
+        require(ownVisible(app.skipConfigure)==expanded,"Settings page visibility is inconsistent.");expectReadOnly=false;const auto settings=app.settings;const int configurations=detailsProbe::configures;
         std::vector<HWND> starts{app.tabs[app.panelTab],app.statusDetails};if(expanded)starts.push_back(app.skipConfigure);else starts.push_back(app.openFolder);if(state==State::Idle && !expanded)starts.push_back(app.folder);
         for(HWND start:starts){
             const int folders=detailsProbe::folderCalls,compressed=compressionDialogs,shells=detailsProbe::shellCalls,details=detailDialogs;

@@ -609,7 +609,7 @@ void deferredVisuals(bool minimized){Fixture f;probe::current.state=State::Recor
     require(app.visibleDirty&&app.status.state==State::Paused&&probe::enables==0&&probe::textWrites==0&&probe::invalidated.empty(),"Hidden status changed visual controls or was discarded");
     if(minimized){probe::iconic=false;windowProc(app.window,WM_SIZE,SIZE_RESTORED,0);}else f.command(TrayShow);
     wchar_t value[128]{};GetWindowTextW(app.statusText,value,128);
-    require(!app.visibleDirty&&std::wstring(value)==probe::current.message&&!IsWindowEnabled(app.lowDisk)&&!probe::configured.stopOnLowDiskSpace&&probe::configured.recordingLimitSeconds==3600,"Restore lost deferred text, active lock, or Advanced settings");
+    require(!app.visibleDirty&&std::wstring(value)==probe::current.message&&IsWindowEnabled(app.lowDisk)&&!IsWindowEnabled(app.videoSize)&&!probe::configured.stopOnLowDiskSpace&&probe::configured.recordingLimitSeconds==3600,"Restore lost deferred text, live/locked option state, or Advanced settings");
     GetWindowTextW(app.pause,value,128);require(std::wstring(value)==L"&Resume","Restore left a stale Pause label");
     probe::resetWork();f.tick();require(probe::enables==0&&probe::textWrites==0&&probe::invalidated.empty(),"Restored status repeated its full refresh");
 }

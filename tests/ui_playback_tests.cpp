@@ -117,10 +117,19 @@ void shortcutLifecycle(){
 }
 void dialogStateAndGeometry(){
     PlaybackFixture fixture;
-    for(auto state:{State::Waiting,State::Starting,State::Recording,State::Paused,State::Finishing}){
+    for(auto state:{State::Waiting,State::Starting,State::Finishing}){
         fixture.owned.state(state);playbackProbe::dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<PlaybackDraft*>(parameter);
-            require(draft.readOnly && !IsWindowEnabled(draft.first) && !IsWindowEnabled(draft.second) && !IsWindowEnabled(draft.stop) && !IsWindowEnabled(draft.okay),"Session settings were editable.");
-            SetWindowTextW(draft.first,L"120");acceptPlayback(window);};editPlayback();require(app.settings.outputFps==30 && playbackProbe::registrations.empty(),"Forged active OK changed frozen settings.");}
+            require(draft.readOnly && !IsWindowEnabled(draft.first) && !IsWindowEnabled(draft.second) && !IsWindowEnabled(draft.stop) && !IsWindowEnabled(draft.okay),"Starting/finishing settings were editable.");
+            SetWindowTextW(draft.first,L"120");acceptPlayback(window);};editPlayback();require(app.settings.outputFps==30 && playbackProbe::registrations.empty(),"Forged locked OK changed settings.");}
+    // While recording or paused, shortcuts change live; the frame rate stays.
+    for(auto state:{State::Recording,State::Paused}){
+        fixture.owned.state(state);playbackProbe::dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<PlaybackDraft*>(parameter);
+            require(!draft.readOnly && draft.fpsLocked && !IsWindowEnabled(draft.first) && IsWindowEnabled(draft.second) && IsWindowEnabled(draft.stop) && IsWindowEnabled(draft.okay),"Live shortcuts were locked or the frame rate was editable.");
+            SetWindowTextW(draft.first,L"120");SendMessageW(draft.second,HKM_SETHOTKEY,key('P'),0);acceptPlayback(window);require(playbackProbe::dialogOutcome==IDOK,"Live shortcut did not commit.");};
+        editPlayback();require(app.settings.outputFps==30 && app.pauseHotkey==key('P') && playbackProbe::registrations.size()==1,"Live shortcut was lost or the frame rate changed.");
+        playbackProbe::dialogScript=[](HWND window,LPARAM){
+            playbackProc(window,WM_COMMAND,MAKEWPARAM(PlaybackClearPause,BN_CLICKED),0);acceptPlayback(window);};
+        editPlayback();require(!app.pauseHotkey && playbackProbe::registrations.empty(),"Live shortcut could not be cleared.");}
     fixture.owned.state(State::Idle);playbackProbe::dialogScript=[](HWND window,LPARAM parameter){auto& draft=*reinterpret_cast<PlaybackDraft*>(parameter);
         for(int dpi:{96,144,192}){draft.dpi=dpi;customFont(window,draft);SetWindowPos(window,nullptr,0,0,draft.scale(460),draft.scale(450),SWP_NOZORDER|SWP_NOACTIVATE);playbackLayout(window,draft);
             RECT pause{},clear{},stop{},help{},error{},okay{};GetWindowRect(draft.second,&pause);GetWindowRect(draft.clearPause,&clear);GetWindowRect(draft.stop,&stop);GetWindowRect(draft.help,&help);GetWindowRect(draft.error,&error);GetWindowRect(draft.okay,&okay);

@@ -317,7 +317,7 @@ void laterAdmission(const std::filesystem::path& root, bool separate, bool query
     // settings change while this recording is paused.
     const auto originalFolder = config.folder;
     config.folder = (root / L"live-folder-must-be-ignored").wstring();
-    config.stopOnLowDiskSpace = false; engine.configure(config);
+    engine.configure(config);
     captureGate.armed = true; engine.setPaused(false); awaitGate(captureGate);
     require(primaryWrites == 1 && secondaryWrites == (separate ? 1u : 0u) && queryCalls == 2,
         "Space queried before a slow requested capture completed");
@@ -370,12 +370,28 @@ void disabledGuard(const std::filesystem::path& root, bool separate) {
     lapse::Engine engine; engine.configure(config); engine.record();
     await(engine, [](const auto& s) { return s.state == lapse::State::Recording && s.frames == 1; });
     engine.setPaused(true); await(engine, [](const auto& s) { return s.state == lapse::State::Paused; });
-    config.stopOnLowDiskSpace = true; engine.configure(config); engine.setPaused(false);
+    engine.setPaused(false);
     await(engine, [](const auto& s) { return s.state == lapse::State::Recording && s.frames == 2; });
     engine.finish(); const auto result = await(engine, [](const auto& s) { return s.state == lapse::State::Idle; });
     saved(result, 2, separate ? 2 : 1);
-    require(queryCalls == 0 && !orderingFailed, "Disabled session performed a disk-space query after live settings changed");
-    std::cout << "PASS disabled guard is frozen and omits every query, separate=" << separate << ".\n";
+    require(queryCalls == 0 && !orderingFailed, "Disabled session performed a disk-space query");
+    std::cout << "PASS disabled guard omits every query across pause, separate=" << separate << ".\n";
+}
+// Turning the guard on while recording joins the session at the next admission.
+void liveGuard(const std::filesystem::path& root, bool separate) {
+    reset(separate); auto config = settings(root / (L"live-guard-" + std::to_wstring(separate)), separate);
+    config.stopOnLowDiskSpace = false; expectQueries = false;
+    lapse::Engine engine; engine.configure(config); engine.record();
+    await(engine, [](const auto& s) { return s.state == lapse::State::Recording && s.frames == 1; });
+    engine.setPaused(true); await(engine, [](const auto& s) { return s.state == lapse::State::Paused; });
+    require(queryCalls == 0, "A disabled guard queried space before it was turned on");
+    availableBytes = 0; config.stopOnLowDiskSpace = true; engine.configure(config); engine.setPaused(false);
+    const auto result = await(engine, [](const auto& s) { return s.state == lapse::State::Idle && s.error; });
+    failed(result, L"Recording stopped: ", false, 1);
+    require(queryCalls >= 1 && primaryWrites == 1 && secondaryWrites == (separate ? 1u : 0u), "A guard turned on live admitted a low-space sample");
+    require(result.savedPaths.size() == (separate ? 2u : 1u), "A guard turned on live lost the admitted outputs");
+    for (const auto& path : result.savedPaths) verifyDecoded(path, 1);
+    std::cout << "PASS guard turned on live checks the next admission, separate=" << separate << ".\n";
 }
 void automaticResult(const lapse::Status& result, bool separate) {
     saved(result, 1, separate ? 2 : 1);
@@ -538,7 +554,7 @@ int main(int argc, char** argv) {
             sufficient(root, false, lapse::Mode::Desktop); sufficient(root, false, lapse::Mode::Camera);
             sufficient(root, false, lapse::Mode::Overlay); sufficient(root, true, lapse::Mode::Camera);
             sufficient(root, false, lapse::Mode::Desktop, true);
-            disabledGuard(root, false); disabledGuard(root, true);
+            disabledGuard(root, false); disabledGuard(root, true); liveGuard(root, false); liveGuard(root, true);
         }
         if (all || selection == "admission") for (bool separate : {false, true}) for (bool queryFailure : {false, true}) {
             firstAdmission(root, separate, queryFailure); laterAdmission(root, separate, queryFailure);

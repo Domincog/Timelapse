@@ -379,10 +379,13 @@ void pages(int dpi){
         "An encoder conflict was not flagged on the Output page.");
     choose(app.encodingMode,0);SendMessageW(app.recoveryMode,BM_SETCHECK,BST_UNCHECKED,0);choose(app.stopAfter,0);configure();updateControls();
     require(!app.tabMarks[OutputTab] && !app.tabMarks[RecordingTab],"Restoring defaults left page marks.");
-    // Recording locks edits but not page browsing or inspection.
+    // Recording keeps live options editable; size, encoder and reset stay locked.
     app.status.state=State::Recording;updateControls();page(RecordingTab);
-    require(IsWindowEnabled(app.tabs[OutputTab]) && !IsWindowEnabled(app.stopAfter) && !IsWindowEnabled(app.lowDisk) && IsWindowEnabled(app.skipConfigure),"Recording locked pages or allowed edits.");
+    require(IsWindowEnabled(app.tabs[OutputTab]) && IsWindowEnabled(app.stopAfter) && IsWindowEnabled(app.lowDisk) && IsWindowEnabled(app.startDelay) && IsWindowEnabled(app.skipConfigure) &&
+        !IsWindowEnabled(app.splitEvery),"Recording locked live options, pages, or allowed turning on splitting.");
     page(OutputTab);require(!IsWindowEnabled(app.encodingMode) && !IsWindowEnabled(app.resetDefaults) && IsWindowEnabled(app.watermarkConfigure) && IsWindowEnabled(app.playbackConfigure),"Recording allowed encoder edits or reset.");
+    for(auto state:{State::Starting,State::Finishing}){app.status.state=state;updateControls();page(RecordingTab);
+        require(!IsWindowEnabled(app.stopAfter) && !IsWindowEnabled(app.lowDisk) && !IsWindowEnabled(app.startDelay),"Preparation or finishing allowed live edits.");}
     app.status={};updateControls();
     std::cout<<"PASS pages dpi="<<dpi<<" default, exclusive rows, Tab order, Ctrl+Tab/PageDown, mnemonic reveal, marks/tooltips and active locks\n";
 }
@@ -603,8 +606,9 @@ void splitRow(int dpi){
     require(drawnText[3].value.find(L"321 frames")!=std::wstring::npos && drawnText[3].value.find(L"2 parts saved")!=std::wstring::npos,
         "Saved-parts statistics reset overall frame/time totals or omitted the count.");
     app.status.completedSegments=1;paintCheck();require(drawnText[3].value.find(L"1 part saved")!=std::wstring::npos,"Singular saved-parts count was incorrect.");
-    page(RecordingTab);require(!IsWindowEnabled(app.splitEvery),"Active splitting was editable.");
-    app.status={};std::cout<<"PASS split row dpi="<<dpi<<" default, exact page marks, row bounds, focus/scroll, cumulative part counts and active lock\n";
+    page(RecordingTab);require(IsWindowEnabled(app.splitEvery),"An active split length was not editable.");
+    app.status.state=State::Finishing;updateControls();require(!IsWindowEnabled(app.splitEvery),"A finishing split length was editable.");
+    app.status={};std::cout<<"PASS split row dpi="<<dpi<<" default, exact page marks, row bounds, focus/scroll, cumulative part counts and live length\n";
 }
 void startDelayRow(int dpi){
     HiddenWindow owned(MulDiv(500,dpi,96),MulDiv(400,dpi,96),dpi);

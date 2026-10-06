@@ -146,13 +146,12 @@ void accelerateAndActivity(const std::filesystem::path& root) {
     await(e,[&](const auto& x){return cameraReports>beforeGeometry&&x.timeSkip.intervalMs==100;},2200);
     await(e,[](const auto& x){return x.timeSkip.intervalMs>110&&x.timeSkip.reason==TimeSkipReason::NoPerson;},4200);
     inferenceDelay=25;
-    // Person mode and uncertainty policy are session-frozen even if an external caller changes controls.
-    s.timeSkip.mode=TimeSkipMode::Off;s.timeSkip.uncertainAsAbsent=true;e.configure(s);verdict=2;
+    verdict=2;
     await(e,[](const auto& x){return x.timeSkip.reason==TimeSkipReason::PersonPresent&&x.timeSkip.intervalMs==100;},2200);
     verdict=0;
     const auto uncertain=await(e,[](const auto& x){return x.timeSkip.reason==TimeSkipReason::PersonUncertain&&x.timeSkip.intervalMs==100&&std::wstring(x.timeSkip.diagnostic.data()).find(L"Too little image detail")!=std::wstring::npos;},2200);
     require(std::wstring(uncertain.timeSkip.diagnostic.data()).find(L"using normal cadence")!=std::wstring::npos,
-        "Uncertainty diagnostic used a live setting instead of the frozen opt-out");
+        "Uncertainty diagnostic ignored the session opt-out");
     const auto holdUntil=uncertain.timeSkip.lastCheckTick+uint64_t(s.timeSkip.quietAfterMs)+1200;
     while(e.status().timeSkip.lastCheckTick<holdUntil){
         const auto current=e.status();
@@ -167,7 +166,25 @@ void accelerateAndActivity(const std::filesystem::path& root) {
     require(std::wstring(ambiguous.timeSkip.diagnostic.data()).find(L"using normal cadence")!=std::wstring::npos,
         "Opt-out failed to keep model ambiguity at normal cadence");
     decode(finish(e),2);require(detectorLive==0,"Finished detector retained its resources");boundedCadence();
-    std::cout<<"camera-only paired acceleration, Present/Unknown return and frozen opt-out passed\n";
+    std::cout<<"camera-only paired acceleration, Present/Unknown return and opt-out passed\n";
+}
+// The person policy changes live: uncertainty can start counting as absence,
+// and turning compression off releases the detector at normal cadence.
+void livePolicy(const std::filesystem::path& root) {
+    resetEvidence();verdict=0;Engine e;auto s=configuration(root/L"live-policy");s.timeSkip.uncertainAsAbsent=false;e.configure(s);e.record();
+    await(e,[](const auto& x){return x.timeSkip.reason==TimeSkipReason::PersonUncertain&&x.timeSkip.intervalMs==100&&
+        std::wstring(x.timeSkip.diagnostic.data()).find(L"using normal cadence")!=std::wstring::npos;},2200);
+    s.timeSkip.uncertainAsAbsent=true;e.configure(s);
+    const auto counted=await(e,[](const auto& x){return std::wstring(x.timeSkip.diagnostic.data()).find(L"treating uncertainty as no person detected")!=std::wstring::npos;},2200);
+    require(counted.timeSkip.intervalMs==100,"A live uncertainty change skipped the absence dwell");
+    await(e,[](const auto& x){return x.timeSkip.reason==TimeSkipReason::NoPersonUncertain&&x.timeSkip.intervalMs>=350;},4200);
+    s.timeSkip.mode=TimeSkipMode::Off;e.configure(s);
+    const auto off=await(e,[](const auto& x){return !x.timeSkip.enabled;},2200);
+    await(e,[&](const auto& x){return x.frames>=off.frames+3;},2200);
+    require(detectorLive==0,"Compression turned off live kept the detector running");
+    {std::lock_guard<std::mutex> lock(evidenceMutex);require(writes.size()>=2&&writes.back().us-writes[writes.size()-2].us<250000,"Compression turned off live kept the stretched interval");}
+    decode(finish(e));
+    std::cout<<"live uncertainty policy and live Off release the detector at base cadence passed\n";
 }
 void ambiguousAbsenceAndUncertainty(const std::filesystem::path& root) {
     resetEvidence(); verdict=2;
@@ -200,8 +217,6 @@ void ambiguousAbsenceAndUncertainty(const std::filesystem::path& root) {
         std::wstring(uncertain.timeSkip.diagnostic.data()).find(L"Too little image detail")!=std::wstring::npos&&
         std::wstring(uncertain.timeSkip.diagnostic.data()).find(L"treating uncertainty as no person detected")!=std::wstring::npos,
         "Default low-detail uncertainty was unavailable, hid its policy or skipped its dwell");
-    // Changes made during recording must not alter either cadence or diagnostics.
-    s.timeSkip.uncertainAsAbsent=false;e.configure(s);
     const auto uncertainDwellAt=uncertain.timeSkip.lastCheckTick+uint64_t(s.timeSkip.quietAfterMs);
     while(GetTickCount64()+100<uncertainDwellAt){
         require(e.status().timeSkip.intervalMs==100,"Unknown result borrowed earlier absence or presence dwell");
@@ -210,7 +225,7 @@ void ambiguousAbsenceAndUncertainty(const std::filesystem::path& root) {
     const auto uncertainAccelerated=await(e,[](const auto& x){return x.timeSkip.reason==TimeSkipReason::NoPersonUncertain&&x.timeSkip.intervalMs>=350;},7000);
     require(uncertainAccelerated.timeSkip.lastCheckTick-uncertain.timeSkip.lastCheckTick+10>=uint64_t(s.timeSkip.quietAfterMs)&&
         std::wstring(uncertainAccelerated.timeSkip.diagnostic.data()).find(L"treating uncertainty as no person detected")!=std::wstring::npos,
-        "Default uncertainty skipped full dwell or its frozen diagnostic policy");
+        "Default uncertainty skipped full dwell or its diagnostic policy");
     await(e,[&](const auto& x){return x.frames>=uncertainAccelerated.frames+3&&x.timeSkip.reason==TimeSkipReason::NoPersonUncertain;},2200);
     {
         std::lock_guard<std::mutex> lock(evidenceMutex);
@@ -424,7 +439,7 @@ void personOnlyRecording(const std::filesystem::path& root) {
 int main(){
     const HRESULT com=CoInitializeEx(nullptr,COINIT_MULTITHREADED);if(FAILED(com))return 1;if(FAILED(MFStartup(MF_VERSION))){CoUninitialize();return 1;}
     const auto root=std::filesystem::current_path()/(L"engine-person-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64()));int code=0;
-    try{offAndNoCamera(root/L"isolation");accelerateAndActivity(root);ambiguousAbsenceAndUncertainty(root);pauseProvenance(root);malformedAndDuplicate(root);failuresLatch(root/L"failures");asynchronousDeadlines(root);scheduledNight(root);splitPresenceContinuity(root);
+    try{offAndNoCamera(root/L"isolation");accelerateAndActivity(root);livePolicy(root);ambiguousAbsenceAndUncertainty(root);pauseProvenance(root);malformedAndDuplicate(root);failuresLatch(root/L"failures");asynchronousDeadlines(root);scheduledNight(root);splitPresenceContinuity(root);
         splitResumePerson(root,false);splitResumePerson(root,true);personOnlyRecording(root);
         std::filesystem::remove_all(root);std::cout<<"All synthetic person engine contracts passed.\n";
     }catch(const std::exception& e){std::cerr<<e.what()<<'\n';std::wcerr<<L"Retained artifacts: "<<root.wstring()<<L'\n';code=1;}

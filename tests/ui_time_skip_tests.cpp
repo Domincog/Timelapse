@@ -100,15 +100,24 @@ void boundsAndFreeze(){
         require(!IsWindowEnabled(draft.add),"Sixteenth range did not disable Add.");const auto calls=skipDialogCalls;skipProc(window,WM_COMMAND,SkipAdd,0);require(skipDialogCalls==calls,"Forged Add exceeded bounded list.");
         skipProc(window,WM_COMMAND,SkipRemove,0);require(draft.policy.rangeCount==15 && IsWindowEnabled(draft.add),"Remove did not restore bounded Add.");skipProc(window,WM_COMMAND,IDCANCEL,0);};
     editSkip();require(app.settings.timeSkip.rangeCount==16,"Cancelled removal mutated policy.");
-    for(auto state:{State::Starting,State::Recording,State::Paused,State::Finishing}){
+    for(auto state:{State::Starting,State::Finishing}){
         app.status.state=state;const int initial=lapse::configurationCalls;
-        skipScript=[](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);require(draft.readOnly,"Active editor not read only.");
+        skipScript=[](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);require(draft.readOnly,"Starting/finishing editor not read only.");
             for(HWND child:{draft.mode,draft.speed,draft.ramp,draft.quiet,draft.repeat,draft.uncertain,draft.add,draft.edit,draft.remove,draft.okay})require(!IsWindowEnabled(child),"Active edit control enabled.");
             require(IsWindowEnabled(draft.ranges) && IsWindowEnabled(draft.cancel),"Active schedule cannot be inspected or closed.");
             const auto count=draft.policy.rangeCount;skipProc(window,WM_COMMAND,SkipRemove,0);skipProc(window,WM_COMMAND,SkipAdd,0);require(count==draft.policy.rangeCount,"Forged active mutation changed draft.");
             choose(draft.mode,0);skipProc(window,WM_COMMAND,IDOK,0);require(outcome()==IDCANCEL,"Forged active OK committed.");};
-        editSkip();require(app.settings.timeSkip.rangeCount==16 && app.settings.timeSkip.mode==TimeSkipMode::Manual && initial==lapse::configurationCalls,"Active policy changed.");
+        editSkip();require(app.settings.timeSkip.rangeCount==16 && app.settings.timeSkip.mode==TimeSkipMode::Manual && initial==lapse::configurationCalls,"Starting/finishing policy changed.");
     }
+    // Recording or paused: the policy changes live.
+    app.status.state=State::Recording;{const int initial=lapse::configurationCalls;
+        skipScript=[](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);require(!draft.readOnly && IsWindowEnabled(draft.mode) && IsWindowEnabled(draft.okay),"Live editor was read only.");
+            SendMessageW(draft.ranges,LB_SETCURSEL,0,0);skipProc(window,WM_COMMAND,MAKEWPARAM(SkipRanges,LBN_SELCHANGE),0);skipProc(window,WM_COMMAND,SkipRemove,0);
+            require(draft.policy.rangeCount==15,"Live range removal failed.");skipProc(window,WM_COMMAND,IDOK,0);require(outcome()==IDOK,"Live OK was refused.");};
+        editSkip();require(app.settings.timeSkip.rangeCount==15 && lapse::configured.timeSkip.rangeCount==15 && lapse::configurationCalls==initial+1,"Live policy did not reach the session once.");}
+    app.status.state=State::Paused;
+    skipScript=[](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);mode(window,draft,TimeSkipMode::Off);skipProc(window,WM_COMMAND,IDOK,0);require(outcome()==IDOK,"Paused OK was refused.");};
+    editSkip();require(app.settings.timeSkip.mode==TimeSkipMode::Off && lapse::configured.timeSkip.mode==TimeSkipMode::Off,"Paused policy change did not reach the session.");
     app.status={};skipDialogFailure=true;const auto before=app.settings.timeSkip;editSkip();require(app.settings.timeSkip.mode==before.mode && !startupMessage.empty(),"Dialog creation failure lost settings or its message.");
     std::cout<<"PASS bounded sixteen-range editor, active read-only inspection, forged-command locks and creation failure\n";
 }
@@ -231,13 +240,14 @@ void personModesAndManagement(){
         "Exact person policy lost values or camera-only checks blocked ordinary desktop recording.");
     const unsigned inspections=lapse::uiPersonPackInspections,dialogs=lapse::uiPersonPackDialogs;
     for(auto state:{State::Starting,State::Recording,State::Paused,State::Finishing}){
-        app.status.state=state;
-        skipScript=[](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);
-            require(draft.readOnly && !IsWindowEnabled(draft.packManage),"Active manager remained enabled.");
+        app.status.state=state;const bool live=state==State::Recording || state==State::Paused;const unsigned before=lapse::uiPersonPackInspections;
+        skipScript=[live](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);
+            require(draft.readOnly==!live && !IsWindowEnabled(draft.packManage),"Detector management was available during a session.");
             skipProc(window,WM_COMMAND,SkipPackManage,0);skipProc(window,WM_COMMAND,IDCANCEL,0);};
         editSkip();
+        require(live || before==lapse::uiPersonPackInspections,"Starting/finishing inspection did pack work.");
     }
-    require(inspections==lapse::uiPersonPackInspections && dialogs==lapse::uiPersonPackDialogs,"Active inspection/forged management did pack work.");
+    require(inspections<=lapse::uiPersonPackInspections && dialogs==lapse::uiPersonPackDialogs,"Forged management opened the detector manager during a session.");
     app.status={};std::cout<<"PASS explicit person modes, exact reused dwell/schedule, cached management, cancel isolation and active locks\n";
 }
 void personLayoutAndStatus(){
@@ -309,14 +319,19 @@ void personUncertaintyChoice(){
     skipScript=[](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);
         require(SendMessageW(draft.uncertain,BM_GETCHECK,0,0)==BST_UNCHECKED,"Reopened dialog lost uncertainty opt-out.");SendMessageW(draft.uncertain,BM_CLICK,0,0);skipProc(window,WM_COMMAND,IDCANCEL,0);};
     editSkip();require(!app.settings.timeSkip.uncertainAsAbsent,"Cancelled uncertainty opt-in changed accepted settings.");
-    for(auto state:{State::Waiting,State::Starting,State::Recording,State::Paused,State::Finishing}){
+    for(auto state:{State::Waiting,State::Starting,State::Finishing}){
         app.status.state=state;
         skipScript=[](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);
-            require(draft.readOnly && !IsWindowEnabled(draft.uncertain) && SendMessageW(draft.uncertain,BM_GETCHECK,0,0)==BST_UNCHECKED,"Active uncertainty option is editable or displays a different choice.");
-            SendMessageW(draft.uncertain,BM_SETCHECK,BST_CHECKED,0);skipProc(window,WM_COMMAND,SkipUncertain,0);skipProc(window,WM_COMMAND,IDOK,0);require(outcome()==IDCANCEL,"Forged active uncertainty acceptance committed.");};
-        editSkip();require(!app.settings.timeSkip.uncertainAsAbsent && lapse::configurationCalls==initial+1,"Active uncertainty mutation reached accepted or engine settings.");
+            require(draft.readOnly && !IsWindowEnabled(draft.uncertain) && SendMessageW(draft.uncertain,BM_GETCHECK,0,0)==BST_UNCHECKED,"Locked uncertainty option is editable or displays a different choice.");
+            SendMessageW(draft.uncertain,BM_SETCHECK,BST_CHECKED,0);skipProc(window,WM_COMMAND,SkipUncertain,0);skipProc(window,WM_COMMAND,IDOK,0);require(outcome()==IDCANCEL,"Forged locked uncertainty acceptance committed.");};
+        editSkip();require(!app.settings.timeSkip.uncertainAsAbsent && lapse::configurationCalls==initial+1,"Locked uncertainty mutation reached accepted or engine settings.");
     }
-    app.status={};std::cout<<"PASS enabled uncertainty default, native opt-out, mode/tab behavior, cancel isolation, exact configuration, truthful availability and frozen active choices\n";
+    app.status.state=State::Recording;
+    skipScript=[](HWND,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);
+        require(!draft.readOnly && IsWindowEnabled(draft.uncertain),"Live uncertainty option was locked.");
+        SendMessageW(draft.uncertain,BM_CLICK,0,0);SendMessageW(draft.okay,BM_CLICK,0,0);require(outcome()==IDOK,"Live uncertainty change was refused.");};
+    editSkip();require(app.settings.timeSkip.uncertainAsAbsent && lapse::configured.timeSkip.uncertainAsAbsent && lapse::configurationCalls==initial+2,"Live uncertainty change did not reach the session once.");
+    app.status={};std::cout<<"PASS enabled uncertainty default, native opt-out, mode/tab behavior, cancel isolation, exact configuration, truthful availability, live and locked session choices\n";
 }
 void nativeModalButtons(){
     HiddenFixture owned;setupSkip();
@@ -360,7 +375,7 @@ void nativeModalButtons(){
     };
     editSkip();require(app.settings.timeSkip.mode==TimeSkipMode::NoPersonWithinSchedule && app.settings.timeSkip.rangeCount==1,"Native dialog acceptance failed to commit policy.");
     for(bool readOnly:{false,true}){
-        app.status.state=readOnly?State::Recording:State::Idle;
+        app.status.state=readOnly?State::Finishing:State::Idle;
         const auto policy=app.settings.timeSkip;const int configurationCount=lapse::configurationCalls;
         skipScript=[&](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);
             require(!outcome() && draft.readOnly==readOnly,"Read-only initialization activated Close on focus.");
@@ -416,7 +431,7 @@ void fineTuning(){
     app.settings.timeSkip.mode=TimeSkipMode::Quiet;
     skipScript=[&](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);toggle(window,draft);choose(draft.sensitivity,0);choose(draft.ramp,0);skipProc(window,WM_COMMAND,IDCANCEL,0);};
     editSkip();require(app.settings.timeSkip.quietSensitivity==QuietSensitivity::High && app.settings.timeSkip.rampFrames==30,"Cancelled tuning changed saved policy.");
-    for(auto state:{State::Starting,State::Recording,State::Paused,State::Finishing}){
+    for(auto state:{State::Starting,State::Finishing}){
         app.status.state=state;
         skipScript=[&](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);
             require(IsWindowEnabled(draft.fine) && !IsWindowEnabled(draft.ramp) && !IsWindowEnabled(draft.sensitivity),"Read-only tuning lost inspection or unlocked session options.");
@@ -424,6 +439,10 @@ void fineTuning(){
             skipProc(window,WM_COMMAND,IDCANCEL,0);
         };editSkip();
     }
+    app.status.state=State::Recording;
+    skipScript=[&](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);
+        require(IsWindowEnabled(draft.ramp) && IsWindowEnabled(draft.sensitivity),"Live tuning was locked.");skipProc(window,WM_COMMAND,IDCANCEL,0);};
+    editSkip();
     app.status={};require(app.settings.timeSkip.quietSensitivity==QuietSensitivity::High && lapse::configurationCalls==initial+1,"Read-only inspection reconfigured tuning.");
     std::cout<<"PASS Fine tuning default/nondefault disclosure, native keyboard/DPI, hidden validation, Off, cancellation and read-only inspection\n";
 }
@@ -452,7 +471,7 @@ void nativeScheduleMnemonicsAndReadOnlyEnter(){
         };editSkip();
         require(app.settings.timeSkip.rangeCount==1 && lapse::configurationCalls==configurations,"Cancelled mnemonic edit changed persistent policy.");
     }
-    for(auto state:{State::Starting,State::Recording,State::Paused,State::Finishing}){
+    for(auto state:{State::Starting,State::Finishing}){
         app.status.state=state;const int configurations=lapse::configurationCalls;
         skipScript=[&](HWND window,DLGPROC,LPARAM parameter){auto& draft=*reinterpret_cast<SkipDraft*>(parameter);
             require(draft.readOnly && IsWindowEnabled(draft.ranges) && !IsWindowEnabled(draft.remove),"Read-only schedule inspection locks changed.");
@@ -470,7 +489,7 @@ void nativePageWheelOwnership(){
     for(auto policyMode:{TimeSkipMode::QuietWithinSchedule,TimeSkipMode::NoPersonWithinSchedule})for(bool readOnly:{false,true}){
         HiddenFixture owned;setupSkip();app.settings.timeSkip.mode=policyMode;
         app.settings.timeSkip.rangeCount=16;for(unsigned i=0;i<16;++i)app.settings.timeSkip.ranges[i]={int(i*60),int(i*60+30)};
-        app.status.state=readOnly?State::Recording:State::Idle;
+        app.status.state=readOnly?State::Finishing:State::Idle;
         const auto accepted=skipValues(app.settings.timeSkip);const int configurationCount=lapse::configurationCalls;int nested=0;HWND outer{};
         skipScript=[&](HWND window,DLGPROC procedure,LPARAM parameter){
             if(procedure==customProc){
